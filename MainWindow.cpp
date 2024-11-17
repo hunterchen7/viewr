@@ -15,7 +15,7 @@ MainWindow::MainWindow(QWidget *parent, ImageController *controller)
     QPixmap pixmap(QString::fromStdString(imageController->getCurrentFile()));
 
     if (!pixmap.isNull()) {
-        imageLabel->setPixmap(pixmap.scaled(800, 600, Qt::KeepAspectRatio));
+        imageLabel->setPixmap(pixmap.scaled(1600, 1200, Qt::KeepAspectRatio));
         imageLabel->setAlignment(Qt::AlignCenter);
         setCentralWidget(imageLabel);
     } else {
@@ -38,14 +38,14 @@ void MainWindow::keyPressEvent(QKeyEvent *event) {
         imageController->nextImage();
         break;
     default:
-        QMainWindow::keyPressEvent(event);
+        // QMainWindow::keyPressEvent(event);
         break;
     }
 
     // Update the displayed image
     QPixmap pixmap(QString::fromStdString(imageController->getCurrentFile()));
     if (!pixmap.isNull()) {
-        imageLabel->setPixmap(pixmap.scaled(800, 600, Qt::KeepAspectRatio));
+        imageLabel->setPixmap(pixmap.scaled(1600, 1200, Qt::KeepAspectRatio));
     } else {
         imageLabel->setText("Failed to load image");
     }
