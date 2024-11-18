@@ -10,6 +10,7 @@ MainWindow::MainWindow(QWidget *parent, ImageController *controller)
     , imageController(controller)  // Initialize controller
 {
     ui->setupUi(this);
+    move(700,200);
 
     // Display the first image
     QPixmap pixmap(QString::fromStdString(imageController->getCurrentFile()));
