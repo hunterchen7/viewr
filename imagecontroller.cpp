@@ -10,14 +10,11 @@
 
 namespace fs = std::filesystem;
 
-ImageController::ImageController() : currentIndex(0), cacheManager() {
+ImageController::ImageController() : currentIndex(0), cacheManager(), cancelPreloading(false) {
     connect(&cacheManager, &CacheManager::cacheSizeChanged, this, &ImageController::cacheSizeChanged);
 }
 
-
-ImageController::~ImageController() {
-
-}
+ImageController::~ImageController() {}
 
 void ImageController::initialize(const std::string &path) {
     fileList.clear();
@@ -105,13 +102,24 @@ QPixmap ImageController::getPixMap() {
 }
 
 void ImageController::startPreloading() {
+    // Cancel any currently running tasks
+    cancelPreloading.store(true);
+
+    // Allow new tasks to proceed
+    cancelPreloading.store(false);
+
     const int totalFiles = fileList.size();
-    const int forwardCacheSize = (2 * cacheManager.getMaxCacheSize()) / 3; // Forward cache size (2/3 of total)
-    const int backwardCacheSize = cacheManager.getMaxCacheSize() / 3;      // Backward cache size (1/3 of total)
+    const int forwardCacheSize = (2 * cacheManager.getMaxCacheSize()) / 3;
+    const int backwardCacheSize = cacheManager.getMaxCacheSize() / 3;
 
     // Forward caching for even indices
     QThreadPool::globalInstance()->start([this, forwardCacheSize, totalFiles]() {
-        for (int offset = 0; offset < forwardCacheSize; offset += 2) { // Cache even indices
+        for (int offset = 0; offset < forwardCacheSize; offset += 2) {
+            if (cancelPreloading.load()) {
+                qDebug() << "Forward even caching task cancelled";
+                return; // Exit task early
+            }
+
             int preloadIndex = (currentIndex + offset + totalFiles) % totalFiles;
             std::string imageID = std::filesystem::absolute(fileList[preloadIndex]).string();
 
@@ -128,7 +136,12 @@ void ImageController::startPreloading() {
 
     // Forward caching for odd indices
     QThreadPool::globalInstance()->start([this, forwardCacheSize, totalFiles]() {
-        for (int offset = 1; offset < forwardCacheSize; offset += 2) { // Cache odd indices
+        for (int offset = 1; offset < forwardCacheSize; offset += 2) {
+            if (cancelPreloading.load()) {
+                qDebug() << "Forward odd caching task cancelled";
+                return; // Exit task early
+            }
+
             int preloadIndex = (currentIndex + offset + totalFiles) % totalFiles;
             std::string imageID = std::filesystem::absolute(fileList[preloadIndex]).string();
 
@@ -146,6 +159,11 @@ void ImageController::startPreloading() {
     // Backward caching
     QThreadPool::globalInstance()->start([this, backwardCacheSize, totalFiles]() {
         for (int offset = -1; offset >= -backwardCacheSize; --offset) {
+            if (cancelPreloading.load()) {
+                qDebug() << "Backward caching task cancelled";
+                return; // Exit task early
+            }
+
             int preloadIndex = (currentIndex + offset + totalFiles) % totalFiles;
             std::string imageID = std::filesystem::absolute(fileList[preloadIndex]).string();
 
@@ -160,6 +178,7 @@ void ImageController::startPreloading() {
         }
     });
 }
+
 
 int ImageController::getCacheSize() {
     return cacheManager.getCurrentCacheSize();

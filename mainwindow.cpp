@@ -5,6 +5,7 @@
 #include <QFileInfo>
 #include <QScreen>
 #include <QElapsedTimer>
+#include <QVBoxLayout>
 
 MainWindow::MainWindow(QWidget *parent, ImageController *controller)
     : QMainWindow(parent)
@@ -16,10 +17,10 @@ MainWindow::MainWindow(QWidget *parent, ImageController *controller)
 
     // Get the screen dimensions
     QRect screenGeometry = screen()->geometry();
-    int screenWidth = screenGeometry.width();
-    int screenHeight = screenGeometry.height();
+    int screenWidth = screenGeometry.width() * 0.8;
+    int screenHeight = screenGeometry.height() * 0.8;
 
-    move(0,0);
+    move(600,100);
 
     // Display the first image
     imageController->startPreloading();
@@ -29,7 +30,6 @@ MainWindow::MainWindow(QWidget *parent, ImageController *controller)
         imageLabel->setPixmap(pixmap.scaled(screenWidth, screenHeight, Qt::KeepAspectRatio));
         imageLabel->setAlignment(Qt::AlignCenter);
         setCentralWidget(imageLabel);
-
         setWindowTitle(imageController->getFileInfo().fileName());
     } else {
         imageLabel->setText("Failed to load image");
@@ -45,8 +45,8 @@ MainWindow::~MainWindow() {
 void MainWindow::keyPressEvent(QKeyEvent *event) {
     // Get the screen dimensions
     QRect screenGeometry = screen()->geometry();
-    int screenWidth = screenGeometry.width();
-    int screenHeight = screenGeometry.height();
+    int screenWidth = screenGeometry.width() * 0.8;
+    int screenHeight = screenGeometry.height() * 0.8;
 
     switch (event->key()) {
     case Qt::Key_Left:

@@ -7,6 +7,7 @@
 #include <QPixMap>
 #include <QMutex>
 #include <QThread>
+#include <atomic>
 #include "cachemanager.h"
 
 class ImageController : public QObject {
@@ -31,6 +32,7 @@ signals:
     void cacheSizeChanged(int newSize); // Signal to notify when cache size changes (for displaying on frontend)
 
 private:
+    std::atomic<bool> cancelPreloading; // cancellation flag for preloading tasks
     void scanDirectory(const std::string &directory);
     bool isSupportedFile(const std::string &file) const;
 

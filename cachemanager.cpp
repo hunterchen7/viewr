@@ -37,9 +37,6 @@ void CacheManager::storeImageInCache(const std::string& imageID, const QPixmap& 
         cacheList.emplace_front(imageID, data);
         cacheMap[imageID] = cacheList.begin();
     }
-
-    // Emit the signal with the updated cache size
-    emit cacheSizeChanged(static_cast<int>(cacheList.size()));
 }
 
 void CacheManager::evictImageFromCache() {
