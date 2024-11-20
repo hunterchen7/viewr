@@ -3,7 +3,7 @@
 
 #include <QMainWindow>
 #include <QLabel>
-#include "ImageController.h"
+#include "imagecontroller.h"
 
 QT_BEGIN_NAMESPACE
 namespace Ui { class MainWindow; }

@@ -1,9 +1,10 @@
-#include "MainWindow.h"
+#include "mainwindow.h"
 #include "./ui_mainwindow.h"
 #include <QPixmap>
 #include <QKeyEvent>
 #include <QFileInfo>
 #include <QScreen>
+#include <QElapsedTimer>
 
 MainWindow::MainWindow(QWidget *parent, ImageController *controller)
     : QMainWindow(parent)
@@ -21,6 +22,7 @@ MainWindow::MainWindow(QWidget *parent, ImageController *controller)
     move(0,0);
 
     // Display the first image
+    imageController->startPreloading();
     QPixmap pixmap = imageController->getPixMap();
 
     if (!pixmap.isNull()) {
@@ -57,8 +59,12 @@ void MainWindow::keyPressEvent(QKeyEvent *event) {
         break;
     }
 
+    QElapsedTimer timer;
+    timer.start();
     // Update the displayed image
     QPixmap pixmap = imageController->getPixMap();
+    qDebug() << "pixmap loaded in" << timer.elapsed() << "ms";
+    qDebug() << "Cached images: " << imageController->getCacheSize();
 
     if (!pixmap.isNull()) {
         imageLabel->setPixmap(pixmap.scaled(screenWidth, screenHeight, Qt::KeepAspectRatio));

@@ -1,13 +1,20 @@
-#include "ImageController.h"
+#include "imagecontroller.h"
 #include <filesystem>
 #include <stdexcept>
 #include <algorithm>
 #include <QFileInfo>
 #include <QString>
+#include <QtConcurrent>
+#include <QMutex>
+#include <filesystem>
 
 namespace fs = std::filesystem;
 
 ImageController::ImageController() : currentIndex(0) {}
+
+ImageController::~ImageController() {
+
+}
 
 void ImageController::initialize(const std::string &path) {
     fileList.clear();
@@ -52,12 +59,14 @@ std::string ImageController::getCurrentFile() const {
 void ImageController::nextImage() {
     if (!fileList.empty()) {
         currentIndex = (currentIndex + 1) % fileList.size();
+        startPreloading();
     }
 }
 
 void ImageController::previousImage() {
     if (!fileList.empty()) {
         currentIndex = (currentIndex - 1 + fileList.size()) % fileList.size();
+        startPreloading();
     }
 }
 
@@ -72,7 +81,56 @@ QFileInfo ImageController::getFileInfo() {
     return QFileInfo(QString::fromStdString(this->getCurrentFile()));
 }
 
-// TODO: turn this into using cache when available
 QPixmap ImageController::getPixMap() {
-    return QPixmap(QString::fromStdString(this->getCurrentFile()));
+    // Normalize the file path to ensure consistent cache keys
+    std::string currentFile = std::filesystem::absolute(this->getCurrentFile()).string();
+
+    // Check if the image is in the cache
+    QPixmap* cachedPixmap = cacheManager.getImageFromCache(currentFile);
+    if (cachedPixmap != nullptr) {
+        return *cachedPixmap; // Return the cached pixmap
+    }
+
+    // If not in cache, load the pixmap
+    QPixmap pixmap(QString::fromStdString(currentFile));
+    if (!pixmap.isNull()) {
+        // Store it in the cache for future use
+        qDebug() << "caching " << currentFile << " in getPixMap";
+        cacheManager.storeImageInCache(currentFile, pixmap);
+    }
+
+    return pixmap; // Return the newly loaded pixmap (or an empty one if loading failed)
+}
+
+void ImageController::startPreloading() {
+    QThreadPool::globalInstance()->start([this]() {
+        const int preloadRange = cacheManager.getMaxCacheSize() / 2; // Cache half before and half after
+        int totalFiles = fileList.size();
+
+        for (int offset = -preloadRange; offset <= preloadRange; ++offset) {
+            int preloadIndex = (currentIndex + offset + totalFiles) % totalFiles; // Handle wrap-around
+            std::string imageID = std::filesystem::absolute(fileList[preloadIndex]).string(); // Normalize path
+
+            QMutexLocker locker(&cacheMutex);
+
+            if (!cacheManager.cacheContainsImage(imageID)) {
+                QPixmap pixmap(QString::fromStdString(imageID));
+                if (!pixmap.isNull()) {
+                    cacheManager.storeImageInCache(imageID, pixmap);
+                    qDebug() << "caching " << imageID << " in preload";
+                    if (cacheManager.getCurrentCacheSize() >= cacheManager.getMaxCacheSize()) {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+int ImageController::getCacheSize() {
+    return cacheManager.getCurrentCacheSize();
+}
+
+int ImageController::getMaxCacheSize() {
+    return cacheManager.getMaxCacheSize();
 }
