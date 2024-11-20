@@ -5,10 +5,13 @@
 #include <unordered_map>
 #include <list>
 #include <QPixmap>
+#include <QObject>
 
-class CacheManager {
+class CacheManager : public QObject {
+    Q_OBJECT // Add this macro for Qt's signal-slot mechanism
+
 public:
-    explicit CacheManager(int cacheSize = 100); // Default size of 100
+    explicit CacheManager(int cacheSize = 256); // Default size of 100
     ~CacheManager();
 
     // Fetch an image from the cache
@@ -26,6 +29,9 @@ public:
     // Get maximum size of cache
     int getMaxCacheSize() const;
 
+
+signals:
+    void cacheSizeChanged(int newSize);
 
 private:
     void evictImageFromCache();

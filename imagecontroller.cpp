@@ -10,7 +10,10 @@
 
 namespace fs = std::filesystem;
 
-ImageController::ImageController() : currentIndex(0) {}
+ImageController::ImageController() : currentIndex(0), cacheManager() {
+    connect(&cacheManager, &CacheManager::cacheSizeChanged, this, &ImageController::cacheSizeChanged);
+}
+
 
 ImageController::~ImageController() {
 
@@ -95,7 +98,6 @@ QPixmap ImageController::getPixMap() {
     QPixmap pixmap(QString::fromStdString(currentFile));
     if (!pixmap.isNull()) {
         // Store it in the cache for future use
-        qDebug() << "caching " << currentFile << " in getPixMap";
         cacheManager.storeImageInCache(currentFile, pixmap);
     }
 
@@ -103,13 +105,15 @@ QPixmap ImageController::getPixMap() {
 }
 
 void ImageController::startPreloading() {
-    QThreadPool::globalInstance()->start([this]() {
-        const int preloadRange = cacheManager.getMaxCacheSize() / 2; // Cache half before and half after
-        int totalFiles = fileList.size();
+    const int totalFiles = fileList.size();
+    const int forwardCacheSize = (2 * cacheManager.getMaxCacheSize()) / 3; // Forward cache size (2/3 of total)
+    const int backwardCacheSize = cacheManager.getMaxCacheSize() / 3;      // Backward cache size (1/3 of total)
 
-        for (int offset = -preloadRange; offset <= preloadRange; ++offset) {
-            int preloadIndex = (currentIndex + offset + totalFiles) % totalFiles; // Handle wrap-around
-            std::string imageID = std::filesystem::absolute(fileList[preloadIndex]).string(); // Normalize path
+    // Forward caching for even indices
+    QThreadPool::globalInstance()->start([this, forwardCacheSize, totalFiles]() {
+        for (int offset = 0; offset < forwardCacheSize; offset += 2) { // Cache even indices
+            int preloadIndex = (currentIndex + offset + totalFiles) % totalFiles;
+            std::string imageID = std::filesystem::absolute(fileList[preloadIndex]).string();
 
             QMutexLocker locker(&cacheMutex);
 
@@ -117,10 +121,40 @@ void ImageController::startPreloading() {
                 QPixmap pixmap(QString::fromStdString(imageID));
                 if (!pixmap.isNull()) {
                     cacheManager.storeImageInCache(imageID, pixmap);
-                    qDebug() << "caching " << imageID << " in preload";
-                    if (cacheManager.getCurrentCacheSize() >= cacheManager.getMaxCacheSize()) {
-                        break;
-                    }
+                }
+            }
+        }
+    });
+
+    // Forward caching for odd indices
+    QThreadPool::globalInstance()->start([this, forwardCacheSize, totalFiles]() {
+        for (int offset = 1; offset < forwardCacheSize; offset += 2) { // Cache odd indices
+            int preloadIndex = (currentIndex + offset + totalFiles) % totalFiles;
+            std::string imageID = std::filesystem::absolute(fileList[preloadIndex]).string();
+
+            QMutexLocker locker(&cacheMutex);
+
+            if (!cacheManager.cacheContainsImage(imageID)) {
+                QPixmap pixmap(QString::fromStdString(imageID));
+                if (!pixmap.isNull()) {
+                    cacheManager.storeImageInCache(imageID, pixmap);
+                }
+            }
+        }
+    });
+
+    // Backward caching
+    QThreadPool::globalInstance()->start([this, backwardCacheSize, totalFiles]() {
+        for (int offset = -1; offset >= -backwardCacheSize; --offset) {
+            int preloadIndex = (currentIndex + offset + totalFiles) % totalFiles;
+            std::string imageID = std::filesystem::absolute(fileList[preloadIndex]).string();
+
+            QMutexLocker locker(&cacheMutex);
+
+            if (!cacheManager.cacheContainsImage(imageID)) {
+                QPixmap pixmap(QString::fromStdString(imageID));
+                if (!pixmap.isNull()) {
+                    cacheManager.storeImageInCache(imageID, pixmap);
                 }
             }
         }
@@ -134,3 +168,4 @@ int ImageController::getCacheSize() {
 int ImageController::getMaxCacheSize() {
     return cacheManager.getMaxCacheSize();
 }
+

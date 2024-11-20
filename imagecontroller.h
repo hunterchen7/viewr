@@ -27,6 +27,9 @@ public:
     int getCacheSize();
     int getMaxCacheSize();
 
+signals:
+    void cacheSizeChanged(int newSize); // Signal to notify when cache size changes (for displaying on frontend)
+
 private:
     void scanDirectory(const std::string &directory);
     bool isSupportedFile(const std::string &file) const;

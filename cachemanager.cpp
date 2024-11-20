@@ -27,18 +27,19 @@ bool CacheManager::cacheContainsImage(const std::string& imageID) const {
 void CacheManager::storeImageInCache(const std::string& imageID, const QPixmap& data) {
     auto it = cacheMap.find(imageID);
     if (it != cacheMap.end()) {
-        // Image already in cache; update it and move to the front
+        // Update and move to the front
         it->second->second = data;
         cacheList.splice(cacheList.begin(), cacheList, it->second);
     } else {
-        // Image not in cache; insert it
         if (cacheList.size() >= cacheSize) {
-            // Evict the least recently used image
             evictImageFromCache();
         }
         cacheList.emplace_front(imageID, data);
         cacheMap[imageID] = cacheList.begin();
     }
+
+    // Emit the signal with the updated cache size
+    emit cacheSizeChanged(static_cast<int>(cacheList.size()));
 }
 
 void CacheManager::evictImageFromCache() {
