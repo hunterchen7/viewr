@@ -2,6 +2,8 @@
 #include "./ui_mainwindow.h"
 #include <QPixmap>
 #include <QKeyEvent>
+#include <QFileInfo>
+#include <QScreen>
 
 MainWindow::MainWindow(QWidget *parent, ImageController *controller)
     : QMainWindow(parent)
@@ -10,15 +12,24 @@ MainWindow::MainWindow(QWidget *parent, ImageController *controller)
     , imageController(controller)  // Initialize controller
 {
     ui->setupUi(this);
-    move(700,200);
+
+    // Get the screen dimensions
+    QRect screenGeometry = screen()->geometry();
+    int screenWidth = screenGeometry.width();
+    int screenHeight = screenGeometry.height();
+
+    move(0,0);
 
     // Display the first image
     QPixmap pixmap(QString::fromStdString(imageController->getCurrentFile()));
 
     if (!pixmap.isNull()) {
-        imageLabel->setPixmap(pixmap.scaled(1600, 1200, Qt::KeepAspectRatio));
+        imageLabel->setPixmap(pixmap.scaled(screenWidth, screenHeight, Qt::KeepAspectRatio));
         imageLabel->setAlignment(Qt::AlignCenter);
         setCentralWidget(imageLabel);
+
+        QFileInfo fileInfo(QString::fromStdString(imageController->getCurrentFile()));
+        setWindowTitle(fileInfo.fileName());
     } else {
         imageLabel->setText("Failed to load image");
         imageLabel->setAlignment(Qt::AlignCenter);
@@ -31,6 +42,11 @@ MainWindow::~MainWindow() {
 }
 
 void MainWindow::keyPressEvent(QKeyEvent *event) {
+    // Get the screen dimensions
+    QRect screenGeometry = screen()->geometry();
+    int screenWidth = screenGeometry.width();
+    int screenHeight = screenGeometry.height();
+
     switch (event->key()) {
     case Qt::Key_Left:
         imageController->previousImage();
@@ -39,14 +55,15 @@ void MainWindow::keyPressEvent(QKeyEvent *event) {
         imageController->nextImage();
         break;
     default:
-        // QMainWindow::keyPressEvent(event);
         break;
     }
 
     // Update the displayed image
     QPixmap pixmap(QString::fromStdString(imageController->getCurrentFile()));
     if (!pixmap.isNull()) {
-        imageLabel->setPixmap(pixmap.scaled(1600, 1200, Qt::KeepAspectRatio));
+        imageLabel->setPixmap(pixmap.scaled(screenWidth, screenHeight, Qt::KeepAspectRatio));
+        QFileInfo fileInfo(QString::fromStdString(imageController->getCurrentFile()));
+        setWindowTitle(fileInfo.fileName());
     } else {
         imageLabel->setText("Failed to load image");
     }
