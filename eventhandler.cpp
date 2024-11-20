@@ -1,4 +1,4 @@
-#include "EventHandler.h"
+#include "eventhandler.h"
 #include <QDebug>
 
 EventHandler::EventHandler(QObject *parent) : QObject(parent) {}

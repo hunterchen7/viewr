@@ -9,13 +9,13 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets)
-find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets)
+find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets Concurrent)
+find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets Concurrent)
 
 set(PROJECT_SOURCES
         main.cpp
-        MainWindow.cpp
-        MainWindow.h
+        mainwindow.cpp
+        mainwindow.h
         MainWindow.ui
 )
 
@@ -23,8 +23,9 @@ if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
     qt_add_executable(viewr
         MANUAL_FINALIZATION
         ${PROJECT_SOURCES}
-        EventHandler.h EventHandler.cpp
-        ImageController.h ImageController.cpp
+        eventhandler.h eventhandler.cpp
+        imagecontroller.h imagecontroller.cpp
+        CacheManager.h cachemanager.cpp
     )
 # Define target properties for Android with Qt 6 as:
 #    set_property(TARGET viewr APPEND PROPERTY QT_ANDROID_PACKAGE_SOURCE_DIR
@@ -44,7 +45,7 @@ else()
     endif()
 endif()
 
-target_link_libraries(viewr PRIVATE Qt${QT_VERSION_MAJOR}::Widgets)
+target_link_libraries(viewr PRIVATE Qt${QT_VERSION_MAJOR}::Widgets Qt${QT_VERSION_MAJOR}::Concurrent)
 
 # Qt for iOS sets MACOSX_BUNDLE_GUI_IDENTIFIER automatically since Qt 6.1.
 # If you are developing for iOS or macOS you should consider setting an

@@ -1,6 +1,6 @@
 #include <QApplication>
-#include "MainWindow.h"
-#include "ImageController.h"
+#include "mainwindow.h"
+#include "imagecontroller.h"
 #include <iostream>
 
 int main(int argc, char *argv[]) {

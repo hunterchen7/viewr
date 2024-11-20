@@ -1,9 +1,11 @@
-#include "MainWindow.h"
+#include "mainwindow.h"
 #include "./ui_mainwindow.h"
 #include <QPixmap>
 #include <QKeyEvent>
 #include <QFileInfo>
 #include <QScreen>
+#include <QElapsedTimer>
+#include <QVBoxLayout>
 
 MainWindow::MainWindow(QWidget *parent, ImageController *controller)
     : QMainWindow(parent)
@@ -15,21 +17,20 @@ MainWindow::MainWindow(QWidget *parent, ImageController *controller)
 
     // Get the screen dimensions
     QRect screenGeometry = screen()->geometry();
-    int screenWidth = screenGeometry.width();
-    int screenHeight = screenGeometry.height();
+    int screenWidth = screenGeometry.width() * 0.8;
+    int screenHeight = screenGeometry.height() * 0.8;
 
-    move(0,0);
+    move(600,100);
 
     // Display the first image
-    QPixmap pixmap(QString::fromStdString(imageController->getCurrentFile()));
+    imageController->startPreloading();
+    QPixmap pixmap = imageController->getPixMap();
 
     if (!pixmap.isNull()) {
         imageLabel->setPixmap(pixmap.scaled(screenWidth, screenHeight, Qt::KeepAspectRatio));
         imageLabel->setAlignment(Qt::AlignCenter);
         setCentralWidget(imageLabel);
-
-        QFileInfo fileInfo(QString::fromStdString(imageController->getCurrentFile()));
-        setWindowTitle(fileInfo.fileName());
+        setWindowTitle(imageController->getFileInfo().fileName());
     } else {
         imageLabel->setText("Failed to load image");
         imageLabel->setAlignment(Qt::AlignCenter);
@@ -44,8 +45,8 @@ MainWindow::~MainWindow() {
 void MainWindow::keyPressEvent(QKeyEvent *event) {
     // Get the screen dimensions
     QRect screenGeometry = screen()->geometry();
-    int screenWidth = screenGeometry.width();
-    int screenHeight = screenGeometry.height();
+    int screenWidth = screenGeometry.width() * 0.8;
+    int screenHeight = screenGeometry.height() * 0.8;
 
     switch (event->key()) {
     case Qt::Key_Left:
@@ -58,12 +59,16 @@ void MainWindow::keyPressEvent(QKeyEvent *event) {
         break;
     }
 
+    QElapsedTimer timer;
+    timer.start();
     // Update the displayed image
-    QPixmap pixmap(QString::fromStdString(imageController->getCurrentFile()));
+    QPixmap pixmap = imageController->getPixMap();
+    qDebug() << "pixmap loaded in" << timer.elapsed() << "ms";
+    qDebug() << "Cached images: " << imageController->getCacheSize();
+
     if (!pixmap.isNull()) {
         imageLabel->setPixmap(pixmap.scaled(screenWidth, screenHeight, Qt::KeepAspectRatio));
-        QFileInfo fileInfo(QString::fromStdString(imageController->getCurrentFile()));
-        setWindowTitle(fileInfo.fileName());
+        setWindowTitle(imageController->getFileInfo().fileName());
     } else {
         imageLabel->setText("Failed to load image");
     }
