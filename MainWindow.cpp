@@ -21,15 +21,14 @@ MainWindow::MainWindow(QWidget *parent, ImageController *controller)
     move(0,0);
 
     // Display the first image
-    QPixmap pixmap(QString::fromStdString(imageController->getCurrentFile()));
+    QPixmap pixmap = imageController->getPixMap();
 
     if (!pixmap.isNull()) {
         imageLabel->setPixmap(pixmap.scaled(screenWidth, screenHeight, Qt::KeepAspectRatio));
         imageLabel->setAlignment(Qt::AlignCenter);
         setCentralWidget(imageLabel);
 
-        QFileInfo fileInfo(QString::fromStdString(imageController->getCurrentFile()));
-        setWindowTitle(fileInfo.fileName());
+        setWindowTitle(imageController->getFileInfo().fileName());
     } else {
         imageLabel->setText("Failed to load image");
         imageLabel->setAlignment(Qt::AlignCenter);
@@ -59,11 +58,11 @@ void MainWindow::keyPressEvent(QKeyEvent *event) {
     }
 
     // Update the displayed image
-    QPixmap pixmap(QString::fromStdString(imageController->getCurrentFile()));
+    QPixmap pixmap = imageController->getPixMap();
+
     if (!pixmap.isNull()) {
         imageLabel->setPixmap(pixmap.scaled(screenWidth, screenHeight, Qt::KeepAspectRatio));
-        QFileInfo fileInfo(QString::fromStdString(imageController->getCurrentFile()));
-        setWindowTitle(fileInfo.fileName());
+        setWindowTitle(imageController->getFileInfo().fileName());
     } else {
         imageLabel->setText("Failed to load image");
     }

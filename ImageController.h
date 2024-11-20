@@ -3,6 +3,8 @@
 
 #include <string>
 #include <vector>
+#include <QFileInfo>
+#include <QPixMap>
 
 class ImageController {
 public:
@@ -12,6 +14,8 @@ public:
     std::string getCurrentFile() const;
     void nextImage();
     void previousImage();
+    QFileInfo getFileInfo();
+    QPixmap getPixMap();
 
 private:
     std::vector<std::string> fileList;

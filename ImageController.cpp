@@ -2,6 +2,8 @@
 #include <filesystem>
 #include <stdexcept>
 #include <algorithm>
+#include <QFileInfo>
+#include <QString>
 
 namespace fs = std::filesystem;
 
@@ -64,4 +66,13 @@ bool ImageController::isSupportedFile(const std::string &file) const {
     std::string ext = fs::path(file).extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
     return std::find(supportedExtensions.begin(), supportedExtensions.end(), ext) != supportedExtensions.end();
+}
+
+QFileInfo ImageController::getFileInfo() {
+    return QFileInfo(QString::fromStdString(this->getCurrentFile()));
+}
+
+// TODO: turn this into using cache when available
+QPixmap ImageController::getPixMap() {
+    return QPixmap(QString::fromStdString(this->getCurrentFile()));
 }
