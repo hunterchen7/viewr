@@ -1,5 +1,6 @@
 #include "CacheManager.h"
 #include <stdexcept>
+#include <QFileInfo>
 
 CacheManager::CacheManager(int size) : cacheSize(size) {
     if (size <= 0) {
@@ -57,3 +58,25 @@ int CacheManager::getCurrentCacheSize() const {
 int CacheManager::getMaxCacheSize() const {
     return cacheSize;
 }
+
+void CacheManager::printCachedImages() const {
+    // Step 1: Extract the filenames from the paths
+    std::vector<std::string> fileNames;
+    for (const auto& entry : cacheMap) {
+        std::string fullPath = entry.first; // Convert QString to std::string
+        size_t lastSlash = fullPath.find_last_of("\\/");
+        fileNames.push_back(fullPath.substr(lastSlash + 1)); // Extract the filename
+    }
+
+    // Step 2: Sort the filenames in order
+    std::sort(fileNames.begin(), fileNames.end());
+
+    // Step 3: Print the filenames on the same line, separated by commas
+    for (size_t i = 0; i < fileNames.size(); ++i) {
+        qDebug().noquote().nospace() << QString::fromStdString(fileNames[i]); // Print the filename
+    }
+}
+
+
+
+

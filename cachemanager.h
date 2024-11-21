@@ -29,6 +29,7 @@ public:
     // Get maximum size of cache
     int getMaxCacheSize() const;
 
+    void printCachedImages() const;
 
 signals:
     void cacheSizeChanged(int newSize);
@@ -40,5 +41,6 @@ private:
     std::unordered_map<std::string, std::list<std::pair<std::string, QPixmap>>::iterator> cacheMap;
     std::list<std::pair<std::string, QPixmap>> cacheList; // Keeps track of the order for LRU
 };
+
 
 #endif // CACHEMANAGER_H

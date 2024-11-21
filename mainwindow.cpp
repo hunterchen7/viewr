@@ -17,23 +17,34 @@ MainWindow::MainWindow(QWidget *parent, ImageController *controller)
 
     // Get the screen dimensions
     QRect screenGeometry = screen()->geometry();
-    int screenWidth = screenGeometry.width() * 0.8;
-    int screenHeight = screenGeometry.height() * 0.8;
-
-    move(600,100);
+    int screenWidth = screenGeometry.width();
+    int screenHeight = screenGeometry.height();
 
     // Display the first image
     imageController->startPreloading();
     QPixmap pixmap = imageController->getPixMap();
+    imageLabel->setAlignment(Qt::AlignTop | Qt::AlignLeft);  // Align to top-left
+    imageLabel->setScaledContents(false);                   // Disable scaling QLabel contents
+
+    // Calculate center position
+    int centerX = (this->width() - imageLabel->width()) / 2;
+    int centerY = (this->height() - imageLabel->height()) / 2;
+
+    // Move QLabel to center
+    imageLabel->move(centerX, centerY);
+
+    // Calculate scale to fit the window
+    double scaleX = static_cast<double>(screenWidth) / pixmap.width();
+    double scaleY = static_cast<double>(screenHeight) / pixmap.height();
+    currentScale = std::min(scaleX, scaleY); // Choose the smaller scale to fit
+    qDebug() << "current scale: " << currentScale;
 
     if (!pixmap.isNull()) {
         imageLabel->setPixmap(pixmap.scaled(screenWidth, screenHeight, Qt::KeepAspectRatio));
-        imageLabel->setAlignment(Qt::AlignCenter);
         setCentralWidget(imageLabel);
         setWindowTitle(imageController->getFileInfo().fileName());
     } else {
         imageLabel->setText("Failed to load image");
-        imageLabel->setAlignment(Qt::AlignCenter);
         setCentralWidget(imageLabel);
     }
 }
@@ -44,17 +55,14 @@ MainWindow::~MainWindow() {
 
 void MainWindow::wheelEvent(QWheelEvent *event)
 {
+    qDebug() << "wheel event";
+
     // Determine the zoom factor
     double zoomFactor = (event->angleDelta().y() > 0) ? 1.1 : 0.9;
     currentScale *= zoomFactor;
 
     // Clamp the zoom scale to avoid extreme zoom levels
     currentScale = std::clamp(currentScale, 0.1, 5.0);
-
-    // Calculate the pointer's position relative to the QLabel
-    QPointF cursorPosInLabel = imageLabel->mapFromGlobal(event->globalPosition().toPoint());
-    QPointF relativePos = QPointF(cursorPosInLabel.x() / imageLabel->width(),
-                                  cursorPosInLabel.y() / imageLabel->height());
 
     // Scale the pixmap
     QPixmap currentPixmap = imageController->getPixMap();
@@ -68,13 +76,14 @@ void MainWindow::wheelEvent(QWheelEvent *event)
     imageLabel->setPixmap(scaledPixmap);
     imageLabel->resize(scaledPixmap.size());
 
-    // Adjust QLabel position to center the zoom on the cursor
-    QPointF newCursorPos = QPointF(relativePos.x() * imageLabel->width(),
-                                   relativePos.y() * imageLabel->height());
-    QPointF delta = newCursorPos - cursorPosInLabel;
-
-    imageLabel->move(imageLabel->x() - delta.x(), imageLabel->y() - delta.y());
+    // Debugging
+    qDebug() << "MainWindow size:" << this->size();
+    qDebug() << "ImageLabel size:" << imageLabel->size();
+    qDebug() << "Pixmap size:" << scaledPixmap.size();
+    qDebug() << "ImageLabel position:" << imageLabel->pos();
 }
+
+
 
 // Handle mouse press
 void MainWindow::mousePressEvent(QMouseEvent *event)
@@ -108,8 +117,8 @@ void MainWindow::mouseReleaseEvent(QMouseEvent *event)
 void MainWindow::keyPressEvent(QKeyEvent *event) {
     // Get the screen dimensions
     QRect screenGeometry = screen()->geometry();
-    int screenWidth = screenGeometry.width() * 0.8;
-    int screenHeight = screenGeometry.height() * 0.8;
+    int screenWidth = screenGeometry.width();
+    int screenHeight = screenGeometry.height();
 
     switch (event->key()) {
     case Qt::Key_Left:
@@ -131,6 +140,7 @@ void MainWindow::keyPressEvent(QKeyEvent *event) {
 
     if (!pixmap.isNull()) {
         imageLabel->setPixmap(pixmap.scaled(screenWidth, screenHeight, Qt::KeepAspectRatio));
+        imageLabel->move(0,0);
         setWindowTitle(imageController->getFileInfo().fileName());
     } else {
         imageLabel->setText("Failed to load image");
@@ -139,19 +149,29 @@ void MainWindow::keyPressEvent(QKeyEvent *event) {
 
 void MainWindow::mouseDoubleClickEvent(QMouseEvent *event)
 {
-    // Check if the double-click is with the left mouse button
     if (event->button() == Qt::LeftButton) {
-        // Reset the zoom scale
-        currentScale = 1.0;
+        // Reset to the initial scale
+        QRect screenGeometry = screen()->geometry();
+        int screenWidth = screenGeometry.width();
+        int screenHeight = screenGeometry.height();
 
-        // Load the original pixmap from the controller
+        // Calculate the initial scale again
         QPixmap currentPixmap = imageController->getPixMap();
+        double scaleX = static_cast<double>(screenWidth) / currentPixmap.width();
+        double scaleY = static_cast<double>(screenHeight) / currentPixmap.height();
+        currentScale = std::min(scaleX, scaleY);
 
-        // Reset QLabel to the original pixmap
-        imageLabel->setPixmap(currentPixmap);
-        imageLabel->resize(currentPixmap.size());
+        // Apply the reset zoom
+        QPixmap scaledPixmap = currentPixmap.scaled(
+            currentPixmap.size() * currentScale,
+            Qt::KeepAspectRatio,
+            Qt::SmoothTransformation
+            );
 
-        // Center the image in the window
+        imageLabel->setPixmap(scaledPixmap);
+        imageLabel->resize(scaledPixmap.size());
+
+        // Center the image
         int centerX = (width() - imageLabel->width()) / 2;
         int centerY = (height() - imageLabel->height()) / 2;
         imageLabel->move(centerX, centerY);

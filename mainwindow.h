@@ -30,7 +30,7 @@ private:
     Ui::MainWindow *ui;
     QLabel *imageLabel;
     ImageController *imageController;  // Pointer to the controller
-    double currentScale = 1.0;
+    double currentScale;
     bool isPanning = false;           // To track if the user is panning
     QPoint lastMousePosition;         // To store the last mouse position
 };
