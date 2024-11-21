@@ -25,7 +25,7 @@ int main(int argc, char *argv[]) {
 
     // Pass the controller to MainWindow
     MainWindow mainWindow(nullptr, &controller);
-    mainWindow.show();
+    mainWindow.showMaximized();
 
     return app.exec();
 }

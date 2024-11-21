@@ -181,6 +181,7 @@ void ImageController::startPreloading() {
 
 
 int ImageController::getCacheSize() {
+    // cacheManager.printCachedImages();
     return cacheManager.getCurrentCacheSize();
 }
 
