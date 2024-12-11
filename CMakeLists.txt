@@ -12,6 +12,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Widgets)
 find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Widgets)
 
+# Add Exiv2 package
+find_package(Exiv2 REQUIRED)
+include_directories(${Exiv2_INCLUDE_DIRS})
+
+
 set(PROJECT_SOURCES
         main.cpp
         MainWindow.cpp
@@ -44,7 +49,7 @@ else()
     endif()
 endif()
 
-target_link_libraries(viewr PRIVATE Qt${QT_VERSION_MAJOR}::Widgets)
+target_link_libraries(viewr PRIVATE Qt${QT_VERSION_MAJOR}::Widgets ${Exiv2_LIBRARIES})
 
 # Qt for iOS sets MACOSX_BUNDLE_GUI_IDENTIFIER automatically since Qt 6.1.
 # If you are developing for iOS or macOS you should consider setting an
