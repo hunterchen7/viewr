@@ -11,7 +11,7 @@ class CacheManager : public QObject {
     Q_OBJECT // Add this macro for Qt's signal-slot mechanism
 
 public:
-    explicit CacheManager(int cacheSize = 256); // Default size of 100
+    explicit CacheManager(int cacheSize = 256); // Default size of 256
     ~CacheManager();
 
     // Fetch an image from the cache
