@@ -15,16 +15,16 @@ public:
     ~CacheManager();
 
     // Fetch an image from the cache
-    QPixmap* getImageFromCache(const std::string& imageID);
+    virtual QPixmap* getImageFromCache(const std::string& imageID);
 
     // Check if the image exists in the cache
     bool cacheContainsImage(const std::string& imageID) const;
 
     // Store an image in the cache
-    void storeImageInCache(const std::string& imageID, const QPixmap& data);
+    virtual void storeImageInCache(const std::string& imageID, const QPixmap& data);
 
     // Get current size of cache i.e. number of images cached
-    int getCurrentCacheSize() const;
+    virtual int getCurrentCacheSize() const;
 
     // Get maximum size of cache
     int getMaxCacheSize() const;
