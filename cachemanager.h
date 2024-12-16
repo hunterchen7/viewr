@@ -11,20 +11,20 @@ class CacheManager : public QObject {
     Q_OBJECT // Add this macro for Qt's signal-slot mechanism
 
 public:
-    explicit CacheManager(int cacheSize = 256); // Default size of 100
+    explicit CacheManager(int cacheSize = 100); // Default size of 100
     ~CacheManager();
 
     // Fetch an image from the cache
-    QPixmap* getImageFromCache(const std::string& imageID);
+    virtual QPixmap* getImageFromCache(const std::string& imageID);
 
     // Check if the image exists in the cache
     bool cacheContainsImage(const std::string& imageID) const;
 
     // Store an image in the cache
-    void storeImageInCache(const std::string& imageID, const QPixmap& data);
+    virtual void storeImageInCache(const std::string& imageID, const QPixmap& data);
 
     // Get current size of cache i.e. number of images cached
-    int getCurrentCacheSize() const;
+    virtual int getCurrentCacheSize() const;
 
     // Get maximum size of cache
     int getMaxCacheSize() const;
