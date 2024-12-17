@@ -4,7 +4,6 @@
 #include <string>
 #include <map>
 #include <exiv2/exiv2.hpp>
-#include <memory> // Include for std::unique_ptr
 
 class MetadataManager {
 public:
