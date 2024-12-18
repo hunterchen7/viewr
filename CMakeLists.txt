@@ -39,7 +39,7 @@ if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
     qt_add_executable(viewr
         MANUAL_FINALIZATION
         ${PROJECT_SOURCES}
-        eventhandler.h eventhandler.cpp
+        eventhandler.cpp
         imagecontroller.h imagecontroller.cpp
         CacheManager.h cachemanager.cpp
         metadatamanager.h metadatamanager.cpp
