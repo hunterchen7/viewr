@@ -61,7 +61,7 @@ add_executable(viewr_tests
     tests/imagecontroller_test.cpp
     imagecontroller.cpp
     cachemanager.cpp
-    eventhandler.cpp
+
 )
 
 set_target_properties(viewr_tests PROPERTIES LINK_FLAGS "-Wl,-subsystem,console")
