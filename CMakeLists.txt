@@ -26,8 +26,6 @@ set(PROJECT_SOURCES
     mainwindow.cpp
     mainwindow.h
     MainWindow.ui
-    eventhandler.h
-    eventhandler.cpp
     imagecontroller.h
     imagecontroller.cpp
     CacheManager.h
@@ -39,7 +37,6 @@ if(${QT_VERSION_MAJOR} GREATER_EQUAL 6)
     qt_add_executable(viewr
         MANUAL_FINALIZATION
         ${PROJECT_SOURCES}
-        eventhandler.cpp
         imagecontroller.h imagecontroller.cpp
         CacheManager.h cachemanager.cpp
         metadatamanager.h metadatamanager.cpp
