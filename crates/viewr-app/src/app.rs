@@ -1,8 +1,13 @@
 //! The app shell: draws from the RamCache, dispatches navigation to the
 //! engine, and owns every texture (workers never touch UI types).
+//!
+//! Modes: Loupe (filmstrip + big image) and Grid. A min-rating filter
+//! produces the visible sequence; the engine's prefetch wave follows it.
+//! Refiltering applies lazily on navigation so rating an image below the
+//! threshold doesn't yank it out from under the cursor.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
@@ -25,43 +30,76 @@ const JPEG_BUDGET: u64 = 1536 * 1024 * 1024;
 const THUMB_BUDGET: u64 = 384 * 1024 * 1024;
 
 pub fn run(dir: &Path, select: Option<&Path>) -> Result<()> {
-    let entries = scan(dir)?;
-    if entries.is_empty() {
-        return Err(anyhow!("no raw files found in {}", dir.display()));
-    }
-    let start = select
-        .and_then(|f| entries.iter().position(|e| e.path == f))
-        .unwrap_or(0);
-    let title = format!("viewr — {}", dir.display());
-
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1500.0, 950.0]),
         ..Default::default()
     };
+    let dir = dir.to_owned();
+    let select = select.map(Path::to_owned);
     eframe::run_native(
-        &title,
+        "viewr",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, entries, start)))),
+        Box::new(move |cc| {
+            let mut app = App::empty(cc);
+            app.open_folder(&dir, select.as_deref())
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            Ok(Box::new(app))
+        }),
     )
     .map_err(|e| anyhow!("eframe: {e}"))
 }
 
-pub struct App {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Loupe,
+    Grid,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct Filter {
+    /// 0 = off; N = show only rating ≥ N.
+    min_rating: u8,
+    unrated_only: bool,
+}
+
+impl Filter {
+    fn passes(&self, rating: u8) -> bool {
+        if self.unrated_only {
+            return rating == 0;
+        }
+        rating >= self.min_rating
+    }
+    fn active(&self) -> bool {
+        self.min_rating > 0 || self.unrated_only
+    }
+}
+
+/// Per-folder session state, rebuilt by open_folder.
+struct Session {
+    dir: PathBuf,
     entries: Arc<Vec<FolderEntry>>,
     engine: Engine,
     events: Receiver<Event>,
     cache: Arc<RamCache>,
+    library: Library,
+    ratings: HashMap<usize, u8>,
+    metas: HashMap<usize, FileMeta>,
+    thumbs: HashMap<usize, egui::TextureHandle>,
+    textures: HashMap<(usize, Tier), egui::TextureHandle>,
+}
+
+pub struct App {
+    ctx: egui::Context,
+    session: Option<Session>,
 
     current: usize,
     direction: i8,
     zoom: Zoom,
-
-    library: Library,
-    ratings: HashMap<usize, u8>,
-
-    thumbs: HashMap<usize, egui::TextureHandle>,
-    metas: HashMap<usize, FileMeta>,
-    textures: HashMap<(usize, Tier), egui::TextureHandle>,
+    mode: Mode,
+    filter: Filter,
+    visible: Vec<usize>,
+    fullscreen: bool,
+    show_metadata: bool,
 
     nav_started: Option<Instant>,
     status: String,
@@ -69,55 +107,138 @@ pub struct App {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, entries: Vec<FolderEntry>, start: usize) -> Self {
+    fn empty(cc: &eframe::CreationContext<'_>) -> Self {
+        Self {
+            ctx: cc.egui_ctx.clone(),
+            session: None,
+            current: 0,
+            direction: 1,
+            zoom: Zoom::Fit,
+            mode: Mode::Loupe,
+            filter: Filter::default(),
+            visible: Vec::new(),
+            fullscreen: false,
+            show_metadata: false,
+            nav_started: None,
+            status: String::new(),
+            scroll_to_current: true,
+        }
+    }
+
+    fn open_folder(&mut self, dir: &Path, select: Option<&Path>) -> Result<()> {
+        let entries = scan(dir)?;
+        if entries.is_empty() {
+            return Err(anyhow!("no raw files found in {}", dir.display()));
+        }
+        let start = select
+            .and_then(|f| entries.iter().position(|e| e.path == f))
+            .unwrap_or(0);
         let entries = Arc::new(entries);
         let cache = Arc::new(RamCache::new(THUMB_BUDGET, RGBA_BUDGET, JPEG_BUDGET));
         let disk = DiskCache::open_default();
-        let ctx = cc.egui_ctx.clone();
+        let ctx = self.ctx.clone();
         let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
         let (engine, events) = Engine::new((*entries).clone(), start, cache.clone(), disk, notify);
 
-        // Resolve ratings: sidecar > DB (embedded arrives later via thumbs).
         let db = default_db_path().and_then(|p| Db::open(&p).ok());
         let ratings = load_ratings(&entries, db.as_ref());
         let library = Library::start();
 
-        let app = Self {
+        self.session = Some(Session {
+            dir: dir.to_owned(),
             entries,
             engine,
             events,
             cache,
-            current: start,
-            direction: 1,
-            zoom: Zoom::Fit,
             library,
             ratings,
-            thumbs: HashMap::new(),
             metas: HashMap::new(),
+            thumbs: HashMap::new(),
             textures: HashMap::new(),
-            nav_started: Some(Instant::now()),
-            status: String::new(),
-            scroll_to_current: true,
+        });
+        self.current = start;
+        self.direction = 1;
+        self.zoom = Zoom::Fit;
+        self.filter = Filter::default();
+        self.nav_started = Some(Instant::now());
+        self.scroll_to_current = true;
+        self.apply_filter();
+        self.replan();
+        Ok(())
+    }
+
+    fn pick_folder(&mut self) {
+        let start_dir = self.session.as_ref().map(|s| s.dir.clone());
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(d) = start_dir {
+            dialog = dialog.set_directory(d);
+        }
+        if let Some(dir) = dialog.pick_folder()
+            && let Err(e) = self.open_folder(&dir, None)
+        {
+            self.status = format!("open failed: {e}");
+        }
+    }
+
+    /// Rebuild the visible sequence from the filter. Falls back to "all"
+    /// when nothing matches so navigation never dead-ends.
+    fn apply_filter(&mut self) {
+        let Some(session) = &self.session else {
+            return;
         };
-        app.replan();
-        app
+        let all = || (0..session.entries.len()).collect::<Vec<_>>();
+        self.visible = if self.filter.active() {
+            let v: Vec<usize> = (0..session.entries.len())
+                .filter(|i| {
+                    self.filter
+                        .passes(session.ratings.get(i).copied().unwrap_or(0))
+                })
+                .collect();
+            if v.is_empty() { all() } else { v }
+        } else {
+            all()
+        };
+        session.engine.set_sequence(self.visible.clone());
     }
 
     fn replan(&self) {
-        self.engine.navigate(NavState {
-            current: self.current,
-            direction: self.direction,
-            zoomed: !matches!(self.zoom, Zoom::Fit),
-        });
+        if let Some(session) = &self.session {
+            session.engine.navigate(NavState {
+                current: self.current,
+                direction: self.direction,
+                zoomed: !matches!(self.zoom, Zoom::Fit),
+            });
+        }
+    }
+
+    /// Position of `current` within the visible sequence (nearest if the
+    /// current image was filtered out).
+    fn visible_pos(&self) -> usize {
+        self.visible
+            .iter()
+            .position(|&i| i == self.current)
+            .unwrap_or_else(|| {
+                self.visible
+                    .iter()
+                    .position(|&i| i > self.current)
+                    .unwrap_or(self.visible.len().saturating_sub(1))
+            })
     }
 
     fn navigate(&mut self, delta: isize) {
-        let len = self.entries.len() as isize;
-        let next = (self.current as isize + delta).clamp(0, len - 1) as usize;
+        self.apply_filter(); // lazy refilter happens at nav time
+        if self.visible.is_empty() {
+            return;
+        }
+        let pos = self.visible_pos() as isize;
+        let on_visible = self.visible.get(pos as usize) == Some(&self.current);
+        // Stepping off a filtered-out image: land on the neighbor itself.
+        let adjust = if !on_visible && delta > 0 { -1 } else { 0 };
+        let next = (pos + delta + adjust).clamp(0, self.visible.len() as isize - 1) as usize;
         if delta != 0 {
             self.direction = if delta < 0 { -1 } else { 1 };
         }
-        self.select(next);
+        self.select(self.visible[next]);
     }
 
     fn select(&mut self, index: usize) {
@@ -129,27 +250,37 @@ impl App {
         self.zoom = Zoom::Fit;
         self.scroll_to_current = true;
         self.nav_started = Some(Instant::now());
-        self.library.flush(); // navigate-away: push pending sidecar writes
+        if let Some(s) = &self.session {
+            s.library.flush();
+        }
         self.replan();
     }
 
     fn set_rating(&mut self, rating: u8) {
         let index = self.current;
+        let Some(session) = &mut self.session else {
+            return;
+        };
         if rating == 0 {
-            self.ratings.remove(&index);
+            session.ratings.remove(&index);
         } else {
-            self.ratings.insert(index, rating);
+            session.ratings.insert(index, rating);
         }
-        self.library.set_rating(&self.entries[index], rating);
+        session.library.set_rating(&session.entries[index], rating);
     }
 
-    fn drain_events(&mut self, ctx: &egui::Context) {
+    fn drain_events(&mut self) {
+        let ctx = self.ctx.clone();
+        let current = self.current;
+        let Some(session) = &mut self.session else {
+            return;
+        };
         let mut replan = false;
-        while let Ok(event) = self.events.try_recv() {
+        while let Ok(event) = session.events.try_recv() {
             match event {
                 Event::ThumbReady { index, meta } => {
-                    if let Some(buf) = self.cache.get_rgba((index, Tier::Thumb)) {
-                        self.thumbs.insert(
+                    if let Some(buf) = session.cache.get_rgba((index, Tier::Thumb)) {
+                        session.thumbs.insert(
                             index,
                             ctx.load_texture(
                                 format!("thumb{index}"),
@@ -158,18 +289,17 @@ impl App {
                             ),
                         );
                     }
-                    // Embedded in-camera rating: lowest precedence.
                     if let Some(embedded) = meta.rating
                         && embedded > 0
-                        && !self.ratings.contains_key(&index)
+                        && !session.ratings.contains_key(&index)
                     {
-                        self.ratings.insert(index, embedded.min(5) as u8);
+                        session.ratings.insert(index, embedded.min(5) as u8);
                     }
-                    self.metas.insert(index, *meta);
+                    session.metas.insert(index, *meta);
                 }
                 Event::ImageReady { .. } => replan = true,
                 Event::ImageFailed { index, tier, error } => {
-                    if index == self.current && tier != Tier::Thumb {
+                    if index == current && tier != Tier::Thumb {
                         self.status = format!("error: {error}");
                     } else {
                         eprintln!("job failed {index}/{tier:?}: {error}");
@@ -182,54 +312,84 @@ impl App {
         }
     }
 
-    /// Upload policy: current image first (Full then Browse), then at most
-    /// one neighbor browse texture per frame; prune textures outside the
-    /// keep window.
-    fn manage_textures(&mut self, ctx: &egui::Context) {
+    /// Upload policy: current image first (Browse then Full), then one
+    /// neighbor browse per frame; prune outside the keep window.
+    fn manage_textures(&mut self) {
+        let ctx = self.ctx.clone();
         let current = self.current;
-        self.textures.retain(|(i, tier), _| match tier {
+        // Keep-window over the visible sequence.
+        let pos = self.visible_pos();
+        let near: Vec<usize> = (-2isize..=2)
+            .filter_map(|d| {
+                let p = pos as isize + d;
+                (p >= 0)
+                    .then(|| self.visible.get(p as usize).copied())
+                    .flatten()
+            })
+            .collect();
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        session.textures.retain(|(i, tier), _| match tier {
             Tier::Full => *i == current,
-            _ => i.abs_diff(current) <= 2,
+            _ => near.contains(i),
         });
 
-        let ensure = |app: &mut Self, key: (usize, Tier), budget: &mut i32| {
-            if *budget <= 0 || app.textures.contains_key(&key) {
+        let mut upload = |key: (usize, Tier), budget: &mut i32| {
+            if *budget <= 0 || session.textures.contains_key(&key) {
                 return;
             }
-            if let Some(buf) = app.cache.get_rgba(key) {
+            if let Some(buf) = session.cache.get_rgba(key) {
                 let tex = ctx.load_texture(
                     format!("img{}-{:?}", key.0, key.1),
                     to_color_image(&buf),
                     egui::TextureOptions::LINEAR,
                 );
-                app.textures.insert(key, tex);
+                session.textures.insert(key, tex);
                 *budget -= 1;
             }
         };
-        // Current image may consume up to two uploads (browse + full).
         let mut budget = 2;
-        ensure(self, (current, Tier::Browse), &mut budget);
-        ensure(self, (current, Tier::Full), &mut budget);
-        // One neighbor pre-upload per frame, forward first.
+        upload((current, Tier::Browse), &mut budget);
+        upload((current, Tier::Full), &mut budget);
         let mut neighbor_budget = 1;
-        let fwd = self.direction >= 0;
-        let order: [isize; 4] = if fwd { [1, 2, -1, -2] } else { [-1, -2, 1, 2] };
-        for d in order {
-            let i = current as isize + d;
-            if i >= 0 && (i as usize) < self.entries.len() {
-                ensure(self, (i as usize, Tier::Browse), &mut neighbor_budget);
-            }
+        for &i in near.iter().filter(|&&i| i != current) {
+            upload((i, Tier::Browse), &mut neighbor_budget);
         }
     }
 
-    fn handle_keys(
-        &mut self,
-        ctx: &egui::Context,
-        loupe_rect: egui::Rect,
-        img_size: Option<egui::Vec2>,
-    ) {
-        let (right, left, shift, home, end, toggle, rating) = ctx.input(|i| {
-            let rating = [
+    fn handle_keys(&mut self, loupe_rect: egui::Rect, img_size: Option<egui::Vec2>) {
+        let ctx = self.ctx.clone();
+        struct Keys {
+            right: bool,
+            left: bool,
+            up: bool,
+            down: bool,
+            shift: bool,
+            home: bool,
+            end: bool,
+            toggle_zoom: bool,
+            grid: bool,
+            info: bool,
+            fullscreen: bool,
+            open: bool,
+            rating: Option<u8>,
+        }
+        let k = ctx.input(|i| Keys {
+            right: i.key_pressed(egui::Key::ArrowRight),
+            left: i.key_pressed(egui::Key::ArrowLeft),
+            up: i.key_pressed(egui::Key::ArrowUp),
+            down: i.key_pressed(egui::Key::ArrowDown),
+            shift: i.modifiers.shift,
+            home: i.key_pressed(egui::Key::Home),
+            end: i.key_pressed(egui::Key::End),
+            toggle_zoom: i.key_pressed(egui::Key::Space) || i.key_pressed(egui::Key::Z),
+            grid: i.key_pressed(egui::Key::G)
+                || (self.mode == Mode::Grid && i.key_pressed(egui::Key::Enter)),
+            info: i.key_pressed(egui::Key::I),
+            fullscreen: i.key_pressed(egui::Key::F),
+            open: i.modifiers.command && i.key_pressed(egui::Key::O),
+            rating: [
                 egui::Key::Num0,
                 egui::Key::Num1,
                 egui::Key::Num2,
@@ -238,35 +398,63 @@ impl App {
                 egui::Key::Num5,
             ]
             .iter()
-            .position(|k| i.key_pressed(*k))
-            .map(|n| n as u8);
-            (
-                i.key_pressed(egui::Key::ArrowRight),
-                i.key_pressed(egui::Key::ArrowLeft),
-                i.modifiers.shift,
-                i.key_pressed(egui::Key::Home),
-                i.key_pressed(egui::Key::End),
-                i.key_pressed(egui::Key::Space) || i.key_pressed(egui::Key::Z),
-                rating,
-            )
+            .position(|key| i.key_pressed(*key))
+            .map(|n| n as u8),
         });
-        if let Some(r) = rating {
+
+        if k.open {
+            self.pick_folder();
+            return;
+        }
+        if let Some(r) = k.rating {
             self.set_rating(r);
         }
-        let step = if shift { 10 } else { 1 };
-        if right {
+        let step = if k.shift { 10 } else { 1 };
+        let grid_cols = self.grid_cols() as isize;
+        if k.right {
             self.navigate(step);
         }
-        if left {
+        if k.left {
             self.navigate(-step);
         }
-        if home {
-            self.select(0);
+        if self.mode == Mode::Grid {
+            if k.down {
+                self.navigate(grid_cols);
+            }
+            if k.up {
+                self.navigate(-grid_cols);
+            }
         }
-        if end {
-            self.select(self.entries.len() - 1);
+        if k.home {
+            self.apply_filter();
+            if let Some(&first) = self.visible.first() {
+                self.select(first);
+            }
         }
-        if toggle && let Some(size) = img_size {
+        if k.end {
+            self.apply_filter();
+            if let Some(&last) = self.visible.last() {
+                self.select(last);
+            }
+        }
+        if k.grid {
+            self.mode = match self.mode {
+                Mode::Loupe => Mode::Grid,
+                Mode::Grid => Mode::Loupe,
+            };
+            self.scroll_to_current = true;
+        }
+        if k.info {
+            self.show_metadata = !self.show_metadata;
+        }
+        if k.fullscreen {
+            self.fullscreen = !self.fullscreen;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        }
+        if k.toggle_zoom
+            && self.mode == Mode::Loupe
+            && let Some(size) = img_size
+        {
             let anchor = ctx
                 .pointer_hover_pos()
                 .filter(|p| loupe_rect.contains(*p))
@@ -276,81 +464,97 @@ impl App {
         }
     }
 
-    /// Best displayable texture for the current image.
-    fn best_current(&self) -> Option<(Tier, &egui::TextureHandle)> {
-        self.textures
-            .get(&(self.current, Tier::Full))
-            .map(|t| (Tier::Full, t))
-            .or_else(|| {
-                self.textures
-                    .get(&(self.current, Tier::Browse))
-                    .map(|t| (Tier::Browse, t))
-            })
+    fn grid_cols(&self) -> usize {
+        let width = self.ctx.content_rect().width();
+        ((width / 216.0).floor() as usize).max(2)
     }
+
+    fn rating_of(&self, index: usize) -> u8 {
+        self.session
+            .as_ref()
+            .and_then(|s| s.ratings.get(&index).copied())
+            .unwrap_or(0)
+    }
+}
+
+fn stars(rating: u8) -> String {
+    (0..5).map(|i| if i < rating { '★' } else { '☆' }).collect()
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        self.drain_events(&ctx);
-        self.manage_textures(&ctx);
-
-        // Filmstrip.
-        let current = self.current;
-        let mut clicked: Option<usize> = None;
-        egui::Panel::bottom("filmstrip")
-            .exact_size(112.0)
-            .show(ui, |ui| {
-                egui::ScrollArea::horizontal()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.horizontal_centered(|ui| {
-                            for i in 0..self.entries.len() {
-                                let selected = i == current;
-                                let response = match self.thumbs.get(&i) {
-                                    Some(tex) => {
-                                        let size = tex.size_vec2();
-                                        let h = 92.0;
-                                        let w = (size.x / size.y * h).clamp(30.0, 180.0);
-                                        ui.add(
-                                            egui::Button::image(egui::Image::new((
-                                                tex.id(),
-                                                vec2(w, h),
-                                            )))
-                                            .selected(selected),
-                                        )
-                                    }
-                                    None => ui.add_sized(
-                                        vec2(120.0, 92.0),
-                                        egui::Button::new(egui::RichText::new("…").weak())
-                                            .selected(selected),
-                                    ),
-                                };
-                                if response.clicked() {
-                                    clicked = Some(i);
-                                }
-                                if selected && self.scroll_to_current {
-                                    response.scroll_to_me(Some(egui::Align::Center));
-                                }
-                            }
-                        });
-                    });
+        self.drain_events();
+        self.manage_textures();
+        if self.session.is_none() {
+            ui.centered_and_justified(|u| {
+                u.label("Open a folder of raws with Cmd+O");
             });
-        self.scroll_to_current = false;
-        if let Some(i) = clicked {
-            self.select(i);
+            self.handle_keys(ui.max_rect(), None);
+            return;
         }
 
-        // Status bar.
+        self.top_bar(ui);
+        if self.show_metadata {
+            self.metadata_panel(ui);
+        }
+        match self.mode {
+            Mode::Loupe => self.loupe_mode(ui),
+            Mode::Grid => self.grid_mode(ui),
+        }
+    }
+}
+
+impl App {
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
+        let mut filter_changed = false;
+        let session_len = self.session.as_ref().map_or(0, |s| s.entries.len());
+        let file_name = self
+            .session
+            .as_ref()
+            .map(|s| s.entries[self.current].file_name.clone())
+            .unwrap_or_default();
         egui::Panel::top("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!(
                     "{}/{}  {}",
-                    self.current + 1,
-                    self.entries.len(),
-                    self.entries[self.current].file_name
+                    self.visible_pos() + 1,
+                    self.visible.len(),
+                    file_name,
                 ));
-                if let Some(meta) = self.metas.get(&self.current) {
+                if self.visible.len() != session_len {
+                    ui.label(egui::RichText::new(format!("(of {session_len})")).weak());
+                }
+                ui.separator();
+
+                // Filter: ≥N stars + unrated-only.
+                ui.label("filter:");
+                for n in 1..=5u8 {
+                    let active = self.filter.min_rating >= n && !self.filter.unrated_only;
+                    let star = if active { '★' } else { '☆' };
+                    if ui
+                        .add(egui::Button::new(star.to_string()).frame(false))
+                        .clicked()
+                    {
+                        self.filter.unrated_only = false;
+                        self.filter.min_rating = if self.filter.min_rating == n { 0 } else { n };
+                        filter_changed = true;
+                    }
+                }
+                if ui
+                    .selectable_label(self.filter.unrated_only, "unrated")
+                    .clicked()
+                {
+                    self.filter.unrated_only = !self.filter.unrated_only;
+                    self.filter.min_rating = 0;
+                    filter_changed = true;
+                }
+                ui.separator();
+
+                if let Some(meta) = self
+                    .session
+                    .as_ref()
+                    .and_then(|s| s.metas.get(&self.current))
+                {
                     let mut parts: Vec<String> = Vec::new();
                     if let Some(iso) = meta.iso {
                         parts.push(format!("ISO {iso}"));
@@ -364,32 +568,174 @@ impl eframe::App for App {
                     if let Some(f) = meta.focal_mm {
                         parts.push(format!("{f:.0}mm"));
                     }
-                    ui.separator();
                     ui.label(parts.join("  "));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let stats = self.cache.stats();
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{}  |  rgba {}M  jpeg {}M",
-                            self.status,
-                            stats.rgba_bytes / (1024 * 1024),
-                            stats.jpeg_bytes / (1024 * 1024),
-                        ))
-                        .weak(),
-                    );
+                    if let Some(s) = &self.session {
+                        let st = s.cache.stats();
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{}  |  rgba {}M  jpeg {}M",
+                                self.status,
+                                st.rgba_bytes / (1024 * 1024),
+                                st.jpeg_bytes / (1024 * 1024),
+                            ))
+                            .weak(),
+                        );
+                    }
                 });
             });
         });
+        if filter_changed {
+            self.apply_filter();
+            // If the current image fell out of view, jump to the nearest.
+            if !self.visible.contains(&self.current)
+                && let Some(&target) = self.visible.get(self.visible_pos())
+            {
+                self.select(target);
+            }
+            self.scroll_to_current = true;
+            self.replan();
+        }
+    }
+
+    fn metadata_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let entry = &session.entries[self.current];
+        let meta = session.metas.get(&self.current);
+        let rating = self.rating_of(self.current);
+        egui::Panel::right("metadata")
+            .exact_size(260.0)
+            .show(ui, |ui| {
+                ui.add_space(8.0);
+                ui.heading(&entry.file_name);
+                ui.label(stars(rating));
+                ui.separator();
+                if let Some(m) = meta {
+                    ui.label(&m.camera);
+                    if let Some(lens) = &m.lens {
+                        ui.label(lens);
+                    }
+                    ui.add_space(6.0);
+                    egui::Grid::new("exif").num_columns(2).show(ui, |ui| {
+                        if let Some(iso) = m.iso {
+                            ui.label("ISO");
+                            ui.label(iso.to_string());
+                            ui.end_row();
+                        }
+                        if let Some(s) = &m.shutter {
+                            ui.label("Shutter");
+                            ui.label(s);
+                            ui.end_row();
+                        }
+                        if let Some(a) = &m.aperture {
+                            ui.label("Aperture");
+                            ui.label(a);
+                            ui.end_row();
+                        }
+                        if let Some(f) = m.focal_mm {
+                            ui.label("Focal");
+                            ui.label(format!("{f:.0}mm"));
+                            ui.end_row();
+                        }
+                        if let Some(t) = &m.taken {
+                            ui.label("Taken");
+                            ui.label(t);
+                            ui.end_row();
+                        }
+                        ui.label("Size");
+                        ui.label(format!("{:.1} MB", entry.size as f64 / 1e6));
+                        ui.end_row();
+                    });
+                } else {
+                    ui.spinner();
+                }
+            });
+    }
+
+    fn loupe_mode(&mut self, ui: &mut egui::Ui) {
+        // Filmstrip over the visible sequence.
+        let mut clicked: Option<usize> = None;
+        let current = self.current;
+        let scroll_to = self.scroll_to_current;
+        if let Some(session) = &self.session {
+            egui::Panel::bottom("filmstrip")
+                .exact_size(112.0)
+                .show(ui, |ui| {
+                    egui::ScrollArea::horizontal()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.horizontal_centered(|ui| {
+                                for &i in &self.visible {
+                                    let selected = i == current;
+                                    let rating = session.ratings.get(&i).copied().unwrap_or(0);
+                                    let response = match session.thumbs.get(&i) {
+                                        Some(tex) => {
+                                            let size = tex.size_vec2();
+                                            let h = 84.0;
+                                            let w = (size.x / size.y * h).clamp(30.0, 170.0);
+                                            ui.vertical(|ui| {
+                                                let r = ui.add(
+                                                    egui::Button::image(egui::Image::new((
+                                                        tex.id(),
+                                                        vec2(w, h),
+                                                    )))
+                                                    .selected(selected),
+                                                );
+                                                if rating > 0 {
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            "★".repeat(rating as usize),
+                                                        )
+                                                        .size(10.0)
+                                                        .color(egui::Color32::GOLD),
+                                                    );
+                                                }
+                                                r
+                                            })
+                                            .inner
+                                        }
+                                        None => ui.add_sized(
+                                            vec2(112.0, 84.0),
+                                            egui::Button::new(egui::RichText::new("…").weak())
+                                                .selected(selected),
+                                        ),
+                                    };
+                                    if response.clicked() {
+                                        clicked = Some(i);
+                                    }
+                                    if selected && scroll_to {
+                                        response.scroll_to_me(Some(egui::Align::Center));
+                                    }
+                                }
+                            });
+                        });
+                });
+        }
+        self.scroll_to_current = false;
+        if let Some(i) = clicked {
+            self.select(i);
+        }
 
         // Loupe.
         let loupe_rect = ui.available_rect_before_wrap();
         let mut img_size = None;
-        match self.best_current() {
+        let best = self.session.as_ref().and_then(|s| {
+            s.textures
+                .get(&(self.current, Tier::Full))
+                .map(|t| (Tier::Full, t.clone()))
+                .or_else(|| {
+                    s.textures
+                        .get(&(self.current, Tier::Browse))
+                        .map(|t| (Tier::Browse, t.clone()))
+                })
+        });
+        match best {
             Some((tier, tex)) => {
                 let size = tex.size_vec2();
                 img_size = Some(size);
-                let tex = tex.clone();
                 if let Some(t0) = self.nav_started.take() {
                     self.status = format!("{tier:?} in {:.0?}", t0.elapsed());
                 }
@@ -400,10 +746,12 @@ impl eframe::App for App {
                 }
             }
             None => {
-                // Waiting on first develop: thumb placeholder or spinner.
-                if let Some(tex) = self.thumbs.get(&self.current) {
+                let thumb = self
+                    .session
+                    .as_ref()
+                    .and_then(|s| s.thumbs.get(&self.current).cloned());
+                if let Some(tex) = thumb {
                     let size = tex.size_vec2();
-                    let tex = tex.clone();
                     loupe::show(ui, &tex, size, &mut Zoom::Fit);
                 } else {
                     ui.centered_and_justified(|ui| {
@@ -413,14 +761,13 @@ impl eframe::App for App {
             }
         }
 
-        // Rating overlay, bottom-left of the loupe.
-        let rating = self.ratings.get(&self.current).copied().unwrap_or(0);
-        let stars: String = (0..5).map(|i| if i < rating { '★' } else { '☆' }).collect();
+        // Rating overlay.
+        let rating = self.rating_of(self.current);
         egui::Area::new(egui::Id::new("rating-overlay"))
             .fixed_pos(loupe_rect.left_bottom() + egui::vec2(12.0, -40.0))
-            .show(&ctx, |ui| {
+            .show(&self.ctx.clone(), |ui| {
                 ui.label(
-                    egui::RichText::new(stars)
+                    egui::RichText::new(stars(rating))
                         .size(24.0)
                         .color(if rating > 0 {
                             egui::Color32::GOLD
@@ -431,7 +778,84 @@ impl eframe::App for App {
                 );
             });
 
-        self.handle_keys(&ctx, loupe_rect, img_size);
+        self.handle_keys(loupe_rect, img_size);
+    }
+
+    fn grid_mode(&mut self, ui: &mut egui::Ui) {
+        let cols = self.grid_cols();
+        let cell = vec2(200.0, 150.0);
+        let mut clicked: Option<usize> = None;
+        let mut open_loupe = false;
+        let current = self.current;
+        let scroll_to = self.scroll_to_current;
+        let rect = ui.max_rect();
+        if let Some(session) = &self.session {
+            let rows = self.visible.len().div_ceil(cols);
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show_rows(ui, cell.y + 26.0, rows, |ui, range| {
+                    for row in range {
+                        ui.horizontal(|ui| {
+                            for col in 0..cols {
+                                let Some(&i) = self.visible.get(row * cols + col) else {
+                                    break;
+                                };
+                                let selected = i == current;
+                                let rating = session.ratings.get(&i).copied().unwrap_or(0);
+                                ui.vertical(|ui| {
+                                    ui.set_width(cell.x);
+                                    let response = match session.thumbs.get(&i) {
+                                        Some(tex) => {
+                                            let size = tex.size_vec2();
+                                            let scale =
+                                                (cell.x / size.x).min(cell.y / size.y).min(1.0);
+                                            ui.add(
+                                                egui::Button::image(egui::Image::new((
+                                                    tex.id(),
+                                                    size * scale,
+                                                )))
+                                                .selected(selected),
+                                            )
+                                        }
+                                        None => ui.add_sized(
+                                            cell,
+                                            egui::Button::new(egui::RichText::new("…").weak())
+                                                .selected(selected),
+                                        ),
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(if rating > 0 {
+                                            "★".repeat(rating as usize)
+                                        } else {
+                                            String::new()
+                                        })
+                                        .size(11.0)
+                                        .color(egui::Color32::GOLD),
+                                    );
+                                    if response.clicked() {
+                                        clicked = Some(i);
+                                    }
+                                    if response.double_clicked() {
+                                        clicked = Some(i);
+                                        open_loupe = true;
+                                    }
+                                    if selected && scroll_to {
+                                        response.scroll_to_me(Some(egui::Align::Center));
+                                    }
+                                });
+                            }
+                        });
+                    }
+                });
+        }
+        self.scroll_to_current = false;
+        if let Some(i) = clicked {
+            self.select(i);
+        }
+        if open_loupe {
+            self.mode = Mode::Loupe;
+        }
+        self.handle_keys(rect, None);
     }
 }
 

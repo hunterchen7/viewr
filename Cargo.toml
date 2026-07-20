@@ -17,6 +17,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 fast_image_resize = "6"
 anyhow = "1"
 eframe = "0.35"
+rfd = "0.15"
 jpeg-encoder = { version = "0.6", features = ["simd"] }
 zune-jpeg = "0.5"
 rusqlite = { version = "0.32", features = ["bundled"] }

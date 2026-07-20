@@ -13,3 +13,4 @@ viewr-core.workspace = true
 anyhow.workspace = true
 eframe.workspace = true
 jpeg-encoder.workspace = true
+rfd.workspace = true

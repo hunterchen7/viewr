@@ -239,6 +239,10 @@ struct Shared {
     heavy: JobQueue,
     light: JobQueue,
     shutdown: AtomicBool,
+    /// Display order the prefetch wave follows (filtered view). Empty ⇒
+    /// identity. Distances are positions in this sequence, so with a
+    /// rating filter active the wave targets the next *visible* images.
+    sequence: Mutex<Vec<usize>>,
 }
 
 pub struct Engine {
@@ -266,6 +270,7 @@ impl Engine {
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             shutdown: AtomicBool::new(false),
+            sequence: Mutex::new(Vec::new()),
         });
 
         for _ in 0..HEAVY_WORKERS {
@@ -333,13 +338,25 @@ impl Engine {
         want(current, Tier::Browse, 0, 0);
         want(current, Tier::Full, if nav.zoomed { 0 } else { 1 }, 0);
 
-        // Outward wave with 3:1 forward bias.
-        for index in 0..len {
-            if index == current {
+        // Outward wave with 3:1 forward bias, over the display sequence.
+        let sequence: Vec<usize> = {
+            let s = self.shared.sequence.lock().unwrap();
+            if s.is_empty() {
+                (0..len).collect()
+            } else {
+                s.clone()
+            }
+        };
+        let cur_pos = sequence
+            .iter()
+            .position(|&i| i == current)
+            .unwrap_or_default();
+        for (pos, &index) in sequence.iter().enumerate() {
+            if index == current || index >= len {
                 continue;
             }
-            let ahead = (index > current) == (nav.direction >= 0);
-            let dist = index.abs_diff(current) as u32;
+            let ahead = (pos > cur_pos) == (nav.direction >= 0);
+            let dist = pos.abs_diff(cur_pos) as u32;
             let eff = if ahead { dist } else { dist.saturating_mul(3) };
             if eff <= FULL_WINDOW {
                 want(index, Tier::Browse, 2, eff);
@@ -374,6 +391,12 @@ impl Engine {
         }
 
         self.shared.heavy.set_plan(plan);
+    }
+
+    /// Set the display order (filtered view) the wave follows.
+    /// Call `navigate` afterwards to apply.
+    pub fn set_sequence(&self, sequence: Vec<usize>) {
+        *self.shared.sequence.lock().unwrap() = sequence;
     }
 
     pub fn cache(&self) -> &Arc<RamCache> {
