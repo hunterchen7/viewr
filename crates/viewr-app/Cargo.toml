@@ -1,0 +1,15 @@
+[package]
+name = "viewr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "viewr"
+path = "src/main.rs"
+
+[dependencies]
+viewr-core.workspace = true
+anyhow.workspace = true
+eframe.workspace = true
+jpeg-encoder.workspace = true

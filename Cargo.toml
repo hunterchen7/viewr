@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["crates/viewr-core", "crates/viewr-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+
+[workspace.dependencies]
+viewr-core = { path = "crates/viewr-core" }
+# rawler is not semver-stable yet — pin exactly; upgrades are deliberate events.
+rawler = "=0.7.2"
+thiserror = "2"
+anyhow = "1"
+eframe = "0.35"
+jpeg-encoder = { version = "0.6", features = ["simd"] }
+
+[profile.release]
+lto = "thin"
+
+# Keep our own code fast to compile, but dependencies (rawler, zune, eframe)
+# optimized even in dev builds — raw decode is unusable at opt-level 0.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
