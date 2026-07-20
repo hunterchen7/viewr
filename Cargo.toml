@@ -13,6 +13,8 @@ viewr-core = { path = "crates/viewr-core" }
 rawler = "=0.7.2"
 rayon = "1"
 thiserror = "2"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+fast_image_resize = "6"
 anyhow = "1"
 eframe = "0.35"
 jpeg-encoder = { version = "0.6", features = ["simd"] }

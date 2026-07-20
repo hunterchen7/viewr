@@ -7,12 +7,52 @@ use rawler::RawImage;
 use rawler::decoders::{RawDecodeParams, RawMetadata};
 use rawler::rawsource::RawSource;
 
+use crate::meta::FileMeta;
+use crate::resize;
+use crate::types::PixelBuf;
+
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("rawler: {0}")]
     Rawler(#[from] rawler::RawlerError),
+    #[error("no embedded preview or thumbnail")]
+    NoThumb,
+    #[error("{0}")]
+    Resize(#[from] resize::ResizeError),
+}
+
+pub struct ThumbResult {
+    pub thumb: PixelBuf,
+    pub meta: FileMeta,
+}
+
+/// Light pass: metadata + a display-oriented thumbnail from the embedded
+/// preview JPEG. No raw pixel decode. (Embedded previews are allowed for
+/// thumbnails only — the main view always renders from raw.)
+pub fn thumb_and_meta(path: &Path, max_edge: u32) -> Result<ThumbResult, DecodeError> {
+    let source = RawSource::new(path)?;
+    let decoder = rawler::get_decoder(&source)?;
+    let params = RawDecodeParams::default();
+    let md = decoder.raw_metadata(&source, &params)?;
+    let meta = FileMeta::from_metadata(&md);
+
+    let dyn_img = match decoder.preview_image(&source, &params)? {
+        Some(img) => img,
+        None => decoder
+            .thumbnail_image(&source, &params)?
+            .ok_or(DecodeError::NoThumb)?,
+    };
+    let rgba = dyn_img.to_rgba8();
+    let buf = PixelBuf {
+        width: rgba.width(),
+        height: rgba.height(),
+        rgba: rgba.into_raw(),
+    };
+    let small = resize::downscale_to_fit(buf, max_edge)?;
+    let thumb = resize::apply_orient(small, meta.orient);
+    Ok(ThumbResult { thumb, meta })
 }
 
 pub struct DecodedRaw {

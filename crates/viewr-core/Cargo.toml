@@ -8,3 +8,5 @@ rust-version.workspace = true
 rawler.workspace = true
 rayon.workspace = true
 thiserror.workspace = true
+image.workspace = true
+fast_image_resize.workspace = true
