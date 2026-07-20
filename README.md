@@ -47,21 +47,39 @@ the same detail. All binds and the scroll behavior are configurable in
 `~/Library/Application Support/viewr/viewr.toml` (a documented template
 is written on first run).
 
-## Build
+## Install
+
+Grab a binary from [Releases](https://github.com/hunterchen7/viewr/releases)
+(macOS Apple Silicon, Windows x64), or build from source:
 
 ```
 cargo build --release        # binary at target/release/viewr
 cargo test --workspace
 ```
 
-Rust stable, macOS-first (pure Rust; egui/wgpu → Metal). RAW decoding by
-[rawler](https://github.com/dnglab/dnglab) (LGPL-2.1) — Sony ARW
-first-class including lossless compressed; DNG comes along for free.
+Rust stable; pure Rust throughout (egui/wgpu → Metal on macOS, DX12/Vulkan
+on Windows). CI builds and tests both platforms. RAW decoding by
+[rawler](https://github.com/dnglab/dnglab) — Sony ARW first-class
+including lossless compressed; DNG comes along for free.
 
 ## Notes
 
 - Ratings precedence on load: sidecar > local DB > in-camera rating.
   Sidecar writes are debounced, atomic, and merge-preserving (existing
   Lightroom develop settings/keywords in a sidecar are untouched).
-- The local DB lives at `~/Library/Application Support/viewr/viewr.db`.
+- The local DB lives at `~/Library/Application Support/viewr/viewr.db`
+  (platform-equivalent config dir elsewhere).
 - Design/implementation notes: `docs/m0-notes.md`.
+
+## License
+
+viewr is MIT-licensed. It links [rawler](https://github.com/dnglab/dnglab)
+(LGPL-2.1) for raw decoding; distributed binaries include that LGPL
+component, whose source and license are available at the link above.
+
+## Releases
+
+Automated with release-please: commits to `main` using
+[Conventional Commits](https://www.conventionalcommits.org) (`feat:`,
+`fix:`, …) accumulate into a release PR; merging it tags a version,
+generates the changelog, and CI attaches macOS/Windows binaries.
