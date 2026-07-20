@@ -1,3 +1,5 @@
+mod viewer;
+
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -17,8 +19,10 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|| PathBuf::from("."));
             spike(Path::new(input), &out_dir)
         }
+        Some(path) if Path::new(path).is_file() => viewer::run(Path::new(path)),
         _ => {
-            eprintln!("usage: viewr dev <file.arw> [out-dir]   (M0 spike)");
+            eprintln!("usage: viewr <file.arw>            open in a window");
+            eprintln!("       viewr dev <file.arw> [out]  decode spike with timings");
             Ok(())
         }
     }
