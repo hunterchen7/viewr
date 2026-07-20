@@ -38,11 +38,16 @@ pub fn thumb_and_meta(path: &Path, max_edge: u32) -> Result<ThumbResult, DecodeE
     let md = decoder.raw_metadata(&source, &params)?;
     let meta = FileMeta::from_metadata(&md);
 
+    // Sony's decoder implements only full_image(); try smallest-first the
+    // same way dnglab's own extractors fall back.
     let dyn_img = match decoder.preview_image(&source, &params)? {
         Some(img) => img,
-        None => decoder
-            .thumbnail_image(&source, &params)?
-            .ok_or(DecodeError::NoThumb)?,
+        None => match decoder.thumbnail_image(&source, &params)? {
+            Some(img) => img,
+            None => decoder
+                .full_image(&source, &params)?
+                .ok_or(DecodeError::NoThumb)?,
+        },
     };
     let rgba = dyn_img.to_rgba8();
     let buf = PixelBuf {
