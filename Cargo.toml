@@ -26,6 +26,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 blake3 = "1"
 quick-xml = "0.36"
 dirs = "5"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 [profile.release]
 lto = "thin"

@@ -34,12 +34,18 @@ viewr dev <file.arw> [out]     decode one file, print per-stage timings
 | Home / End | first / last |
 | 0–5 | rate (0 clears) — writes `.xmp` sidecar |
 | Space / Z / double-click | toggle fit ↔ 100% at cursor |
-| wheel / pinch, drag | zoom, pan |
+| pinch or Ctrl/Cmd+scroll | zoom at cursor |
+| scroll or drag | pan (zoomed) |
 | G (Enter in grid) | grid ↔ loupe |
 | I | metadata panel |
 | F | fullscreen |
 | Cmd+O | open folder |
 | ★ buttons in top bar | filter ≥N stars / unrated |
+
+Zoom framing persists across images — cull a burst at 100% comparing
+the same detail. All binds and the scroll behavior are configurable in
+`~/Library/Application Support/viewr/viewr.toml` (a documented template
+is written on first run).
 
 ## Build
 

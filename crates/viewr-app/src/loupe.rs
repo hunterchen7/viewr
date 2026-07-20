@@ -30,16 +30,22 @@ pub fn show(
     texture: &egui::TextureHandle,
     img_size: Vec2,
     zoom: &mut Zoom,
+    scroll_zooms: bool,
 ) -> LoupeResponse {
     let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
     let viewport = rect.size();
     let fit_scale = (viewport.x / img_size.x).min(viewport.y / img_size.y);
 
-    // Wheel zoom about the hover point.
     if let Some(hover) = response.hover_pos() {
-        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-        let zoom_gesture = ui.input(|i| i.zoom_delta());
-        let factor = zoom_gesture * (1.0 + scroll * 0.003);
+        // zoom_delta covers pinch AND Ctrl/Cmd+scroll (egui folds those
+        // in); smooth_scroll_delta is the plain scroll gesture.
+        let scroll = ui.input(|i| i.smooth_scroll_delta);
+        let pinch = ui.input(|i| i.zoom_delta());
+        let factor = if scroll_zooms {
+            pinch * (1.0 + scroll.y * 0.003)
+        } else {
+            pinch
+        };
         if (factor - 1.0).abs() > f32::EPSILON {
             let current = match *zoom {
                 Zoom::Fit => fit_scale,
@@ -52,6 +58,23 @@ pub fn show(
                 let uv_at_hover = uv_at(rect, img_size, *zoom, fit_scale, hover);
                 *zoom = anchored_keeping(rect, img_size, new_scale, uv_at_hover, hover);
             }
+        }
+
+        // Plain scroll pans the zoomed image (both axes — trackpads are
+        // 2D), matching drag direction.
+        if !scroll_zooms
+            && scroll != Vec2::ZERO
+            && let Zoom::Anchored { scale, center } = *zoom
+        {
+            let new_center = center
+                - vec2(
+                    scroll.x / (scale * img_size.x),
+                    scroll.y / (scale * img_size.y),
+                );
+            *zoom = Zoom::Anchored {
+                scale,
+                center: clamp_center(new_center, viewport, img_size, scale),
+            };
         }
     }
 

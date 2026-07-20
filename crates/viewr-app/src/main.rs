@@ -1,5 +1,6 @@
 mod app;
 mod color;
+mod config;
 mod loupe;
 
 use std::path::{Path, PathBuf};

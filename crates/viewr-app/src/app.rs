@@ -23,6 +23,7 @@ use viewr_core::library::{Library, load_ratings};
 use viewr_core::meta::FileMeta;
 use viewr_core::types::{PixelBuf, Tier};
 
+use crate::config::{Action, Config, ScrollMode};
 use crate::loupe::{self, Zoom};
 
 const RGBA_BUDGET: u64 = 3 * 1024 * 1024 * 1024;
@@ -91,6 +92,7 @@ struct Session {
 
 pub struct App {
     ctx: egui::Context,
+    config: Config,
     session: Option<Session>,
 
     current: usize,
@@ -114,6 +116,7 @@ impl App {
     fn empty(cc: &eframe::CreationContext<'_>) -> Self {
         Self {
             ctx: cc.egui_ctx.clone(),
+            config: Config::load(),
             session: None,
             current: 0,
             direction: 1,
@@ -381,31 +384,22 @@ impl App {
             open: bool,
             rating: Option<u8>,
         }
+        let config = &self.config;
+        let in_grid = self.mode == Mode::Grid;
         let k = ctx.input(|i| Keys {
-            right: i.key_pressed(egui::Key::ArrowRight),
-            left: i.key_pressed(egui::Key::ArrowLeft),
+            right: config.pressed(i, Action::Next),
+            left: config.pressed(i, Action::Prev),
             up: i.key_pressed(egui::Key::ArrowUp),
             down: i.key_pressed(egui::Key::ArrowDown),
             shift: i.modifiers.shift,
-            home: i.key_pressed(egui::Key::Home),
-            end: i.key_pressed(egui::Key::End),
-            toggle_zoom: i.key_pressed(egui::Key::Space) || i.key_pressed(egui::Key::Z),
-            grid: i.key_pressed(egui::Key::G)
-                || (self.mode == Mode::Grid && i.key_pressed(egui::Key::Enter)),
-            info: i.key_pressed(egui::Key::I),
-            fullscreen: i.key_pressed(egui::Key::F),
-            open: i.modifiers.command && i.key_pressed(egui::Key::O),
-            rating: [
-                egui::Key::Num0,
-                egui::Key::Num1,
-                egui::Key::Num2,
-                egui::Key::Num3,
-                egui::Key::Num4,
-                egui::Key::Num5,
-            ]
-            .iter()
-            .position(|key| i.key_pressed(*key))
-            .map(|n| n as u8),
+            home: config.pressed(i, Action::First),
+            end: config.pressed(i, Action::Last),
+            toggle_zoom: config.pressed(i, Action::ToggleZoom),
+            grid: config.pressed(i, Action::Grid) || (in_grid && i.key_pressed(egui::Key::Enter)),
+            info: config.pressed(i, Action::Metadata),
+            fullscreen: config.pressed(i, Action::Fullscreen),
+            open: config.pressed(i, Action::OpenFolder),
+            rating: config.pressed_rating(i),
         });
 
         if k.open {
@@ -750,7 +744,8 @@ impl App {
                     self.status = format!("{tier:?} in {:.0?}", t0.elapsed());
                 }
                 standin = tier != Tier::Full && !matches!(self.zoom, Zoom::Fit);
-                let response = loupe::show(ui, &tex, logical, &mut self.zoom);
+                let scroll_zooms = self.config.scroll == ScrollMode::Zoom;
+                let response = loupe::show(ui, &tex, logical, &mut self.zoom, scroll_zooms);
                 if let Some(pos) = response.double_clicked_at {
                     loupe::toggle_100(&mut self.zoom, loupe_rect, logical, pos);
                     self.replan();
@@ -767,7 +762,8 @@ impl App {
                     let logical = self.last_logical.unwrap_or_else(|| tex.size_vec2());
                     img_size = Some(logical);
                     standin = !matches!(self.zoom, Zoom::Fit);
-                    loupe::show(ui, &tex, logical, &mut self.zoom);
+                    let scroll_zooms = self.config.scroll == ScrollMode::Zoom;
+                    loupe::show(ui, &tex, logical, &mut self.zoom, scroll_zooms);
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.spinner();

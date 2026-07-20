@@ -4126,11 +4126,14 @@ name = "viewr"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs",
  "eframe",
  "jpeg-encoder",
  "objc2 0.6.4",
  "raw-window-handle",
  "rfd",
+ "serde",
+ "toml",
  "viewr-core",
 ]
 
