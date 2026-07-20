@@ -19,6 +19,10 @@ anyhow = "1"
 eframe = "0.35"
 jpeg-encoder = { version = "0.6", features = ["simd"] }
 zune-jpeg = "0.5"
+rusqlite = { version = "0.32", features = ["bundled"] }
+blake3 = "1"
+quick-xml = "0.36"
+dirs = "5"
 
 [profile.release]
 lto = "thin"

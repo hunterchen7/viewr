@@ -8,6 +8,17 @@ use std::path::{Path, PathBuf};
 pub struct FolderEntry {
     pub path: PathBuf,
     pub file_name: String,
+    /// File size + mtime feed the disk-cache key: any change to the raw
+    /// invalidates its cached develops.
+    pub size: u64,
+    pub mtime_ns: i64,
+}
+
+impl FolderEntry {
+    /// Lightroom-convention sidecar path: `HCA04696.ARW` → `HCA04696.xmp`.
+    pub fn sidecar_path(&self) -> PathBuf {
+        self.path.with_extension("xmp")
+    }
 }
 
 /// Extensions we open, lowercase. ARW first-class; DNG decodes via the same
@@ -28,9 +39,21 @@ pub fn scan(dir: &Path) -> io::Result<Vec<FolderEntry>> {
             if !RAW_EXTENSIONS.contains(&ext.as_str()) {
                 return None;
             }
-            path.is_file().then_some(FolderEntry {
+            let md = e.metadata().ok()?;
+            if !md.is_file() {
+                return None;
+            }
+            let mtime_ns = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0);
+            Some(FolderEntry {
                 path,
                 file_name: name,
+                size: md.len(),
+                mtime_ns,
             })
         })
         .collect();

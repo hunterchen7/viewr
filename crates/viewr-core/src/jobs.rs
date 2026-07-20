@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 
+use crate::cache_disk::DiskCache;
 use crate::cache_ram::RamCache;
 use crate::decode;
 use crate::develop::{Quality, develop};
@@ -73,6 +74,9 @@ struct Prio {
 enum Action {
     Thumb,
     Develop(Quality),
+    /// Develop only to fill ring 2 + disk (P3 folder warm): no RGBA
+    /// insert, no event — keeps far images from thrashing ring 1.
+    WarmDevelop(Quality),
     Rehydrate,
 }
 
@@ -229,6 +233,7 @@ impl JobQueue {
 struct Shared {
     entries: Vec<FolderEntry>,
     cache: Arc<RamCache>,
+    disk: Option<DiskCache>,
     events: Sender<Event>,
     notify: Arc<dyn Fn() + Send + Sync>,
     heavy: JobQueue,
@@ -248,12 +253,14 @@ impl Engine {
         entries: Vec<FolderEntry>,
         start: usize,
         cache: Arc<RamCache>,
+        disk: Option<DiskCache>,
         notify: Arc<dyn Fn() + Send + Sync>,
     ) -> (Self, Receiver<Event>) {
         let (events, rx) = std::sync::mpsc::channel();
         let shared = Arc::new(Shared {
             entries,
             cache,
+            disk,
             events,
             notify,
             heavy: JobQueue::new(),
@@ -299,13 +306,19 @@ impl Engine {
         }
         cache.set_pins(pins);
 
+        let disk = &self.shared.disk;
+        let entries = &self.shared.entries;
         let mut plan: Vec<(JobId, u8, u32, Action)> = Vec::new();
         let mut want = |index: usize, tier: Tier, class: u8, eff: u32| {
             let id = (index, tier);
             if cache.has_rgba(id) {
                 return;
             }
-            let action = if cache.has_jpeg(id) {
+            let on_disk = || {
+                disk.as_ref()
+                    .is_some_and(|d| d.has(&DiskCache::key(&entries[index], tier)))
+            };
+            let action = if cache.has_jpeg(id) || on_disk() {
                 Action::Rehydrate
             } else {
                 Action::Develop(match tier {
@@ -333,6 +346,30 @@ impl Engine {
                 want(index, Tier::Full, 3, eff);
             } else if eff <= BROWSE_WINDOW {
                 want(index, Tier::Browse, 4, eff);
+            }
+        }
+
+        // P3 folder warm: make sure every image's browse render reaches the
+        // disk cache eventually, expanding outward. Ring 1 is untouched.
+        if let Some(disk) = disk {
+            for (index, entry) in entries.iter().enumerate() {
+                if index == current {
+                    continue;
+                }
+                let ahead = (index > current) == (nav.direction >= 0);
+                let dist = index.abs_diff(current) as u32;
+                let eff = if ahead { dist } else { dist.saturating_mul(3) };
+                if eff > BROWSE_WINDOW
+                    && !cache.has_jpeg((index, Tier::Browse))
+                    && !disk.has(&DiskCache::key(entry, Tier::Browse))
+                {
+                    plan.push((
+                        (index, Tier::Browse),
+                        6,
+                        eff,
+                        Action::WarmDevelop(Quality::Browse),
+                    ));
+                }
             }
         }
 
@@ -370,7 +407,8 @@ fn run_job(shared: &Shared, id: JobId, action: Action, token: &CancelToken) {
     match action {
         Action::Thumb => run_thumb(shared, index),
         Action::Rehydrate => run_rehydrate(shared, index, tier, token),
-        Action::Develop(quality) => run_develop(shared, index, tier, quality, token),
+        Action::Develop(quality) => run_develop(shared, index, tier, quality, token, false),
+        Action::WarmDevelop(quality) => run_develop(shared, index, tier, quality, token, true),
     }
 }
 
@@ -399,7 +437,14 @@ fn run_thumb(shared: &Shared, index: usize) {
     }
 }
 
-fn run_develop(shared: &Shared, index: usize, tier: Tier, quality: Quality, token: &CancelToken) {
+fn run_develop(
+    shared: &Shared,
+    index: usize,
+    tier: Tier,
+    quality: Quality,
+    token: &CancelToken,
+    warm_only: bool,
+) {
     let path = &shared.entries[index].path;
     let fail = |e: String| {
         publish(
@@ -430,32 +475,49 @@ fn run_develop(shared: &Shared, index: usize, tier: Tier, quality: Quality, toke
 
     // Completed work always lands in the cache; the event is suppressed
     // for cancelled jobs so the UI never sees stale publishes.
-    shared.cache.insert_rgba((index, tier), buf.clone());
-    if !token.cancelled() {
-        publish(shared, Event::ImageReady { index, tier });
+    if !warm_only {
+        shared.cache.insert_rgba((index, tier), buf.clone());
+        if !token.cancelled() {
+            publish(shared, Event::ImageReady { index, tier });
+        }
     }
 
-    // Ring-2 insurance: encode the developed result so future evictions
-    // demote instead of discarding. Skipped when already cancelled.
-    if !token.cancelled() && !shared.cache.has_jpeg((index, tier)) {
+    // Ring-2 + ring-3 insurance: encode the developed result so future
+    // evictions demote instead of discarding, and folder reopens are warm.
+    if warm_only || (!token.cancelled() && !shared.cache.has_jpeg((index, tier))) {
         let quality_jpeg = match tier {
             Tier::Full => JPEG_QUALITY_FULL,
             _ => JPEG_QUALITY_BROWSE,
         };
         if let Ok(bytes) = encode_jpeg(&buf, quality_jpeg) {
-            shared.cache.insert_jpeg((index, tier), Arc::new(bytes));
+            if let Some(disk) = &shared.disk {
+                let key = DiskCache::key(&shared.entries[index], tier);
+                if let Err(e) = disk.put(&key, &bytes) {
+                    eprintln!("disk cache write failed: {e}");
+                }
+            }
+            if !warm_only {
+                shared.cache.insert_jpeg((index, tier), Arc::new(bytes));
+            }
         }
     }
 }
 
 fn run_rehydrate(shared: &Shared, index: usize, tier: Tier, token: &CancelToken) {
-    let Some(bytes) = shared.cache.get_jpeg((index, tier)) else {
-        // JPEG evicted between planning and execution — fall back.
+    // Ring 2 first, then ring 3 (disk), else develop from scratch.
+    let bytes = shared.cache.get_jpeg((index, tier)).or_else(|| {
+        let disk = shared.disk.as_ref()?;
+        let bytes = disk.get(&DiskCache::key(&shared.entries[index], tier))?;
+        let bytes = Arc::new(bytes);
+        shared.cache.insert_jpeg((index, tier), bytes.clone());
+        Some(bytes)
+    });
+    let Some(bytes) = bytes else {
         let quality = match tier {
             Tier::Full => Quality::Full,
             _ => Quality::Browse,
         };
-        return run_develop(shared, index, tier, quality, token);
+        return run_develop(shared, index, tier, quality, token, false);
     };
     if token.cancelled() {
         return;

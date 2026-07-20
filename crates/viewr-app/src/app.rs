@@ -9,9 +9,12 @@ use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 use eframe::egui::{self, vec2};
+use viewr_core::cache_disk::DiskCache;
 use viewr_core::cache_ram::RamCache;
+use viewr_core::db::{Db, default_db_path};
 use viewr_core::folder::{FolderEntry, scan};
 use viewr_core::jobs::{Engine, Event, NavState};
+use viewr_core::library::{Library, load_ratings};
 use viewr_core::meta::FileMeta;
 use viewr_core::types::{PixelBuf, Tier};
 
@@ -53,6 +56,9 @@ pub struct App {
     direction: i8,
     zoom: Zoom,
 
+    library: Library,
+    ratings: HashMap<usize, u8>,
+
     thumbs: HashMap<usize, egui::TextureHandle>,
     metas: HashMap<usize, FileMeta>,
     textures: HashMap<(usize, Tier), egui::TextureHandle>,
@@ -66,9 +72,15 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>, entries: Vec<FolderEntry>, start: usize) -> Self {
         let entries = Arc::new(entries);
         let cache = Arc::new(RamCache::new(THUMB_BUDGET, RGBA_BUDGET, JPEG_BUDGET));
+        let disk = DiskCache::open_default();
         let ctx = cc.egui_ctx.clone();
         let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
-        let (engine, events) = Engine::new((*entries).clone(), start, cache.clone(), notify);
+        let (engine, events) = Engine::new((*entries).clone(), start, cache.clone(), disk, notify);
+
+        // Resolve ratings: sidecar > DB (embedded arrives later via thumbs).
+        let db = default_db_path().and_then(|p| Db::open(&p).ok());
+        let ratings = load_ratings(&entries, db.as_ref());
+        let library = Library::start();
 
         let app = Self {
             entries,
@@ -78,6 +90,8 @@ impl App {
             current: start,
             direction: 1,
             zoom: Zoom::Fit,
+            library,
+            ratings,
             thumbs: HashMap::new(),
             metas: HashMap::new(),
             textures: HashMap::new(),
@@ -115,7 +129,18 @@ impl App {
         self.zoom = Zoom::Fit;
         self.scroll_to_current = true;
         self.nav_started = Some(Instant::now());
+        self.library.flush(); // navigate-away: push pending sidecar writes
         self.replan();
+    }
+
+    fn set_rating(&mut self, rating: u8) {
+        let index = self.current;
+        if rating == 0 {
+            self.ratings.remove(&index);
+        } else {
+            self.ratings.insert(index, rating);
+        }
+        self.library.set_rating(&self.entries[index], rating);
     }
 
     fn drain_events(&mut self, ctx: &egui::Context) {
@@ -132,6 +157,13 @@ impl App {
                                 egui::TextureOptions::LINEAR,
                             ),
                         );
+                    }
+                    // Embedded in-camera rating: lowest precedence.
+                    if let Some(embedded) = meta.rating
+                        && embedded > 0
+                        && !self.ratings.contains_key(&index)
+                    {
+                        self.ratings.insert(index, embedded.min(5) as u8);
                     }
                     self.metas.insert(index, *meta);
                 }
@@ -196,7 +228,18 @@ impl App {
         loupe_rect: egui::Rect,
         img_size: Option<egui::Vec2>,
     ) {
-        let (right, left, shift, home, end, toggle) = ctx.input(|i| {
+        let (right, left, shift, home, end, toggle, rating) = ctx.input(|i| {
+            let rating = [
+                egui::Key::Num0,
+                egui::Key::Num1,
+                egui::Key::Num2,
+                egui::Key::Num3,
+                egui::Key::Num4,
+                egui::Key::Num5,
+            ]
+            .iter()
+            .position(|k| i.key_pressed(*k))
+            .map(|n| n as u8);
             (
                 i.key_pressed(egui::Key::ArrowRight),
                 i.key_pressed(egui::Key::ArrowLeft),
@@ -204,8 +247,12 @@ impl App {
                 i.key_pressed(egui::Key::Home),
                 i.key_pressed(egui::Key::End),
                 i.key_pressed(egui::Key::Space) || i.key_pressed(egui::Key::Z),
+                rating,
             )
         });
+        if let Some(r) = rating {
+            self.set_rating(r);
+        }
         let step = if shift { 10 } else { 1 };
         if right {
             self.navigate(step);
@@ -365,6 +412,24 @@ impl eframe::App for App {
                 }
             }
         }
+
+        // Rating overlay, bottom-left of the loupe.
+        let rating = self.ratings.get(&self.current).copied().unwrap_or(0);
+        let stars: String = (0..5).map(|i| if i < rating { '★' } else { '☆' }).collect();
+        egui::Area::new(egui::Id::new("rating-overlay"))
+            .fixed_pos(loupe_rect.left_bottom() + egui::vec2(12.0, -40.0))
+            .show(&ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(stars)
+                        .size(24.0)
+                        .color(if rating > 0 {
+                            egui::Color32::GOLD
+                        } else {
+                            egui::Color32::from_white_alpha(48)
+                        })
+                        .background_color(egui::Color32::from_black_alpha(120)),
+                );
+            });
 
         self.handle_keys(&ctx, loupe_rect, img_size);
     }

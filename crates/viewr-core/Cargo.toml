@@ -12,3 +12,7 @@ image.workspace = true
 fast_image_resize.workspace = true
 jpeg-encoder.workspace = true
 zune-jpeg.workspace = true
+rusqlite.workspace = true
+blake3.workspace = true
+quick-xml.workspace = true
+dirs.workspace = true
