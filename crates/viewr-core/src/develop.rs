@@ -140,7 +140,7 @@ pub fn develop(
         }
     }
 
-    // sRGB gamma encode + pack to RGBA8.
+    // sRGB gamma encode + base tone curve + pack to RGBA8.
     let t = Instant::now();
     let out_w = image.width as u32;
     let out_h = image.height as u32;
@@ -151,9 +151,9 @@ pub fn develop(
         .zip(rgba.par_chunks_exact_mut(4))
         .for_each(|(pix, out)| {
             let p = srgb::srgb_apply_gamma_n(*pix);
-            out[0] = (p[0].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-            out[1] = (p[1].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-            out[2] = (p[2].clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            out[0] = (base_curve(p[0].clamp(0.0, 1.0)) * 255.0 + 0.5) as u8;
+            out[1] = (base_curve(p[1].clamp(0.0, 1.0)) * 255.0 + 0.5) as u8;
+            out[2] = (base_curve(p[2].clamp(0.0, 1.0)) * 255.0 + 0.5) as u8;
             out[3] = 255;
         });
     timings.gamma_pack = t.elapsed();
@@ -170,4 +170,36 @@ pub fn develop(
 
 pub fn total(timings: &DevelopTimings) -> Duration {
     timings.rescale + timings.demosaic + timings.calibrate + timings.gamma_pack
+}
+
+/// Fixed "camera-standard-ish" base tone curve: a mild S in display
+/// space (smoothstep blend) so renders match the punch of camera JPEGs
+/// instead of looking flat. No editing UI — it's a culler; the constant
+/// is versioned by `cache_disk::DEVELOP_VERSION`.
+const TONE_STRENGTH: f32 = 0.35;
+
+#[inline]
+fn base_curve(v: f32) -> f32 {
+    let s = v * v * (3.0 - 2.0 * v); // smoothstep
+    v + TONE_STRENGTH * (s - v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::base_curve;
+
+    #[test]
+    fn base_curve_is_monotonic_and_anchored() {
+        assert_eq!(base_curve(0.0), 0.0);
+        assert!((base_curve(1.0) - 1.0).abs() < 1e-6);
+        assert!((base_curve(0.5) - 0.5).abs() < 1e-6); // midpoint fixed
+        assert!(base_curve(0.25) < 0.25); // shadows deepen
+        assert!(base_curve(0.75) > 0.75); // highlights lift
+        let mut prev = 0.0;
+        for i in 1..=100 {
+            let v = base_curve(i as f32 / 100.0);
+            assert!(v >= prev);
+            prev = v;
+        }
+    }
 }
