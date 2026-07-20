@@ -18,8 +18,13 @@ pub struct LoupeResponse {
     pub double_clicked_at: Option<Pos2>,
 }
 
-/// Draw `texture` (native size `img_size`) into the available space
-/// honoring `zoom`, mutating it on drag/scroll.
+/// Draw `texture` into the available space honoring `zoom`.
+///
+/// `img_size` is the LOGICAL image size (full-resolution dimensions),
+/// not the texture's — the layout only samples UVs, so any tier
+/// (thumb/browse/full) can back the same framing. Zoom scale therefore
+/// always means "screen px per full-res px": 1.0 is true 100% even
+/// while a lower tier is standing in.
 pub fn show(
     ui: &mut egui::Ui,
     texture: &egui::TextureHandle,

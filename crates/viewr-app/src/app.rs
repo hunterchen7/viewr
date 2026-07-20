@@ -103,6 +103,9 @@ pub struct App {
     show_metadata: bool,
 
     nav_started: Option<Instant>,
+    /// Last known full-res logical size; carries the zoom framing onto
+    /// thumb placeholders before the new image's develop lands.
+    last_logical: Option<egui::Vec2>,
     status: String,
     scroll_to_current: bool,
 }
@@ -121,6 +124,7 @@ impl App {
             fullscreen: false,
             show_metadata: false,
             nav_started: None,
+            last_logical: None,
             status: String::new(),
             scroll_to_current: true,
         }
@@ -248,7 +252,8 @@ impl App {
         }
         self.direction = if index < self.current { -1 } else { 1 };
         self.current = index;
-        self.zoom = Zoom::Fit;
+        // Zoom state is intentionally retained: culling a burst at 100%
+        // keeps the same framing (eye, detail) across images.
         self.scroll_to_current = true;
         self.nav_started = Some(Instant::now());
         if let Some(s) = &self.session {
@@ -720,29 +725,34 @@ impl App {
             self.select(i);
         }
 
-        // Loupe.
+        // Loupe. The zoom state lives in full-res "logical" space so the
+        // same framing holds no matter which tier backs the texture:
+        // full = exact, browse = half-res (×2), thumb = stand-in drawn at
+        // the retained framing (blurry→sharp in place, no flash-to-fit).
         let loupe_rect = ui.available_rect_before_wrap();
         let mut img_size = None;
         let best = self.session.as_ref().and_then(|s| {
             s.textures
                 .get(&(self.current, Tier::Full))
-                .map(|t| (Tier::Full, t.clone()))
+                .map(|t| (Tier::Full, t.clone(), t.size_vec2()))
                 .or_else(|| {
                     s.textures
                         .get(&(self.current, Tier::Browse))
-                        .map(|t| (Tier::Browse, t.clone()))
+                        .map(|t| (Tier::Browse, t.clone(), t.size_vec2() * 2.0))
                 })
         });
+        let mut standin = false; // zoomed onto a lower tier than Full
         match best {
-            Some((tier, tex)) => {
-                let size = tex.size_vec2();
-                img_size = Some(size);
+            Some((tier, tex, logical)) => {
+                img_size = Some(logical);
+                self.last_logical = Some(logical);
                 if let Some(t0) = self.nav_started.take() {
                     self.status = format!("{tier:?} in {:.0?}", t0.elapsed());
                 }
-                let response = loupe::show(ui, &tex, size, &mut self.zoom);
+                standin = tier != Tier::Full && !matches!(self.zoom, Zoom::Fit);
+                let response = loupe::show(ui, &tex, logical, &mut self.zoom);
                 if let Some(pos) = response.double_clicked_at {
-                    loupe::toggle_100(&mut self.zoom, loupe_rect, size, pos);
+                    loupe::toggle_100(&mut self.zoom, loupe_rect, logical, pos);
                     self.replan();
                 }
             }
@@ -752,14 +762,33 @@ impl App {
                     .as_ref()
                     .and_then(|s| s.thumbs.get(&self.current).cloned());
                 if let Some(tex) = thumb {
-                    let size = tex.size_vec2();
-                    loupe::show(ui, &tex, size, &mut Zoom::Fit);
+                    // Burst frames share dimensions, so the previous logical
+                    // size keeps the framing; fall back to fit otherwise.
+                    let logical = self.last_logical.unwrap_or_else(|| tex.size_vec2());
+                    img_size = Some(logical);
+                    standin = !matches!(self.zoom, Zoom::Fit);
+                    loupe::show(ui, &tex, logical, &mut self.zoom);
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.spinner();
                     });
                 }
             }
+        }
+
+        // Never let a low-res stand-in masquerade as full res while
+        // judging focus: badge until the Full texture takes over.
+        if standin {
+            egui::Area::new(egui::Id::new("standin-badge"))
+                .fixed_pos(loupe_rect.center_top() + egui::vec2(-70.0, 10.0))
+                .show(&self.ctx.clone(), |ui| {
+                    ui.label(
+                        egui::RichText::new(" PREVIEW — loading full res ")
+                            .size(13.0)
+                            .color(egui::Color32::BLACK)
+                            .background_color(egui::Color32::from_rgb(255, 200, 60)),
+                    );
+                });
         }
 
         // Rating overlay.
