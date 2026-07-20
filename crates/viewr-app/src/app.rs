@@ -1,57 +1,25 @@
-//! M1 app: folder browsing with filmstrip, keyboard nav, progressive
-//! loupe (thumb → browse → full), zoom/pan.
-//!
-//! Interim worker model until the M2 scheduler lands: one loupe worker
-//! (decodes the current image, aborting between stages when the target
-//! moves) and one thumb worker (walks the folder outward from the start
-//! index). Workers only produce PixelBufs; textures are UI-thread-only.
+//! The app shell: draws from the RamCache, dispatches navigation to the
+//! engine, and owns every texture (workers never touch UI types).
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 use eframe::egui::{self, vec2};
-use viewr_core::develop::{Quality, develop};
-use viewr_core::folder::{FolderEntry, outward_order, scan};
+use viewr_core::cache_ram::RamCache;
+use viewr_core::folder::{FolderEntry, scan};
+use viewr_core::jobs::{Engine, Event, NavState};
 use viewr_core::meta::FileMeta;
-use viewr_core::resize::apply_orient;
-use viewr_core::types::PixelBuf;
+use viewr_core::types::{PixelBuf, Tier};
 
 use crate::loupe::{self, Zoom};
 
-const THUMB_EDGE: u32 = 360;
-
-enum Event {
-    Thumb {
-        index: usize,
-        buf: PixelBuf,
-        meta: Box<FileMeta>,
-    },
-    ThumbFailed {
-        index: usize,
-        error: String,
-    },
-    Loupe {
-        index: usize,
-        quality: Quality,
-        buf: PixelBuf,
-        started: Instant,
-    },
-    LoupeFailed {
-        index: usize,
-        error: String,
-    },
-}
-
-struct LoupeReq {
-    index: usize,
-    path: PathBuf,
-    generation: u64,
-}
+const RGBA_BUDGET: u64 = 3 * 1024 * 1024 * 1024;
+const JPEG_BUDGET: u64 = 1536 * 1024 * 1024;
+const THUMB_BUDGET: u64 = 384 * 1024 * 1024;
 
 pub fn run(dir: &Path, select: Option<&Path>) -> Result<()> {
     let entries = scan(dir)?;
@@ -70,29 +38,26 @@ pub fn run(dir: &Path, select: Option<&Path>) -> Result<()> {
     eframe::run_native(
         &title,
         options,
-        Box::new(move |cc| {
-            let app = App::new(cc, entries, start);
-            Ok(Box::new(app))
-        }),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, entries, start)))),
     )
     .map_err(|e| anyhow!("eframe: {e}"))
 }
 
 pub struct App {
     entries: Arc<Vec<FolderEntry>>,
-    current: usize,
-    generation: Arc<AtomicU64>,
-    loupe_tx: Sender<LoupeReq>,
+    engine: Engine,
     events: Receiver<Event>,
+    cache: Arc<RamCache>,
+
+    current: usize,
+    direction: i8,
+    zoom: Zoom,
 
     thumbs: HashMap<usize, egui::TextureHandle>,
     metas: HashMap<usize, FileMeta>,
-    thumb_errors: usize,
+    textures: HashMap<(usize, Tier), egui::TextureHandle>,
 
-    /// (index, quality) the main texture currently shows.
-    main_shows: Option<(usize, Quality)>,
-    main_tex: Option<egui::TextureHandle>,
-    zoom: Zoom,
+    nav_started: Option<Instant>,
     status: String,
     scroll_to_current: bool,
 }
@@ -100,77 +65,44 @@ pub struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, entries: Vec<FolderEntry>, start: usize) -> Self {
         let entries = Arc::new(entries);
-        let (event_tx, events) = std::sync::mpsc::channel::<Event>();
-        let (loupe_tx, loupe_rx) = std::sync::mpsc::channel::<LoupeReq>();
-        let generation = Arc::new(AtomicU64::new(0));
+        let cache = Arc::new(RamCache::new(THUMB_BUDGET, RGBA_BUDGET, JPEG_BUDGET));
+        let ctx = cc.egui_ctx.clone();
+        let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
+        let (engine, events) = Engine::new((*entries).clone(), start, cache.clone(), notify);
 
-        // Loupe worker.
-        {
-            let tx = event_tx.clone();
-            let ctx = cc.egui_ctx.clone();
-            let generation = generation.clone();
-            std::thread::spawn(move || loupe_worker(&loupe_rx, &tx, &ctx, &generation));
-        }
-        // Thumb worker: outward from the starting image.
-        {
-            let tx = event_tx;
-            let ctx = cc.egui_ctx.clone();
-            let entries = entries.clone();
-            std::thread::spawn(move || {
-                for index in outward_order(entries.len(), start) {
-                    let event = match viewr_core::decode::thumb_and_meta(
-                        &entries[index].path,
-                        THUMB_EDGE,
-                    ) {
-                        Ok(r) => Event::Thumb {
-                            index,
-                            buf: r.thumb,
-                            meta: Box::new(r.meta),
-                        },
-                        Err(e) => Event::ThumbFailed {
-                            index,
-                            error: e.to_string(),
-                        },
-                    };
-                    if tx.send(event).is_err() {
-                        return; // UI gone
-                    }
-                    ctx.request_repaint();
-                }
-            });
-        }
-
-        let mut app = Self {
+        let app = Self {
             entries,
-            current: start,
-            generation,
-            loupe_tx,
+            engine,
             events,
+            cache,
+            current: start,
+            direction: 1,
+            zoom: Zoom::Fit,
             thumbs: HashMap::new(),
             metas: HashMap::new(),
-            thumb_errors: 0,
-            main_shows: None,
-            main_tex: None,
-            zoom: Zoom::Fit,
+            textures: HashMap::new(),
+            nav_started: Some(Instant::now()),
             status: String::new(),
             scroll_to_current: true,
         };
-        app.request_current();
+        app.replan();
         app
     }
 
-    fn request_current(&mut self) {
-        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let _ = self.loupe_tx.send(LoupeReq {
-            index: self.current,
-            path: self.entries[self.current].path.clone(),
-            generation,
+    fn replan(&self) {
+        self.engine.navigate(NavState {
+            current: self.current,
+            direction: self.direction,
+            zoomed: !matches!(self.zoom, Zoom::Fit),
         });
     }
 
     fn navigate(&mut self, delta: isize) {
         let len = self.entries.len() as isize;
         let next = (self.current as isize + delta).clamp(0, len - 1) as usize;
+        if delta != 0 {
+            self.direction = if delta < 0 { -1 } else { 1 };
+        }
         self.select(next);
     }
 
@@ -178,66 +110,82 @@ impl App {
         if index == self.current {
             return;
         }
+        self.direction = if index < self.current { -1 } else { 1 };
         self.current = index;
         self.zoom = Zoom::Fit;
         self.scroll_to_current = true;
-        self.request_current();
+        self.nav_started = Some(Instant::now());
+        self.replan();
     }
 
     fn drain_events(&mut self, ctx: &egui::Context) {
+        let mut replan = false;
         while let Ok(event) = self.events.try_recv() {
             match event {
-                Event::Thumb { index, buf, meta } => {
-                    let image = to_color_image(&buf);
-                    self.thumbs.insert(
-                        index,
-                        ctx.load_texture(
-                            format!("thumb{index}"),
-                            image,
-                            egui::TextureOptions::LINEAR,
-                        ),
-                    );
+                Event::ThumbReady { index, meta } => {
+                    if let Some(buf) = self.cache.get_rgba((index, Tier::Thumb)) {
+                        self.thumbs.insert(
+                            index,
+                            ctx.load_texture(
+                                format!("thumb{index}"),
+                                to_color_image(&buf),
+                                egui::TextureOptions::LINEAR,
+                            ),
+                        );
+                    }
                     self.metas.insert(index, *meta);
                 }
-                Event::ThumbFailed { index, error } => {
-                    eprintln!("thumb {index}: {error}");
-                    self.thumb_errors += 1;
-                }
-                Event::Loupe {
-                    index,
-                    quality,
-                    buf,
-                    started,
-                } => {
-                    if index != self.current {
-                        continue; // stale
-                    }
-                    // Don't replace a Full result with a late Browse one.
-                    if quality == Quality::Browse && self.main_shows == Some((index, Quality::Full))
-                    {
-                        continue;
-                    }
-                    let image = to_color_image(&buf);
-                    self.main_tex =
-                        Some(ctx.load_texture("main", image, egui::TextureOptions::LINEAR));
-                    self.main_shows = Some((index, quality));
-                    self.status = format!(
-                        "{} — {} {}x{} in {:?}",
-                        self.entries[index].file_name,
-                        match quality {
-                            Quality::Browse => "browse",
-                            Quality::Full => "full",
-                        },
-                        buf.width,
-                        buf.height,
-                        started.elapsed(),
-                    );
-                }
-                Event::LoupeFailed { index, error } => {
-                    if index == self.current {
+                Event::ImageReady { .. } => replan = true,
+                Event::ImageFailed { index, tier, error } => {
+                    if index == self.current && tier != Tier::Thumb {
                         self.status = format!("error: {error}");
+                    } else {
+                        eprintln!("job failed {index}/{tier:?}: {error}");
                     }
                 }
+            }
+        }
+        if replan {
+            self.replan();
+        }
+    }
+
+    /// Upload policy: current image first (Full then Browse), then at most
+    /// one neighbor browse texture per frame; prune textures outside the
+    /// keep window.
+    fn manage_textures(&mut self, ctx: &egui::Context) {
+        let current = self.current;
+        self.textures.retain(|(i, tier), _| match tier {
+            Tier::Full => *i == current,
+            _ => i.abs_diff(current) <= 2,
+        });
+
+        let ensure = |app: &mut Self, key: (usize, Tier), budget: &mut i32| {
+            if *budget <= 0 || app.textures.contains_key(&key) {
+                return;
+            }
+            if let Some(buf) = app.cache.get_rgba(key) {
+                let tex = ctx.load_texture(
+                    format!("img{}-{:?}", key.0, key.1),
+                    to_color_image(&buf),
+                    egui::TextureOptions::LINEAR,
+                );
+                app.textures.insert(key, tex);
+                *budget -= 1;
+            }
+        };
+        // Current image may consume up to two uploads (browse + full).
+        let mut budget = 2;
+        ensure(self, (current, Tier::Browse), &mut budget);
+        ensure(self, (current, Tier::Full), &mut budget);
+        // One neighbor pre-upload per frame, forward first.
+        let mut neighbor_budget = 1;
+        let fwd = self.direction >= 0;
+        let order: [isize; 4] = if fwd { [1, 2, -1, -2] } else { [-1, -2, 1, 2] };
+        for d in order {
+            let i = current as isize + d;
+            if i >= 0 && (i as usize) < self.entries.len() {
+                ensure(self, (i as usize, Tier::Browse), &mut neighbor_budget);
             }
         }
     }
@@ -277,7 +225,20 @@ impl App {
                 .filter(|p| loupe_rect.contains(*p))
                 .unwrap_or_else(|| loupe_rect.center());
             loupe::toggle_100(&mut self.zoom, loupe_rect, size, anchor);
+            self.replan();
         }
+    }
+
+    /// Best displayable texture for the current image.
+    fn best_current(&self) -> Option<(Tier, &egui::TextureHandle)> {
+        self.textures
+            .get(&(self.current, Tier::Full))
+            .map(|t| (Tier::Full, t))
+            .or_else(|| {
+                self.textures
+                    .get(&(self.current, Tier::Browse))
+                    .map(|t| (Tier::Browse, t))
+            })
     }
 }
 
@@ -285,8 +246,9 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain_events(&ctx);
+        self.manage_textures(&ctx);
 
-        // Filmstrip along the bottom.
+        // Filmstrip.
         let current = self.current;
         let mut clicked: Option<usize> = None;
         egui::Panel::bottom("filmstrip")
@@ -296,7 +258,7 @@ impl eframe::App for App {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.horizontal_centered(|ui| {
-                            for (i, _entry) in self.entries.iter().enumerate() {
+                            for i in 0..self.entries.len() {
                                 let selected = i == current;
                                 let response = match self.thumbs.get(&i) {
                                     Some(tex) => {
@@ -332,7 +294,7 @@ impl eframe::App for App {
             self.select(i);
         }
 
-        // Status line.
+        // Status bar.
         egui::Panel::top("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!(
@@ -359,26 +321,39 @@ impl eframe::App for App {
                     ui.label(parts.join("  "));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new(&self.status).weak());
+                    let stats = self.cache.stats();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}  |  rgba {}M  jpeg {}M",
+                            self.status,
+                            stats.rgba_bytes / (1024 * 1024),
+                            stats.jpeg_bytes / (1024 * 1024),
+                        ))
+                        .weak(),
+                    );
                 });
             });
         });
 
-        // Main loupe area fills the remaining central space.
+        // Loupe.
         let loupe_rect = ui.available_rect_before_wrap();
         let mut img_size = None;
-        match (&self.main_tex, self.main_shows) {
-            (Some(tex), Some((index, _quality))) if index == self.current => {
+        match self.best_current() {
+            Some((tier, tex)) => {
                 let size = tex.size_vec2();
                 img_size = Some(size);
                 let tex = tex.clone();
+                if let Some(t0) = self.nav_started.take() {
+                    self.status = format!("{tier:?} in {:.0?}", t0.elapsed());
+                }
                 let response = loupe::show(ui, &tex, size, &mut self.zoom);
                 if let Some(pos) = response.double_clicked_at {
                     loupe::toggle_100(&mut self.zoom, loupe_rect, size, pos);
+                    self.replan();
                 }
             }
-            _ => {
-                // Waiting for develop: show the thumb blown up as a placeholder.
+            None => {
+                // Waiting on first develop: thumb placeholder or spinner.
                 if let Some(tex) = self.thumbs.get(&self.current) {
                     let size = tex.size_vec2();
                     let tex = tex.clone();
@@ -397,78 +372,4 @@ impl eframe::App for App {
 
 fn to_color_image(buf: &PixelBuf) -> egui::ColorImage {
     egui::ColorImage::from_rgba_unmultiplied([buf.width as usize, buf.height as usize], &buf.rgba)
-}
-
-/// Decode + develop the requested image, browse then full, skipping stale
-/// work whenever the UI has already moved on (generation mismatch).
-fn loupe_worker(
-    rx: &Receiver<LoupeReq>,
-    tx: &Sender<Event>,
-    ctx: &egui::Context,
-    generation: &AtomicU64,
-) {
-    while let Ok(mut req) = rx.recv() {
-        // Collapse to the newest pending request.
-        while let Ok(newer) = rx.try_recv() {
-            req = newer;
-        }
-        let stale = || generation.load(Ordering::SeqCst) != req.generation;
-        let send = |event: Event| {
-            let _ = tx.send(event);
-            ctx.request_repaint();
-        };
-        let started = Instant::now();
-
-        let decoded = match viewr_core::decode::load(&req.path) {
-            Ok(d) => d,
-            Err(e) => {
-                send(Event::LoupeFailed {
-                    index: req.index,
-                    error: e.to_string(),
-                });
-                continue;
-            }
-        };
-        let meta = FileMeta::from_metadata(&decoded.metadata);
-        if stale() {
-            continue;
-        }
-
-        let raw_for_full = decoded.raw.clone();
-        match develop(decoded.raw, Quality::Browse) {
-            Ok((buf, _)) => send(Event::Loupe {
-                index: req.index,
-                quality: Quality::Browse,
-                buf: apply_orient(buf, meta.orient),
-                started,
-            }),
-            Err(e) => {
-                send(Event::LoupeFailed {
-                    index: req.index,
-                    error: e.to_string(),
-                });
-                continue;
-            }
-        }
-        if stale() {
-            continue;
-        }
-        match develop(raw_for_full, Quality::Full) {
-            Ok((buf, _)) => {
-                if stale() {
-                    continue;
-                }
-                send(Event::Loupe {
-                    index: req.index,
-                    quality: Quality::Full,
-                    buf: apply_orient(buf, meta.orient),
-                    started,
-                });
-            }
-            Err(e) => send(Event::LoupeFailed {
-                index: req.index,
-                error: e.to_string(),
-            }),
-        }
-    }
 }

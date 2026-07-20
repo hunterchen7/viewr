@@ -1,3 +1,14 @@
+/// Cache/display tier of a rendered image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Tier {
+    /// Small filmstrip/grid thumbnail (from the embedded preview).
+    Thumb,
+    /// Half-res superpixel develop — real raw data, browse quality.
+    Browse,
+    /// Full-res PPG develop for 100% zoom.
+    Full,
+}
+
 /// Display rotation derived from the EXIF orientation tag. Mirrored
 /// variants collapse onto the nearest rotation (cameras don't mirror).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

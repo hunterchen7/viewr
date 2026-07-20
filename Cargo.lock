@@ -3862,9 +3862,11 @@ version = "0.1.0"
 dependencies = [
  "fast_image_resize",
  "image",
+ "jpeg-encoder",
  "rawler",
  "rayon",
  "thiserror 2.0.19",
+ "zune-jpeg",
 ]
 
 [[package]]
