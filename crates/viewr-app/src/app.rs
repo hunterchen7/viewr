@@ -478,24 +478,23 @@ impl App {
         }
     }
 
-    /// Subtle border on the loupe image indicating the displayed cache
-    /// tier: green = full-res develop, amber = browse, red = thumbnail
-    /// stand-in (None = thumb).
-    fn tier_border(&self, ui: &egui::Ui, draw_rect: egui::Rect, tier: Option<Tier>) {
+    /// Cache-tier stroke color for a thumbnail: green = full-res in RAM,
+    /// amber = browse in RAM, dim blue = warm (JPEG ring, instant
+    /// rehydrate), none = cold.
+    fn tier_stroke(&self, session: &Session, index: usize) -> Option<egui::Color32> {
         if !self.config.tier_border {
-            return;
+            return None;
         }
-        let color = match tier {
-            Some(Tier::Full) => egui::Color32::from_rgba_unmultiplied(70, 200, 110, 110),
-            Some(_) => egui::Color32::from_rgba_unmultiplied(240, 180, 60, 110),
-            None => egui::Color32::from_rgba_unmultiplied(240, 90, 70, 130),
-        };
-        ui.painter().rect_stroke(
-            draw_rect.shrink(1.0),
-            0.0,
-            egui::Stroke::new(2.0, color),
-            egui::StrokeKind::Outside,
-        );
+        let cache = &session.cache;
+        if cache.has_rgba((index, Tier::Full)) {
+            Some(egui::Color32::from_rgba_unmultiplied(70, 200, 110, 150))
+        } else if cache.has_rgba((index, Tier::Browse)) {
+            Some(egui::Color32::from_rgba_unmultiplied(240, 180, 60, 150))
+        } else if cache.has_jpeg((index, Tier::Browse)) || cache.has_jpeg((index, Tier::Full)) {
+            Some(egui::Color32::from_rgba_unmultiplied(90, 140, 240, 110))
+        } else {
+            None
+        }
     }
 
     fn grid_cols(&self) -> usize {
@@ -563,28 +562,49 @@ impl App {
                 }
                 ui.separator();
 
-                // Filter: ≥N stars + unrated-only.
-                ui.label("filter:");
-                for n in 1..=5u8 {
-                    let active = self.filter.min_rating >= n && !self.filter.unrated_only;
-                    let star = if active { '★' } else { '☆' };
-                    if ui
-                        .add(egui::Button::new(star.to_string()).frame(false))
-                        .clicked()
-                    {
-                        self.filter.unrated_only = false;
-                        self.filter.min_rating = if self.filter.min_rating == n { 0 } else { n };
-                        filter_changed = true;
+                // Filter dropdown (distinct from the rating display).
+                let filter_label = |f: &Filter| -> String {
+                    if f.unrated_only {
+                        "unrated".into()
+                    } else if f.min_rating == 0 {
+                        "all".into()
+                    } else {
+                        format!("≥ {}", "★".repeat(f.min_rating as usize))
                     }
-                }
-                if ui
-                    .selectable_label(self.filter.unrated_only, "unrated")
-                    .clicked()
-                {
-                    self.filter.unrated_only = !self.filter.unrated_only;
-                    self.filter.min_rating = 0;
-                    filter_changed = true;
-                }
+                };
+                egui::ComboBox::from_id_salt("filter")
+                    .selected_text(format!("filter: {}", filter_label(&self.filter)))
+                    .show_ui(ui, |ui| {
+                        let mut options: Vec<(String, Filter)> = vec![(
+                            "all".into(),
+                            Filter {
+                                min_rating: 0,
+                                unrated_only: false,
+                            },
+                        )];
+                        for n in 1..=5u8 {
+                            options.push((
+                                format!("≥ {}", "★".repeat(n as usize)),
+                                Filter {
+                                    min_rating: n,
+                                    unrated_only: false,
+                                },
+                            ));
+                        }
+                        options.push((
+                            "unrated".into(),
+                            Filter {
+                                min_rating: 0,
+                                unrated_only: true,
+                            },
+                        ));
+                        for (label, value) in options {
+                            if ui.selectable_label(self.filter == value, label).clicked() {
+                                self.filter = value;
+                                filter_changed = true;
+                            }
+                        }
+                    });
                 ui.separator();
 
                 if let Some(meta) = self
@@ -649,13 +669,11 @@ impl App {
         };
         let entry = &session.entries[self.current];
         let meta = session.metas.get(&self.current);
-        let rating = self.rating_of(self.current);
         egui::Panel::right("metadata")
             .exact_size(260.0)
             .show(ui, |ui| {
                 ui.add_space(8.0);
                 ui.heading(&entry.file_name);
-                ui.label(stars(rating));
                 ui.separator();
                 if let Some(m) = meta {
                     ui.label(&m.camera);
@@ -715,6 +733,7 @@ impl App {
                                 for &i in &self.visible {
                                     let selected = i == current;
                                     let rating = session.ratings.get(&i).copied().unwrap_or(0);
+                                    let tier_stroke = self.tier_stroke(session, i);
                                     let response = match session.thumbs.get(&i) {
                                         Some(tex) => {
                                             let size = tex.size_vec2();
@@ -747,6 +766,14 @@ impl App {
                                                 .selected(selected),
                                         ),
                                     };
+                                    if let Some(color) = tier_stroke {
+                                        ui.painter().rect_stroke(
+                                            response.rect.expand(1.0),
+                                            3.0,
+                                            egui::Stroke::new(2.0, color),
+                                            egui::StrokeKind::Outside,
+                                        );
+                                    }
                                     if response.clicked() {
                                         clicked = Some(i);
                                     }
@@ -790,7 +817,6 @@ impl App {
                 standin = tier != Tier::Full && !matches!(self.zoom, Zoom::Fit);
                 let scroll_zooms = self.config.scroll == ScrollMode::Zoom;
                 let response = loupe::show(ui, &tex, logical, &mut self.zoom, scroll_zooms);
-                self.tier_border(ui, response.draw_rect, Some(tier));
                 if let Some(pos) = response.double_clicked_at {
                     loupe::toggle_100(&mut self.zoom, loupe_rect, logical, pos);
                     self.replan();
@@ -808,8 +834,7 @@ impl App {
                     img_size = Some(logical);
                     standin = !matches!(self.zoom, Zoom::Fit);
                     let scroll_zooms = self.config.scroll == ScrollMode::Zoom;
-                    let response = loupe::show(ui, &tex, logical, &mut self.zoom, scroll_zooms);
-                    self.tier_border(ui, response.draw_rect, None);
+                    loupe::show(ui, &tex, logical, &mut self.zoom, scroll_zooms);
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.spinner();
@@ -874,6 +899,7 @@ impl App {
                                 };
                                 let selected = i == current;
                                 let rating = session.ratings.get(&i).copied().unwrap_or(0);
+                                let tier_stroke = self.tier_stroke(session, i);
                                 ui.vertical(|ui| {
                                     ui.set_width(cell.x);
                                     let response = match session.thumbs.get(&i) {
@@ -895,6 +921,14 @@ impl App {
                                                 .selected(selected),
                                         ),
                                     };
+                                    if let Some(color) = tier_stroke {
+                                        ui.painter().rect_stroke(
+                                            response.rect.expand(1.0),
+                                            3.0,
+                                            egui::Stroke::new(2.0, color),
+                                            egui::StrokeKind::Outside,
+                                        );
+                                    }
                                     ui.label(
                                         egui::RichText::new(if rating > 0 {
                                             "★".repeat(rating as usize)

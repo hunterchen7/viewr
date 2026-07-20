@@ -74,7 +74,7 @@ impl SettingsState {
                 changed |= ui
                     .checkbox(
                         &mut config.tier_border,
-                        "Cache-tier border on the image (green full · amber browse · red thumb)",
+                        "Cache-tier border on thumbnails (green full · amber browse · blue warm)",
                     )
                     .changed();
                 ui.add_space(8.0);
