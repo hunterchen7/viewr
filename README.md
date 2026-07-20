@@ -50,15 +50,17 @@ is written on first run).
 ## Install
 
 Grab a binary from [Releases](https://github.com/hunterchen7/viewr/releases)
-(macOS Apple Silicon, Windows x64), or build from source:
+(macOS Apple Silicon, Windows x64, Linux x64), or build from source:
 
 ```
 cargo build --release        # binary at target/release/viewr
 cargo test --workspace
 ```
 
-Rust stable; pure Rust throughout (egui/wgpu → Metal on macOS, DX12/Vulkan
-on Windows). CI builds and tests both platforms. RAW decoding by
+Rust stable; pure Rust throughout (egui/wgpu → Metal on macOS,
+DX12/Vulkan on Windows, Vulkan on Linux). CI builds and tests all three.
+Linux builds need `libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev
+libxcb-xfixes0-dev libxkbcommon-dev`. RAW decoding by
 [rawler](https://github.com/dnglab/dnglab) — Sony ARW first-class
 including lossless compressed; DNG comes along for free.
 

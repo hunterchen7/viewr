@@ -1,3 +1,5 @@
+# Builds and attaches binaries when a GitHub release is created —
+# which only happens when the release-please PR is merged.
 name: Release binaries
 on:
   release:
@@ -18,16 +20,24 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             asset: viewr-windows-x64.zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: viewr-linux-x64.tar.gz
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --target ${{ matrix.target }}
-      - name: Package (macOS)
-        if: runner.os == 'macOS'
+      - name: Package (unix)
+        if: runner.os != 'Windows'
         run: |
           tar -czf ${{ matrix.asset }} -C target/${{ matrix.target }}/release viewr
       - name: Package (Windows)
