@@ -76,6 +76,10 @@ impl Bind {
 pub struct Config {
     pub scroll: ScrollMode,
     pub tier_border: bool,
+    /// Filmstrip panel height in px (drag the divider to change).
+    pub filmstrip_height: f32,
+    /// Grid cell width in px.
+    pub grid_cell: f32,
     /// Total RAM cache budget in GB (rgba ⅔, jpeg ⅓). Applies on the
     /// next folder open.
     pub ram_gb: f32,
@@ -103,10 +107,16 @@ struct RawInput {
 #[serde(default)]
 struct RawUi {
     tier_border: bool,
+    filmstrip_height: f32,
+    grid_cell: f32,
 }
 impl Default for RawUi {
     fn default() -> Self {
-        Self { tier_border: true }
+        Self {
+            tier_border: true,
+            filmstrip_height: 112.0,
+            grid_cell: 200.0,
+        }
     }
 }
 
@@ -240,6 +250,8 @@ impl Config {
         Self {
             scroll: raw.input.scroll,
             tier_border: raw.ui.tier_border,
+            filmstrip_height: raw.ui.filmstrip_height.clamp(70.0, 320.0),
+            grid_cell: raw.ui.grid_cell.clamp(120.0, 400.0),
             ram_gb: raw.cache.ram_gb.clamp(1.0, 20.0),
             disk_gb: raw.cache.disk_gb.clamp(1.0, 500.0),
             binds,
@@ -283,12 +295,14 @@ impl Config {
              # hand-edits are read at startup but comments are not kept.\n\n[input]\n",
         );
         out.push_str(&format!(
-            "scroll = \"{}\"\n\n[ui]\ntier_border = {}\n\n[cache]\nram_gb = {:.1}\ndisk_gb = {:.1}\n\n[binds]\n",
+            "scroll = \"{}\"\n\n[ui]\ntier_border = {}\nfilmstrip_height = {:.0}\ngrid_cell = {:.0}\n\n[cache]\nram_gb = {:.1}\ndisk_gb = {:.1}\n\n[binds]\n",
             match self.scroll {
                 ScrollMode::Pan => "pan",
                 ScrollMode::Zoom => "zoom",
             },
             self.tier_border,
+            self.filmstrip_height,
+            self.grid_cell,
             self.ram_gb,
             self.disk_gb,
         ));

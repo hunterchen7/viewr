@@ -499,7 +499,7 @@ impl App {
 
     fn grid_cols(&self) -> usize {
         let width = self.ctx.content_rect().width();
-        ((width / 216.0).floor() as usize).max(2)
+        ((width / (self.config.grid_cell + 16.0)).floor() as usize).max(2)
     }
 
     fn rating_of(&self, index: usize) -> u8 {
@@ -718,14 +718,19 @@ impl App {
     }
 
     fn loupe_mode(&mut self, ui: &mut egui::Ui) {
-        // Filmstrip over the visible sequence.
+        // Filmstrip over the visible sequence. Drag the divider to
+        // resize; the height persists to viewr.toml.
         let mut clicked: Option<usize> = None;
         let current = self.current;
         let scroll_to = self.scroll_to_current;
+        let mut strip_height = None;
         if let Some(session) = &self.session {
-            egui::Panel::bottom("filmstrip")
-                .exact_size(112.0)
+            let inner = egui::Panel::bottom("filmstrip")
+                .resizable(true)
+                .default_size(self.config.filmstrip_height)
+                .size_range(egui::Rangef::new(70.0, 320.0))
                 .show(ui, |ui| {
+                    let thumb_h = (ui.available_height() - 24.0).clamp(46.0, 290.0);
                     egui::ScrollArea::horizontal()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -737,13 +742,13 @@ impl App {
                                     let response = match session.thumbs.get(&i) {
                                         Some(tex) => {
                                             let size = tex.size_vec2();
-                                            let h = 84.0;
-                                            let w = (size.x / size.y * h).clamp(30.0, 170.0);
+                                            let w = (size.x / size.y * thumb_h)
+                                                .clamp(30.0, thumb_h * 2.2);
                                             ui.vertical(|ui| {
                                                 let r = ui.add(
                                                     egui::Button::image(egui::Image::new((
                                                         tex.id(),
-                                                        vec2(w, h),
+                                                        vec2(w, thumb_h),
                                                     )))
                                                     .selected(selected),
                                                 );
@@ -761,7 +766,7 @@ impl App {
                                             .inner
                                         }
                                         None => ui.add_sized(
-                                            vec2(112.0, 84.0),
+                                            vec2(thumb_h * 1.4, thumb_h),
                                             egui::Button::new(egui::RichText::new("…").weak())
                                                 .selected(selected),
                                         ),
@@ -784,6 +789,15 @@ impl App {
                             });
                         });
                 });
+            strip_height = Some(inner.response.rect.height());
+        }
+        // Persist a divider-drag once the mouse is released.
+        if let Some(h) = strip_height
+            && (h - self.config.filmstrip_height).abs() > 1.0
+            && !self.ctx.input(|i| i.pointer.any_down())
+        {
+            self.config.filmstrip_height = h;
+            self.config.save();
         }
         self.scroll_to_current = false;
         if let Some(i) = clicked {
@@ -880,7 +894,7 @@ impl App {
 
     fn grid_mode(&mut self, ui: &mut egui::Ui) {
         let cols = self.grid_cols();
-        let cell = vec2(200.0, 150.0);
+        let cell = vec2(self.config.grid_cell, self.config.grid_cell * 0.75);
         let mut clicked: Option<usize> = None;
         let mut open_loupe = false;
         let current = self.current;

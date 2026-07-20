@@ -77,6 +77,20 @@ impl SettingsState {
                         "Cache-tier border on thumbnails (green full · amber browse · blue warm)",
                     )
                     .changed();
+                ui.horizontal(|ui| {
+                    ui.label("Grid cell size");
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(&mut config.grid_cell, 120.0..=400.0)
+                                .fixed_decimals(0),
+                        )
+                        .changed();
+                });
+                ui.label(
+                    egui::RichText::new("Filmstrip size: drag its top divider.")
+                        .weak()
+                        .size(11.0),
+                );
                 ui.add_space(8.0);
 
                 ui.heading("Cache");
