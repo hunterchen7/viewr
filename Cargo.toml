@@ -11,6 +11,7 @@ rust-version = "1.96"
 viewr-core = { path = "crates/viewr-core" }
 # rawler is not semver-stable yet — pin exactly; upgrades are deliberate events.
 rawler = "=0.7.2"
+rayon = "1"
 thiserror = "2"
 anyhow = "1"
 eframe = "0.35"
