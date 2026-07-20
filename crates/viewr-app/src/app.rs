@@ -40,6 +40,7 @@ pub fn run(dir: &Path, select: Option<&Path>) -> Result<()> {
         "viewr",
         options,
         Box::new(move |cc| {
+            crate::color::pin_srgb_colorspace(cc);
             let mut app = App::empty(cc);
             app.open_folder(&dir, select.as_deref())
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;

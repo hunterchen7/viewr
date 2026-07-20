@@ -70,7 +70,51 @@ impl DiskCache {
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, &path)
     }
+
+    /// Enforce the byte budget by deleting oldest objects first
+    /// (age-approximated LRU; stale-keyed objects age out naturally).
+    /// Also sweeps orphaned .tmp files. Returns bytes deleted.
+    pub fn gc(&self, budget_bytes: u64) -> u64 {
+        let mut objects: Vec<(std::path::PathBuf, std::time::SystemTime, u64)> = Vec::new();
+        let mut total: u64 = 0;
+        let Ok(shards) = std::fs::read_dir(&self.root) else {
+            return 0;
+        };
+        for shard in shards.flatten() {
+            let Ok(files) = std::fs::read_dir(shard.path()) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let path = file.path();
+                let Ok(md) = file.metadata() else { continue };
+                if path.extension().is_some_and(|e| e == "tmp") {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
+                total += md.len();
+                objects.push((path, mtime, md.len()));
+            }
+        }
+        if total <= budget_bytes {
+            return 0;
+        }
+        objects.sort_by_key(|(_, mtime, _)| *mtime);
+        let mut deleted = 0u64;
+        for (path, _, len) in objects {
+            if total - deleted <= budget_bytes {
+                break;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                deleted += len;
+            }
+        }
+        deleted
+    }
 }
+
+/// Default disk budget: 20GB.
+pub const DEFAULT_DISK_BUDGET: u64 = 20 * 1024 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -92,6 +136,26 @@ mod tests {
         assert_ne!(a, DiskCache::key(&entry(10, 2), Tier::Browse));
         assert_ne!(a, DiskCache::key(&entry(10, 1), Tier::Full));
         assert_eq!(a, DiskCache::key(&entry(10, 1), Tier::Browse));
+    }
+
+    #[test]
+    fn gc_deletes_oldest_until_under_budget() {
+        let dir = std::env::temp_dir().join(format!("viewr-gc-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let cache = DiskCache::open_at(dir.clone());
+        let keys: Vec<String> = (0..3)
+            .map(|i| DiskCache::key(&entry(10 + i, 1), Tier::Browse))
+            .collect();
+        for key in &keys {
+            cache.put(key, &[0u8; 1000]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        // Budget fits two objects: the oldest must go.
+        let deleted = cache.gc(2500);
+        assert_eq!(deleted, 1000);
+        assert!(!cache.has(&keys[0]));
+        assert!(cache.has(&keys[1]) && cache.has(&keys[2]));
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

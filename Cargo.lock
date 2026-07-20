@@ -4128,6 +4128,8 @@ dependencies = [
  "anyhow",
  "eframe",
  "jpeg-encoder",
+ "objc2 0.6.4",
+ "raw-window-handle",
  "rfd",
  "viewr-core",
 ]

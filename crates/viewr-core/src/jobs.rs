@@ -282,6 +282,13 @@ impl Engine {
             std::thread::spawn(move || worker(&shared, true));
         }
 
+        // Background disk-cache GC sweep on open.
+        if let Some(disk) = shared.disk.clone() {
+            std::thread::spawn(move || {
+                disk.gc(crate::cache_disk::DEFAULT_DISK_BUDGET);
+            });
+        }
+
         // One-shot thumb+metadata wave, outward from the start position.
         let len = shared.entries.len();
         shared.light.extend(
