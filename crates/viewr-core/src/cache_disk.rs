@@ -19,19 +19,23 @@ pub const DEVELOP_VERSION: u32 = 2;
 #[derive(Clone)]
 pub struct DiskCache {
     root: PathBuf,
+    budget_bytes: u64,
 }
 
 impl DiskCache {
-    pub fn open_default() -> Option<Self> {
+    pub fn open_default(budget_bytes: u64) -> Option<Self> {
         let root = dirs::cache_dir()?.join("viewr").join("objects");
         std::fs::create_dir_all(&root).ok()?;
-        Some(Self { root })
+        Some(Self { root, budget_bytes })
     }
 
     #[cfg(test)]
     pub fn open_at(root: PathBuf) -> Self {
         std::fs::create_dir_all(&root).unwrap();
-        Self { root }
+        Self {
+            root,
+            budget_bytes: DEFAULT_DISK_BUDGET,
+        }
     }
 
     pub fn key(entry: &FolderEntry, tier: Tier) -> String {
@@ -69,6 +73,11 @@ impl DiskCache {
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, &path)
+    }
+
+    /// Enforce the configured byte budget.
+    pub fn gc_to_budget(&self) -> u64 {
+        self.gc(self.budget_bytes)
     }
 
     /// Enforce the byte budget by deleting oldest objects first

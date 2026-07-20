@@ -1,8 +1,9 @@
-//! User configuration: input behavior and keybinds.
+//! User configuration: input behavior, UI prefs, cache budgets, keybinds.
 //!
 //! Lives at `~/Library/Application Support/viewr/viewr.toml`. A
 //! documented template is written on first run; absent file or absent
-//! keys fall back to defaults, so partial configs are fine.
+//! keys fall back to defaults, so partial configs are fine. The
+//! Preferences window edits this in memory and saves a regenerated file.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -21,6 +22,7 @@ pub enum Action {
     Metadata,
     Fullscreen,
     OpenFolder,
+    Preferences,
     Rate(u8),
 }
 
@@ -34,16 +36,16 @@ pub enum ScrollMode {
     Zoom,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bind {
-    key: egui::Key,
-    mods: egui::Modifiers,
+    pub key: egui::Key,
+    pub mods: egui::Modifiers,
 }
 
 impl Bind {
     /// cmd/ctrl/alt must match exactly; shift is ignored unless the bind
     /// requires it (so Shift+arrow can mean "step 10" on a plain bind).
-    fn pressed(&self, input: &egui::InputState) -> bool {
+    fn is_pressed(&self, input: &egui::InputState) -> bool {
         let m = input.modifiers;
         input.key_pressed(self.key)
             && m.command == self.mods.command
@@ -51,10 +53,34 @@ impl Bind {
             && m.alt == self.mods.alt
             && (!self.mods.shift || m.shift)
     }
+
+    pub fn label(&self) -> String {
+        let mut s = String::new();
+        if self.mods.command {
+            s.push_str("Cmd+");
+        }
+        if self.mods.ctrl {
+            s.push_str("Ctrl+");
+        }
+        if self.mods.alt {
+            s.push_str("Alt+");
+        }
+        if self.mods.shift {
+            s.push_str("Shift+");
+        }
+        s.push_str(self.key.name());
+        s
+    }
 }
 
 pub struct Config {
     pub scroll: ScrollMode,
+    pub tier_border: bool,
+    /// Total RAM cache budget in GB (rgba ⅔, jpeg ⅓). Applies on the
+    /// next folder open.
+    pub ram_gb: f32,
+    /// Disk cache budget in GB. Applies on the next folder open.
+    pub disk_gb: f32,
     binds: HashMap<Action, Vec<Bind>>,
 }
 
@@ -62,6 +88,8 @@ pub struct Config {
 #[serde(default)]
 struct RawConfig {
     input: RawInput,
+    ui: RawUi,
+    cache: RawCache,
     binds: HashMap<String, Vec<String>>,
 }
 
@@ -71,22 +99,49 @@ struct RawInput {
     scroll: ScrollMode,
 }
 
-const ACTIONS: &[(&str, Action)] = &[
-    ("next", Action::Next),
-    ("prev", Action::Prev),
-    ("first", Action::First),
-    ("last", Action::Last),
-    ("toggle_zoom", Action::ToggleZoom),
-    ("grid", Action::Grid),
-    ("metadata", Action::Metadata),
-    ("fullscreen", Action::Fullscreen),
-    ("open_folder", Action::OpenFolder),
-    ("rate_0", Action::Rate(0)),
-    ("rate_1", Action::Rate(1)),
-    ("rate_2", Action::Rate(2)),
-    ("rate_3", Action::Rate(3)),
-    ("rate_4", Action::Rate(4)),
-    ("rate_5", Action::Rate(5)),
+#[derive(Deserialize)]
+#[serde(default)]
+struct RawUi {
+    tier_border: bool,
+}
+impl Default for RawUi {
+    fn default() -> Self {
+        Self { tier_border: true }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct RawCache {
+    ram_gb: f32,
+    disk_gb: f32,
+}
+impl Default for RawCache {
+    fn default() -> Self {
+        Self {
+            ram_gb: 4.5,
+            disk_gb: 20.0,
+        }
+    }
+}
+
+pub const ACTIONS: &[(&str, &str, Action)] = &[
+    ("next", "Next image", Action::Next),
+    ("prev", "Previous image", Action::Prev),
+    ("first", "First image", Action::First),
+    ("last", "Last image", Action::Last),
+    ("toggle_zoom", "Toggle fit / 100%", Action::ToggleZoom),
+    ("grid", "Grid view", Action::Grid),
+    ("metadata", "Metadata panel", Action::Metadata),
+    ("fullscreen", "Fullscreen", Action::Fullscreen),
+    ("open_folder", "Open folder", Action::OpenFolder),
+    ("preferences", "Preferences", Action::Preferences),
+    ("rate_0", "Clear rating", Action::Rate(0)),
+    ("rate_1", "Rate ★", Action::Rate(1)),
+    ("rate_2", "Rate ★★", Action::Rate(2)),
+    ("rate_3", "Rate ★★★", Action::Rate(3)),
+    ("rate_4", "Rate ★★★★", Action::Rate(4)),
+    ("rate_5", "Rate ★★★★★", Action::Rate(5)),
 ];
 
 fn default_binds(action: Action) -> &'static [&'static str] {
@@ -100,6 +155,7 @@ fn default_binds(action: Action) -> &'static [&'static str] {
         Action::Metadata => &["I"],
         Action::Fullscreen => &["F"],
         Action::OpenFolder => &["Cmd+O"],
+        Action::Preferences => &["Cmd+Comma"],
         Action::Rate(n) => match n {
             0 => &["0"],
             1 => &["1"],
@@ -139,6 +195,7 @@ fn parse_key(name: &str) -> Option<egui::Key> {
         "7" => Some(egui::Key::Num7),
         "8" => Some(egui::Key::Num8),
         "9" => Some(egui::Key::Num9),
+        "," | "Comma" => Some(egui::Key::Comma),
         _ => None,
     })
 }
@@ -161,7 +218,7 @@ impl Config {
 
     fn from_raw(raw: RawConfig) -> Self {
         let mut binds = HashMap::new();
-        for &(name, action) in ACTIONS {
+        for &(name, _, action) in ACTIONS {
             let specs: Vec<String> = raw.binds.get(name).cloned().unwrap_or_else(|| {
                 default_binds(action)
                     .iter()
@@ -182,6 +239,9 @@ impl Config {
         }
         Self {
             scroll: raw.input.scroll,
+            tier_border: raw.ui.tier_border,
+            ram_gb: raw.cache.ram_gb.clamp(1.0, 20.0),
+            disk_gb: raw.cache.disk_gb.clamp(1.0, 500.0),
             binds,
         }
     }
@@ -189,12 +249,60 @@ impl Config {
     pub fn pressed(&self, input: &egui::InputState, action: Action) -> bool {
         self.binds
             .get(&action)
-            .is_some_and(|binds| binds.iter().any(|b| b.pressed(input)))
+            .is_some_and(|binds| binds.iter().any(|b| b.is_pressed(input)))
     }
 
     /// First rating action whose bind fired this frame.
     pub fn pressed_rating(&self, input: &egui::InputState) -> Option<u8> {
         (0..=5).find(|&n| self.pressed(input, Action::Rate(n)))
+    }
+
+    pub fn binds_of(&self, action: Action) -> &[Bind] {
+        self.binds.get(&action).map_or(&[], |v| v.as_slice())
+    }
+
+    pub fn add_bind(&mut self, action: Action, bind: Bind) {
+        let binds = self.binds.entry(action).or_default();
+        if !binds.contains(&bind) {
+            binds.push(bind);
+        }
+    }
+
+    pub fn remove_bind(&mut self, action: Action, bind: Bind) {
+        if let Some(binds) = self.binds.get_mut(&action) {
+            binds.retain(|b| *b != bind);
+        }
+    }
+
+    /// Regenerate viewr.toml from the current state. (Hand-edited
+    /// comments are replaced — the file is round-tripped by the app.)
+    pub fn save(&self) {
+        let Some(path) = config_path() else { return };
+        let mut out = String::from(
+            "# viewr configuration. Managed by the Preferences window;\n\
+             # hand-edits are read at startup but comments are not kept.\n\n[input]\n",
+        );
+        out.push_str(&format!(
+            "scroll = \"{}\"\n\n[ui]\ntier_border = {}\n\n[cache]\nram_gb = {:.1}\ndisk_gb = {:.1}\n\n[binds]\n",
+            match self.scroll {
+                ScrollMode::Pan => "pan",
+                ScrollMode::Zoom => "zoom",
+            },
+            self.tier_border,
+            self.ram_gb,
+            self.disk_gb,
+        ));
+        for &(name, _, action) in ACTIONS {
+            let labels: Vec<String> = self
+                .binds_of(action)
+                .iter()
+                .map(|b| format!("\"{}\"", b.label()))
+                .collect();
+            out.push_str(&format!("{name} = [{}]\n", labels.join(", ")));
+        }
+        if let Err(e) = std::fs::write(&path, out) {
+            eprintln!("failed to save {}: {e}", path.display());
+        }
     }
 }
 
@@ -206,16 +314,28 @@ fn config_path() -> Option<PathBuf> {
 
 const TEMPLATE: &str = r#"# viewr configuration.
 # Missing keys fall back to defaults, so override only what you want.
+# The in-app Preferences window (Cmd+,) edits and saves this file.
 
 [input]
 # "pan":  plain scroll pans the zoomed image; pinch or Ctrl/Cmd+scroll zooms.
 # "zoom": plain scroll zooms.
 scroll = "pan"
 
+[ui]
+# Subtle border on the main image showing which cache tier is displayed:
+# green = full res, amber = browse (half-res), red = thumbnail stand-in.
+tier_border = true
+
+[cache]
+# RAM cache budget in GB (decoded pixels 2/3, developed-JPEG ring 1/3).
+ram_gb = 4.5
+# Disk cache budget in GB (~/Library/Caches/viewr).
+disk_gb = 20.0
+
 [binds]
 # Each action takes a list of binds: "Key" or "Mod+Key".
 # Modifiers: Cmd, Ctrl, Alt, Shift. Keys use egui names
-# (A-Z, 0-9, ArrowLeft/Right/Up/Down, Space, Home, End, Enter, ...).
+# (A-Z, 0-9, ArrowLeft/Right/Up/Down, Space, Home, End, Enter, Comma...).
 # Defaults shown below — uncomment to change.
 #next = ["ArrowRight"]
 #prev = ["ArrowLeft"]
@@ -226,6 +346,7 @@ scroll = "pan"
 #metadata = ["I"]
 #fullscreen = ["F"]
 #open_folder = ["Cmd+O"]
+#preferences = ["Cmd+Comma"]
 #rate_0 = ["0"]
 #rate_1 = ["1"]
 #rate_2 = ["2"]
@@ -257,6 +378,8 @@ mod tests {
             r#"
             [input]
             scroll = "zoom"
+            [cache]
+            ram_gb = 8.0
             [binds]
             next = ["D"]
             "#,
@@ -264,9 +387,21 @@ mod tests {
         .unwrap();
         let cfg = Config::from_raw(raw);
         assert_eq!(cfg.scroll, ScrollMode::Zoom);
+        assert!((cfg.ram_gb - 8.0).abs() < f32::EPSILON);
+        assert!(cfg.tier_border); // untouched default
         assert_eq!(cfg.binds[&Action::Next].len(), 1);
         assert_eq!(cfg.binds[&Action::Next][0].key, egui::Key::D);
-        // Untouched action keeps its default.
         assert_eq!(cfg.binds[&Action::Prev][0].key, egui::Key::ArrowLeft);
+    }
+
+    #[test]
+    fn bind_labels_round_trip_through_parser() {
+        for &(_, _, action) in ACTIONS {
+            for spec in default_binds(action) {
+                let bind = parse_bind(spec).unwrap();
+                let reparsed = parse_bind(&bind.label()).unwrap();
+                assert_eq!(bind, reparsed, "spec {spec}");
+            }
+        }
     }
 }

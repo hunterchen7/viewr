@@ -16,6 +16,8 @@ pub enum Zoom {
 
 pub struct LoupeResponse {
     pub double_clicked_at: Option<Pos2>,
+    /// Screen rect the image was actually drawn into (for overlays).
+    pub draw_rect: Rect,
 }
 
 /// Draw `texture` into the available space honoring `zoom`.
@@ -106,6 +108,7 @@ pub fn show(
                 .interact_pointer_pos()
                 .unwrap_or_else(|| rect.center())
         }),
+        draw_rect: draw_rect.intersect(rect),
     }
 }
 

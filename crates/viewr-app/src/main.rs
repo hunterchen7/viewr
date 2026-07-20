@@ -2,6 +2,7 @@ mod app;
 mod color;
 mod config;
 mod loupe;
+mod settings;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;

@@ -25,9 +25,8 @@ use viewr_core::types::{PixelBuf, Tier};
 
 use crate::config::{Action, Config, ScrollMode};
 use crate::loupe::{self, Zoom};
+use crate::settings::SettingsState;
 
-const RGBA_BUDGET: u64 = 3 * 1024 * 1024 * 1024;
-const JPEG_BUDGET: u64 = 1536 * 1024 * 1024;
 const THUMB_BUDGET: u64 = 384 * 1024 * 1024;
 
 pub fn run(dir: &Path, select: Option<&Path>) -> Result<()> {
@@ -93,6 +92,7 @@ struct Session {
 pub struct App {
     ctx: egui::Context,
     config: Config,
+    settings: SettingsState,
     session: Option<Session>,
 
     current: usize,
@@ -117,6 +117,7 @@ impl App {
         Self {
             ctx: cc.egui_ctx.clone(),
             config: Config::load(),
+            settings: SettingsState::default(),
             session: None,
             current: 0,
             direction: 1,
@@ -142,8 +143,13 @@ impl App {
             .and_then(|f| entries.iter().position(|e| e.path == f))
             .unwrap_or(0);
         let entries = Arc::new(entries);
-        let cache = Arc::new(RamCache::new(THUMB_BUDGET, RGBA_BUDGET, JPEG_BUDGET));
-        let disk = DiskCache::open_default();
+        let ram_bytes = (self.config.ram_gb as f64 * 1e9) as u64;
+        let cache = Arc::new(RamCache::new(
+            THUMB_BUDGET,
+            ram_bytes * 2 / 3,
+            ram_bytes / 3,
+        ));
+        let disk = DiskCache::open_default((self.config.disk_gb as f64 * 1e9) as u64);
         let ctx = self.ctx.clone();
         let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
         let (engine, events) = Engine::new((*entries).clone(), start, cache.clone(), disk, notify);
@@ -368,6 +374,9 @@ impl App {
     }
 
     fn handle_keys(&mut self, loupe_rect: egui::Rect, img_size: Option<egui::Vec2>) {
+        if self.settings.capturing() {
+            return; // keystrokes are being captured as new binds
+        }
         let ctx = self.ctx.clone();
         struct Keys {
             right: bool,
@@ -382,6 +391,7 @@ impl App {
             info: bool,
             fullscreen: bool,
             open: bool,
+            prefs: bool,
             rating: Option<u8>,
         }
         let config = &self.config;
@@ -399,8 +409,12 @@ impl App {
             info: config.pressed(i, Action::Metadata),
             fullscreen: config.pressed(i, Action::Fullscreen),
             open: config.pressed(i, Action::OpenFolder),
+            prefs: config.pressed(i, Action::Preferences),
             rating: config.pressed_rating(i),
         });
+        if k.prefs {
+            self.settings.open = !self.settings.open;
+        }
 
         if k.open {
             self.pick_folder();
@@ -464,6 +478,26 @@ impl App {
         }
     }
 
+    /// Subtle border on the loupe image indicating the displayed cache
+    /// tier: green = full-res develop, amber = browse, red = thumbnail
+    /// stand-in (None = thumb).
+    fn tier_border(&self, ui: &egui::Ui, draw_rect: egui::Rect, tier: Option<Tier>) {
+        if !self.config.tier_border {
+            return;
+        }
+        let color = match tier {
+            Some(Tier::Full) => egui::Color32::from_rgba_unmultiplied(70, 200, 110, 110),
+            Some(_) => egui::Color32::from_rgba_unmultiplied(240, 180, 60, 110),
+            None => egui::Color32::from_rgba_unmultiplied(240, 90, 70, 130),
+        };
+        ui.painter().rect_stroke(
+            draw_rect.shrink(1.0),
+            0.0,
+            egui::Stroke::new(2.0, color),
+            egui::StrokeKind::Outside,
+        );
+    }
+
     fn grid_cols(&self) -> usize {
         let width = self.ctx.content_rect().width();
         ((width / 216.0).floor() as usize).max(2)
@@ -483,6 +517,9 @@ fn stars(rating: u8) -> String {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = self.ctx.clone();
+        self.settings.maybe_capture(&ctx, &mut self.config);
+        self.settings.show(&ctx, &mut self.config);
         self.drain_events();
         self.manage_textures();
         if self.session.is_none() {
@@ -571,6 +608,13 @@ impl App {
                     ui.label(parts.join("  "));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button("⚙")
+                        .on_hover_text("Preferences (Cmd+,)")
+                        .clicked()
+                    {
+                        self.settings.open = !self.settings.open;
+                    }
                     if let Some(s) = &self.session {
                         let st = s.cache.stats();
                         ui.label(
@@ -746,6 +790,7 @@ impl App {
                 standin = tier != Tier::Full && !matches!(self.zoom, Zoom::Fit);
                 let scroll_zooms = self.config.scroll == ScrollMode::Zoom;
                 let response = loupe::show(ui, &tex, logical, &mut self.zoom, scroll_zooms);
+                self.tier_border(ui, response.draw_rect, Some(tier));
                 if let Some(pos) = response.double_clicked_at {
                     loupe::toggle_100(&mut self.zoom, loupe_rect, logical, pos);
                     self.replan();
@@ -763,7 +808,8 @@ impl App {
                     img_size = Some(logical);
                     standin = !matches!(self.zoom, Zoom::Fit);
                     let scroll_zooms = self.config.scroll == ScrollMode::Zoom;
-                    loupe::show(ui, &tex, logical, &mut self.zoom, scroll_zooms);
+                    let response = loupe::show(ui, &tex, logical, &mut self.zoom, scroll_zooms);
+                    self.tier_border(ui, response.draw_rect, None);
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.spinner();

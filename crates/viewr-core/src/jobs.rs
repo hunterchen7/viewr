@@ -285,7 +285,7 @@ impl Engine {
         // Background disk-cache GC sweep on open.
         if let Some(disk) = shared.disk.clone() {
             std::thread::spawn(move || {
-                disk.gc(crate::cache_disk::DEFAULT_DISK_BUDGET);
+                disk.gc_to_budget();
             });
         }
 
