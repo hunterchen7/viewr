@@ -2,6 +2,9 @@
 
 > This file is a historical spike snapshot. Some pending notes are now
 > implemented. Use `docs/testing-and-benchmarking.md` for current procedures.
+> The [second performance and adversarial pass](performance-adversarial-pass-2026-07-21.md)
+> supersedes the implementation-status and pre-warm statements below; the
+> original snapshot is preserved for historical comparison.
 
 Machine: Apple M4 (10-core, 24GB). Release build.
 File: Sony A7C II (ILCE-7CM2), 33MP lossless-compressed ARW, 49MB

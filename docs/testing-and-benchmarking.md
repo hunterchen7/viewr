@@ -45,13 +45,17 @@ cargo bench -p viewr-core --bench core_hot_paths --locked -- jpeg
 The suite measures these workloads:
 
 - Navigation planning for 100, 1,000, and 10,000 images.
-- Bounded navigation planning with persistent disk warming configured, plus
-  the former folder-wide planner as an explicitly labeled reference.
+- A pure bounded-planner proxy for navigation after persistent disk warming is
+  configured, plus the former folder-wide planner as an explicitly labeled
+  reference. These measurements exclude Engine locks, cache probes, queue
+  synchronization, and the one-time warm-order installation.
 - Outward-order construction for up to 1,000,000 images.
-- Resize and rotation of deterministic 12.2-megapixel and 33-megapixel images.
+- Resize of a deterministic 12.2-megapixel image, plus rotation at 12.2 and
+  32.7 megapixels.
 - JPEG encoding, JPEG decoding, RAM-cache hits, and eviction scaling.
 - XMP parsing, XMP updates, and disk-cache key generation.
 - Loupe filmstrip widget scaling at 10,000 and 50,000 images.
+- Thumbnail texture-LRU maintenance for 200 touches among 773 residents.
 
 Criterion stores reports in `target/criterion`.
 Git ignores this directory.
@@ -105,7 +109,8 @@ Download its Criterion artifact to inspect the complete report.
 ## Real RAW benchmarks
 
 Set `VIEWR_BENCH_RAW` to one ARW or DNG file.
-The file stays outside the repository.
+The file must remain untracked. It can stay outside the repository or under
+the ignored `testdata/` directory.
 
 Run this command on macOS or Linux:
 
@@ -121,10 +126,13 @@ $env:VIEWR_BENCH_RAW = "C:\Photos\photo.ARW"
 cargo bench -p viewr-core --bench core_hot_paths --locked -- raw_opt_in
 ```
 
-The RAW suite measures metadata-only extraction, thumbnail extraction, entropy
-decode, and both develop qualities.
+The RAW suite measures metadata-only extraction, thumbnail extraction, the
+complete `decode::load` path, and both develop qualities. The decode benchmark
+includes source construction, metadata extraction, and CFA mosaic decode; it
+does not isolate entropy decoding.
 The develop benchmark excludes decode setup.
-Criterion warm-up makes these results warm-cache measurements.
+The initial probe and Criterion warm-up normally make these warm operating-
+system page-cache measurements. They are not Viewr RAM- or disk-cache hits.
 
 Use `viewr dev` in a new process for a cold-path inspection:
 
