@@ -1,6 +1,7 @@
 //! SIMD downscaling and orientation rotation for PixelBuf.
 
 use fast_image_resize as fir;
+use rayon::prelude::*;
 
 use crate::types::{Orient, PixelBuf};
 
@@ -60,8 +61,7 @@ pub fn apply_orient(buf: PixelBuf, orient: Orient) -> PixelBuf {
             let (dw, dh) = (sh, sw);
             let src = buf.rgba;
             let mut dst = vec![0u8; src.len()];
-            for yd in 0..dh {
-                let row = &mut dst[yd * dw * 4..(yd + 1) * dw * 4];
+            let rotate_row = |yd: usize, row: &mut [u8]| {
                 for (xd, out) in row.chunks_exact_mut(4).enumerate() {
                     let (xs, ys) = match orient {
                         Orient::R90 => (yd, sh - 1 - xd),
@@ -70,6 +70,44 @@ pub fn apply_orient(buf: PixelBuf, orient: Orient) -> PixelBuf {
                     let i = (ys * sw + xs) * 4;
                     out.copy_from_slice(&src[i..i + 4]);
                 }
+            };
+            if sw.saturating_mul(sh) >= 256 * 256 {
+                // A destination row walks one source column, which is a
+                // cache-hostile stride for large photos. Rotate bands of
+                // destination rows instead: every source-row visit then
+                // reads a compact horizontal run while the band's output
+                // working set stays small enough for cache.
+                const BAND_ROWS: usize = 16;
+                let row_bytes = dw * 4;
+                dst.par_chunks_mut(row_bytes * BAND_ROWS)
+                    .enumerate()
+                    .for_each(|(band_index, band)| {
+                        let first_yd = band_index * BAND_ROWS;
+                        let band_rows = band.len() / row_bytes;
+                        for ys in 0..sh {
+                            let xd = match orient {
+                                Orient::R90 => sh - 1 - ys,
+                                Orient::R270 => ys,
+                                _ => unreachable!(),
+                            };
+                            for local_yd in 0..band_rows {
+                                let yd = first_yd + local_yd;
+                                let xs = match orient {
+                                    Orient::R90 => yd,
+                                    Orient::R270 => sw - 1 - yd,
+                                    _ => unreachable!(),
+                                };
+                                let src_offset = (ys * sw + xs) * 4;
+                                let dst_offset = (local_yd * dw + xd) * 4;
+                                band[dst_offset..dst_offset + 4]
+                                    .copy_from_slice(&src[src_offset..src_offset + 4]);
+                            }
+                        }
+                    });
+            } else {
+                dst.chunks_exact_mut(dw * 4)
+                    .enumerate()
+                    .for_each(|(yd, row)| rotate_row(yd, row));
             }
             PixelBuf {
                 width: dw as u32,
