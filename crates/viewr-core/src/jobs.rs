@@ -13,10 +13,10 @@
 //! - Encoded ring-2 JPEGs are written post-orientation, so rehydrates
 //!   never rotate.
 
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, TryLockError};
 
 use crate::cache_disk::DiskCache;
 use crate::cache_ram::RamCache;
@@ -32,6 +32,11 @@ pub type JobId = (usize, Tier);
 
 const HEAVY_WORKERS: usize = 3;
 const LIGHT_WORKERS: usize = 2;
+/// One worker owns at most one active buffer, plus at most this many pending
+/// bytes. 256 MiB fits a typical 61 MP RGBA frame (~230 MiB), so the lane is
+/// bounded to at most two such retained frames; larger and excess requests are
+/// best-effort cache misses.
+const PERSIST_PENDING_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const JPEG_QUALITY_BROWSE: u8 = 87;
 const JPEG_QUALITY_FULL: u8 = 90;
 
@@ -128,6 +133,149 @@ struct QueueState {
 struct JobQueue {
     state: Mutex<QueueState>,
     cond: Condvar,
+}
+
+struct PersistenceRequest {
+    id: JobId,
+    pixels: Arc<PixelBuf>,
+    /// Warm-only work populates disk but deliberately skips the RAM JPEG ring.
+    insert_ram: bool,
+}
+
+impl PersistenceRequest {
+    fn retained_bytes(&self) -> usize {
+        self.pixels.byte_len()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistenceEnqueue {
+    Queued,
+    Coalesced,
+    Saturated,
+    Busy,
+    Closed,
+}
+
+struct ActivePersistence {
+    id: JobId,
+    insert_ram: bool,
+}
+
+struct PersistenceState {
+    order: VecDeque<JobId>,
+    pending: HashMap<JobId, PersistenceRequest>,
+    pending_bytes: usize,
+    active: Option<ActivePersistence>,
+    closed: bool,
+}
+
+/// A single-consumer, byte-bounded lane for JPEG encoding and persistence.
+///
+/// Producers use `try_lock`, so a completed develop never waits behind JPEG
+/// work. Requests for an active or pending ID coalesce; otherwise excess work
+/// is dropped as a best-effort cache miss.
+struct PersistenceQueue {
+    state: Mutex<PersistenceState>,
+    ready: Condvar,
+    pending_budget_bytes: usize,
+}
+
+impl PersistenceQueue {
+    fn new() -> Self {
+        Self::with_budget(PERSIST_PENDING_BUDGET_BYTES)
+    }
+
+    fn with_budget(pending_budget_bytes: usize) -> Self {
+        Self {
+            state: Mutex::new(PersistenceState {
+                order: VecDeque::new(),
+                pending: HashMap::new(),
+                pending_bytes: 0,
+                active: None,
+                closed: false,
+            }),
+            ready: Condvar::new(),
+            pending_budget_bytes,
+        }
+    }
+
+    fn try_enqueue(&self, request: PersistenceRequest) -> PersistenceEnqueue {
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return PersistenceEnqueue::Busy,
+            Err(TryLockError::Poisoned(_)) => return PersistenceEnqueue::Closed,
+        };
+        if state.closed {
+            return PersistenceEnqueue::Closed;
+        }
+
+        if let Some(active) = state.active.as_mut()
+            && active.id == request.id
+        {
+            active.insert_ram |= request.insert_ram;
+            return PersistenceEnqueue::Coalesced;
+        }
+        if let Some(pending) = state.pending.get_mut(&request.id) {
+            pending.insert_ram |= request.insert_ram;
+            return PersistenceEnqueue::Coalesced;
+        }
+
+        let retained_bytes = request.retained_bytes();
+        if retained_bytes > self.pending_budget_bytes
+            || state.pending_bytes > self.pending_budget_bytes - retained_bytes
+        {
+            return PersistenceEnqueue::Saturated;
+        }
+
+        state.pending_bytes += retained_bytes;
+        state.order.push_back(request.id);
+        state.pending.insert(request.id, request);
+        drop(state);
+        self.ready.notify_one();
+        PersistenceEnqueue::Queued
+    }
+
+    fn pop(&self) -> Option<PersistenceRequest> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(id) = state.order.pop_front() {
+                let request = state
+                    .pending
+                    .remove(&id)
+                    .expect("persistence order must reference a pending request");
+                state.pending_bytes -= request.retained_bytes();
+                debug_assert!(state.active.is_none());
+                state.active = Some(ActivePersistence {
+                    id,
+                    insert_ram: request.insert_ram,
+                });
+                return Some(request);
+            }
+            if state.closed {
+                return None;
+            }
+            state = self.ready.wait(state).unwrap();
+        }
+    }
+
+    /// Finish the active request and return the RAM-insert requirement merged
+    /// from every duplicate that arrived while it was being persisted.
+    fn finish(&self, id: JobId) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let active = state
+            .active
+            .take()
+            .expect("a persistence request must be active when it finishes");
+        debug_assert_eq!(active.id, id);
+        active.insert_ram
+    }
+
+    /// Reject new work, drain accepted requests, then let the worker exit.
+    fn close(&self) {
+        self.state.lock().unwrap().closed = true;
+        self.ready.notify_all();
+    }
 }
 
 impl JobQueue {
@@ -253,6 +401,7 @@ struct Shared {
     notify: Arc<dyn Fn() + Send + Sync>,
     heavy: JobQueue,
     light: JobQueue,
+    persistence: PersistenceQueue,
     shutdown: AtomicBool,
     /// Display order the prefetch wave follows (filtered view). Empty ⇒
     /// identity. Distances are positions in this sequence, so with a
@@ -262,6 +411,7 @@ struct Shared {
 
 pub struct Engine {
     shared: Arc<Shared>,
+    persistence_worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Engine {
@@ -284,9 +434,18 @@ impl Engine {
             notify,
             heavy: JobQueue::new(),
             light: JobQueue::new(),
+            persistence: PersistenceQueue::new(),
             shutdown: AtomicBool::new(false),
             sequence: Mutex::new(Vec::new()),
         });
+
+        let persistence_worker = {
+            let shared = shared.clone();
+            std::thread::Builder::new()
+                .name("viewr-persistence".into())
+                .spawn(move || persistence_worker(&shared))
+                .expect("failed to spawn persistence worker")
+        };
 
         for _ in 0..HEAVY_WORKERS {
             let shared = shared.clone();
@@ -313,7 +472,13 @@ impl Engine {
                 .map(|(dist, index)| ((index, Tier::Thumb), 5, dist as u32, Action::Thumb)),
         );
 
-        (Self { shared }, rx)
+        (
+            Self {
+                shared,
+                persistence_worker: Some(persistence_worker),
+            },
+            rx,
+        )
     }
 
     /// Recompute and sync the heavy plan for a navigation state. Cheap;
@@ -395,6 +560,10 @@ impl Drop for Engine {
         self.shared.shutdown.store(true, Ordering::Relaxed);
         self.shared.heavy.cond.notify_all();
         self.shared.light.cond.notify_all();
+        self.shared.persistence.close();
+        if let Some(worker) = self.persistence_worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -409,6 +578,32 @@ fn worker(shared: &Shared, light: bool) {
 fn publish(shared: &Shared, event: Event) {
     let _ = shared.events.send(event);
     (shared.notify)();
+}
+
+fn persistence_worker(shared: &Shared) {
+    while let Some(request) = shared.persistence.pop() {
+        // This lane is intentionally single-threaded and yields before CPU
+        // work so interactive develop workers retain scheduling priority.
+        std::thread::yield_now();
+        let quality = match request.id.1 {
+            Tier::Full => JPEG_QUALITY_FULL,
+            _ => JPEG_QUALITY_BROWSE,
+        };
+        let encoded = encode_jpeg(&request.pixels, quality);
+        if let Ok(bytes) = &encoded
+            && let Some(disk) = &shared.disk
+        {
+            let key = DiskCache::key(&shared.entries[request.id.0], request.id.1);
+            if let Err(e) = disk.put(&key, bytes) {
+                eprintln!("disk cache write failed: {e}");
+            }
+        }
+
+        let insert_ram = shared.persistence.finish(request.id);
+        if insert_ram && let Ok(bytes) = encoded {
+            shared.cache.insert_jpeg(request.id, Arc::new(bytes));
+        }
+    }
 }
 
 fn run_job(shared: &Shared, id: JobId, action: Action, token: &CancelToken) {
@@ -512,28 +707,15 @@ fn run_develop(
         }
     }
 
-    // Ring-2 + ring-3 insurance: encode the developed result so future
-    // evictions demote instead of discarding, and folder reopens are warm.
-    // Once the expensive develop has completed, always finish its cache
-    // insurance. ImageReady can trigger a replan that cancels this token
-    // while JPEG encoding is starting; cancellation suppresses stale UI
-    // events, but must not discard already-completed work from rings 2/3.
+    // Ring-2 + ring-3 insurance runs on a bounded background lane. ImageReady
+    // can trigger a replan that cancels this token immediately; persistence is
+    // deliberately independent of that token once completed pixels enqueue.
     if warm_only || !shared.cache.has_jpeg((index, tier)) {
-        let quality_jpeg = match tier {
-            Tier::Full => JPEG_QUALITY_FULL,
-            _ => JPEG_QUALITY_BROWSE,
-        };
-        if let Ok(bytes) = encode_jpeg(&buf, quality_jpeg) {
-            if let Some(disk) = &shared.disk {
-                let key = DiskCache::key(&shared.entries[index], tier);
-                if let Err(e) = disk.put(&key, &bytes) {
-                    eprintln!("disk cache write failed: {e}");
-                }
-            }
-            if !warm_only {
-                shared.cache.insert_jpeg((index, tier), Arc::new(bytes));
-            }
-        }
+        let _ = shared.persistence.try_enqueue(PersistenceRequest {
+            id: (index, tier),
+            pixels: buf,
+            insert_ram: !warm_only,
+        });
     }
 }
 
@@ -631,6 +813,53 @@ mod tests {
 
     fn job(id: JobId, class: u8, dist: u32) -> (JobId, u8, u32, Action) {
         (id, class, dist, Action::Thumb)
+    }
+
+    fn persistence_request(
+        id: JobId,
+        pixels: Arc<PixelBuf>,
+        insert_ram: bool,
+    ) -> PersistenceRequest {
+        PersistenceRequest {
+            id,
+            pixels,
+            insert_ram,
+        }
+    }
+
+    fn persistence_shared(
+        entries: Vec<FolderEntry>,
+        cache: Arc<RamCache>,
+        disk: Option<DiskCache>,
+        pending_budget_bytes: usize,
+    ) -> Arc<Shared> {
+        let (events, _receiver) = std::sync::mpsc::channel();
+        Arc::new(Shared {
+            entries,
+            cache,
+            disk,
+            events,
+            notify: Arc::new(|| {}),
+            heavy: JobQueue::new(),
+            light: JobQueue::new(),
+            persistence: PersistenceQueue::with_budget(pending_budget_bytes),
+            shutdown: AtomicBool::new(false),
+            sequence: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn entry(path: impl Into<std::path::PathBuf>, size: u64) -> FolderEntry {
+        let path = path.into();
+        FolderEntry {
+            file_name: path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            path,
+            size,
+            mtime_ns: 456,
+        }
     }
 
     #[test]
@@ -824,6 +1053,7 @@ mod tests {
             notify: Arc::new(|| {}),
             heavy: JobQueue::new(),
             light: JobQueue::new(),
+            persistence: PersistenceQueue::new(),
             shutdown: AtomicBool::new(false),
             sequence: Mutex::new(Vec::new()),
         };
@@ -841,6 +1071,163 @@ mod tests {
             Err(std::sync::mpsc::TryRecvError::Empty)
         ));
         assert_eq!(disk.get(&key).unwrap(), b"already warm");
+    }
+
+    #[test]
+    fn persistence_queue_is_bounded_nonblocking_and_coalesces_by_id() {
+        let queue = PersistenceQueue::with_budget(64);
+        let pixels = Arc::new(patterned_buf(4, 4));
+        let id = (0, Tier::Browse);
+
+        assert_eq!(
+            queue.try_enqueue(persistence_request(id, pixels.clone(), false)),
+            PersistenceEnqueue::Queued
+        );
+        let active = queue.pop().unwrap();
+        assert_eq!(active.id, id);
+
+        // A display request for the active warm item reuses its encoding and
+        // upgrades the eventual cache action to include the RAM JPEG ring.
+        assert_eq!(
+            queue.try_enqueue(persistence_request(id, pixels.clone(), true)),
+            PersistenceEnqueue::Coalesced
+        );
+
+        let pending_id = (1, Tier::Browse);
+        assert_eq!(
+            queue.try_enqueue(persistence_request(pending_id, pixels.clone(), false)),
+            PersistenceEnqueue::Queued
+        );
+        assert_eq!(
+            queue.try_enqueue(persistence_request(pending_id, pixels.clone(), true)),
+            PersistenceEnqueue::Coalesced
+        );
+        assert_eq!(
+            queue.try_enqueue(persistence_request(
+                (2, Tier::Browse),
+                Arc::new(patterned_buf(1, 1)),
+                true,
+            )),
+            PersistenceEnqueue::Saturated
+        );
+
+        {
+            let state = queue.state.lock().unwrap();
+            assert_eq!(state.pending.len(), 1);
+            assert_eq!(state.pending_bytes, 64);
+        }
+        assert!(queue.finish(id));
+        assert_eq!(queue.pop().unwrap().id, pending_id);
+        assert!(queue.finish(pending_id));
+
+        // Contention cannot delay a heavy worker: enqueue fails immediately.
+        let guard = queue.state.lock().unwrap();
+        assert_eq!(
+            queue.try_enqueue(persistence_request(id, pixels, true)),
+            PersistenceEnqueue::Busy
+        );
+        drop(guard);
+
+        queue.close();
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn production_persistence_budget_fits_a_61mp_rgba_frame() {
+        let frame_61mp_bytes = std::hint::black_box(9_504 * 6_336 * 4);
+        let budget = std::hint::black_box(PERSIST_PENDING_BUDGET_BYTES);
+        assert!(budget >= frame_61mp_bytes);
+        assert!(budget < frame_61mp_bytes * 2);
+    }
+
+    #[test]
+    fn engine_shutdown_drains_persistence_and_obeys_warm_ram_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = DiskCache::open_at(dir.path().join("cache"));
+        let entries = vec![
+            entry(dir.path().join("display.arw"), 100),
+            entry(dir.path().join("warm.arw"), 200),
+        ];
+        let keys = [
+            DiskCache::key(&entries[0], Tier::Browse),
+            DiskCache::key(&entries[1], Tier::Browse),
+        ];
+        let cache = Arc::new(RamCache::new(0, 0, 1024 * 1024));
+        let shared = persistence_shared(entries, cache.clone(), Some(disk.clone()), 1024 * 1024);
+
+        assert_eq!(
+            shared.persistence.try_enqueue(persistence_request(
+                (0, Tier::Browse),
+                Arc::new(patterned_buf(96, 64)),
+                true,
+            )),
+            PersistenceEnqueue::Queued
+        );
+        assert_eq!(
+            shared.persistence.try_enqueue(persistence_request(
+                (1, Tier::Browse),
+                Arc::new(patterned_buf(96, 64)),
+                false,
+            )),
+            PersistenceEnqueue::Queued
+        );
+
+        let worker_shared = shared.clone();
+        let worker = std::thread::spawn(move || persistence_worker(&worker_shared));
+        // Engine shutdown rejects new work, drains both accepted requests, and
+        // joins the persistence worker before returning.
+        let engine = Engine {
+            shared: shared.clone(),
+            persistence_worker: Some(worker),
+        };
+        drop(engine);
+        assert_eq!(
+            shared.persistence.try_enqueue(persistence_request(
+                (0, Tier::Full),
+                Arc::new(patterned_buf(1, 1)),
+                true,
+            )),
+            PersistenceEnqueue::Closed
+        );
+
+        for key in &keys {
+            let persisted = disk.get(key).expect("accepted work must reach disk");
+            let decoded = decode_jpeg(&persisted).unwrap();
+            assert_eq!((decoded.width, decoded.height), (96, 64));
+        }
+        assert!(cache.has_jpeg((0, Tier::Browse)));
+        assert!(!cache.has_jpeg((1, Tier::Browse)));
+    }
+
+    #[test]
+    fn persistence_survives_replan_cancellation_after_pixels_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = DiskCache::open_at(dir.path().join("cache"));
+        let entries = vec![entry(dir.path().join("stale.arw"), 100)];
+        let key = DiskCache::key(&entries[0], Tier::Browse);
+        let cache = Arc::new(RamCache::new(0, 0, 1024 * 1024));
+        let shared = persistence_shared(entries, cache.clone(), Some(disk.clone()), 1024 * 1024);
+
+        shared.heavy.set_plan(vec![job((0, Tier::Browse), 1, 0)]);
+        let (_, _, token) = shared.heavy.pop(&shared.shutdown).unwrap();
+        assert_eq!(
+            shared.persistence.try_enqueue(persistence_request(
+                (0, Tier::Browse),
+                Arc::new(patterned_buf(64, 48)),
+                true,
+            )),
+            PersistenceEnqueue::Queued
+        );
+
+        shared.heavy.set_plan(Vec::new());
+        assert!(token.cancelled());
+        let worker_shared = shared.clone();
+        let worker = std::thread::spawn(move || persistence_worker(&worker_shared));
+        shared.persistence.close();
+        worker.join().unwrap();
+
+        assert!(disk.has(&key));
+        assert!(cache.has_jpeg((0, Tier::Browse)));
     }
 
     #[test]
