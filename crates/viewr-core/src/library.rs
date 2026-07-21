@@ -14,6 +14,7 @@ use crate::folder::FolderEntry;
 use crate::xmp;
 
 const SIDECAR_DEBOUNCE: Duration = Duration::from_millis(400);
+const SIDECAR_RETRY: Duration = Duration::from_secs(5);
 
 enum Cmd {
     SetRating {
@@ -23,7 +24,7 @@ enum Cmd {
         rating: u8,
     },
     Flush {
-        done: Sender<()>,
+        done: Sender<bool>,
     },
     Shutdown,
 }
@@ -50,10 +51,12 @@ pub fn load_ratings(entries: &[FolderEntry], db: Option<&Db>) -> HashMap<usize, 
             .map(|d| d.as_nanos() as i64);
         let row = db.and_then(|db| db.get_image(&entry.path.to_string_lossy()));
 
-        // Sidecar wins when it exists and is at least as new as our record.
+        // A dirty row is a database rating that has not reached its sidecar.
+        // It must win even when the old sidecar has an equal or newer mtime.
         let from_sidecar = sidecar_mtime.and_then(|mt| {
-            let db_mt = row.as_ref().map_or(0, |r| r.sidecar_mtime_ns);
-            if mt >= db_mt {
+            let db_row = row.as_ref();
+            let db_mt = db_row.map_or(0, |r| r.sidecar_mtime_ns);
+            if !db_row.is_some_and(|r| r.sidecar_dirty) && mt >= db_mt {
                 xmp::read_rating(&sidecar)
             } else {
                 None
@@ -109,8 +112,12 @@ impl Library {
             return;
         }
         let (done, wait) = std::sync::mpsc::channel();
-        if self.tx.send(Cmd::Flush { done }).is_ok() {
-            let _ = wait.recv();
+        let clean =
+            self.tx.send(Cmd::Flush { done }).is_ok() && wait.recv().is_ok_and(|clean| clean);
+        if !clean {
+            // Keep the fast-path state dirty so a later flush retries any
+            // sidecar that failed. The DB remains the crash-safe authority.
+            self.dirty.store(true, Ordering::Release);
         }
     }
 }
@@ -132,7 +139,28 @@ struct Pending {
 }
 
 fn persist_thread(rx: &Receiver<Cmd>, db: Option<&Db>, debounce: Duration) {
-    let mut pending: HashMap<PathBuf, Pending> = HashMap::new();
+    let mut pending: HashMap<PathBuf, Pending> = db
+        .map(|db| match db.pending_sidecars() {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.path,
+                        Pending {
+                            size: row.size,
+                            mtime_ns: row.mtime_ns,
+                            rating: row.rating,
+                            due: Instant::now(),
+                        },
+                    )
+                })
+                .collect(),
+            Err(error) => {
+                eprintln!("failed to load pending sidecars: {error}");
+                HashMap::new()
+            }
+        })
+        .unwrap_or_default();
 
     loop {
         let timeout = pending
@@ -147,13 +175,19 @@ fn persist_thread(rx: &Receiver<Cmd>, db: Option<&Db>, debounce: Duration) {
                 mtime_ns,
                 rating,
             }) => {
-                // DB immediately (crash-safe), sidecar debounced. Preserve
-                // the previously-known sidecar mtime so a crash before the
-                // sidecar write doesn't hand precedence to a stale sidecar.
+                // Commit the rating and dirty marker together before the
+                // debounced sidecar write. A restart can then recover both the
+                // rating precedence and the unfinished sidecar operation.
                 if let Some(db) = &db {
                     let key = path.to_string_lossy().into_owned();
-                    let prior_mtime = db.get_image(&key).map_or(0, |r| r.sidecar_mtime_ns);
-                    let _ = db.upsert_rating(&key, size, mtime_ns, Some(rating), prior_mtime);
+                    if let Err(error) =
+                        db.record_rating_pending_sidecar(&key, size, mtime_ns, rating)
+                    {
+                        eprintln!(
+                            "rating database write failed for {}: {error}",
+                            path.display()
+                        );
+                    }
                 }
                 pending.insert(
                     path,
@@ -166,19 +200,21 @@ fn persist_thread(rx: &Receiver<Cmd>, db: Option<&Db>, debounce: Duration) {
                 );
             }
             Ok(Cmd::Flush { done }) => {
-                flush_due(&mut pending, db, true);
-                let _ = done.send(());
+                let clean = flush_due(&mut pending, db, true);
+                let _ = done.send(clean);
             }
             Ok(Cmd::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
                 flush_due(&mut pending, db, true);
                 return;
             }
-            Err(RecvTimeoutError::Timeout) => flush_due(&mut pending, db, false),
+            Err(RecvTimeoutError::Timeout) => {
+                flush_due(&mut pending, db, false);
+            }
         }
     }
 }
 
-fn flush_due(pending: &mut HashMap<PathBuf, Pending>, db: Option<&Db>, all: bool) {
+fn flush_due(pending: &mut HashMap<PathBuf, Pending>, db: Option<&Db>, all: bool) -> bool {
     let now = Instant::now();
     let due: Vec<PathBuf> = pending
         .iter()
@@ -192,6 +228,7 @@ fn flush_due(pending: &mut HashMap<PathBuf, Pending>, db: Option<&Db>, all: bool
         let sidecar = path.with_extension("xmp");
         if let Err(e) = xmp::write_rating(&sidecar, p.rating) {
             eprintln!("sidecar write failed for {}: {e}", sidecar.display());
+            retry_later(pending, path, p);
             continue;
         }
         // Record the sidecar mtime we just produced so external edits
@@ -200,18 +237,34 @@ fn flush_due(pending: &mut HashMap<PathBuf, Pending>, db: Option<&Db>, all: bool
             .ok()
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos() as i64)
-            .unwrap_or(0);
-        if let Some(db) = db {
-            let _ = db.upsert_rating(
+            .map(|d| d.as_nanos() as i64);
+        let Some(mtime) = mtime else {
+            eprintln!("sidecar metadata read failed for {}", sidecar.display());
+            retry_later(pending, path, p);
+            continue;
+        };
+        if let Some(db) = db
+            && let Err(error) = db.upsert_rating(
                 &path.to_string_lossy(),
                 p.size,
                 p.mtime_ns,
                 Some(p.rating),
                 mtime,
+            )
+        {
+            eprintln!(
+                "rating database sync failed for {}: {error}",
+                path.display()
             );
+            retry_later(pending, path, p);
         }
     }
+    pending.is_empty()
+}
+
+fn retry_later(pending: &mut HashMap<PathBuf, Pending>, path: PathBuf, mut item: Pending) {
+    item.due = Instant::now() + SIDECAR_RETRY;
+    pending.insert(path, item);
 }
 
 #[cfg(test)]
@@ -311,6 +364,7 @@ mod tests {
             .expect("flush must make the DB row visible");
         assert_eq!(row.rating, Some(2));
         assert!(row.sidecar_mtime_ns > 0);
+        assert!(!row.sidecar_dirty);
         assert!(!library.dirty.load(Ordering::Acquire));
     }
 
@@ -339,6 +393,108 @@ mod tests {
         assert_eq!(
             db.get_image(&entry.path.to_string_lossy()).unwrap().rating,
             Some(4)
+        );
+        assert!(
+            !db.get_image(&entry.path.to_string_lossy())
+                .unwrap()
+                .sidecar_dirty
+        );
+    }
+
+    #[test]
+    fn dirty_database_rating_wins_after_a_crash_before_sidecar_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("viewr.db");
+        let entry = entry(dir.path().join("photo.ARW"));
+        xmp::write_rating(&entry.sidecar_path(), 2).unwrap();
+        let original_sidecar_mtime = sidecar_mtime(&entry);
+
+        {
+            let db = Db::open(&db_path).unwrap();
+            put_db_rating(&db, &entry, Some(2), original_sidecar_mtime);
+            db.record_rating_pending_sidecar(
+                &entry.path.to_string_lossy(),
+                entry.size,
+                entry.mtime_ns,
+                5,
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&db_path).unwrap();
+        let row = db.get_image(&entry.path.to_string_lossy()).unwrap();
+        assert_eq!(row.rating, Some(5));
+        assert_eq!(row.sidecar_mtime_ns, original_sidecar_mtime);
+        assert!(row.sidecar_dirty);
+        assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(2));
+        assert_eq!(load_ratings(&[entry], Some(&db)), HashMap::from([(0, 5)]));
+    }
+
+    #[test]
+    fn startup_recovers_a_sidecar_left_dirty_by_a_prior_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("viewr.db");
+        let entry = entry(dir.path().join("photo.ARW"));
+        xmp::write_rating(&entry.sidecar_path(), 1).unwrap();
+        {
+            let db = Db::open(&db_path).unwrap();
+            put_db_rating(&db, &entry, Some(1), sidecar_mtime(&entry));
+            db.record_rating_pending_sidecar(
+                &entry.path.to_string_lossy(),
+                entry.size,
+                entry.mtime_ns,
+                4,
+            )
+            .unwrap();
+        }
+
+        {
+            let library = Library::start_with(Some(db_path.clone()), Duration::from_secs(60));
+            drop(library);
+        }
+
+        assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(4));
+        let db = Db::open(&db_path).unwrap();
+        let row = db.get_image(&entry.path.to_string_lossy()).unwrap();
+        assert_eq!(row.rating, Some(4));
+        assert!(!row.sidecar_dirty);
+        assert!(db.pending_sidecars().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_flush_remains_dirty_and_retries_after_the_path_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("viewr.db");
+        let raw_path = dir.path().join("missing-parent/photo.ARW");
+        let entry = FolderEntry {
+            file_name: "photo.ARW".into(),
+            path: raw_path,
+            size: 3,
+            mtime_ns: 7,
+        };
+        let library = Library::start_with(Some(db_path.clone()), Duration::from_secs(60));
+
+        library.set_rating(&entry, 3);
+        library.flush();
+
+        assert!(library.dirty.load(Ordering::Acquire));
+        assert!(!entry.sidecar_path().exists());
+        let db = Db::open(&db_path).unwrap();
+        let row = db.get_image(&entry.path.to_string_lossy()).unwrap();
+        assert_eq!(row.rating, Some(3));
+        assert!(row.sidecar_dirty);
+        drop(db);
+
+        std::fs::create_dir_all(entry.path.parent().unwrap()).unwrap();
+        library.flush();
+
+        assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(3));
+        assert!(!library.dirty.load(Ordering::Acquire));
+        let db = Db::open(&db_path).unwrap();
+        assert!(
+            !db.get_image(&entry.path.to_string_lossy())
+                .unwrap()
+                .sidecar_dirty
         );
     }
 }
