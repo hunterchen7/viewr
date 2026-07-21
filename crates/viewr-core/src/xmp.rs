@@ -12,7 +12,7 @@ use std::path::Path;
 use quick_xml::NsReader;
 use quick_xml::Writer;
 use quick_xml::events::{BytesCData, BytesEnd, BytesStart, BytesText, Event};
-use quick_xml::name::{PrefixDeclaration, ResolveResult};
+use quick_xml::name::{PrefixDeclaration, QName, ResolveResult};
 
 use crate::atomic_write;
 
@@ -32,6 +32,22 @@ fn is_xmp_rating(namespace: &ResolveResult<'_>, local_name: &[u8]) -> bool {
         && matches!(namespace, ResolveResult::Bound(uri) if uri.as_ref() == XMP_NAMESPACE)
 }
 
+fn is_xmp_rating_element(reader: &NsReader<&[u8]>, name: QName<'_>) -> bool {
+    if name.local_name().as_ref() != b"Rating" {
+        return false;
+    }
+    let (namespace, local_name) = reader.resolve_element(name);
+    is_xmp_rating(&namespace, local_name.as_ref())
+}
+
+fn is_xmp_rating_attribute(reader: &NsReader<&[u8]>, name: QName<'_>) -> bool {
+    if name.local_name().as_ref() != b"Rating" {
+        return false;
+    }
+    let (namespace, local_name) = reader.resolve_attribute(name);
+    is_xmp_rating(&namespace, local_name.as_ref())
+}
+
 fn is_description(name: &[u8]) -> bool {
     name == b"Description" || name.ends_with(b":Description")
 }
@@ -49,16 +65,14 @@ pub fn parse_rating(xml: &str) -> Option<u8> {
     let mut depth = 0usize;
     let mut captures: Vec<RatingCapture> = Vec::new();
     loop {
-        let (namespace, event) = reader.read_resolved_event().ok()?;
-        match event {
+        match reader.read_event().ok()? {
             Event::Eof => return None,
             Event::Start(e) => {
-                let is_rating_element = is_xmp_rating(&namespace, e.local_name().as_ref());
+                let is_rating_element = is_xmp_rating_element(&reader, e.name());
                 if is_description(e.name().as_ref()) {
                     for attr in e.attributes() {
                         let attr = attr.ok()?;
-                        let (namespace, local_name) = reader.resolve_attribute(attr.key);
-                        if is_xmp_rating(&namespace, local_name.as_ref())
+                        if is_xmp_rating_attribute(&reader, attr.key)
                             && let Ok(value) = attr.unescape_value()
                             && let Some(rating) = parse_rating_value(&value)
                         {
@@ -79,8 +93,7 @@ pub fn parse_rating(xml: &str) -> Option<u8> {
                 if is_description(e.name().as_ref()) {
                     for attr in e.attributes() {
                         let attr = attr.ok()?;
-                        let (namespace, local_name) = reader.resolve_attribute(attr.key);
-                        if is_xmp_rating(&namespace, local_name.as_ref())
+                        if is_xmp_rating_attribute(&reader, attr.key)
                             && let Ok(value) = attr.unescape_value()
                             && let Some(rating) = parse_rating_value(&value)
                         {
@@ -110,7 +123,7 @@ pub fn parse_rating(xml: &str) -> Option<u8> {
             }
             Event::End(e) => {
                 depth = depth.checked_sub(1)?;
-                if is_xmp_rating(&namespace, e.local_name().as_ref())
+                if is_xmp_rating_element(&reader, e.name())
                     && captures
                         .last()
                         .is_some_and(|capture| capture.depth == depth)
@@ -163,21 +176,21 @@ pub fn update_rating_xml(xml: &str, rating: u8) -> Result<String, XmpError> {
     let mut events: Vec<Event<'static>> = Vec::new();
 
     loop {
-        let (namespace, event) = reader
-            .read_resolved_event()
-            .map_err(|e| XmpError::Xml(e.to_string()))?;
-        match event {
+        match reader
+            .read_event()
+            .map_err(|e| XmpError::Xml(e.to_string()))?
+        {
             Event::Eof => break,
             Event::Start(e) => {
-                validate_attributes(&e)?;
                 let is_desc = is_description(e.name().as_ref());
-                let is_rating = is_xmp_rating(&namespace, e.local_name().as_ref());
+                let is_rating = is_xmp_rating_element(&reader, e.name());
                 let rewritten = if is_desc {
                     if injection.is_none() {
                         injection = Some(injection_target(&reader, events.len()));
                     }
                     rewrite_attrs(&reader, &e, rating, &mut wrote)?
                 } else {
+                    validate_attributes(&e)?;
                     e.into_owned()
                 };
                 events.push(Event::Start(rewritten));
@@ -192,14 +205,15 @@ pub fn update_rating_xml(xml: &str, rating: u8) -> Result<String, XmpError> {
                 depth += 1;
             }
             Event::Empty(e) => {
-                validate_attributes(&e)?;
-                let is_rating = is_xmp_rating(&namespace, e.local_name().as_ref());
-                let rewritten = if is_description(e.name().as_ref()) {
+                let is_desc = is_description(e.name().as_ref());
+                let is_rating = is_xmp_rating_element(&reader, e.name());
+                let rewritten = if is_desc {
                     if injection.is_none() {
                         injection = Some(injection_target(&reader, events.len()));
                     }
                     rewrite_attrs(&reader, &e, rating, &mut wrote)?
                 } else {
+                    validate_attributes(&e)?;
                     e.into_owned()
                 };
                 if is_rating {
@@ -233,7 +247,7 @@ pub fn update_rating_xml(xml: &str, rating: u8) -> Result<String, XmpError> {
                 depth = depth
                     .checked_sub(1)
                     .ok_or_else(|| XmpError::Xml("unexpected closing element".into()))?;
-                if is_xmp_rating(&namespace, e.local_name().as_ref())
+                if is_xmp_rating_element(&reader, e.name())
                     && rating_elements
                         .last()
                         .is_some_and(|capture| capture.depth == depth)
@@ -290,8 +304,7 @@ fn rewrite_attrs(
     let mut found_rating = false;
     for attr in e.attributes() {
         let attr = attr.map_err(|error| XmpError::Xml(error.to_string()))?;
-        let (namespace, local_name) = reader.resolve_attribute(attr.key);
-        if is_xmp_rating(&namespace, local_name.as_ref()) {
+        if is_xmp_rating_attribute(reader, attr.key) {
             if found_rating {
                 return Err(XmpError::Xml(
                     "duplicate XMP rating attributes on one element".into(),
