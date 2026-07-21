@@ -17,6 +17,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, TryLockError};
+use std::time::Duration;
 
 use crate::cache_disk::DiskCache;
 use crate::cache_ram::RamCache;
@@ -39,6 +40,8 @@ const LIGHT_WORKERS: usize = 2;
 const PERSIST_PENDING_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const JPEG_QUALITY_BROWSE: u8 = 87;
 const JPEG_QUALITY_FULL: u8 = 90;
+const PERSIST_WRITE_ATTEMPTS: usize = 3;
+const PERSIST_RETRY_BASE_DELAY: Duration = Duration::from_millis(2);
 
 #[derive(Debug)]
 pub enum Event {
@@ -139,6 +142,25 @@ struct InFlight {
     token: Arc<CancelToken>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobCompletion {
+    /// The background obligation was either satisfied or made best-effort by
+    /// an accepted persistence request.
+    Complete,
+    /// Cancellation stopped the job before it produced or handed off pixels.
+    RetryBackground,
+    /// The bounded persistence lane could not accept completed pixels. Park
+    /// the job until that lane next frees capacity instead of immediately
+    /// developing the RAW again.
+    DeferBackground { required_bytes: usize },
+}
+
+struct DeferredJob {
+    id: JobId,
+    action: Action,
+    required_bytes: usize,
+}
+
 #[derive(Default)]
 struct QueueState {
     heap: BinaryHeap<QueuedJob>,
@@ -155,9 +177,14 @@ struct QueueState {
     /// queued.
     background: VecDeque<(JobId, Action)>,
     /// Background generations remain tracked after a foreground replacement
-    /// takes over the same ID. A cancelled generation is requeued when its
-    /// worker exits, preserving eventual folder coverage.
+    /// takes over the same ID. The worker's completion disposition decides
+    /// whether cancellation requires retry or accepted persistence completed
+    /// the one-shot obligation.
     background_in_flight: HashMap<JobId, InFlight>,
+    /// Warm jobs rejected by the nonblocking persistence lane wait here until
+    /// the persistence worker frees capacity. Keeping this separate prevents
+    /// a tight RAW-develop/reject loop under backpressure.
+    background_deferred: VecDeque<DeferredJob>,
     background_initialized: bool,
     epoch: u64,
     seq: u64,
@@ -169,11 +196,16 @@ struct JobQueue {
     cond: Condvar,
 }
 
+#[derive(Clone)]
 struct PersistenceRequest {
     id: JobId,
     pixels: Arc<PixelBuf>,
     /// Warm-only work populates disk but deliberately skips the RAM JPEG ring.
     insert_ram: bool,
+    /// At least one coalesced producer was a persistent folder-warm job. This
+    /// bit follows active and pending coalescing through completion so failure
+    /// reporting reflects the background obligation honestly.
+    warm_completion: bool,
 }
 
 impl PersistenceRequest {
@@ -186,7 +218,12 @@ impl PersistenceRequest {
 enum PersistenceEnqueue {
     Queued,
     Coalesced,
+    /// Temporary byte-budget pressure; at least one pending request will free
+    /// capacity and wake a deferred warm job.
     Saturated,
+    /// This buffer can never fit the configured pending budget. Retrying would
+    /// park it forever, so persistence remains explicitly best-effort.
+    Oversized,
     Busy,
     Closed,
 }
@@ -194,6 +231,13 @@ enum PersistenceEnqueue {
 struct ActivePersistence {
     id: JobId,
     insert_ram: bool,
+    warm_completion: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PersistenceCompletion {
+    insert_ram: bool,
+    warm_completion: bool,
 }
 
 struct PersistenceState {
@@ -206,9 +250,10 @@ struct PersistenceState {
 
 /// A single-consumer, byte-bounded lane for JPEG encoding and persistence.
 ///
-/// Producers use `try_lock`, so a completed develop never waits behind JPEG
-/// work. Requests for an active or pending ID coalesce; otherwise excess work
-/// is dropped as a best-effort cache miss.
+/// Producers try the state lock first and take it once only on contention;
+/// JPEG encode and disk I/O never hold it. Requests for an active or pending
+/// ID coalesce. Warm work rejected by temporary byte pressure is parked by the
+/// job queue, while oversized buffers remain an explicit best-effort miss.
 struct PersistenceQueue {
     state: Mutex<PersistenceState>,
     ready: Condvar,
@@ -234,12 +279,49 @@ impl PersistenceQueue {
         }
     }
 
+    /// Prefer a nonblocking state update. If another producer owns the short
+    /// queue-state critical section, retain the completed pixels and take that
+    /// mutex once instead of dropping them or re-developing the RAW. JPEG
+    /// encode and disk I/O never run under this lock.
+    fn enqueue(&self, request: PersistenceRequest) -> PersistenceEnqueue {
+        match self.try_enqueue(request.clone()) {
+            PersistenceEnqueue::Busy => self.enqueue_after_busy(request),
+            outcome => outcome,
+        }
+    }
+
     fn try_enqueue(&self, request: PersistenceRequest) -> PersistenceEnqueue {
         let mut state = match self.state.try_lock() {
             Ok(state) => state,
             Err(TryLockError::WouldBlock) => return PersistenceEnqueue::Busy,
             Err(TryLockError::Poisoned(_)) => return PersistenceEnqueue::Closed,
         };
+        let outcome = self.enqueue_locked(&mut state, request);
+        drop(state);
+        if outcome == PersistenceEnqueue::Queued {
+            self.ready.notify_one();
+        }
+        outcome
+    }
+
+    fn enqueue_after_busy(&self, request: PersistenceRequest) -> PersistenceEnqueue {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return PersistenceEnqueue::Closed,
+        };
+        let outcome = self.enqueue_locked(&mut state, request);
+        drop(state);
+        if outcome == PersistenceEnqueue::Queued {
+            self.ready.notify_one();
+        }
+        outcome
+    }
+
+    fn enqueue_locked(
+        &self,
+        state: &mut PersistenceState,
+        request: PersistenceRequest,
+    ) -> PersistenceEnqueue {
         if state.closed {
             return PersistenceEnqueue::Closed;
         }
@@ -248,25 +330,26 @@ impl PersistenceQueue {
             && active.id == request.id
         {
             active.insert_ram |= request.insert_ram;
+            active.warm_completion |= request.warm_completion;
             return PersistenceEnqueue::Coalesced;
         }
         if let Some(pending) = state.pending.get_mut(&request.id) {
             pending.insert_ram |= request.insert_ram;
+            pending.warm_completion |= request.warm_completion;
             return PersistenceEnqueue::Coalesced;
         }
 
         let retained_bytes = request.retained_bytes();
-        if retained_bytes > self.pending_budget_bytes
-            || state.pending_bytes > self.pending_budget_bytes - retained_bytes
-        {
+        if retained_bytes > self.pending_budget_bytes {
+            return PersistenceEnqueue::Oversized;
+        }
+        if state.pending_bytes > self.pending_budget_bytes - retained_bytes {
             return PersistenceEnqueue::Saturated;
         }
 
         state.pending_bytes += retained_bytes;
         state.order.push_back(request.id);
         state.pending.insert(request.id, request);
-        drop(state);
-        self.ready.notify_one();
         PersistenceEnqueue::Queued
     }
 
@@ -283,6 +366,7 @@ impl PersistenceQueue {
                 state.active = Some(ActivePersistence {
                     id,
                     insert_ram: request.insert_ram,
+                    warm_completion: request.warm_completion,
                 });
                 return Some(request);
             }
@@ -293,16 +377,48 @@ impl PersistenceQueue {
         }
     }
 
-    /// Finish the active request and return the RAM-insert requirement merged
-    /// from every duplicate that arrived while it was being persisted.
-    fn finish(&self, id: JobId) -> bool {
+    /// Mark an existing active/pending request as satisfying a folder-warm
+    /// obligation. This is the zero-copy coalescing path used before a warm
+    /// worker starts another RAW decode. Both states are observed under one
+    /// lock so the handoff between them cannot look like an idle gap.
+    fn mark_warm_completion_if_present(&self, id: JobId) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if let Some(active) = state.active.as_mut()
+            && active.id == id
+        {
+            active.warm_completion = true;
+            return true;
+        }
+        if let Some(pending) = state.pending.get_mut(&id) {
+            pending.warm_completion = true;
+            return true;
+        }
+        false
+    }
+
+    fn available_pending_bytes(&self) -> usize {
+        let state = self.state.lock().unwrap();
+        if state.closed {
+            0
+        } else {
+            self.pending_budget_bytes
+                .saturating_sub(state.pending_bytes)
+        }
+    }
+
+    /// Finish the active request and return requirements merged from every
+    /// duplicate that arrived while it was being persisted.
+    fn finish(&self, id: JobId) -> PersistenceCompletion {
         let mut state = self.state.lock().unwrap();
         let active = state
             .active
             .take()
             .expect("a persistence request must be active when it finishes");
         debug_assert_eq!(active.id, id);
-        active.insert_ram
+        PersistenceCompletion {
+            insert_ram: active.insert_ram,
+            warm_completion: active.warm_completion,
+        }
     }
 
     /// Reject new work, drain accepted requests, then let the worker exit.
@@ -551,15 +667,30 @@ impl JobQueue {
         }
     }
 
+    #[cfg(test)]
     fn finish(&self, id: JobId, token: &Arc<CancelToken>) {
+        self.finish_with(id, token, JobCompletion::Complete);
+    }
+
+    fn finish_with(&self, id: JobId, token: &Arc<CancelToken>, completion: JobCompletion) {
         let mut state = self.state.lock().unwrap();
         let retry_action = state.background_in_flight.get(&id).and_then(|background| {
             Arc::ptr_eq(&background.token, token).then_some(background.action)
         });
         if let Some(action) = retry_action {
             state.background_in_flight.remove(&id);
-            if token.cancelled() && !state.closed {
-                state.background.push_back((id, action));
+            if !state.closed {
+                match completion {
+                    JobCompletion::Complete => {}
+                    JobCompletion::RetryBackground => state.background.push_back((id, action)),
+                    JobCompletion::DeferBackground { required_bytes } => {
+                        state.background_deferred.push_back(DeferredJob {
+                            id,
+                            action,
+                            required_bytes,
+                        });
+                    }
+                }
             }
         }
         if state
@@ -573,6 +704,30 @@ impl JobQueue {
         self.cond.notify_one();
     }
 
+    /// Make one backpressured warm job runnable after persistence capacity or
+    /// state changes. Releasing one at a time avoids a thundering herd of RAW
+    /// decodes that would immediately saturate the byte budget again.
+    fn release_one_deferred(&self, available_bytes: usize) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.closed {
+            return false;
+        }
+        let Some(job) = state.background_deferred.front() else {
+            return false;
+        };
+        if job.required_bytes > available_bytes {
+            return false;
+        }
+        let job = state
+            .background_deferred
+            .pop_front()
+            .expect("the deferred front was inspected under the queue lock");
+        state.background.push_back((job.id, job.action));
+        drop(state);
+        self.cond.notify_one();
+        true
+    }
+
     /// Cancel active work, discard queued work, and wake every waiter.
     /// `closed` is protected by the same mutex as the condition-variable
     /// predicate, so shutdown cannot lose a wakeup between check and wait.
@@ -583,6 +738,7 @@ impl JobQueue {
         state.queued.clear();
         state.urgent.clear();
         state.background.clear();
+        state.background_deferred.clear();
         for running in state.in_flight.values() {
             running.token.cancel();
         }
@@ -885,14 +1041,48 @@ impl Drop for Engine {
 fn worker(shared: &Shared, light: bool) {
     let queue = if light { &shared.light } else { &shared.heavy };
     while let Some((id, action, token)) = queue.pop() {
-        run_job(shared, id, action, &token);
-        queue.finish(id, &token);
+        let completion = run_job(shared, id, action, &token);
+        let deferred_bytes = match completion {
+            JobCompletion::DeferBackground { required_bytes } => Some(required_bytes),
+            JobCompletion::Complete | JobCompletion::RetryBackground => None,
+        };
+        queue.finish_with(id, &token, completion);
+        // Close the race where persistence frees capacity immediately before
+        // this worker parks its rejected warm item. A later completion also
+        // runs the same one-at-a-time admission check.
+        if let Some(required_bytes) = deferred_bytes {
+            let available_bytes = shared.persistence.available_pending_bytes();
+            if required_bytes <= available_bytes {
+                queue.release_one_deferred(available_bytes);
+            }
+        }
     }
 }
 
 fn publish(shared: &Shared, event: Event) {
     let _ = shared.events.send(event);
     (shared.notify)();
+}
+
+fn retry_persistence_write(
+    attempts: usize,
+    mut write: impl FnMut() -> std::io::Result<()>,
+    mut backoff: impl FnMut(usize),
+) -> std::io::Result<()> {
+    let attempts = attempts.max(1);
+    for attempt in 0..attempts {
+        match write() {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt + 1 == attempts => return Err(error),
+            Err(_) => backoff(attempt + 1),
+        }
+    }
+    unreachable!("at least one persistence attempt always runs")
+}
+
+fn persistence_retry_backoff(retry: usize) {
+    let multiplier = 1_u32 << retry.saturating_sub(1).min(2);
+    std::thread::sleep(PERSIST_RETRY_BASE_DELAY.saturating_mul(multiplier));
 }
 
 fn persistence_worker(shared: &Shared) {
@@ -905,31 +1095,65 @@ fn persistence_worker(shared: &Shared) {
             _ => JPEG_QUALITY_BROWSE,
         };
         let encoded = encode_jpeg(&request.pixels, quality);
+        let mut persistence_error = None;
+        let encode_error = encoded.as_ref().err().cloned();
         if let Ok(bytes) = &encoded
             && let Some(disk) = &shared.disk
         {
             let key = DiskCache::key(&shared.entries[request.id.0], request.id.1);
-            if let Err(e) = disk.put(&key, bytes) {
-                eprintln!("disk cache write failed: {e}");
+            if let Err(error) = retry_persistence_write(
+                PERSIST_WRITE_ATTEMPTS,
+                || disk.put(&key, bytes),
+                persistence_retry_backoff,
+            ) {
+                persistence_error = Some(error.to_string());
             }
         }
 
-        let insert_ram = shared.persistence.finish(request.id);
-        if insert_ram && let Ok(bytes) = encoded {
+        let completion = shared.persistence.finish(request.id);
+        // One completed request admits at most one parked warm retry. Waiting
+        // until completion also covers producers that collided with `pop` or
+        // `finish` without creating a two-job admission burst.
+        let available_bytes = shared.persistence.available_pending_bytes();
+        shared.heavy.release_one_deferred(available_bytes);
+        if completion.insert_ram
+            && let Ok(bytes) = encoded
+        {
             shared.cache.insert_jpeg(request.id, Arc::new(bytes));
+        }
+        if let Some(error) = persistence_error {
+            let context = if completion.warm_completion {
+                "background disk-cache warm"
+            } else {
+                "disk cache"
+            };
+            eprintln!("{context} write failed after {PERSIST_WRITE_ATTEMPTS} attempts: {error}");
+        }
+        if let Some(error) = encode_error {
+            let context = if completion.warm_completion {
+                "background disk-cache warm"
+            } else {
+                "disk cache"
+            };
+            eprintln!("{context} JPEG encode failed: {error}");
         }
     }
 }
 
-fn run_job(shared: &Shared, id: JobId, action: Action, token: &CancelToken) {
+fn run_job(shared: &Shared, id: JobId, action: Action, token: &CancelToken) -> JobCompletion {
     let (index, tier) = id;
     match action {
         Action::Metadata => run_metadata(shared, index, token),
         Action::Thumb => run_thumb(shared, index),
         Action::Rehydrate => run_rehydrate(shared, index, tier, token),
-        Action::Develop(quality) => run_develop(shared, index, tier, quality, token, false),
-        Action::WarmDevelop(quality) => run_warm_develop(shared, index, tier, quality, token),
+        Action::Develop(quality) => {
+            let _ = run_develop(shared, index, tier, quality, token, false);
+        }
+        Action::WarmDevelop(quality) => {
+            return run_warm_develop(shared, index, tier, quality, token);
+        }
     }
+    JobCompletion::Complete
 }
 
 fn run_metadata(shared: &Shared, index: usize, token: &CancelToken) {
@@ -956,25 +1180,67 @@ fn run_metadata(shared: &Shared, index: usize, token: &CancelToken) {
     }
 }
 
-/// Probe background cache state away from the navigation/UI thread. A warm
-/// hit is a no-op; a miss follows the same develop-and-persist path as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DevelopCompletion {
+    Finished,
+    Cancelled,
+    Persistence {
+        outcome: PersistenceEnqueue,
+        retained_bytes: usize,
+    },
+}
+
+fn warm_job_completion(completion: DevelopCompletion) -> JobCompletion {
+    match completion {
+        DevelopCompletion::Cancelled => JobCompletion::RetryBackground,
+        DevelopCompletion::Persistence {
+            outcome: PersistenceEnqueue::Busy | PersistenceEnqueue::Saturated,
+            retained_bytes,
+        } => JobCompletion::DeferBackground {
+            required_bytes: retained_bytes,
+        },
+        DevelopCompletion::Finished
+        | DevelopCompletion::Persistence {
+            outcome:
+                PersistenceEnqueue::Queued
+                | PersistenceEnqueue::Coalesced
+                | PersistenceEnqueue::Oversized
+                | PersistenceEnqueue::Closed,
+            ..
+        } => JobCompletion::Complete,
+    }
+}
+
+/// Probe background cache and persistence state away from the navigation/UI
+/// thread. An active or pending encode satisfies this one-shot attempt without
+/// starting another RAW decode; backpressure parks the item until capacity
+/// changes.
 fn run_warm_develop(
     shared: &Shared,
     index: usize,
     tier: Tier,
     quality: Quality,
     token: &CancelToken,
-) {
-    if token.cancelled() || shared.cache.has_jpeg((index, tier)) {
-        return;
+) -> JobCompletion {
+    if token.cancelled() {
+        return JobCompletion::RetryBackground;
+    }
+    if shared.cache.has_jpeg((index, tier)) {
+        return JobCompletion::Complete;
     }
     let Some(disk) = &shared.disk else {
-        return;
+        return JobCompletion::Complete;
     };
     if disk.has(&DiskCache::key(&shared.entries[index], tier)) {
-        return;
+        return JobCompletion::Complete;
     }
-    run_develop(shared, index, tier, quality, token, true);
+    if shared
+        .persistence
+        .mark_warm_completion_if_present((index, tier))
+    {
+        return JobCompletion::Complete;
+    }
+    warm_job_completion(run_develop(shared, index, tier, quality, token, true))
 }
 
 fn run_thumb(shared: &Shared, index: usize) {
@@ -1037,7 +1303,7 @@ fn run_develop(
     quality: Quality,
     token: &CancelToken,
     warm_only: bool,
-) {
+) -> DevelopCompletion {
     let path = &shared.entries[index].path;
     let fail = |e: String| {
         if !token.cancelled() {
@@ -1052,19 +1318,33 @@ fn run_develop(
         }
     };
     if token.cancelled() {
-        return;
+        return DevelopCompletion::Cancelled;
     }
     let decoded = match decode::load(path) {
         Ok(d) => d,
-        Err(e) => return fail(e.to_string()),
+        Err(e) => {
+            fail(e.to_string());
+            return if token.cancelled() {
+                DevelopCompletion::Cancelled
+            } else {
+                DevelopCompletion::Finished
+            };
+        }
     };
     let meta = FileMeta::from_metadata(&decoded.metadata);
     if token.cancelled() {
-        return;
+        return DevelopCompletion::Cancelled;
     }
     let (buf, _) = match develop(decoded.raw, quality) {
         Ok(r) => r,
-        Err(e) => return fail(e.to_string()),
+        Err(e) => {
+            fail(e.to_string());
+            return if token.cancelled() {
+                DevelopCompletion::Cancelled
+            } else {
+                DevelopCompletion::Finished
+            };
+        }
     };
     let buf = Arc::new(apply_orient(buf, meta.orient));
 
@@ -1081,12 +1361,25 @@ fn run_develop(
     // can trigger a replan that cancels this token immediately; persistence is
     // deliberately independent of that token once completed pixels enqueue.
     if warm_only || !shared.cache.has_jpeg((index, tier)) {
-        let _ = shared.persistence.try_enqueue(PersistenceRequest {
+        let retained_bytes = buf.byte_len();
+        let enqueue = shared.persistence.enqueue(PersistenceRequest {
             id: (index, tier),
             pixels: buf,
             insert_ram: !warm_only,
+            warm_completion: warm_only,
         });
+        if enqueue == PersistenceEnqueue::Oversized {
+            eprintln!(
+                "disk cache persistence skipped: {retained_bytes} byte buffer exceeds the {} byte pending budget",
+                shared.persistence.pending_budget_bytes
+            );
+        }
+        return DevelopCompletion::Persistence {
+            outcome: enqueue,
+            retained_bytes,
+        };
     }
+    DevelopCompletion::Finished
 }
 
 fn run_rehydrate(shared: &Shared, index: usize, tier: Tier, token: &CancelToken) {
@@ -1219,6 +1512,7 @@ mod tests {
             id,
             pixels,
             insert_ram,
+            warm_completion: !insert_ram,
         }
     }
 
@@ -1456,7 +1750,7 @@ mod tests {
 
         // The stale warm completion cannot erase the foreground generation,
         // and its canceled item returns behind the untouched background item.
-        q.finish(id, &background_token);
+        q.finish_with(id, &background_token, JobCompletion::RetryBackground);
         assert!(
             q.state
                 .lock()
@@ -1510,6 +1804,146 @@ mod tests {
         assert!(state.background_in_flight.is_empty());
         drop(state);
         assert!(q.pop().is_none());
+    }
+
+    #[test]
+    fn busy_and_saturated_warm_work_parks_until_capacity_changes() {
+        assert_eq!(
+            warm_job_completion(DevelopCompletion::Persistence {
+                outcome: PersistenceEnqueue::Busy,
+                retained_bytes: 64,
+            }),
+            JobCompletion::DeferBackground { required_bytes: 64 }
+        );
+        assert_eq!(
+            warm_job_completion(DevelopCompletion::Persistence {
+                outcome: PersistenceEnqueue::Saturated,
+                retained_bytes: 64,
+            }),
+            JobCompletion::DeferBackground { required_bytes: 64 }
+        );
+
+        let q = JobQueue::new();
+        let first = (3, Tier::Browse);
+        let second = (4, Tier::Browse);
+        assert!(q.initialize_background(|| [warm(first), warm(second)]));
+        for expected in [first, second] {
+            let (id, _, token) = q.pop().unwrap();
+            assert_eq!(id, expected);
+            q.finish_with(
+                id,
+                &token,
+                JobCompletion::DeferBackground { required_bytes: 64 },
+            );
+        }
+
+        {
+            let state = q.state.lock().unwrap();
+            assert!(state.background.is_empty());
+            assert_eq!(state.background_deferred.len(), 2);
+        }
+        assert!(!q.release_one_deferred(63));
+        assert!(q.release_one_deferred(64));
+        {
+            let state = q.state.lock().unwrap();
+            assert_eq!(state.background.len(), 1);
+            assert_eq!(state.background_deferred.len(), 1);
+        }
+
+        let (id, _, token) = q.pop().unwrap();
+        assert_eq!(id, first);
+        q.finish_with(id, &token, JobCompletion::Complete);
+        assert!(q.release_one_deferred(64));
+        let (id, _, token) = q.pop().unwrap();
+        assert_eq!(id, second);
+        q.finish_with(id, &token, JobCompletion::Complete);
+
+        let state = q.state.lock().unwrap();
+        assert!(state.background.is_empty());
+        assert!(state.background_deferred.is_empty());
+        assert!(state.background_in_flight.is_empty());
+    }
+
+    #[test]
+    fn cancellation_after_persistence_handoff_does_not_redevelop_raw() {
+        let q = JobQueue::new();
+        let id = (3, Tier::Browse);
+        assert!(q.initialize_background(|| [warm(id)]));
+        let (_, _, token) = q.pop().unwrap();
+        token.cancel();
+
+        let completion = warm_job_completion(DevelopCompletion::Persistence {
+            outcome: PersistenceEnqueue::Queued,
+            retained_bytes: 64,
+        });
+        assert_eq!(completion, JobCompletion::Complete);
+        q.finish_with(id, &token, completion);
+
+        let state = q.state.lock().unwrap();
+        assert!(state.background.is_empty());
+        assert!(state.background_deferred.is_empty());
+        assert!(state.background_in_flight.is_empty());
+    }
+
+    #[test]
+    fn saturated_warm_self_releases_when_capacity_freed_before_park() {
+        let persistence = PersistenceQueue::with_budget(64);
+        assert_eq!(
+            persistence.try_enqueue(persistence_request(
+                (0, Tier::Browse),
+                Arc::new(patterned_buf(4, 4)),
+                false,
+            )),
+            PersistenceEnqueue::Queued
+        );
+        let rejected = persistence_request((1, Tier::Browse), Arc::new(patterned_buf(4, 4)), false);
+        assert_eq!(
+            persistence.try_enqueue(rejected),
+            PersistenceEnqueue::Saturated
+        );
+
+        // Persistence frees pending capacity before the warm worker records
+        // its deferred disposition, so the earlier completion notification
+        // cannot release it.
+        let active = persistence.pop().unwrap();
+        let q = JobQueue::new();
+        let id = (1, Tier::Browse);
+        assert!(q.initialize_background(|| [warm(id)]));
+        let (_, _, token) = q.pop().unwrap();
+        q.finish_with(
+            id,
+            &token,
+            JobCompletion::DeferBackground { required_bytes: 64 },
+        );
+
+        let available_bytes = persistence.available_pending_bytes();
+        assert_eq!(available_bytes, 64);
+        assert!(q.release_one_deferred(available_bytes));
+        let (retried, _, retried_token) = q.pop().unwrap();
+        assert_eq!(retried, id);
+        q.finish(retried, &retried_token);
+        let _ = persistence.finish(active.id);
+    }
+
+    #[test]
+    fn oversized_warm_buffer_is_not_deferred_forever() {
+        let queue = PersistenceQueue::with_budget(63);
+        let enqueue = queue.try_enqueue(persistence_request(
+            (0, Tier::Browse),
+            Arc::new(patterned_buf(4, 4)),
+            false,
+        ));
+        assert_eq!(enqueue, PersistenceEnqueue::Oversized);
+        assert_eq!(
+            warm_job_completion(DevelopCompletion::Persistence {
+                outcome: enqueue,
+                retained_bytes: 64,
+            }),
+            JobCompletion::Complete
+        );
+        let state = queue.state.lock().unwrap();
+        assert!(state.pending.is_empty());
+        assert_eq!(state.pending_bytes, 0);
     }
 
     #[test]
@@ -1880,6 +2314,154 @@ mod tests {
     }
 
     #[test]
+    fn active_persistence_prevents_duplicate_warm_raw_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = FolderEntry {
+            path: dir.path().join("missing.arw"),
+            file_name: "missing.arw".into(),
+            size: 123,
+            mtime_ns: 456,
+        };
+        let cache = Arc::new(RamCache::new(0, 0, 1024 * 1024));
+        let shared = persistence_shared(
+            vec![entry],
+            cache,
+            Some(DiskCache::open_at(dir.path().join("cache"))),
+            1024 * 1024,
+        );
+        let id = (0, Tier::Browse);
+        assert_eq!(
+            shared.persistence.try_enqueue(persistence_request(
+                id,
+                Arc::new(patterned_buf(4, 4)),
+                true,
+            )),
+            PersistenceEnqueue::Queued
+        );
+        let _active = shared.persistence.pop().unwrap();
+
+        // The source path is deliberately missing. Reaching RAW decode would
+        // fail; the active persistence request must instead absorb the warm
+        // completion flag under the same queue lock.
+        assert_eq!(
+            run_warm_develop(
+                &shared,
+                0,
+                Tier::Browse,
+                Quality::Browse,
+                &CancelToken::default(),
+            ),
+            JobCompletion::Complete
+        );
+        assert_eq!(
+            shared.persistence.finish(id),
+            PersistenceCompletion {
+                insert_ram: true,
+                warm_completion: true,
+            }
+        );
+    }
+
+    #[test]
+    fn persistence_membership_marks_active_and_pending_warm_atomically() {
+        let queue = PersistenceQueue::with_budget(128);
+        let pixels = Arc::new(patterned_buf(4, 4));
+        let active_id = (0, Tier::Browse);
+        let pending_id = (1, Tier::Browse);
+        assert_eq!(
+            queue.try_enqueue(persistence_request(active_id, pixels.clone(), true)),
+            PersistenceEnqueue::Queued
+        );
+        let _active = queue.pop().unwrap();
+        assert_eq!(
+            queue.try_enqueue(persistence_request(pending_id, pixels, true)),
+            PersistenceEnqueue::Queued
+        );
+
+        assert!(queue.mark_warm_completion_if_present(active_id));
+        assert!(queue.mark_warm_completion_if_present(pending_id));
+        assert!(!queue.mark_warm_completion_if_present((2, Tier::Browse)));
+        assert_eq!(
+            queue.finish(active_id),
+            PersistenceCompletion {
+                insert_ram: true,
+                warm_completion: true,
+            }
+        );
+        assert_eq!(queue.pop().unwrap().id, pending_id);
+        assert_eq!(
+            queue.finish(pending_id),
+            PersistenceCompletion {
+                insert_ram: true,
+                warm_completion: true,
+            }
+        );
+    }
+
+    #[test]
+    fn persistence_write_retry_recovers_and_permanent_failure_terminates() {
+        let mut attempts = 0;
+        let mut backoffs = Vec::new();
+        retry_persistence_write(
+            PERSIST_WRITE_ATTEMPTS,
+            || {
+                attempts += 1;
+                if attempts < PERSIST_WRITE_ATTEMPTS {
+                    Err(std::io::Error::other("transient"))
+                } else {
+                    Ok(())
+                }
+            },
+            |retry| backoffs.push(retry),
+        )
+        .unwrap();
+        assert_eq!(attempts, PERSIST_WRITE_ATTEMPTS);
+        assert_eq!(backoffs, [1, 2]);
+
+        let mut attempts = 0;
+        let mut backoffs = Vec::new();
+        let error = retry_persistence_write(
+            PERSIST_WRITE_ATTEMPTS,
+            || {
+                attempts += 1;
+                Err(std::io::Error::other("permanent"))
+            },
+            |retry| backoffs.push(retry),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "permanent");
+        assert_eq!(attempts, PERSIST_WRITE_ATTEMPTS);
+        assert_eq!(backoffs, [1, 2]);
+    }
+
+    #[test]
+    fn busy_enqueue_fallback_preserves_pixels_without_future_completion() {
+        let queue = PersistenceQueue::with_budget(64);
+        let request = persistence_request((0, Tier::Browse), Arc::new(patterned_buf(4, 4)), false);
+
+        let guard = queue.state.lock().unwrap();
+        assert_eq!(queue.try_enqueue(request.clone()), PersistenceEnqueue::Busy);
+        drop(guard);
+
+        // Nothing was active or pending to produce a later capacity wakeup.
+        // The retained request can still take the short lock once and enqueue
+        // without another RAW develop.
+        assert_eq!(
+            queue.enqueue_after_busy(request),
+            PersistenceEnqueue::Queued
+        );
+        let accepted = queue.pop().unwrap();
+        assert_eq!(accepted.id, (0, Tier::Browse));
+        assert_eq!(
+            queue.finish(accepted.id),
+            PersistenceCompletion {
+                insert_ram: false,
+                warm_completion: true,
+            }
+        );
+    }
+
+    #[test]
     fn persistence_queue_is_bounded_nonblocking_and_coalesces_by_id() {
         let queue = PersistenceQueue::with_budget(64);
         let pixels = Arc::new(patterned_buf(4, 4));
@@ -1922,9 +2504,21 @@ mod tests {
             assert_eq!(state.pending.len(), 1);
             assert_eq!(state.pending_bytes, 64);
         }
-        assert!(queue.finish(id));
+        assert_eq!(
+            queue.finish(id),
+            PersistenceCompletion {
+                insert_ram: true,
+                warm_completion: true,
+            }
+        );
         assert_eq!(queue.pop().unwrap().id, pending_id);
-        assert!(queue.finish(pending_id));
+        assert_eq!(
+            queue.finish(pending_id),
+            PersistenceCompletion {
+                insert_ram: true,
+                warm_completion: true,
+            }
+        );
 
         // Contention cannot delay a heavy worker: enqueue fails immediately.
         let guard = queue.state.lock().unwrap();

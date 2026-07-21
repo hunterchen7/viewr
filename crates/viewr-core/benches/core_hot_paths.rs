@@ -90,11 +90,13 @@ fn bench_navigation_plan(c: &mut Criterion) {
                 ))
             });
         });
-        // Disk warming is now persistent queue state, so its repeated
-        // navigation cost is the same bounded interactive planner. Keep this
-        // case separate to catch an accidental return to folder-wide rebuilds.
+        // With a disk cache configured, repeated navigation still uses this
+        // bounded pure planner after the one-shot warm queue is initialized.
+        // This intentionally excludes Engine locks, cache probes, queue sync,
+        // and the first O(N) initialization; it is an asymptotic planner
+        // comparison, not an end-to-end navigation benchmark.
         group.bench_with_input(
-            BenchmarkId::new("persistent_disk_warm", len),
+            BenchmarkId::new("bounded_planner_with_disk_config", len),
             &len,
             |b, &len| {
                 b.iter(|| {
