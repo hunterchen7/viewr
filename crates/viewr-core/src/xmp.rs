@@ -9,9 +9,10 @@
 
 use std::path::Path;
 
-use quick_xml::Reader;
+use quick_xml::NsReader;
 use quick_xml::Writer;
-use quick_xml::events::{BytesStart, Event};
+use quick_xml::events::{BytesCData, BytesEnd, BytesStart, BytesText, Event};
+use quick_xml::name::{PrefixDeclaration, ResolveResult};
 
 use crate::atomic_write;
 
@@ -23,12 +24,16 @@ pub enum XmpError {
     Xml(String),
 }
 
-fn is_rating_name(name: &[u8]) -> bool {
-    name == b"xmp:Rating"
+const XMP_NAMESPACE: &[u8] = b"http://ns.adobe.com/xap/1.0/";
+const XMP_NAMESPACE_STR: &str = "http://ns.adobe.com/xap/1.0/";
+
+fn is_xmp_rating(namespace: &ResolveResult<'_>, local_name: &[u8]) -> bool {
+    local_name == b"Rating"
+        && matches!(namespace, ResolveResult::Bound(uri) if uri.as_ref() == XMP_NAMESPACE)
 }
 
 fn is_description(name: &[u8]) -> bool {
-    name == b"rdf:Description" || name.ends_with(b":Description")
+    name == b"Description" || name.ends_with(b":Description")
 }
 
 /// Read the rating from a sidecar (attribute or element form).
@@ -39,39 +44,100 @@ pub fn read_rating(path: &Path) -> Option<u8> {
 }
 
 pub fn parse_rating(xml: &str) -> Option<u8> {
-    let mut reader = Reader::from_str(xml);
+    let mut reader = NsReader::from_str(xml);
     reader.config_mut().trim_text(false);
-    let mut in_rating_element = false;
+    let mut depth = 0usize;
+    let mut captures: Vec<RatingCapture> = Vec::new();
     loop {
-        match reader.read_event().ok()? {
+        let (namespace, event) = reader.read_resolved_event().ok()?;
+        match event {
             Event::Eof => return None,
-            Event::Start(e) | Event::Empty(e) => {
-                if is_rating_name(e.name().as_ref()) {
-                    in_rating_element = true;
-                } else if is_description(e.name().as_ref()) {
-                    for attr in e.attributes().flatten() {
-                        if is_rating_name(attr.key.as_ref())
-                            && let Ok(v) = attr.unescape_value()
-                            && let Ok(n) = v.trim().parse::<f32>()
+            Event::Start(e) => {
+                let is_rating_element = is_xmp_rating(&namespace, e.local_name().as_ref());
+                if is_description(e.name().as_ref()) {
+                    for attr in e.attributes() {
+                        let attr = attr.ok()?;
+                        let (namespace, local_name) = reader.resolve_attribute(attr.key);
+                        if is_xmp_rating(&namespace, local_name.as_ref())
+                            && let Ok(value) = attr.unescape_value()
+                            && let Some(rating) = parse_rating_value(&value)
                         {
-                            return Some(n.max(0.0) as u8);
+                            return Some(rating);
                         }
                     }
                 }
+                if is_rating_element {
+                    captures.push(RatingCapture {
+                        depth,
+                        content: String::new(),
+                        saw_cdata: false,
+                    });
+                }
+                depth += 1;
             }
-            Event::Text(t) if in_rating_element => {
-                if let Ok(v) = t.unescape()
-                    && let Ok(n) = v.trim().parse::<f32>()
+            Event::Empty(e) => {
+                if is_description(e.name().as_ref()) {
+                    for attr in e.attributes() {
+                        let attr = attr.ok()?;
+                        let (namespace, local_name) = reader.resolve_attribute(attr.key);
+                        if is_xmp_rating(&namespace, local_name.as_ref())
+                            && let Ok(value) = attr.unescape_value()
+                            && let Some(rating) = parse_rating_value(&value)
+                        {
+                            return Some(rating);
+                        }
+                    }
+                }
+                // A self-closing rating element has no scalar value. Do not
+                // enter capture state that could consume a later text node.
+            }
+            Event::Text(text) => {
+                if let Some(capture) = captures.last_mut()
+                    && depth == capture.depth + 1
                 {
-                    return Some(n.max(0.0) as u8);
+                    capture.content.push_str(&text.unescape().ok()?);
                 }
             }
-            Event::End(e) if is_rating_name(e.name().as_ref()) => {
-                in_rating_element = false;
+            Event::CData(cdata) => {
+                if let Some(capture) = captures.last_mut()
+                    && depth == capture.depth + 1
+                {
+                    capture
+                        .content
+                        .push_str(std::str::from_utf8(cdata.as_ref()).ok()?);
+                    capture.saw_cdata = true;
+                }
+            }
+            Event::End(e) => {
+                depth = depth.checked_sub(1)?;
+                if is_xmp_rating(&namespace, e.local_name().as_ref())
+                    && captures
+                        .last()
+                        .is_some_and(|capture| capture.depth == depth)
+                {
+                    let capture = captures.pop()?;
+                    if let Some(rating) = parse_rating_value(&capture.content) {
+                        return Some(rating);
+                    }
+                }
             }
             _ => {}
         }
     }
+}
+
+struct RatingCapture {
+    depth: usize,
+    content: String,
+    saw_cdata: bool,
+}
+
+fn parse_rating_value(value: &str) -> Option<u8> {
+    value
+        .trim()
+        .parse::<f32>()
+        .ok()
+        .map(|rating| rating.max(0.0) as u8)
 }
 
 /// Write `rating` into the sidecar, preserving all other content.
@@ -87,78 +153,119 @@ pub fn write_rating(path: &Path, rating: u8) -> Result<(), XmpError> {
 
 /// Rewrite only the xmp:Rating token inside existing sidecar XML.
 pub fn update_rating_xml(xml: &str, rating: u8) -> Result<String, XmpError> {
-    let mut reader = Reader::from_str(xml);
+    let mut reader = NsReader::from_str(xml);
     reader.config_mut().trim_text(false);
     let mut writer = Writer::new(Vec::new());
     let mut wrote = false;
-    let mut replace_next_text = false;
-    let mut first_description_pos: Option<usize> = None;
+    let mut depth = 0usize;
+    let mut rating_elements: Vec<RatingCapture> = Vec::new();
+    let mut injection: Option<InjectionTarget> = None;
     let mut events: Vec<Event<'static>> = Vec::new();
 
     loop {
-        match reader
-            .read_event()
-            .map_err(|e| XmpError::Xml(e.to_string()))?
-        {
+        let (namespace, event) = reader
+            .read_resolved_event()
+            .map_err(|e| XmpError::Xml(e.to_string()))?;
+        match event {
             Event::Eof => break,
             Event::Start(e) => {
+                validate_attributes(&e)?;
                 let is_desc = is_description(e.name().as_ref());
-                let is_rating = is_rating_name(e.name().as_ref());
+                let is_rating = is_xmp_rating(&namespace, e.local_name().as_ref());
                 let rewritten = if is_desc {
-                    if first_description_pos.is_none() {
-                        first_description_pos = Some(events.len());
+                    if injection.is_none() {
+                        injection = Some(injection_target(&reader, events.len()));
                     }
-                    rewrite_attrs(&e, rating, &mut wrote)
+                    rewrite_attrs(&reader, &e, rating, &mut wrote)?
+                } else {
+                    e.into_owned()
+                };
+                events.push(Event::Start(rewritten));
+                if is_rating {
+                    wrote = true;
+                    rating_elements.push(RatingCapture {
+                        depth,
+                        content: String::new(),
+                        saw_cdata: false,
+                    });
+                }
+                depth += 1;
+            }
+            Event::Empty(e) => {
+                validate_attributes(&e)?;
+                let is_rating = is_xmp_rating(&namespace, e.local_name().as_ref());
+                let rewritten = if is_description(e.name().as_ref()) {
+                    if injection.is_none() {
+                        injection = Some(injection_target(&reader, events.len()));
+                    }
+                    rewrite_attrs(&reader, &e, rating, &mut wrote)?
                 } else {
                     e.into_owned()
                 };
                 if is_rating {
-                    replace_next_text = true;
-                }
-                events.push(Event::Start(rewritten));
-            }
-            Event::Empty(e) => {
-                let rewritten = if is_description(e.name().as_ref()) {
-                    if first_description_pos.is_none() {
-                        first_description_pos = Some(events.len());
-                    }
-                    rewrite_attrs(&e, rating, &mut wrote)
+                    wrote = true;
+                    let name = String::from_utf8(rewritten.name().as_ref().to_vec())
+                        .map_err(|error| XmpError::Xml(error.to_string()))?;
+                    events.push(Event::Start(rewritten));
+                    events.push(Event::Text(
+                        BytesText::new(&rating.to_string()).into_owned(),
+                    ));
+                    events.push(Event::End(BytesEnd::new(name)));
                 } else {
-                    e.into_owned()
-                };
-                events.push(Event::Empty(rewritten));
+                    events.push(Event::Empty(rewritten));
+                }
             }
-            Event::Text(t) if replace_next_text => {
-                replace_next_text = false;
-                wrote = true;
-                let text = rating.to_string();
-                events.push(Event::Text(
-                    quick_xml::events::BytesText::new(&text).into_owned(),
-                ));
-                let _ = t;
+            Event::Text(text) => {
+                if !is_direct_rating_content(&rating_elements, depth) {
+                    events.push(Event::Text(text.into_owned()));
+                }
+            }
+            Event::CData(cdata) => {
+                if is_direct_rating_content(&rating_elements, depth) {
+                    if let Some(capture) = rating_elements.last_mut() {
+                        capture.saw_cdata = true;
+                    }
+                } else {
+                    events.push(Event::CData(cdata.into_owned()));
+                }
+            }
+            Event::End(e) => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| XmpError::Xml("unexpected closing element".into()))?;
+                if is_xmp_rating(&namespace, e.local_name().as_ref())
+                    && rating_elements
+                        .last()
+                        .is_some_and(|capture| capture.depth == depth)
+                {
+                    let capture = rating_elements
+                        .pop()
+                        .expect("matching rating capture must exist");
+                    let value = rating.to_string();
+                    if capture.saw_cdata {
+                        events.push(Event::CData(BytesCData::new(value)));
+                    } else {
+                        events.push(Event::Text(BytesText::new(&value).into_owned()));
+                    }
+                }
+                events.push(Event::End(e.into_owned()));
             }
             other => events.push(other.into_owned()),
         }
     }
 
     // Neither form present: inject the attribute onto the first Description.
-    if !wrote && let Some(pos) = first_description_pos {
-        let (Event::Start(e) | Event::Empty(e)) = events[pos].clone() else {
+    if !wrote && let Some(target) = injection {
+        let (Event::Start(e) | Event::Empty(e)) = events[target.position].clone() else {
             unreachable!()
         };
         let mut new_e = e.clone();
-        new_e.push_attribute(("xmp:Rating", rating.to_string().as_str()));
-        // Ensure the xmp namespace exists on this element or assume the
-        // document declares it (Lightroom sidecars always do).
-        let has_ns = e
-            .attributes()
-            .flatten()
-            .any(|a| a.key.as_ref() == b"xmlns:xmp")
-            || xml.contains("xmlns:xmp");
-        if !has_ns {
-            new_e.push_attribute(("xmlns:xmp", "http://ns.adobe.com/xap/1.0/"));
+        let rating_value = rating.to_string();
+        new_e.push_attribute((target.rating_name.as_str(), rating_value.as_str()));
+        if let Some(namespace_name) = &target.namespace_name {
+            new_e.push_attribute((namespace_name.as_str(), XMP_NAMESPACE_STR));
         }
-        events[pos] = match &events[pos] {
+        events[target.position] = match &events[target.position] {
             Event::Empty(_) => Event::Empty(new_e),
             _ => Event::Start(new_e),
         };
@@ -172,11 +279,25 @@ pub fn update_rating_xml(xml: &str, rating: u8) -> Result<String, XmpError> {
     String::from_utf8(writer.into_inner()).map_err(|e| XmpError::Xml(e.to_string()))
 }
 
-fn rewrite_attrs(e: &BytesStart<'_>, rating: u8, wrote: &mut bool) -> BytesStart<'static> {
+fn rewrite_attrs(
+    reader: &NsReader<&[u8]>,
+    e: &BytesStart<'_>,
+    rating: u8,
+    wrote: &mut bool,
+) -> Result<BytesStart<'static>, XmpError> {
     let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
     let mut new_e = BytesStart::new(name);
-    for attr in e.attributes().flatten() {
-        if is_rating_name(attr.key.as_ref()) {
+    let mut found_rating = false;
+    for attr in e.attributes() {
+        let attr = attr.map_err(|error| XmpError::Xml(error.to_string()))?;
+        let (namespace, local_name) = reader.resolve_attribute(attr.key);
+        if is_xmp_rating(&namespace, local_name.as_ref()) {
+            if found_rating {
+                return Err(XmpError::Xml(
+                    "duplicate XMP rating attributes on one element".into(),
+                ));
+            }
+            found_rating = true;
             *wrote = true;
             new_e.push_attribute((
                 String::from_utf8_lossy(attr.key.as_ref()).as_ref(),
@@ -186,7 +307,65 @@ fn rewrite_attrs(e: &BytesStart<'_>, rating: u8, wrote: &mut bool) -> BytesStart
             new_e.push_attribute(attr);
         }
     }
-    new_e.into_owned()
+    Ok(new_e.into_owned())
+}
+
+fn validate_attributes(e: &BytesStart<'_>) -> Result<(), XmpError> {
+    for attr in e.attributes() {
+        attr.map_err(|error| XmpError::Xml(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn is_direct_rating_content(rating_elements: &[RatingCapture], depth: usize) -> bool {
+    rating_elements
+        .last()
+        .is_some_and(|capture| depth == capture.depth + 1)
+}
+
+struct InjectionTarget {
+    position: usize,
+    rating_name: String,
+    namespace_name: Option<String>,
+}
+
+fn injection_target(reader: &NsReader<&[u8]>, position: usize) -> InjectionTarget {
+    let mut active_prefixes = Vec::new();
+    for (declaration, namespace) in reader.prefixes() {
+        let PrefixDeclaration::Named(prefix) = declaration else {
+            continue;
+        };
+        active_prefixes.push(prefix.to_vec());
+        if namespace.as_ref() == XMP_NAMESPACE
+            && let Ok(prefix) = std::str::from_utf8(prefix)
+        {
+            return InjectionTarget {
+                position,
+                rating_name: format!("{prefix}:Rating"),
+                namespace_name: None,
+            };
+        }
+    }
+
+    let prefix = (0usize..)
+        .map(|suffix| {
+            if suffix == 0 {
+                "xmp".to_string()
+            } else {
+                format!("viewrXmp{suffix}")
+            }
+        })
+        .find(|candidate| {
+            !active_prefixes
+                .iter()
+                .any(|prefix| prefix.as_slice() == candidate.as_bytes())
+        })
+        .expect("an unused namespace prefix must exist");
+    InjectionTarget {
+        position,
+        rating_name: format!("{prefix}:Rating"),
+        namespace_name: Some(format!("xmlns:{prefix}")),
+    }
 }
 
 fn new_sidecar(rating: u8) -> String {
@@ -249,6 +428,70 @@ mod tests {
     }
 
     #[test]
+    fn namespace_aliases_work_for_attribute_and_element_forms() {
+        let attribute = r#"<rdf:Description
+            xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+            xmlns:alias="http://ns.adobe.com/xap/1.0/"
+            alias:Rating="3" keep="yes"/>"#;
+        let element = r#"<rdf:Description
+            xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+            xmlns:photo="http://ns.adobe.com/xap/1.0/">
+            <photo:Rating>4</photo:Rating>
+        </rdf:Description>"#;
+
+        assert_eq!(parse_rating(attribute), Some(3));
+        assert_eq!(parse_rating(element), Some(4));
+
+        let attribute = update_rating_xml(attribute, 5).unwrap();
+        let element = update_rating_xml(element, 2).unwrap();
+        assert!(attribute.contains(r#"alias:Rating="5""#));
+        assert!(attribute.contains(r#"keep="yes""#));
+        assert!(element.contains("<photo:Rating>2</photo:Rating>"));
+        assert_eq!(parse_rating(&attribute), Some(5));
+        assert_eq!(parse_rating(&element), Some(2));
+    }
+
+    #[test]
+    fn empty_rating_element_does_not_capture_later_text_and_updates_in_place() {
+        let sidecars = [
+            r#"<rdf:Description
+                xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+                xmlns:p="http://ns.adobe.com/xap/1.0/">
+                <p:Rating/><unrelated>5</unrelated>
+            </rdf:Description>"#,
+            r#"<rdf:Description
+                xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+                xmlns:p="http://ns.adobe.com/xap/1.0/">
+                <p:Rating></p:Rating><unrelated>5</unrelated>
+            </rdf:Description>"#,
+        ];
+
+        for xml in sidecars {
+            assert_eq!(parse_rating(xml), None);
+            let updated = update_rating_xml(xml, 3).unwrap();
+            assert!(updated.contains("<p:Rating>3</p:Rating>"));
+            assert!(!updated.contains("<p:Rating/"));
+            assert!(!updated.contains(":Rating=\""));
+            assert_eq!(parse_rating(&updated), Some(3));
+        }
+    }
+
+    #[test]
+    fn cdata_rating_is_replaced_as_one_scalar_value() {
+        let xml = r#"<rdf:Description
+            xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+            xmlns:p="http://ns.adobe.com/xap/1.0/">
+            <p:Rating> <![CDATA[4]]> </p:Rating>
+        </rdf:Description>"#;
+
+        assert_eq!(parse_rating(xml), Some(4));
+        let updated = update_rating_xml(xml, 1).unwrap();
+        assert!(updated.contains("<p:Rating><![CDATA[1]]></p:Rating>"));
+        assert!(!updated.contains("<![CDATA[4]]>"));
+        assert_eq!(parse_rating(&updated), Some(1));
+    }
+
+    #[test]
     fn attribute_update_touches_only_the_rating() {
         let updated = update_rating_xml(LR_STYLE, 5).unwrap();
         assert!(updated.contains(r#"xmp:Rating="5""#));
@@ -279,6 +522,23 @@ mod tests {
         assert!(updated.contains(r#"xmp:Rating="3""#));
         assert!(updated.contains("xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\""));
         assert!(updated.contains("bird"));
+    }
+
+    #[test]
+    fn injection_reuses_an_existing_xmp_namespace_alias() {
+        let bare = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"
+            xmlns:photo="http://ns.adobe.com/xap/1.0/">
+            <rdf:Description
+                xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+                keep="yes"/>
+        </x:xmpmeta>"#;
+
+        let updated = update_rating_xml(bare, 4).unwrap();
+
+        assert!(updated.contains(r#"photo:Rating="4""#));
+        assert!(!updated.contains("xmlns:xmp="));
+        assert!(updated.contains(r#"keep="yes""#));
+        assert_eq!(parse_rating(&updated), Some(4));
     }
 
     #[test]
@@ -315,5 +575,27 @@ mod tests {
         assert!(matches!(error, XmpError::Xml(_)));
         assert_eq!(std::fs::read(&path).unwrap(), malformed);
         assert!(!path.with_extension("xmp.tmp").exists());
+    }
+
+    #[test]
+    fn update_rejects_malformed_and_semantically_duplicate_attributes() {
+        let malformed = r#"<rdf:Description
+            xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+            xmlns:p="http://ns.adobe.com/xap/1.0/"
+            p:Rating="2" broken/>"#;
+        let duplicate = r#"<rdf:Description
+            xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+            xmlns:a="http://ns.adobe.com/xap/1.0/"
+            xmlns:b="http://ns.adobe.com/xap/1.0/"
+            a:Rating="2" b:Rating="3"/>"#;
+
+        assert!(matches!(
+            update_rating_xml(malformed, 4),
+            Err(XmpError::Xml(_))
+        ));
+        assert!(matches!(
+            update_rating_xml(duplicate, 4),
+            Err(XmpError::Xml(_))
+        ));
     }
 }
