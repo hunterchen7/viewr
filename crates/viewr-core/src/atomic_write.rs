@@ -31,8 +31,35 @@ fn replace_inner(path: &Path, bytes: &[u8], durable: bool) -> std::io::Result<()
     if durable {
         temporary.as_file().sync_all()?;
     }
-    temporary
-        .persist(path)
-        .map(|_| ())
-        .map_err(|error| error.error)
+    temporary.persist(path).map_err(|error| error.error)?;
+    if durable {
+        sync_parent(parent)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent(parent: &Path) -> std::io::Result<()> {
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_parent: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durable_replacement_publishes_complete_contents() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rating.xmp");
+
+        replace_durable(&path, b"first").unwrap();
+        replace_durable(&path, b"replacement").unwrap();
+
+        assert_eq!(std::fs::read(path).unwrap(), b"replacement");
+    }
 }
