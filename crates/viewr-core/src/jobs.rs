@@ -72,7 +72,7 @@ struct Prio {
     seq: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
     Thumb,
     Develop(Quality),
@@ -119,15 +119,27 @@ impl CancelToken {
     }
 }
 
+#[derive(Clone, Copy)]
+struct QueuedState {
+    epoch: u64,
+    action: Action,
+}
+
+struct InFlight {
+    action: Action,
+    token: Arc<CancelToken>,
+}
+
 #[derive(Default)]
 struct QueueState {
     heap: BinaryHeap<QueuedJob>,
     /// id → epoch of its live heap entry. Entries with a different epoch
     /// are inert and skipped on pop.
-    queued: HashMap<JobId, u64>,
-    in_flight: HashMap<JobId, Arc<CancelToken>>,
+    queued: HashMap<JobId, QueuedState>,
+    in_flight: HashMap<JobId, InFlight>,
     epoch: u64,
     seq: u64,
+    closed: bool,
 }
 
 struct JobQueue {
@@ -290,6 +302,9 @@ impl JobQueue {
     /// cancelled; in-flight jobs still wanted keep running (not duplicated).
     fn set_plan(&self, plan: Vec<(JobId, u8, u32, Action)>) {
         let mut state = self.state.lock().unwrap();
+        if state.closed {
+            return;
+        }
         state.epoch += 1;
         let epoch = state.epoch;
 
@@ -297,12 +312,22 @@ impl JobQueue {
         // index. This avoids a temporary HashSet on every navigation.
         state.queued.clear();
         state.queued.reserve(plan.len());
-        for (id, ..) in &plan {
-            state.queued.insert(*id, epoch);
+        for (id, _, _, action) in &plan {
+            state.queued.insert(
+                *id,
+                QueuedState {
+                    epoch,
+                    action: *action,
+                },
+            );
         }
-        for (id, token) in &state.in_flight {
-            if !state.queued.contains_key(id) {
-                token.cancel();
+        for (id, running) in &state.in_flight {
+            if state
+                .queued
+                .get(id)
+                .is_none_or(|wanted| wanted.action != running.action)
+            {
+                running.token.cancel();
             }
         }
 
@@ -315,7 +340,11 @@ impl JobQueue {
         for (id, class, eff_dist, action) in plan {
             // Skip only if a LIVE instance is already running; a cancelled
             // in-flight instance won't publish, so queue a fresh one.
-            if state.in_flight.get(&id).is_some_and(|t| !t.cancelled()) {
+            if state
+                .in_flight
+                .get(&id)
+                .is_some_and(|running| running.action == action && !running.token.cancelled())
+            {
                 state.queued.remove(&id);
                 continue;
             }
@@ -341,6 +370,9 @@ impl JobQueue {
     /// one-shot thumb wave).
     fn extend(&self, jobs: impl IntoIterator<Item = (JobId, u8, u32, Action)>) {
         let mut state = self.state.lock().unwrap();
+        if state.closed {
+            return;
+        }
         let epoch = state.epoch;
         for (id, class, eff_dist, action) in jobs {
             state.seq += 1;
@@ -349,7 +381,7 @@ impl JobQueue {
                 eff_dist,
                 seq: state.seq,
             };
-            state.queued.insert(id, epoch);
+            state.queued.insert(id, QueuedState { epoch, action });
             state.heap.push(QueuedJob {
                 prio,
                 epoch,
@@ -362,19 +394,25 @@ impl JobQueue {
     }
 
     /// Block until a valid job is available (or shutdown).
-    fn pop(&self, shutdown: &AtomicBool) -> Option<(JobId, Action, Arc<CancelToken>)> {
+    fn pop(&self) -> Option<(JobId, Action, Arc<CancelToken>)> {
         let mut state = self.state.lock().unwrap();
         loop {
-            if shutdown.load(Ordering::Relaxed) {
+            if state.closed {
                 return None;
             }
             while let Some(job) = state.heap.pop() {
-                if state.queued.get(&job.id) != Some(&job.epoch) {
+                if state.queued.get(&job.id).map(|queued| queued.epoch) != Some(job.epoch) {
                     continue; // superseded by a newer plan
                 }
                 state.queued.remove(&job.id);
                 let token = Arc::new(CancelToken::default());
-                state.in_flight.insert(job.id, token.clone());
+                state.in_flight.insert(
+                    job.id,
+                    InFlight {
+                        action: job.action,
+                        token: token.clone(),
+                    },
+                );
                 return Some((job.id, job.action, token));
             }
             state = self.cond.wait(state).unwrap();
@@ -386,10 +424,25 @@ impl JobQueue {
         if state
             .in_flight
             .get(&id)
-            .is_some_and(|current| Arc::ptr_eq(current, token))
+            .is_some_and(|current| Arc::ptr_eq(&current.token, token))
         {
             state.in_flight.remove(&id);
         }
+    }
+
+    /// Cancel active work, discard queued work, and wake every waiter.
+    /// `closed` is protected by the same mutex as the condition-variable
+    /// predicate, so shutdown cannot lose a wakeup between check and wait.
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.closed = true;
+        state.heap.clear();
+        state.queued.clear();
+        for running in state.in_flight.values() {
+            running.token.cancel();
+        }
+        drop(state);
+        self.cond.notify_all();
     }
 }
 
@@ -402,7 +455,6 @@ struct Shared {
     heavy: JobQueue,
     light: JobQueue,
     persistence: PersistenceQueue,
-    shutdown: AtomicBool,
     /// Display order the prefetch wave follows (filtered view). Empty ⇒
     /// identity. Distances are positions in this sequence, so with a
     /// rating filter active the wave targets the next *visible* images.
@@ -411,7 +463,9 @@ struct Shared {
 
 pub struct Engine {
     shared: Arc<Shared>,
+    workers: Vec<std::thread::JoinHandle<()>>,
     persistence_worker: Option<std::thread::JoinHandle<()>>,
+    gc_worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Engine {
@@ -435,7 +489,6 @@ impl Engine {
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             persistence: PersistenceQueue::new(),
-            shutdown: AtomicBool::new(false),
             sequence: Mutex::new(Vec::new()),
         });
 
@@ -447,21 +500,35 @@ impl Engine {
                 .expect("failed to spawn persistence worker")
         };
 
-        for _ in 0..HEAVY_WORKERS {
+        let mut workers = Vec::with_capacity(HEAVY_WORKERS + LIGHT_WORKERS);
+        for worker_index in 0..HEAVY_WORKERS {
             let shared = shared.clone();
-            std::thread::spawn(move || worker(&shared, false));
+            workers.push(
+                std::thread::Builder::new()
+                    .name(format!("viewr-heavy-{worker_index}"))
+                    .spawn(move || worker(&shared, false))
+                    .expect("failed to spawn heavy worker"),
+            );
         }
-        for _ in 0..LIGHT_WORKERS {
+        for worker_index in 0..LIGHT_WORKERS {
             let shared = shared.clone();
-            std::thread::spawn(move || worker(&shared, true));
+            workers.push(
+                std::thread::Builder::new()
+                    .name(format!("viewr-light-{worker_index}"))
+                    .spawn(move || worker(&shared, true))
+                    .expect("failed to spawn light worker"),
+            );
         }
 
         // Background disk-cache GC sweep on open.
-        if let Some(disk) = shared.disk.clone() {
-            std::thread::spawn(move || {
-                disk.gc_to_budget();
-            });
-        }
+        let gc_worker = shared.disk.clone().map(|disk| {
+            std::thread::Builder::new()
+                .name("viewr-cache-gc".into())
+                .spawn(move || {
+                    disk.gc_to_budget();
+                })
+                .expect("failed to spawn disk cache GC worker")
+        });
 
         // One-shot thumb+metadata wave, outward from the start position.
         let len = shared.entries.len();
@@ -475,7 +542,9 @@ impl Engine {
         (
             Self {
                 shared,
+                workers,
                 persistence_worker: Some(persistence_worker),
+                gc_worker,
             },
             rx,
         )
@@ -557,11 +626,16 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        self.shared.shutdown.store(true, Ordering::Relaxed);
-        self.shared.heavy.cond.notify_all();
-        self.shared.light.cond.notify_all();
+        self.shared.heavy.close();
+        self.shared.light.close();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
         self.shared.persistence.close();
         if let Some(worker) = self.persistence_worker.take() {
+            let _ = worker.join();
+        }
+        if let Some(worker) = self.gc_worker.take() {
             let _ = worker.join();
         }
     }
@@ -569,7 +643,7 @@ impl Drop for Engine {
 
 fn worker(shared: &Shared, light: bool) {
     let queue = if light { &shared.light } else { &shared.heavy };
-    while let Some((id, action, token)) = queue.pop(&shared.shutdown) {
+    while let Some((id, action, token)) = queue.pop() {
         run_job(shared, id, action, &token);
         queue.finish(id, &token);
     }
@@ -843,7 +917,6 @@ mod tests {
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             persistence: PersistenceQueue::with_budget(pending_budget_bytes),
-            shutdown: AtomicBool::new(false),
             sequence: Mutex::new(Vec::new()),
         })
     }
@@ -865,21 +938,19 @@ mod tests {
     #[test]
     fn pops_in_priority_order() {
         let q = JobQueue::new();
-        let shutdown = AtomicBool::new(false);
         q.set_plan(vec![
             job((2, Tier::Browse), 4, 6),
             job((0, Tier::Browse), 0, 0),
             job((1, Tier::Browse), 2, 1),
         ]);
-        assert_eq!(q.pop(&shutdown).unwrap().0, (0, Tier::Browse));
-        assert_eq!(q.pop(&shutdown).unwrap().0, (1, Tier::Browse));
-        assert_eq!(q.pop(&shutdown).unwrap().0, (2, Tier::Browse));
+        assert_eq!(q.pop().unwrap().0, (0, Tier::Browse));
+        assert_eq!(q.pop().unwrap().0, (1, Tier::Browse));
+        assert_eq!(q.pop().unwrap().0, (2, Tier::Browse));
     }
 
     #[test]
     fn bulk_heapify_preserves_priority_and_fifo_semantics() {
         let q = JobQueue::new();
-        let shutdown = AtomicBool::new(false);
         let plan: Vec<_> = (0..512)
             .map(|index| {
                 job(
@@ -899,7 +970,7 @@ mod tests {
         q.set_plan(plan);
 
         for (_, _, _, expected_id) in expected {
-            assert_eq!(q.pop(&shutdown).unwrap().0, expected_id);
+            assert_eq!(q.pop().unwrap().0, expected_id);
         }
         let state = q.state.lock().unwrap();
         assert!(state.heap.is_empty());
@@ -910,28 +981,26 @@ mod tests {
     fn forward_bias_orders_wave() {
         // Same class: eff_dist decides; backward×3 means +1,+2,+3 beat -1.
         let q = JobQueue::new();
-        let shutdown = AtomicBool::new(false);
         q.set_plan(vec![
             job((9, Tier::Browse), 4, 3), // backward dist 1 → eff 3
             job((11, Tier::Browse), 4, 1),
             job((12, Tier::Browse), 4, 2),
         ]);
-        assert_eq!(q.pop(&shutdown).unwrap().0.0, 11);
-        assert_eq!(q.pop(&shutdown).unwrap().0.0, 12);
-        assert_eq!(q.pop(&shutdown).unwrap().0.0, 9);
+        assert_eq!(q.pop().unwrap().0.0, 11);
+        assert_eq!(q.pop().unwrap().0.0, 12);
+        assert_eq!(q.pop().unwrap().0.0, 9);
     }
 
     #[test]
     fn replan_supersedes_queued_jobs() {
         let q = JobQueue::new();
-        let shutdown = AtomicBool::new(false);
         q.set_plan(vec![
             job((0, Tier::Browse), 1, 0),
             job((1, Tier::Browse), 2, 0),
         ]);
         // New plan drops job 0 entirely.
         q.set_plan(vec![job((1, Tier::Browse), 1, 0)]);
-        assert_eq!(q.pop(&shutdown).unwrap().0, (1, Tier::Browse));
+        assert_eq!(q.pop().unwrap().0, (1, Tier::Browse));
         assert!(
             q.state.lock().unwrap().heap.is_empty() || {
                 // Any remaining entries must be inert (stale epoch).
@@ -944,12 +1013,11 @@ mod tests {
     #[test]
     fn replan_cancels_unwanted_in_flight_and_keeps_wanted() {
         let q = JobQueue::new();
-        let shutdown = AtomicBool::new(false);
         q.set_plan(vec![
             job((0, Tier::Browse), 1, 0),
             job((1, Tier::Browse), 2, 0),
         ]);
-        let (id0, _, token0) = q.pop(&shutdown).unwrap();
+        let (id0, _, token0) = q.pop().unwrap();
         assert_eq!(id0, (0, Tier::Browse));
         // Job 0 is now in flight. Replan wants only job 1 → 0 cancelled.
         q.set_plan(vec![job((1, Tier::Browse), 1, 0)]);
@@ -969,7 +1037,7 @@ mod tests {
         // But a LIVE in-flight job is never duplicated.
         let q2 = JobQueue::new();
         q2.set_plan(vec![job((7, Tier::Browse), 1, 0)]);
-        let _live = q2.pop(&shutdown).unwrap();
+        let _live = q2.pop().unwrap();
         q2.set_plan(vec![job((7, Tier::Browse), 1, 0)]);
         assert!(
             !q2.state
@@ -981,18 +1049,58 @@ mod tests {
     }
 
     #[test]
+    fn replan_replaces_live_job_when_action_changes() {
+        let q = JobQueue::new();
+        let id = (7, Tier::Browse);
+        q.set_plan(vec![(id, 6, 20, Action::WarmDevelop(Quality::Browse))]);
+        let (_, action, warm_token) = q.pop().unwrap();
+        assert_eq!(action, Action::WarmDevelop(Quality::Browse));
+
+        q.set_plan(vec![(id, 0, 0, Action::Develop(Quality::Browse))]);
+        assert!(warm_token.cancelled());
+
+        let (_, action, display_token) = q.pop().unwrap();
+        assert_eq!(action, Action::Develop(Quality::Browse));
+        assert!(!display_token.cancelled());
+
+        // Completion from the displaced warm generation must not erase the
+        // foreground replacement.
+        q.finish(id, &warm_token);
+        assert!(
+            q.state
+                .lock()
+                .unwrap()
+                .in_flight
+                .get(&id)
+                .is_some_and(|current| Arc::ptr_eq(&current.token, &display_token))
+        );
+    }
+
+    #[test]
+    fn close_wakes_waiters_and_rejects_queued_work() {
+        let q = Arc::new(JobQueue::new());
+        let waiter_queue = q.clone();
+        let waiter = std::thread::spawn(move || waiter_queue.pop());
+
+        q.close();
+        assert!(waiter.join().unwrap().is_none());
+
+        q.set_plan(vec![job((0, Tier::Browse), 0, 0)]);
+        assert!(q.pop().is_none());
+    }
+
+    #[test]
     fn stale_completion_does_not_finish_replacement_generation() {
         let q = JobQueue::new();
-        let shutdown = AtomicBool::new(false);
         let id = (0, Tier::Browse);
 
         q.set_plan(vec![job(id, 1, 0)]);
-        let (_, _, stale) = q.pop(&shutdown).unwrap();
+        let (_, _, stale) = q.pop().unwrap();
         q.set_plan(Vec::new());
         assert!(stale.cancelled());
 
         q.set_plan(vec![job(id, 1, 0)]);
-        let (_, _, replacement) = q.pop(&shutdown).unwrap();
+        let (_, _, replacement) = q.pop().unwrap();
         assert!(!Arc::ptr_eq(&stale, &replacement));
 
         q.finish(id, &stale);
@@ -1002,7 +1110,7 @@ mod tests {
                 .unwrap()
                 .in_flight
                 .get(&id)
-                .is_some_and(|current| Arc::ptr_eq(current, &replacement))
+                .is_some_and(|current| Arc::ptr_eq(&current.token, &replacement))
         );
 
         q.finish(id, &replacement);
@@ -1012,15 +1120,14 @@ mod tests {
     #[test]
     fn equal_priority_jobs_are_fifo() {
         let q = JobQueue::new();
-        let shutdown = AtomicBool::new(false);
         q.set_plan(vec![
             job((0, Tier::Browse), 1, 1),
             job((1, Tier::Browse), 1, 1),
             job((2, Tier::Browse), 1, 1),
         ]);
-        assert_eq!(q.pop(&shutdown).unwrap().0.0, 0);
-        assert_eq!(q.pop(&shutdown).unwrap().0.0, 1);
-        assert_eq!(q.pop(&shutdown).unwrap().0.0, 2);
+        assert_eq!(q.pop().unwrap().0.0, 0);
+        assert_eq!(q.pop().unwrap().0.0, 1);
+        assert_eq!(q.pop().unwrap().0.0, 2);
     }
 
     #[test]
@@ -1054,7 +1161,6 @@ mod tests {
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             persistence: PersistenceQueue::new(),
-            shutdown: AtomicBool::new(false),
             sequence: Mutex::new(Vec::new()),
         };
 
@@ -1178,7 +1284,9 @@ mod tests {
         // joins the persistence worker before returning.
         let engine = Engine {
             shared: shared.clone(),
+            workers: Vec::new(),
             persistence_worker: Some(worker),
+            gc_worker: None,
         };
         drop(engine);
         assert_eq!(
@@ -1209,7 +1317,7 @@ mod tests {
         let shared = persistence_shared(entries, cache.clone(), Some(disk.clone()), 1024 * 1024);
 
         shared.heavy.set_plan(vec![job((0, Tier::Browse), 1, 0)]);
-        let (_, _, token) = shared.heavy.pop(&shared.shutdown).unwrap();
+        let (_, _, token) = shared.heavy.pop().unwrap();
         assert_eq!(
             shared.persistence.try_enqueue(persistence_request(
                 (0, Tier::Browse),
