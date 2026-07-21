@@ -22,13 +22,15 @@ jobs:
           rustc -Vv
           uname -a
           lscpu
-      - name: Run synthetic benchmarks
+      - name: Run core synthetic benchmarks
         run: cargo bench -p viewr-core --bench core_hot_paths --locked -- --noplot
+      - name: Run filmstrip scaling benchmarks
+        run: cargo bench -p viewr --bench filmstrip_scaling --locked -- --noplot
       - name: Upload Criterion results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: criterion-${{ github.run_id }}
-          path: crates/viewr-core/target/criterion
+          path: target/criterion
           if-no-files-found: warn
           retention-days: 14

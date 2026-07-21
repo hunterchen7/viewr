@@ -32,6 +32,7 @@ Run the full benchmark suite:
 
 ```sh
 cargo bench -p viewr-core --bench core_hot_paths --locked
+cargo bench -p viewr --bench filmstrip_scaling --locked
 ```
 
 Use a filter when you work on one subsystem:
@@ -48,8 +49,9 @@ The suite measures these workloads:
 - Resize and rotation of deterministic 12.2-megapixel and 33-megapixel images.
 - JPEG encoding, JPEG decoding, RAM-cache hits, and eviction scaling.
 - XMP parsing, XMP updates, and disk-cache key generation.
+- Loupe filmstrip widget scaling at 10,000 and 50,000 images.
 
-Criterion stores reports in `crates/viewr-core/target/criterion`.
+Criterion stores reports in `target/criterion`.
 Git ignores this directory.
 See [the first reference run](benchmark-baseline-2026-07-21.md).
 See [the optimization campaign](performance-optimization-2026-07-21.md) for the current results and tradeoffs.

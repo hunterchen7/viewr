@@ -40,9 +40,9 @@ jobs:
         run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
-      - name: Compile benchmark harness
+      - name: Compile benchmark harnesses
         if: runner.os == 'Linux'
-        run: cargo bench -p viewr-core --bench core_hot_paths --no-run --locked
+        run: cargo bench --workspace --no-run --locked
       - name: Build release
         run: cargo build --release --locked
 
