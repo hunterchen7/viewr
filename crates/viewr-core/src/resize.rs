@@ -60,6 +60,13 @@ pub fn apply_orient(buf: PixelBuf, orient: Orient) -> PixelBuf {
             let (sw, sh) = (buf.width as usize, buf.height as usize);
             let (dw, dh) = (sh, sw);
             let src = buf.rgba;
+            if dw == 0 || dh == 0 {
+                return PixelBuf {
+                    width: dw as u32,
+                    height: dh as u32,
+                    rgba: src,
+                };
+            }
             let mut dst = vec![0u8; src.len()];
             let rotate_row = |yd: usize, row: &mut [u8]| {
                 for (xd, out) in row.chunks_exact_mut(4).enumerate() {
@@ -196,8 +203,8 @@ mod tests {
 
     #[test]
     fn inverse_and_full_turn_rotations_restore_every_pixel() {
-        for width in 1..=7 {
-            for height in 1..=7 {
+        for width in 0..=7 {
+            for height in 0..=7 {
                 let source = labelled(width, height);
                 let restored =
                     apply_orient(apply_orient(source.clone(), Orient::R90), Orient::R270);
