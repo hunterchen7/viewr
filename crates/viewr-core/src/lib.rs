@@ -1,3 +1,5 @@
+mod atomic_write;
+
 pub mod cache_disk;
 pub mod cache_ram;
 pub mod db;

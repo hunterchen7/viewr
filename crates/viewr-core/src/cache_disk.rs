@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 
+use crate::atomic_write;
 use crate::folder::FolderEntry;
 use crate::types::Tier;
 
@@ -70,9 +71,7 @@ impl DiskCache {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, &path)
+        atomic_write::replace(&path, bytes)
     }
 
     /// Enforce the configured byte budget.

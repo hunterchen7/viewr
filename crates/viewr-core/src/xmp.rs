@@ -7,12 +7,13 @@
 //! rating token — every other byte of an existing sidecar passes through
 //! untouched, so Lightroom develop settings/keywords survive.
 
-use std::io::Write as _;
 use std::path::Path;
 
 use quick_xml::Reader;
 use quick_xml::Writer;
 use quick_xml::events::{BytesStart, Event};
+
+use crate::atomic_write;
 
 #[derive(Debug, thiserror::Error)]
 pub enum XmpError {
@@ -81,14 +82,7 @@ pub fn write_rating(path: &Path, rating: u8) -> Result<(), XmpError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => new_sidecar(rating),
         Err(e) => return Err(e.into()),
     };
-    let tmp = path.with_extension("xmp.tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(output.as_bytes())?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    atomic_write::replace_durable(path, output.as_bytes()).map_err(Into::into)
 }
 
 /// Rewrite only the xmp:Rating token inside existing sidecar XML.
