@@ -155,6 +155,15 @@ fn install_metadata(
     filter_dirty
 }
 
+/// Store every explicit user choice, including zero. Absence means that no
+/// higher-precedence rating source has been observed yet, so removing a zero
+/// would let a delayed embedded-metadata event resurrect the camera rating.
+fn install_user_rating(ratings: &mut HashMap<usize, u8>, index: usize, rating: u8) -> u8 {
+    let old_rating = ratings.get(&index).copied().unwrap_or(0);
+    ratings.insert(index, rating);
+    old_rating
+}
+
 /// Per-folder session state, rebuilt by open_folder.
 struct Session {
     dir: PathBuf,
@@ -365,12 +374,7 @@ impl App {
         let Some(session) = &mut self.session else {
             return;
         };
-        let old_rating = session.ratings.get(&index).copied().unwrap_or(0);
-        if rating == 0 {
-            session.ratings.remove(&index);
-        } else {
-            session.ratings.insert(index, rating);
-        }
+        let old_rating = install_user_rating(&mut session.ratings, index, rating);
         session.library.set_rating(&session.entries[index], rating);
         if self.filter.passes(old_rating) != self.filter.passes(rating) {
             self.filter_dirty = true;
@@ -1273,6 +1277,48 @@ mod tests {
             filter,
         ));
         assert_eq!(ratings.get(&1), Some(&5), "persisted rating must win");
+    }
+
+    #[test]
+    fn delayed_metadata_and_thumbnail_events_do_not_resurrect_a_cleared_rating() {
+        let mut ratings = HashMap::from([(0, 5)]);
+        let mut metas = HashMap::new();
+        let filter = Filter {
+            min_rating: 0,
+            unrated_only: true,
+        };
+
+        assert_eq!(install_user_rating(&mut ratings, 0, 0), 5);
+        assert_eq!(ratings.get(&0), Some(&0), "zero remains authoritative");
+
+        // Models a MetadataReady event that was decoded before the user's
+        // clear-rating command reached the sidecar.
+        assert!(!install_metadata(
+            &mut ratings,
+            &mut metas,
+            0,
+            metadata_with_rating(Some(4)),
+            filter,
+        ));
+        assert_eq!(ratings.get(&0), Some(&0));
+
+        // Models the duplicate metadata carried by a later ThumbReady event.
+        assert!(!install_metadata(
+            &mut ratings,
+            &mut metas,
+            0,
+            metadata_with_rating(Some(3)),
+            filter,
+        ));
+        assert_eq!(ratings.get(&0), Some(&0));
+
+        let mut visible = Vec::new();
+        assert!(rebuild_visible(&mut visible, 1, &ratings, filter));
+        assert_eq!(
+            visible,
+            [0],
+            "explicit zero still passes the unrated filter"
+        );
     }
 
     #[test]
