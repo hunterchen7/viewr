@@ -473,6 +473,10 @@ fn bench_opt_in_raw(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("metadata_only", |b| {
+        b.iter(|| black_box(decode::metadata(black_box(raw_path.as_path())).unwrap()));
+    });
+
     for quality in [Quality::Browse, Quality::Full] {
         group.throughput(Throughput::Elements(sensor_pixels));
         group.bench_with_input(

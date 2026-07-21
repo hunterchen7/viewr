@@ -135,6 +135,26 @@ fn main_texture_should_be_kept(
     }
 }
 
+fn install_metadata(
+    ratings: &mut HashMap<usize, u8>,
+    metas: &mut HashMap<usize, FileMeta>,
+    index: usize,
+    meta: FileMeta,
+    filter: Filter,
+) -> bool {
+    let mut filter_dirty = false;
+    if let Some(embedded) = meta.rating
+        && embedded > 0
+        && !ratings.contains_key(&index)
+    {
+        let rating = embedded.min(5) as u8;
+        ratings.insert(index, rating);
+        filter_dirty = filter.passes(0) != filter.passes(rating);
+    }
+    metas.insert(index, meta);
+    filter_dirty
+}
+
 /// Per-folder session state, rebuilt by open_folder.
 struct Session {
     dir: PathBuf,
@@ -372,15 +392,22 @@ impl App {
                     // the demand path below safely queues a replacement decode.
                     session.thumb_requests.remove(&index);
                     session.thumb_retry_after.remove(&index);
-                    if let Some(embedded) = meta.rating
-                        && embedded > 0
-                        && !session.ratings.contains_key(&index)
-                    {
-                        let rating = embedded.min(5) as u8;
-                        session.ratings.insert(index, rating);
-                        filter_dirty |= self.filter.passes(0) != self.filter.passes(rating);
-                    }
-                    session.metas.insert(index, *meta);
+                    filter_dirty |= install_metadata(
+                        &mut session.ratings,
+                        &mut session.metas,
+                        index,
+                        *meta,
+                        self.filter,
+                    );
+                }
+                Event::MetadataReady { index, meta } => {
+                    filter_dirty |= install_metadata(
+                        &mut session.ratings,
+                        &mut session.metas,
+                        index,
+                        *meta,
+                        self.filter,
+                    );
                 }
                 Event::ImageReady { .. } => replan = true,
                 Event::ImageFailed { index, tier, error } => {
@@ -393,6 +420,9 @@ impl App {
                     } else {
                         eprintln!("job failed {index}/{tier:?}: {error}");
                     }
+                }
+                Event::MetadataFailed { index, error } => {
+                    eprintln!("metadata failed {index}: {error}");
                 }
             }
         }
@@ -1204,6 +1234,46 @@ fn to_color_image(buf: &PixelBuf) -> egui::ColorImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn metadata_with_rating(rating: Option<u32>) -> FileMeta {
+        FileMeta {
+            rating,
+            camera: "Test Camera".into(),
+            ..FileMeta::default()
+        }
+    }
+
+    #[test]
+    fn metadata_only_events_preserve_rating_precedence_and_filter_updates() {
+        let mut ratings = HashMap::from([(1, 5)]);
+        let mut metas = HashMap::new();
+        let filter = Filter {
+            min_rating: 4,
+            unrated_only: false,
+        };
+
+        assert!(install_metadata(
+            &mut ratings,
+            &mut metas,
+            0,
+            metadata_with_rating(Some(4)),
+            filter,
+        ));
+        assert_eq!(ratings.get(&0), Some(&4));
+        assert_eq!(
+            metas.get(&0).map(|meta| meta.camera.as_str()),
+            Some("Test Camera")
+        );
+
+        assert!(!install_metadata(
+            &mut ratings,
+            &mut metas,
+            1,
+            metadata_with_rating(Some(2)),
+            filter,
+        ));
+        assert_eq!(ratings.get(&1), Some(&5), "persisted rating must win");
+    }
 
     #[test]
     fn visible_position_finds_exact_and_nearest_items() {

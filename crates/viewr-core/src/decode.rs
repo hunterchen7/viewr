@@ -28,6 +28,17 @@ pub struct ThumbResult {
     pub meta: FileMeta,
 }
 
+/// Extract container metadata without decoding an embedded preview or raw
+/// pixels. Folder-open background work uses this to discover in-camera
+/// ratings while thumbnail pixels remain demand-driven.
+pub fn metadata(path: &Path) -> Result<FileMeta, DecodeError> {
+    let source = RawSource::new(path)?;
+    let decoder = rawler::get_decoder(&source)?;
+    let params = RawDecodeParams::default();
+    let md = decoder.raw_metadata(&source, &params)?;
+    Ok(FileMeta::from_metadata(&md))
+}
+
 /// Light pass: metadata + a display-oriented thumbnail from the embedded
 /// preview JPEG. No raw pixel decode. (Embedded previews are allowed for
 /// thumbnails only — the main view always renders from raw.)
@@ -108,8 +119,12 @@ mod tests {
             .join("../../testdata/real-raw-corpus/HCA05417.ARW");
 
         let result = thumb_and_meta(&path, 360).expect("portrait fixture decodes");
+        let metadata = metadata(&path).expect("portrait fixture metadata decodes");
 
         assert_eq!(result.meta.orient, Orient::R270);
+        assert_eq!(metadata.orient, result.meta.orient);
+        assert_eq!(metadata.rating, result.meta.rating);
+        assert_eq!(metadata.camera, result.meta.camera);
         assert_eq!(result.thumb.height, 360);
         assert!(result.thumb.height > result.thumb.width);
         assert_eq!(

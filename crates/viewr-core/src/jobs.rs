@@ -42,6 +42,10 @@ const JPEG_QUALITY_FULL: u8 = 90;
 
 #[derive(Debug)]
 pub enum Event {
+    MetadataReady {
+        index: usize,
+        meta: Box<FileMeta>,
+    },
     ThumbReady {
         index: usize,
         meta: Box<FileMeta>,
@@ -53,6 +57,10 @@ pub enum Event {
     ImageFailed {
         index: usize,
         tier: Tier,
+        error: String,
+    },
+    MetadataFailed {
+        index: usize,
         error: String,
     },
 }
@@ -74,6 +82,7 @@ struct Prio {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
+    Metadata,
     Thumb,
     Develop(Quality),
     /// Develop only to fill ring 2 + disk (P3 folder warm): no RGBA
@@ -444,6 +453,9 @@ impl JobQueue {
                 // actually claimed. Until then, replacing the urgent viewport
                 // leaves the original background priority untouched.
                 state.queued.remove(&id);
+                if let Some(displaced) = state.in_flight.get(&id) {
+                    displaced.token.cancel();
+                }
                 let token = Arc::new(CancelToken::default());
                 state.in_flight.insert(
                     id,
@@ -563,7 +575,7 @@ fn navigation_pins(
 }
 
 impl Engine {
-    /// Spawns the worker pool and queues the outward thumb wave.
+    /// Spawns the worker pool and queues the outward metadata wave.
     /// `notify` is called after every published result (the app passes
     /// `ctx.request_repaint`).
     pub fn new(
@@ -624,13 +636,15 @@ impl Engine {
                 .expect("failed to spawn disk cache GC worker")
         });
 
-        // One-shot thumb+metadata wave, outward from the start position.
+        // Discover embedded ratings and EXIF in the background without
+        // decoding every preview JPEG. Thumbnail pixels are requested only by
+        // the current viewport through `set_thumbnail_demand`.
         let len = shared.entries.len();
         shared.light.extend(
             outward_order(len, start)
                 .into_iter()
                 .enumerate()
-                .map(|(dist, index)| ((index, Tier::Thumb), 5, dist as u32, Action::Thumb)),
+                .map(|(dist, index)| ((index, Tier::Thumb), 5, dist as u32, Action::Metadata)),
         );
 
         (
@@ -714,7 +728,8 @@ impl Engine {
 
     /// Replace the thumbnail viewport demand lane. It is intentionally
     /// separate from the folder-wide metadata wave so rapid scrolling drops
-    /// stale urgency without cancelling useful background work.
+    /// stale urgency. Claiming a thumbnail displaces queued metadata for that
+    /// file because the thumbnail decode returns the same metadata.
     pub fn set_thumbnail_demand(&self, indices: &[usize]) -> bool {
         self.shared.light.set_urgent(
             indices
@@ -789,10 +804,35 @@ fn persistence_worker(shared: &Shared) {
 fn run_job(shared: &Shared, id: JobId, action: Action, token: &CancelToken) {
     let (index, tier) = id;
     match action {
+        Action::Metadata => run_metadata(shared, index, token),
         Action::Thumb => run_thumb(shared, index),
         Action::Rehydrate => run_rehydrate(shared, index, tier, token),
         Action::Develop(quality) => run_develop(shared, index, tier, quality, token, false),
         Action::WarmDevelop(quality) => run_warm_develop(shared, index, tier, quality, token),
+    }
+}
+
+fn run_metadata(shared: &Shared, index: usize, token: &CancelToken) {
+    if token.cancelled() {
+        return;
+    }
+    match decode::metadata(&shared.entries[index].path) {
+        Ok(meta) if !token.cancelled() => publish(
+            shared,
+            Event::MetadataReady {
+                index,
+                meta: Box::new(meta),
+            },
+        ),
+        Ok(_) => {}
+        Err(error) if !token.cancelled() => publish(
+            shared,
+            Event::MetadataFailed {
+                index,
+                error: error.to_string(),
+            },
+        ),
+        Err(_) => {}
     }
 }
 
@@ -1187,6 +1227,51 @@ mod tests {
         let state = q.state.lock().unwrap();
         assert!(state.queued.is_empty());
         assert!(state.heap.iter().all(|job| job.id == requested));
+    }
+
+    #[test]
+    fn urgent_thumbnail_replaces_queued_metadata_for_the_same_image() {
+        let q = JobQueue::new();
+        let requested = (9, Tier::Thumb);
+        q.extend([(requested, 5, 100, Action::Metadata)]);
+
+        assert!(q.set_urgent([(requested, Action::Thumb)]));
+        let (id, action, token) = q.pop().unwrap();
+        assert_eq!(id, requested);
+        assert_eq!(action, Action::Thumb);
+        q.finish(id, &token);
+
+        let state = q.state.lock().unwrap();
+        assert!(state.queued.is_empty());
+        assert!(state.heap.iter().all(|job| job.id == requested));
+    }
+
+    #[test]
+    fn urgent_thumbnail_cancels_in_flight_metadata_generation() {
+        let q = JobQueue::new();
+        let requested = (9, Tier::Thumb);
+        q.extend([(requested, 5, 100, Action::Metadata)]);
+        let (_, action, metadata_token) = q.pop().unwrap();
+        assert_eq!(action, Action::Metadata);
+
+        assert!(q.set_urgent([(requested, Action::Thumb)]));
+        let (id, action, thumbnail_token) = q.pop().unwrap();
+        assert_eq!(id, requested);
+        assert_eq!(action, Action::Thumb);
+        assert!(metadata_token.cancelled());
+
+        // The displaced generation can finish after the thumbnail starts,
+        // but it must not erase the thumbnail's live queue state.
+        q.finish(requested, &metadata_token);
+        assert!(
+            q.state
+                .lock()
+                .unwrap()
+                .in_flight
+                .get(&requested)
+                .is_some_and(|current| Arc::ptr_eq(&current.token, &thumbnail_token))
+        );
+        q.finish(requested, &thumbnail_token);
     }
 
     #[test]
