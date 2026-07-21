@@ -35,6 +35,9 @@ tempfile = "3.27"
 [profile.release]
 lto = "thin"
 
+[profile.bench]
+lto = "thin"
+
 # Keep our own code fast to compile, but dependencies (rawler, zune, eframe)
 # optimized even in dev builds — raw decode is unusable at opt-level 0.
 [profile.dev]
