@@ -9,6 +9,7 @@ pub mod folder;
 pub mod jobs;
 pub mod library;
 pub mod meta;
+pub mod planning;
 pub mod resize;
 pub mod types;
 pub mod xmp;

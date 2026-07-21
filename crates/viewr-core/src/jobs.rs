@@ -24,6 +24,7 @@ use crate::decode;
 use crate::develop::{Quality, develop};
 use crate::folder::{FolderEntry, outward_order};
 use crate::meta::FileMeta;
+use crate::planning::{PlanKind, build_plan_targets};
 use crate::resize::apply_orient;
 use crate::types::{PixelBuf, Tier};
 
@@ -31,10 +32,6 @@ pub type JobId = (usize, Tier);
 
 const HEAVY_WORKERS: usize = 3;
 const LIGHT_WORKERS: usize = 2;
-/// Browse-tier prefetch window in effective distance.
-const BROWSE_WINDOW: u32 = 24;
-/// Full-tier pre-warm window in effective distance.
-const FULL_WINDOW: u32 = 2;
 const JPEG_QUALITY_BROWSE: u8 = 87;
 const JPEG_QUALITY_FULL: u8 = 90;
 
@@ -327,79 +324,51 @@ impl Engine {
 
         let disk = &self.shared.disk;
         let entries = &self.shared.entries;
-        let mut plan: Vec<(JobId, u8, u32, Action)> = Vec::new();
-        let mut want = |index: usize, tier: Tier, class: u8, eff: u32| {
-            let id = (index, tier);
-            if cache.has_rgba(id) {
-                return;
-            }
-            let on_disk = || {
-                disk.as_ref()
-                    .is_some_and(|d| d.has(&DiskCache::key(&entries[index], tier)))
-            };
-            let action = if cache.has_jpeg(id) || on_disk() {
-                Action::Rehydrate
-            } else {
-                Action::Develop(match tier {
-                    Tier::Full => Quality::Full,
-                    _ => Quality::Browse,
-                })
-            };
-            plan.push((id, class, eff, action));
-        };
-
-        // Current image first.
-        want(current, Tier::Browse, 0, 0);
-        want(current, Tier::Full, if nav.zoomed { 0 } else { 1 }, 0);
-
-        // Outward wave with 3:1 forward bias, over the display sequence.
         let sequence: Vec<usize> = {
             let s = self.shared.sequence.lock().unwrap();
-            if s.is_empty() {
-                (0..len).collect()
-            } else {
-                s.clone()
-            }
+            s.clone()
         };
-        let cur_pos = sequence
-            .iter()
-            .position(|&i| i == current)
-            .unwrap_or_default();
-        for (pos, &index) in sequence.iter().enumerate() {
-            if index == current || index >= len {
-                continue;
-            }
-            let ahead = (pos > cur_pos) == (nav.direction >= 0);
-            let dist = pos.abs_diff(cur_pos) as u32;
-            let eff = if ahead { dist } else { dist.saturating_mul(3) };
-            if eff <= FULL_WINDOW {
-                want(index, Tier::Browse, 2, eff);
-                want(index, Tier::Full, 3, eff);
-            } else if eff <= BROWSE_WINDOW {
-                want(index, Tier::Browse, 4, eff);
-            }
-        }
-
-        // P3 folder warm: make sure every image's browse render reaches the
-        // disk cache eventually, expanding outward. Ring 1 is untouched.
-        if let Some(disk) = disk {
-            for (index, entry) in entries.iter().enumerate() {
-                if index == current {
-                    continue;
+        let targets = build_plan_targets(
+            len,
+            current,
+            nav.direction,
+            nav.zoomed,
+            &sequence,
+            disk.is_some(),
+        );
+        let mut plan: Vec<(JobId, u8, u32, Action)> = Vec::with_capacity(targets.len());
+        for target in targets {
+            let id = (target.index, target.tier);
+            match target.kind {
+                PlanKind::Display => {
+                    if cache.has_rgba(id) {
+                        continue;
+                    }
+                    let action = if cache.has_jpeg(id)
+                        || disk.as_ref().is_some_and(|disk| {
+                            disk.has(&DiskCache::key(&entries[target.index], target.tier))
+                        }) {
+                        Action::Rehydrate
+                    } else {
+                        Action::Develop(match target.tier {
+                            Tier::Full => Quality::Full,
+                            _ => Quality::Browse,
+                        })
+                    };
+                    plan.push((id, target.class, target.effective_distance, action));
                 }
-                let ahead = (index > current) == (nav.direction >= 0);
-                let dist = index.abs_diff(current) as u32;
-                let eff = if ahead { dist } else { dist.saturating_mul(3) };
-                if eff > BROWSE_WINDOW
-                    && !cache.has_jpeg((index, Tier::Browse))
-                    && !disk.has(&DiskCache::key(entry, Tier::Browse))
-                {
-                    plan.push((
-                        (index, Tier::Browse),
-                        6,
-                        eff,
-                        Action::WarmDevelop(Quality::Browse),
-                    ));
+                PlanKind::Warm => {
+                    let Some(disk) = disk else { continue };
+                    if !cache.has_jpeg(id)
+                        && !disk.has(&DiskCache::key(&entries[target.index], target.tier))
+                    {
+                        plan.push((
+                            id,
+                            target.class,
+                            target.effective_distance,
+                            Action::WarmDevelop(Quality::Browse),
+                        ));
+                    }
                 }
             }
         }
