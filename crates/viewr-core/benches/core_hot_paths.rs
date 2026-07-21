@@ -188,6 +188,24 @@ fn bench_orientation(c: &mut Criterion) {
     }
 
     group.finish();
+
+    let full_resolution = synthetic_photo(7_008, 4_672);
+    let full_pixels = u64::from(full_resolution.width) * u64::from(full_resolution.height);
+    let mut full_group = c.benchmark_group("orientation_33mp");
+    full_group.sample_size(10);
+    full_group.warm_up_time(Duration::from_millis(300));
+    full_group.measurement_time(Duration::from_secs(3));
+    full_group.throughput(Throughput::Elements(full_pixels));
+    for (name, orient) in [("r90", Orient::R90), ("r270", Orient::R270)] {
+        full_group.bench_function(name, |b| {
+            b.iter_batched(
+                || full_resolution.clone(),
+                |buf| black_box(apply_orient(black_box(buf), orient)),
+                BatchSize::PerIteration,
+            );
+        });
+    }
+    full_group.finish();
 }
 
 fn bench_jpeg(c: &mut Criterion) {
@@ -275,6 +293,42 @@ fn bench_ram_cache(c: &mut Criterion) {
             churn.insert_rgba(black_box(key), Arc::clone(black_box(&rgba)));
         });
     });
+
+    group.finish();
+}
+
+fn bench_ram_cache_eviction_scaling(c: &mut Criterion) {
+    let payload = Arc::new(PixelBuf {
+        width: 1,
+        height: 1,
+        rgba: vec![0; 4],
+    });
+    let mut group = c.benchmark_group("ram_cache_eviction_scaling");
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+    group.throughput(Throughput::Elements(1));
+
+    for entries in [8_usize, 128, 1_024, 10_000] {
+        let cache = RamCache::new(0, entries as u64 * 4, 0);
+        for index in 0..entries {
+            cache.insert_rgba((index, Tier::Browse), Arc::clone(&payload));
+        }
+        let mut next_key = entries;
+        group.bench_with_input(
+            BenchmarkId::new("one_in_one_out", entries),
+            &entries,
+            |b, _| {
+                b.iter(|| {
+                    cache.insert_rgba(
+                        black_box((next_key, Tier::Browse)),
+                        Arc::clone(black_box(&payload)),
+                    );
+                    next_key = next_key.wrapping_add(1);
+                });
+            },
+        );
+    }
 
     group.finish();
 }
@@ -454,6 +508,7 @@ criterion_group! {
         bench_orientation,
         bench_jpeg,
         bench_ram_cache,
+        bench_ram_cache_eviction_scaling,
         bench_xmp,
         bench_disk_cache_key,
         bench_opt_in_raw
