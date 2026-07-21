@@ -102,6 +102,30 @@ fn visible_position(visible: &[usize], current: usize) -> usize {
     }
 }
 
+fn full_texture_work_enabled(zoom: Zoom) -> bool {
+    !matches!(zoom, Zoom::Fit)
+}
+
+fn current_texture_candidates(current: usize, zoom: Zoom) -> impl Iterator<Item = (usize, Tier)> {
+    let include_full = full_texture_work_enabled(zoom);
+    [(current, Tier::Browse), (current, Tier::Full)]
+        .into_iter()
+        .filter(move |(_, tier)| include_full || *tier != Tier::Full)
+}
+
+fn main_texture_should_be_kept(
+    index: usize,
+    tier: Tier,
+    current: usize,
+    near: &[usize],
+    zoom: Zoom,
+) -> bool {
+    match tier {
+        Tier::Full => full_texture_work_enabled(zoom) && index == current,
+        _ => near.contains(&index),
+    }
+}
+
 /// Per-folder session state, rebuilt by open_folder.
 struct Session {
     dir: PathBuf,
@@ -363,11 +387,12 @@ impl App {
         }
     }
 
-    /// Upload policy: current image first (Browse then Full), then one
-    /// neighbor browse per frame; prune outside the keep window.
+    /// Upload policy: current Browse first, current Full only while zoomed,
+    /// then one neighbor Browse per frame. Prune outside the keep window.
     fn manage_textures(&mut self) {
         let ctx = self.ctx.clone();
         let current = self.current;
+        let zoom = self.zoom;
         // Keep-window over the visible sequence.
         let pos = self.visible_pos();
         let near: Vec<usize> = (-2isize..=2)
@@ -381,10 +406,9 @@ impl App {
         let Some(session) = &mut self.session else {
             return;
         };
-        session.textures.retain(|(i, tier), _| match tier {
-            Tier::Full => *i == current,
-            _ => near.contains(i),
-        });
+        session
+            .textures
+            .retain(|(i, tier), _| main_texture_should_be_kept(*i, *tier, current, &near, zoom));
 
         let mut upload = |key: (usize, Tier), budget: &mut i32| {
             if *budget <= 0 || session.textures.contains_key(&key) {
@@ -401,8 +425,9 @@ impl App {
             }
         };
         let mut budget = 2;
-        upload((current, Tier::Browse), &mut budget);
-        upload((current, Tier::Full), &mut budget);
+        for key in current_texture_candidates(current, zoom) {
+            upload(key, &mut budget);
+        }
         let mut neighbor_budget = 1;
         for &i in near.iter().filter(|&&i| i != current) {
             upload((i, Tier::Browse), &mut neighbor_budget);
@@ -1035,6 +1060,46 @@ mod tests {
         assert_eq!(visible_position(&visible, 5), 2);
         assert_eq!(visible_position(&visible, 99), 3);
         assert_eq!(visible_position(&[], 5), 0);
+    }
+
+    #[test]
+    fn fit_texture_policy_omits_full_while_zoomed_preserves_current_full() {
+        let near = [6, 7, 8];
+        assert_eq!(
+            current_texture_candidates(7, Zoom::Fit).collect::<Vec<_>>(),
+            [(7, Tier::Browse)]
+        );
+        assert!(!main_texture_should_be_kept(
+            7,
+            Tier::Full,
+            7,
+            &near,
+            Zoom::Fit
+        ));
+
+        let zoomed = Zoom::Anchored {
+            scale: 1.0,
+            center: vec2(0.5, 0.5),
+        };
+        assert_eq!(
+            current_texture_candidates(7, zoomed).collect::<Vec<_>>(),
+            [(7, Tier::Browse), (7, Tier::Full)]
+        );
+        assert!(main_texture_should_be_kept(7, Tier::Full, 7, &near, zoomed));
+        assert!(!main_texture_should_be_kept(
+            8,
+            Tier::Full,
+            7,
+            &near,
+            zoomed
+        ));
+        assert!(main_texture_should_be_kept(
+            8,
+            Tier::Browse,
+            7,
+            &near,
+            Zoom::Fit
+        ));
     }
 
     #[test]

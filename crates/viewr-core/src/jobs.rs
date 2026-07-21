@@ -468,6 +468,23 @@ pub struct Engine {
     gc_worker: Option<std::thread::JoinHandle<()>>,
 }
 
+fn navigation_pins(len: usize, current: usize, include_full: bool) -> Vec<JobId> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let current = current.min(len - 1);
+    let first = current.saturating_sub(1);
+    let last = (current + 1).min(len - 1);
+    let mut pins = Vec::with_capacity((last - first + 1) * (2 + usize::from(include_full)));
+    for index in first..=last {
+        pins.extend([(index, Tier::Thumb), (index, Tier::Browse)]);
+        if include_full {
+            pins.push((index, Tier::Full));
+        }
+    }
+    pins
+}
+
 impl Engine {
     /// Spawns the worker pool and queues the outward thumb wave.
     /// `notify` is called after every published result (the app passes
@@ -560,12 +577,9 @@ impl Engine {
         let current = nav.current.min(len - 1);
         let cache = &self.shared.cache;
 
-        // Pin current ±1 across tiers.
-        let mut pins: Vec<JobId> = Vec::new();
-        for i in current.saturating_sub(1)..=(current + 1).min(len - 1) {
-            pins.extend([(i, Tier::Thumb), (i, Tier::Browse), (i, Tier::Full)]);
-        }
-        cache.set_pins(pins);
+        // Full buffers are useful only while inspecting at zoom. In Fit mode,
+        // leaving them unpinned lets the byte budget favor browse navigation.
+        cache.set_pins(navigation_pins(len, current, nav.zoomed));
 
         let disk = &self.shared.disk;
         let targets = {
@@ -956,6 +970,21 @@ mod tests {
             size,
             mtime_ns: 456,
         }
+    }
+
+    #[test]
+    fn fit_pins_skip_full_while_zoomed_pins_preserve_the_near_window() {
+        let fit = navigation_pins(5, 2, false);
+        assert_eq!(fit.len(), 6);
+        assert!(fit.iter().all(|(_, tier)| *tier != Tier::Full));
+
+        let zoomed = navigation_pins(5, 2, true);
+        let full: Vec<_> = zoomed
+            .iter()
+            .filter(|(_, tier)| *tier == Tier::Full)
+            .copied()
+            .collect();
+        assert_eq!(full, [(1, Tier::Full), (2, Tier::Full), (3, Tier::Full)]);
     }
 
     #[test]

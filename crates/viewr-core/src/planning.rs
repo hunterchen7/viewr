@@ -61,7 +61,9 @@ pub fn build_plan_targets(
         };
 
         display(current, Tier::Browse, 0, 0);
-        display(current, Tier::Full, u8::from(!zoomed), 0);
+        if zoomed {
+            display(current, Tier::Full, 0, 0);
+        }
 
         let current_position = if sequence.is_empty() {
             current
@@ -84,7 +86,9 @@ pub fn build_plan_targets(
             };
             if effective_distance <= FULL_WINDOW {
                 display(index, Tier::Browse, 2, effective_distance);
-                display(index, Tier::Full, 3, effective_distance);
+                if zoomed {
+                    display(index, Tier::Full, 3, effective_distance);
+                }
             } else if effective_distance <= BROWSE_WINDOW {
                 display(index, Tier::Browse, 4, effective_distance);
             }
@@ -170,7 +174,9 @@ mod tests {
                 });
             };
             display(current, Tier::Browse, 0, 0);
-            display(current, Tier::Full, u8::from(!zoomed), 0);
+            if zoomed {
+                display(current, Tier::Full, 0, 0);
+            }
 
             let current_position = if sequence.is_empty() {
                 current
@@ -197,7 +203,9 @@ mod tests {
                 };
                 if effective_distance <= FULL_WINDOW {
                     display(index, Tier::Browse, 2, effective_distance);
-                    display(index, Tier::Full, 3, effective_distance);
+                    if zoomed {
+                        display(index, Tier::Full, 3, effective_distance);
+                    }
                 } else if effective_distance <= BROWSE_WINDOW {
                     display(index, Tier::Browse, 4, effective_distance);
                 }
@@ -285,18 +293,37 @@ mod tests {
     }
 
     #[test]
-    fn current_priority_reflects_zoom_state_and_clamps_index() {
+    fn fit_omits_full_while_zoomed_prioritizes_it_and_clamps_index() {
         let fit = build_plan_targets(5, usize::MAX, 1, false, &[], false);
         assert_eq!(target(&fit, 4, Tier::Browse, PlanKind::Display).class, 0);
-        assert_eq!(target(&fit, 4, Tier::Full, PlanKind::Display).class, 1);
+        assert!(fit.iter().all(|target| target.tier != Tier::Full));
 
         let zoomed = build_plan_targets(5, 4, 1, true, &[], false);
         assert_eq!(target(&zoomed, 4, Tier::Full, PlanKind::Display).class, 0);
     }
 
     #[test]
+    fn fit_wave_has_no_full_work_but_zoomed_wave_preserves_prefetch() {
+        let fit = build_plan_targets(100, 50, 1, false, &[], true);
+        assert_eq!(
+            fit.iter()
+                .filter(|target| target.tier == Tier::Full)
+                .count(),
+            0
+        );
+
+        let zoomed = build_plan_targets(100, 50, 1, true, &[], true);
+        let full: Vec<_> = zoomed
+            .iter()
+            .filter(|target| target.tier == Tier::Full)
+            .map(|target| (target.index, target.class, target.effective_distance))
+            .collect();
+        assert_eq!(full, [(50, 0, 0), (51, 3, 1), (52, 3, 2)]);
+    }
+
+    #[test]
     fn identity_wave_is_forward_biased_in_both_directions() {
-        let forward = build_plan_targets(10, 4, 1, false, &[], false);
+        let forward = build_plan_targets(10, 4, 1, true, &[], false);
         assert_eq!(
             target(&forward, 5, Tier::Browse, PlanKind::Display).effective_distance,
             1
@@ -315,7 +342,7 @@ mod tests {
                 .all(|target| !(target.index == 3 && target.tier == Tier::Full))
         );
 
-        let backward = build_plan_targets(10, 4, -1, false, &[], false);
+        let backward = build_plan_targets(10, 4, -1, true, &[], false);
         assert_eq!(
             target(&backward, 3, Tier::Full, PlanKind::Display).effective_distance,
             1
@@ -328,7 +355,7 @@ mod tests {
 
     #[test]
     fn filtered_sequence_controls_interactive_neighbors() {
-        let targets = build_plan_targets(10, 4, 1, false, &[1, 4, 8], false);
+        let targets = build_plan_targets(10, 4, 1, true, &[1, 4, 8], false);
         assert!(targets.iter().any(|target| target.index == 8));
         assert!(targets.iter().any(|target| target.index == 1));
         assert!(
