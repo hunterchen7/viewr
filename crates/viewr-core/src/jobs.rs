@@ -144,19 +144,31 @@ impl JobQueue {
         let mut state = self.state.lock().unwrap();
         state.epoch += 1;
         let epoch = state.epoch;
-        state.heap.clear();
+
+        // Build the wanted set in the allocation we retain as the queued
+        // index. This avoids a temporary HashSet on every navigation.
         state.queued.clear();
-        let wanted: std::collections::HashSet<JobId> = plan.iter().map(|(id, ..)| *id).collect();
+        state.queued.reserve(plan.len());
+        for (id, ..) in &plan {
+            state.queued.insert(*id, epoch);
+        }
         for (id, token) in &state.in_flight {
-            if !wanted.contains(id) {
+            if !state.queued.contains_key(id) {
                 token.cancel();
             }
         }
-        let mut heap = std::mem::take(&mut state.heap);
+
+        // Reuse the heap's backing allocation, then heapify once in O(P).
+        // Repeated push would make each navigation O(P log P), which is
+        // noticeable when the folder-wide warm wave contains many images.
+        let mut jobs = std::mem::take(&mut state.heap).into_vec();
+        jobs.clear();
+        jobs.reserve(plan.len());
         for (id, class, eff_dist, action) in plan {
             // Skip only if a LIVE instance is already running; a cancelled
             // in-flight instance won't publish, so queue a fresh one.
             if state.in_flight.get(&id).is_some_and(|t| !t.cancelled()) {
+                state.queued.remove(&id);
                 continue;
             }
             state.seq += 1;
@@ -165,15 +177,14 @@ impl JobQueue {
                 eff_dist,
                 seq: state.seq,
             };
-            state.queued.insert(id, epoch);
-            heap.push(QueuedJob {
+            jobs.push(QueuedJob {
                 prio,
                 epoch,
                 id,
                 action,
             });
         }
-        state.heap = heap;
+        state.heap = BinaryHeap::from(jobs);
         drop(state);
         self.cond.notify_all();
     }
@@ -323,19 +334,10 @@ impl Engine {
         cache.set_pins(pins);
 
         let disk = &self.shared.disk;
-        let entries = &self.shared.entries;
-        let sequence: Vec<usize> = {
+        let targets = {
             let s = self.shared.sequence.lock().unwrap();
-            s.clone()
+            build_plan_targets(len, current, nav.direction, nav.zoomed, &s, disk.is_some())
         };
-        let targets = build_plan_targets(
-            len,
-            current,
-            nav.direction,
-            nav.zoomed,
-            &sequence,
-            disk.is_some(),
-        );
         let mut plan: Vec<(JobId, u8, u32, Action)> = Vec::with_capacity(targets.len());
         for target in targets {
             let id = (target.index, target.tier);
@@ -344,10 +346,10 @@ impl Engine {
                     if cache.has_rgba(id) {
                         continue;
                     }
-                    let action = if cache.has_jpeg(id)
-                        || disk.as_ref().is_some_and(|disk| {
-                            disk.has(&DiskCache::key(&entries[target.index], target.tier))
-                        }) {
+                    // A configured disk cache is probed by the worker during
+                    // rehydrate. Navigation must not issue filesystem calls
+                    // for every candidate on the UI thread.
+                    let action = if cache.has_jpeg(id) || disk.is_some() {
                         Action::Rehydrate
                     } else {
                         Action::Develop(match target.tier {
@@ -358,10 +360,11 @@ impl Engine {
                     plan.push((id, target.class, target.effective_distance, action));
                 }
                 PlanKind::Warm => {
-                    let Some(disk) = disk else { continue };
-                    if !cache.has_jpeg(id)
-                        && !disk.has(&DiskCache::key(&entries[target.index], target.tier))
-                    {
+                    if disk.is_some() {
+                        // RAM and disk presence are checked when this
+                        // background job reaches a worker. Besides removing
+                        // synchronous filesystem probes, this avoids taking
+                        // the RAM-cache mutex once per file during navigation.
                         plan.push((
                             id,
                             target.class,
@@ -414,8 +417,29 @@ fn run_job(shared: &Shared, id: JobId, action: Action, token: &CancelToken) {
         Action::Thumb => run_thumb(shared, index),
         Action::Rehydrate => run_rehydrate(shared, index, tier, token),
         Action::Develop(quality) => run_develop(shared, index, tier, quality, token, false),
-        Action::WarmDevelop(quality) => run_develop(shared, index, tier, quality, token, true),
+        Action::WarmDevelop(quality) => run_warm_develop(shared, index, tier, quality, token),
     }
+}
+
+/// Probe background cache state away from the navigation/UI thread. A warm
+/// hit is a no-op; a miss follows the same develop-and-persist path as before.
+fn run_warm_develop(
+    shared: &Shared,
+    index: usize,
+    tier: Tier,
+    quality: Quality,
+    token: &CancelToken,
+) {
+    if token.cancelled() || shared.cache.has_jpeg((index, tier)) {
+        return;
+    }
+    let Some(disk) = &shared.disk else {
+        return;
+    };
+    if disk.has(&DiskCache::key(&shared.entries[index], tier)) {
+        return;
+    }
+    run_develop(shared, index, tier, quality, token, true);
 }
 
 fn run_thumb(shared: &Shared, index: usize) {
@@ -624,6 +648,36 @@ mod tests {
     }
 
     #[test]
+    fn bulk_heapify_preserves_priority_and_fifo_semantics() {
+        let q = JobQueue::new();
+        let shutdown = AtomicBool::new(false);
+        let plan: Vec<_> = (0..512)
+            .map(|index| {
+                job(
+                    (index, Tier::Browse),
+                    ((index * 17) % 7) as u8,
+                    ((index * 29) % 31) as u32,
+                )
+            })
+            .collect();
+        let mut expected: Vec<_> = plan
+            .iter()
+            .enumerate()
+            .map(|(sequence, (id, class, distance, _))| (*class, *distance, sequence, *id))
+            .collect();
+        expected.sort_unstable();
+
+        q.set_plan(plan);
+
+        for (_, _, _, expected_id) in expected {
+            assert_eq!(q.pop(&shutdown).unwrap().0, expected_id);
+        }
+        let state = q.state.lock().unwrap();
+        assert!(state.heap.is_empty());
+        assert!(state.queued.is_empty());
+    }
+
+    #[test]
     fn forward_bias_orders_wave() {
         // Same class: eff_dist decides; backward×3 means +1,+2,+3 beat -1.
         let q = JobQueue::new();
@@ -747,6 +801,46 @@ mod tests {
         token.cancel();
         token.cancel();
         assert!(token.cancelled());
+    }
+
+    #[test]
+    fn cached_warm_job_does_not_touch_the_raw_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = FolderEntry {
+            path: dir.path().join("missing.arw"),
+            file_name: "missing.arw".into(),
+            size: 123,
+            mtime_ns: 456,
+        };
+        let disk = DiskCache::open_at(dir.path().join("cache"));
+        let key = DiskCache::key(&entry, Tier::Browse);
+        disk.put(&key, b"already warm").unwrap();
+        let (events, receiver) = std::sync::mpsc::channel();
+        let shared = Shared {
+            entries: vec![entry],
+            cache: Arc::new(RamCache::new(0, 0, 0)),
+            disk: Some(disk.clone()),
+            events,
+            notify: Arc::new(|| {}),
+            heavy: JobQueue::new(),
+            light: JobQueue::new(),
+            shutdown: AtomicBool::new(false),
+            sequence: Mutex::new(Vec::new()),
+        };
+
+        run_warm_develop(
+            &shared,
+            0,
+            Tier::Browse,
+            Quality::Browse,
+            &CancelToken::default(),
+        );
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(disk.get(&key).unwrap(), b"already warm");
     }
 
     #[test]
