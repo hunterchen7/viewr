@@ -65,6 +65,14 @@ impl DiskCache {
         std::fs::read(self.object_path(key)).ok()
     }
 
+    pub(crate) fn remove(&self, key: &str) -> std::io::Result<bool> {
+        match std::fs::remove_file(self.object_path(key)) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Atomic write: tmp in the same directory, then rename.
     pub fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<()> {
         let path = self.object_path(key);
@@ -187,6 +195,18 @@ mod tests {
         assert!(cache.has(&key));
         assert_eq!(cache.get(&key).unwrap(), b"replacement");
         assert!(!cache.object_path(&key).with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn remove_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open_at(dir.path().to_owned());
+        let key = DiskCache::key(&entry(10, 1), Tier::Browse);
+        cache.put(&key, b"cached object").unwrap();
+
+        assert!(cache.remove(&key).unwrap());
+        assert!(!cache.remove(&key).unwrap());
+        assert!(!cache.has(&key));
     }
 
     #[test]

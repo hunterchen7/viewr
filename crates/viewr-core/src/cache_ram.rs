@@ -67,6 +67,44 @@ impl<V: Clone> ByteLru<V> {
         self.map.contains_key(key)
     }
 
+    fn remove(&mut self, key: &Key) -> Option<V> {
+        let index = self.map.get(key).copied()?;
+        let (prev, next, bytes, pinned) = {
+            let entry = self.entry(index);
+            (entry.prev, entry.next, entry.bytes, entry.pinned)
+        };
+
+        if !pinned {
+            if self.oldest_unpinned == Some(index) {
+                self.oldest_unpinned = if self.unpinned == 1 {
+                    None
+                } else {
+                    Some(self.find_next_unpinned(next))
+                };
+            }
+            self.unpinned -= 1;
+        }
+
+        if let Some(prev) = prev {
+            self.entry_mut(prev).next = next;
+        } else {
+            self.lru = next;
+        }
+        if let Some(next) = next {
+            self.entry_mut(next).prev = prev;
+        } else {
+            self.mru = prev;
+        }
+
+        debug_assert_eq!(self.map.remove(key), Some(index));
+        let entry = self.entries[index]
+            .take()
+            .expect("LRU index must point to a resident entry");
+        self.vacant.push(index);
+        self.bytes -= bytes;
+        Some(entry.value)
+    }
+
     fn insert(&mut self, key: Key, value: V, bytes: u64, pinned: bool) {
         self.clock += 1;
         let clock = self.clock;
@@ -355,6 +393,10 @@ impl RamCache {
         inner.jpeg.insert(key, bytes_vec, bytes, pinned);
     }
 
+    pub(crate) fn remove_jpeg(&self, key: Key) -> Option<Arc<Vec<u8>>> {
+        self.inner.lock().unwrap().jpeg.remove(&key)
+    }
+
     pub fn stats(&self) -> RamCacheStats {
         let inner = self.inner.lock().unwrap();
         RamCacheStats {
@@ -604,6 +646,25 @@ mod tests {
         assert!(cache.has_rgba((0, Tier::Thumb)));
         assert!(cache.has_rgba((0, Tier::Browse)));
         assert!(cache.has_jpeg((0, Tier::Browse)));
+    }
+
+    #[test]
+    fn removing_pinned_jpeg_repairs_lru_accounting() {
+        let cache = RamCache::new(0, 0, 10);
+        let pinned = (0, Tier::Browse);
+        let other = (1, Tier::Browse);
+        cache.set_pins([pinned]);
+        cache.insert_jpeg(pinned, Arc::new(vec![1; 6]));
+        cache.insert_jpeg(other, Arc::new(vec![2; 4]));
+
+        assert_eq!(*cache.remove_jpeg(pinned).unwrap(), vec![1; 6]);
+        assert!(!cache.has_jpeg(pinned));
+        assert_eq!(cache.stats().jpeg_bytes, 4);
+
+        cache.insert_jpeg((2, Tier::Browse), Arc::new(vec![3; 7]));
+        assert!(!cache.has_jpeg(other));
+        assert!(cache.has_jpeg((2, Tier::Browse)));
+        assert_eq!(cache.stats().jpeg_bytes, 7);
     }
 
     #[test]

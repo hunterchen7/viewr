@@ -746,14 +746,16 @@ fn run_develop(
 ) {
     let path = &shared.entries[index].path;
     let fail = |e: String| {
-        publish(
-            shared,
-            Event::ImageFailed {
-                index,
-                tier,
-                error: e,
-            },
-        );
+        if !token.cancelled() {
+            publish(
+                shared,
+                Event::ImageFailed {
+                    index,
+                    tier,
+                    error: e,
+                },
+            );
+        }
     };
     if token.cancelled() {
         return;
@@ -794,40 +796,61 @@ fn run_develop(
 }
 
 fn run_rehydrate(shared: &Shared, index: usize, tier: Tier, token: &CancelToken) {
-    // Ring 2 first, then ring 3 (disk), else develop from scratch.
-    let bytes = shared.cache.get_jpeg((index, tier)).or_else(|| {
-        let disk = shared.disk.as_ref()?;
-        let bytes = disk.get(&DiskCache::key(&shared.entries[index], tier))?;
-        let bytes = Arc::new(bytes);
-        shared.cache.insert_jpeg((index, tier), bytes.clone());
-        Some(bytes)
-    });
-    let Some(bytes) = bytes else {
-        let quality = match tier {
-            Tier::Full => Quality::Full,
-            _ => Quality::Browse,
-        };
-        return run_develop(shared, index, tier, quality, token, false);
-    };
+    // Ring 2 first, then ring 3 (disk). Disk bytes enter RAM only after JPEG
+    // validation; a corrupt rebuildable object is evicted and falls through
+    // to RAW development instead of poisoning every later request.
     if token.cancelled() {
         return;
     }
-    match decode_jpeg(&bytes) {
-        Ok(buf) => {
-            shared.cache.insert_rgba((index, tier), Arc::new(buf));
-            if !token.cancelled() {
-                publish(shared, Event::ImageReady { index, tier });
+    let id = (index, tier);
+    if let Some(bytes) = shared.cache.get_jpeg(id) {
+        if let Ok(buf) = decode_jpeg(&bytes) {
+            return install_rehydrated(shared, index, tier, buf, token);
+        }
+        shared.cache.remove_jpeg(id);
+    }
+
+    if token.cancelled() {
+        return;
+    }
+    if let Some(disk) = &shared.disk {
+        let key = DiskCache::key(&shared.entries[index], tier);
+        if let Some(bytes) = disk.get(&key) {
+            if token.cancelled() {
+                return;
+            }
+            if let Ok(buf) = decode_jpeg(&bytes) {
+                shared.cache.insert_jpeg(id, Arc::new(bytes));
+                return install_rehydrated(shared, index, tier, buf, token);
+            }
+            if let Err(error) = disk.remove(&key) {
+                eprintln!("failed to remove corrupt disk cache object: {error}");
             }
         }
-        Err(e) => publish(
-            shared,
-            Event::ImageFailed {
-                index,
-                tier,
-                error: e,
-            },
-        ),
     }
+
+    develop_cache_miss(shared, index, tier, token);
+}
+
+fn install_rehydrated(
+    shared: &Shared,
+    index: usize,
+    tier: Tier,
+    buf: PixelBuf,
+    token: &CancelToken,
+) {
+    shared.cache.insert_rgba((index, tier), Arc::new(buf));
+    if !token.cancelled() {
+        publish(shared, Event::ImageReady { index, tier });
+    }
+}
+
+fn develop_cache_miss(shared: &Shared, index: usize, tier: Tier, token: &CancelToken) {
+    let quality = match tier {
+        Tier::Full => Quality::Full,
+        _ => Quality::Browse,
+    };
+    run_develop(shared, index, tier, quality, token, false);
 }
 
 pub fn encode_jpeg(buf: &PixelBuf, quality: u8) -> Result<Vec<u8>, String> {
@@ -1336,6 +1359,43 @@ mod tests {
 
         assert!(disk.has(&key));
         assert!(cache.has_jpeg((0, Tier::Browse)));
+    }
+
+    #[test]
+    fn corrupt_cached_jpeg_is_evicted_before_raw_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw_entry = entry(dir.path().join("missing.arw"), 100);
+        let disk = DiskCache::open_at(dir.path().join("cache"));
+        let key = DiskCache::key(&raw_entry, Tier::Browse);
+        disk.put(&key, b"not a jpeg").unwrap();
+
+        let cache = Arc::new(RamCache::new(0, 0, 1024));
+        cache.insert_jpeg((0, Tier::Browse), Arc::new(b"not a jpeg".to_vec()));
+        let (events, receiver) = std::sync::mpsc::channel();
+        let shared = Shared {
+            entries: vec![raw_entry],
+            cache: cache.clone(),
+            disk: Some(disk.clone()),
+            events,
+            notify: Arc::new(|| {}),
+            heavy: JobQueue::new(),
+            light: JobQueue::new(),
+            persistence: PersistenceQueue::new(),
+            sequence: Mutex::new(Vec::new()),
+        };
+
+        run_rehydrate(&shared, 0, Tier::Browse, &CancelToken::default());
+
+        assert!(!cache.has_jpeg((0, Tier::Browse)));
+        assert!(!disk.has(&key));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::ImageFailed {
+                index: 0,
+                tier: Tier::Browse,
+                ..
+            })
+        ));
     }
 
     #[test]
