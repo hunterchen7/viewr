@@ -25,7 +25,7 @@ jobs:
             asset: viewr-linux-x64.tar.gz
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Linux build deps
         if: runner.os == 'Linux'
         run: |

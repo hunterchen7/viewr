@@ -12,19 +12,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
-    # Cold Windows and Linux runners must compile the optimized test profile,
-    # documentation, benchmarks, and the thin-LTO release profile.
-    timeout-minutes: 90
+  quality:
+    name: Quality gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Linux build deps
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
@@ -32,28 +26,67 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: quality
+          cache-on-failure: true
       - name: Format
         run: cargo fmt --all --check
-      - name: Lint all targets
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Test workspace
-        run: cargo test --workspace --locked
+      - name: Lint all targets and features
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Check documentation
         run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
-      - name: Compile benchmark harnesses
+
+  test:
+    name: Tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Linux build deps
         if: runner.os == 'Linux'
-        run: cargo bench --workspace --no-run --locked
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+      - uses: dtolnay/rust-toolchain@1.96
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: tests
+          cache-on-failure: true
+      - name: Test workspace
+        run: cargo test --workspace --locked
+
+  build:
+    name: Release and benchmark builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+      - uses: dtolnay/rust-toolchain@1.96
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: builds
+          cache-on-failure: true
       - name: Build release
         run: cargo build --release --locked
+      - name: Compile benchmark harnesses
+        run: cargo bench --workspace --features benchmarks --no-run --locked
 
   miri:
     name: Miri unsafe-path checks
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-07-21
@@ -61,6 +94,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: miri
+          cache-on-failure: true
       - name: Check pixel rotations
         run: cargo +nightly-2026-07-21 miri test -p viewr-core --lib resize::tests::rotate_ --locked
       - name: Check superpixel output initialization

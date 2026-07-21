@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96
       - uses: Swatinem/rust-cache@v2
       - name: Record environment
@@ -23,9 +23,9 @@ jobs:
           uname -a
           lscpu
       - name: Run core synthetic benchmarks
-        run: cargo bench -p viewr-core --bench core_hot_paths --locked -- --noplot
+        run: cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- --noplot
       - name: Run filmstrip scaling benchmarks
-        run: cargo bench -p viewr --bench filmstrip_scaling --locked -- --noplot
+        run: cargo bench -p viewr --features benchmarks --bench filmstrip_scaling --locked -- --noplot
       - name: Upload Criterion results
         if: always()
         uses: actions/upload-artifact@v4
