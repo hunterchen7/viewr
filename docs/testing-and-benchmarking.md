@@ -9,7 +9,7 @@ Run these commands before each commit:
 
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 ```
@@ -23,23 +23,30 @@ The test suite covers these areas:
 - XMP preservation, rating precedence, SQLite reopen behavior, and durable flushes.
 - Configuration parsing and loupe layout mathematics.
 
-CI runs the tests on macOS, Windows, and Linux.
-CI also compiles the benchmark harness on Linux.
+CI runs the full test suite on macOS, Windows, and Linux. Platform-independent
+formatting, Clippy, Rustdoc, benchmark compilation, and release compilation run
+once on Linux. Miri uses one pinned Linux nightly job. The independent quality,
+test, optimized-build, and Miri jobs run in parallel.
+
+Normal test builds exclude Criterion and use an unoptimized test profile. This
+keeps correctness feedback fast without changing the optimized development,
+benchmark, or release profiles. The `benchmarks` feature opts into Criterion and
+the custom benchmark targets.
 
 ## Synthetic benchmarks
 
 Run the full benchmark suite:
 
 ```sh
-cargo bench -p viewr-core --bench core_hot_paths --locked
-cargo bench -p viewr --bench filmstrip_scaling --locked
+cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked
+cargo bench -p viewr --features benchmarks --bench filmstrip_scaling --locked
 ```
 
 Use a filter when you work on one subsystem:
 
 ```sh
-cargo bench -p viewr-core --bench core_hot_paths --locked -- navigation_plan
-cargo bench -p viewr-core --bench core_hot_paths --locked -- jpeg
+cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- navigation_plan
+cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- jpeg
 ```
 
 The suite measures these workloads:
@@ -84,13 +91,13 @@ repository code.
 Save a baseline before you change the code:
 
 ```sh
-cargo bench -p viewr-core --bench core_hot_paths --locked -- --save-baseline before
+cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- --save-baseline before
 ```
 
 Compare the changed code with that baseline:
 
 ```sh
-cargo bench -p viewr-core --bench core_hot_paths --locked -- --baseline before
+cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- --baseline before
 ```
 
 Use the same machine and power mode for both runs.
@@ -116,14 +123,14 @@ Run this command on macOS or Linux:
 
 ```sh
 VIEWR_BENCH_RAW=/absolute/path/photo.ARW \
-  cargo bench -p viewr-core --bench core_hot_paths --locked -- raw_opt_in
+  cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- raw_opt_in
 ```
 
 Run these commands in PowerShell on Windows:
 
 ```powershell
 $env:VIEWR_BENCH_RAW = "C:\Photos\photo.ARW"
-cargo bench -p viewr-core --bench core_hot_paths --locked -- raw_opt_in
+cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- raw_opt_in
 ```
 
 The RAW suite measures metadata-only extraction, thumbnail extraction, the

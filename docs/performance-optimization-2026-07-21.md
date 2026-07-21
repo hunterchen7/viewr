@@ -192,7 +192,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
-cargo bench -p viewr-core --bench core_hot_paths --no-run --locked
+cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --no-run --locked
 cargo build --workspace --release --locked
 ```
 
@@ -208,7 +208,7 @@ Run one repeated RAW benchmark:
 
 ```sh
 VIEWR_BENCH_RAW=/absolute/path/photo.ARW \
-  cargo bench -p viewr-core --bench core_hot_paths --locked -- raw_opt_in --noplot
+  cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- raw_opt_in --noplot
 ```
 
 ## Remaining work after the first campaign

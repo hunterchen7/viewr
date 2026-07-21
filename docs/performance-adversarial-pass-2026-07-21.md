@@ -257,7 +257,7 @@ complexity around image color math.
 ## Reproduce focused checks
 
 ```sh
-cargo bench -p viewr --bench filmstrip_scaling --locked -- --noplot
+cargo bench -p viewr --features benchmarks --bench filmstrip_scaling --locked -- --noplot
 cargo +nightly-2026-07-21 miri test -p viewr-core --lib resize::tests::rotate_ --locked
 cargo +nightly-2026-07-21 miri test -p viewr-core --lib \
   develop::tests::superpixel_output_initialization_is_valid_under_miri --locked

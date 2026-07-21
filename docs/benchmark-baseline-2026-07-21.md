@@ -14,7 +14,7 @@ It is a reference result, not a performance limit.
 Command:
 
 ```sh
-cargo bench -p viewr-core --bench core_hot_paths --locked -- --noplot
+cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- --noplot
 ```
 
 ## Representative estimates
