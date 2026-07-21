@@ -60,6 +60,6 @@ jobs:
         with:
           key: miri
       - name: Check pixel rotations
-        run: cargo miri test -p viewr-core --lib resize::tests::rotate_ --locked
+        run: cargo +nightly-2026-07-21 miri test -p viewr-core --lib resize::tests::rotate_ --locked
       - name: Check superpixel output initialization
-        run: cargo miri test -p viewr-core --lib develop::tests::superpixel_output_initialization_is_valid_under_miri --locked
+        run: cargo +nightly-2026-07-21 miri test -p viewr-core --lib develop::tests::superpixel_output_initialization_is_valid_under_miri --locked
