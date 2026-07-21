@@ -3,9 +3,9 @@
 //! Lightroom reads `xmp:Rating` (namespace `http://ns.adobe.com/xap/1.0/`)
 //! from `.xmp` sidecars on import. It writes scalar properties as
 //! ATTRIBUTES on `rdf:Description`; other tools (darktable) use the
-//! ELEMENT form. We read both and, when updating, rewrite only the
-//! rating token — every other byte of an existing sidecar passes through
-//! untouched, so Lightroom develop settings/keywords survive.
+//! ELEMENT form. We read both. Existing rating attributes use a byte-range
+//! splice so every non-value byte passes through untouched; element updates
+//! and new-property injection use the XML event fallback.
 
 use std::ops::Range;
 use std::path::Path;
@@ -27,6 +27,7 @@ pub enum XmpError {
 
 const XMP_NAMESPACE: &[u8] = b"http://ns.adobe.com/xap/1.0/";
 const XMP_NAMESPACE_STR: &str = "http://ns.adobe.com/xap/1.0/";
+const RDF_NAMESPACE: &[u8] = b"http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 
 fn is_xmp_rating(namespace: &ResolveResult<'_>, local_name: &[u8]) -> bool {
     local_name == b"Rating"
@@ -34,14 +35,18 @@ fn is_xmp_rating(namespace: &ResolveResult<'_>, local_name: &[u8]) -> bool {
 }
 
 fn is_xmp_namespace(namespace: &[u8]) -> bool {
-    if namespace == XMP_NAMESPACE {
+    is_namespace(namespace, XMP_NAMESPACE)
+}
+
+fn is_namespace(namespace: &[u8], expected: &[u8]) -> bool {
+    if namespace == expected {
         return true;
     }
     namespace.contains(&b'&')
         && std::str::from_utf8(namespace)
             .ok()
             .and_then(|namespace| quick_xml::escape::unescape(namespace).ok())
-            .is_some_and(|namespace| namespace.as_bytes() == XMP_NAMESPACE)
+            .is_some_and(|namespace| namespace.as_bytes() == expected)
 }
 
 fn is_xmp_rating_element(reader: &NsReader<&[u8]>, name: QName<'_>) -> bool {
@@ -60,8 +65,13 @@ fn is_xmp_rating_attribute(reader: &NsReader<&[u8]>, name: QName<'_>) -> bool {
     is_xmp_rating(&namespace, local_name.as_ref())
 }
 
-fn is_description(name: &[u8]) -> bool {
-    name == b"Description" || name.ends_with(b":Description")
+fn is_rdf_description(reader: &NsReader<&[u8]>, name: QName<'_>) -> bool {
+    if name.local_name().as_ref() != b"Description" {
+        return false;
+    }
+    let (namespace, local_name) = reader.resolve_element(name);
+    local_name.as_ref() == b"Description"
+        && matches!(namespace, ResolveResult::Bound(uri) if is_namespace(uri.as_ref(), RDF_NAMESPACE))
 }
 
 /// Read the rating from a sidecar (attribute or element form).
@@ -74,16 +84,25 @@ pub fn read_rating(path: &Path) -> Option<u8> {
 pub fn parse_rating(xml: &str) -> Option<u8> {
     let mut reader = NsReader::from_str(xml);
     reader.config_mut().trim_text(false);
-    let mut depth = 0usize;
+    let mut rating = None;
+    let mut element_stack: Vec<bool> = Vec::new();
     let mut captures: Vec<RatingCapture> = Vec::new();
     loop {
         match reader.read_event().ok()? {
-            Event::Eof => return None,
+            Event::Eof => {
+                if !element_stack.is_empty() || !captures.is_empty() {
+                    return None;
+                }
+                return rating;
+            }
             Event::Start(e) => {
-                let is_rating_element = is_xmp_rating_element(&reader, e.name());
-                if is_description(e.name().as_ref()) {
-                    if let Some(rating) = parse_rating_attribute(&reader, &e).ok()? {
-                        return Some(rating);
+                let depth = element_stack.len();
+                let is_description = is_rdf_description(&reader, e.name());
+                let is_rating_element = element_stack.last().copied().unwrap_or(false)
+                    && is_xmp_rating_element(&reader, e.name());
+                if is_description {
+                    if let Some(value) = parse_rating_attribute(&reader, &e).ok()? {
+                        rating.get_or_insert(value);
                     }
                 } else if !e.attributes_raw().is_empty() {
                     validate_attributes(&e).ok()?;
@@ -95,12 +114,13 @@ pub fn parse_rating(xml: &str) -> Option<u8> {
                         saw_cdata: false,
                     });
                 }
-                depth += 1;
+                element_stack.push(is_description);
             }
             Event::Empty(e) => {
-                if is_description(e.name().as_ref()) {
-                    if let Some(rating) = parse_rating_attribute(&reader, &e).ok()? {
-                        return Some(rating);
+                let is_description = is_rdf_description(&reader, e.name());
+                if is_description {
+                    if let Some(value) = parse_rating_attribute(&reader, &e).ok()? {
+                        rating.get_or_insert(value);
                     }
                 } else if !e.attributes_raw().is_empty() {
                     validate_attributes(&e).ok()?;
@@ -110,14 +130,14 @@ pub fn parse_rating(xml: &str) -> Option<u8> {
             }
             Event::Text(text) => {
                 if let Some(capture) = captures.last_mut()
-                    && depth == capture.depth + 1
+                    && element_stack.len() == capture.depth + 1
                 {
                     capture.content.push_str(&text.unescape().ok()?);
                 }
             }
             Event::CData(cdata) => {
                 if let Some(capture) = captures.last_mut()
-                    && depth == capture.depth + 1
+                    && element_stack.len() == capture.depth + 1
                 {
                     capture
                         .content
@@ -126,17 +146,18 @@ pub fn parse_rating(xml: &str) -> Option<u8> {
                 }
             }
             Event::End(e) => {
-                depth = depth.checked_sub(1)?;
+                let depth = element_stack.len().checked_sub(1)?;
                 if is_xmp_rating_element(&reader, e.name())
                     && captures
                         .last()
                         .is_some_and(|capture| capture.depth == depth)
                 {
                     let capture = captures.pop()?;
-                    if let Some(rating) = parse_rating_value(&capture.content) {
-                        return Some(rating);
+                    if let Some(value) = parse_rating_value(&capture.content) {
+                        rating.get_or_insert(value);
                     }
                 }
+                element_stack.pop()?;
             }
             _ => {}
         }
@@ -186,18 +207,16 @@ pub fn write_rating(path: &Path, rating: u8) -> Result<(), XmpError> {
     atomic_write::replace_durable(path, output.as_bytes()).map_err(Into::into)
 }
 
-/// Rewrite only the xmp:Rating token inside existing sidecar XML.
+/// Update the semantic xmp:Rating property inside existing sidecar XML.
 pub fn update_rating_xml(xml: &str, rating: u8) -> Result<String, XmpError> {
-    if xml.contains(":Rating=")
-        && let Some(updated) = update_rating_attributes(xml, rating)?
-    {
+    if let Some(updated) = update_rating_attributes(xml, rating)? {
         return Ok(updated);
     }
 
     update_rating_xml_fallback(xml, rating)
 }
 
-/// Validate the complete document and replace existing rating attribute values
+/// Scan the complete document and replace existing rating attribute values
 /// without owning and rewriting every XML event. Returns `None` when an XMP
 /// rating element is also present or no semantic rating attribute was found;
 /// those less common shapes use the general event-rewrite path below.
@@ -205,7 +224,7 @@ fn update_rating_attributes(xml: &str, rating: u8) -> Result<Option<String>, Xmp
     let mut reader = NsReader::from_str(xml);
     reader.config_mut().trim_text(false);
     let mut ranges = Vec::new();
-    let mut depth = 0usize;
+    let mut element_stack: Vec<bool> = Vec::new();
     let mut saw_rating_element = false;
 
     loop {
@@ -215,32 +234,36 @@ fn update_rating_attributes(xml: &str, rating: u8) -> Result<Option<String>, Xmp
         {
             Event::Eof => break,
             Event::Start(e) => {
-                saw_rating_element |= is_xmp_rating_element(&reader, e.name());
-                if is_description(e.name().as_ref()) {
+                let is_description = is_rdf_description(&reader, e.name());
+                saw_rating_element |= element_stack.last().copied().unwrap_or(false)
+                    && is_xmp_rating_element(&reader, e.name());
+                if is_description {
                     collect_rating_attribute_ranges(&reader, &e, xml, &mut ranges)?;
                 } else {
                     validate_attributes(&e)?;
                 }
-                depth += 1;
+                element_stack.push(is_description);
             }
             Event::Empty(e) => {
-                saw_rating_element |= is_xmp_rating_element(&reader, e.name());
-                if is_description(e.name().as_ref()) {
+                let is_description = is_rdf_description(&reader, e.name());
+                saw_rating_element |= element_stack.last().copied().unwrap_or(false)
+                    && is_xmp_rating_element(&reader, e.name());
+                if is_description {
                     collect_rating_attribute_ranges(&reader, &e, xml, &mut ranges)?;
                 } else {
                     validate_attributes(&e)?;
                 }
             }
             Event::End(_) => {
-                depth = depth
-                    .checked_sub(1)
+                element_stack
+                    .pop()
                     .ok_or_else(|| XmpError::Xml("unexpected closing element".into()))?;
             }
             _ => {}
         }
     }
 
-    if depth != 0 {
+    if !element_stack.is_empty() {
         return Err(XmpError::Xml("unexpected end of document".into()));
     }
 
@@ -313,7 +336,7 @@ fn update_rating_xml_fallback(xml: &str, rating: u8) -> Result<String, XmpError>
     reader.config_mut().trim_text(false);
     let mut writer = Writer::new(Vec::new());
     let mut wrote = false;
-    let mut depth = 0usize;
+    let mut element_stack: Vec<bool> = Vec::new();
     let mut rating_elements: Vec<RatingCapture> = Vec::new();
     let mut injection: Option<InjectionTarget> = None;
     let mut events: Vec<Event<'static>> = Vec::new();
@@ -325,9 +348,11 @@ fn update_rating_xml_fallback(xml: &str, rating: u8) -> Result<String, XmpError>
         {
             Event::Eof => break,
             Event::Start(e) => {
-                let is_desc = is_description(e.name().as_ref());
-                let is_rating = is_xmp_rating_element(&reader, e.name());
-                let rewritten = if is_desc {
+                let depth = element_stack.len();
+                let is_description = is_rdf_description(&reader, e.name());
+                let is_rating = element_stack.last().copied().unwrap_or(false)
+                    && is_xmp_rating_element(&reader, e.name());
+                let rewritten = if is_description {
                     if injection.is_none() {
                         injection = Some(injection_target(&reader, events.len()));
                     }
@@ -345,12 +370,13 @@ fn update_rating_xml_fallback(xml: &str, rating: u8) -> Result<String, XmpError>
                         saw_cdata: false,
                     });
                 }
-                depth += 1;
+                element_stack.push(is_description);
             }
             Event::Empty(e) => {
-                let is_desc = is_description(e.name().as_ref());
-                let is_rating = is_xmp_rating_element(&reader, e.name());
-                let rewritten = if is_desc {
+                let is_description = is_rdf_description(&reader, e.name());
+                let is_rating = element_stack.last().copied().unwrap_or(false)
+                    && is_xmp_rating_element(&reader, e.name());
+                let rewritten = if is_description {
                     if injection.is_none() {
                         injection = Some(injection_target(&reader, events.len()));
                     }
@@ -373,12 +399,12 @@ fn update_rating_xml_fallback(xml: &str, rating: u8) -> Result<String, XmpError>
                 }
             }
             Event::Text(text) => {
-                if !is_direct_rating_content(&rating_elements, depth) {
+                if !is_direct_rating_content(&rating_elements, element_stack.len()) {
                     events.push(Event::Text(text.into_owned()));
                 }
             }
             Event::CData(cdata) => {
-                if is_direct_rating_content(&rating_elements, depth) {
+                if is_direct_rating_content(&rating_elements, element_stack.len()) {
                     if let Some(capture) = rating_elements.last_mut() {
                         capture.saw_cdata = true;
                     }
@@ -387,7 +413,8 @@ fn update_rating_xml_fallback(xml: &str, rating: u8) -> Result<String, XmpError>
                 }
             }
             Event::End(e) => {
-                depth = depth
+                let depth = element_stack
+                    .len()
                     .checked_sub(1)
                     .ok_or_else(|| XmpError::Xml("unexpected closing element".into()))?;
                 if is_xmp_rating_element(&reader, e.name())
@@ -406,16 +433,17 @@ fn update_rating_xml_fallback(xml: &str, rating: u8) -> Result<String, XmpError>
                     }
                 }
                 events.push(Event::End(e.into_owned()));
+                element_stack.pop();
             }
             other => events.push(other.into_owned()),
         }
     }
 
-    if depth != 0 {
+    if !element_stack.is_empty() {
         return Err(XmpError::Xml("unexpected end of document".into()));
     }
 
-    // Neither form present: inject the attribute onto the first Description.
+    // Neither form present: inject the attribute onto the first RDF Description.
     if !wrote && let Some(target) = injection {
         let (Event::Start(e) | Event::Empty(e)) = events[target.position].clone() else {
             unreachable!()
@@ -613,7 +641,8 @@ mod tests {
 
     #[test]
     fn namespace_scopes_shadow_and_restore_rating_aliases() {
-        let xml = r#"<root xmlns:p="http://ns.adobe.com/xap/1.0/">
+        let xml = r#"<root xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+            xmlns:p="http://ns.adobe.com/xap/1.0/">
             <group xmlns:p="urn:not-xmp">
                 <rdf:Description p:Rating="5"/>
             </group>
@@ -627,25 +656,42 @@ mod tests {
     }
 
     #[test]
-    fn default_namespace_applies_to_elements_but_not_attributes() {
-        let attribute = r#"<Description xmlns="http://ns.adobe.com/xap/1.0/" Rating="4"/>"#;
-        let element = r#"<Rating xmlns="http://ns.adobe.com/xap/1.0/">4</Rating>"#;
+    fn default_rdf_namespace_is_recognized_but_does_not_bind_attributes() {
+        let attribute = r#"<Description
+            xmlns="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+            xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+            xmp:Rating="4"/>"#;
+        let element = r#"<Description
+            xmlns="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+            xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+            <xmp:Rating>4</xmp:Rating>
+        </Description>"#;
+        let unqualified_attribute = r#"<Description
+            xmlns="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+            Rating="4"/>"#;
 
-        assert_eq!(parse_rating(attribute), None);
+        assert_eq!(parse_rating(attribute), Some(4));
         assert_eq!(parse_rating(element), Some(4));
+        assert_eq!(parse_rating(unqualified_attribute), None);
+        assert_eq!(
+            parse_rating(&update_rating_xml(attribute, 2).unwrap()),
+            Some(2)
+        );
         assert_eq!(
             parse_rating(&update_rating_xml(element, 2).unwrap()),
             Some(2)
         );
 
-        let injected = update_rating_xml(attribute, 3).unwrap();
+        let injected = update_rating_xml(unqualified_attribute, 3).unwrap();
         assert!(injected.contains(r#"Rating="4""#));
         assert_eq!(parse_rating(&injected), Some(3));
     }
 
     #[test]
     fn undeclared_rating_prefix_is_not_xmp() {
-        let xml = r#"<rdf:Description unknown:Rating="4"/>"#;
+        let xml = r#"<rdf:Description
+            xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+            unknown:Rating="4"/>"#;
 
         assert_eq!(parse_rating(xml), None);
         let updated = update_rating_xml(xml, 2).unwrap();
@@ -656,6 +702,7 @@ mod tests {
     #[test]
     fn escaped_namespace_uri_still_resolves_to_xmp() {
         let xml = r#"<rdf:Description
+            xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
             xmlns:p="http://ns.adobe.com/xap/1.&#48;/"
             p:Rating="4"/>"#;
 
@@ -667,15 +714,22 @@ mod tests {
 
     #[test]
     fn malformed_non_description_and_invalid_namespace_bindings_fail_closed() {
-        let malformed = r#"<root broken><rdf:Description
+        let malformed = r#"<root broken
+            xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description
             xmlns:p="http://ns.adobe.com/xap/1.0/" p:Rating="4"/></root>"#;
-        let duplicate_namespace = r#"<root xmlns:p="urn:one" xmlns:p="urn:two">
+        let duplicate_namespace = r#"<root
+            xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+            xmlns:p="urn:one" xmlns:p="urn:two">
             <rdf:Description xmlns:x="http://ns.adobe.com/xap/1.0/" x:Rating="4"/>
         </root>"#;
-        let invalid_xml_binding = r#"<root xmlns:xml="urn:not-xml">
+        let invalid_xml_binding = r#"<root
+            xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+            xmlns:xml="urn:not-xml">
             <rdf:Description xmlns:x="http://ns.adobe.com/xap/1.0/" x:Rating="4"/>
         </root>"#;
-        let invalid_xmlns_binding = r#"<root xmlns:xmlns="urn:not-xmlns">
+        let invalid_xmlns_binding = r#"<root
+            xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+            xmlns:xmlns="urn:not-xmlns">
             <rdf:Description xmlns:x="http://ns.adobe.com/xap/1.0/" x:Rating="4"/>
         </root>"#;
 
@@ -688,6 +742,62 @@ mod tests {
             assert_eq!(parse_rating(xml), None);
             assert!(matches!(update_rating_xml(xml, 2), Err(XmpError::Xml(_))));
         }
+    }
+
+    #[test]
+    fn parse_validates_the_document_tail_before_returning_a_rating() {
+        let truncated = r#"<root
+            xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+            xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+            <rdf:Description xmp:Rating="2"/><broken>"#;
+        let mismatched = r#"<root
+            xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+            xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+            <rdf:Description xmp:Rating="2"></root>"#;
+
+        for xml in [truncated, mismatched] {
+            assert_eq!(parse_rating(xml), None);
+            assert!(matches!(update_rating_xml(xml, 4), Err(XmpError::Xml(_))));
+        }
+    }
+
+    #[test]
+    fn non_rdf_description_is_not_a_rating_subject() {
+        let xml = r#"<root
+            xmlns:fake="urn:not-rdf"
+            xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+            <fake:Description xmp:Rating="2" keep="yes"/>
+        </root>"#;
+
+        assert_eq!(parse_rating(xml), None);
+        assert_eq!(update_rating_xml(xml, 4).unwrap(), xml);
+    }
+
+    #[test]
+    fn rating_elements_must_be_direct_rdf_description_properties() {
+        let xml = r#"<root
+            xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+            xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+            <xmp:Rating>1</xmp:Rating>
+            <rdf:Description>
+                <wrapper><xmp:Rating>2</xmp:Rating></wrapper>
+            </rdf:Description>
+        </root>"#;
+
+        assert_eq!(parse_rating(xml), None);
+        let updated = update_rating_xml(xml, 4).unwrap();
+        assert!(updated.contains("<xmp:Rating>1</xmp:Rating>"));
+        assert!(updated.contains("<wrapper><xmp:Rating>2</xmp:Rating></wrapper>"));
+        assert_eq!(parse_rating(&updated), Some(4));
+    }
+
+    #[test]
+    fn spaced_single_quoted_rating_splice_preserves_every_other_byte() {
+        let xml = r#"<rdf:Description  xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'  xmlns:xmp='http://ns.adobe.com/xap/1.0/'  xmp:Rating = '2'  keep = 'A&amp;B'/>"#;
+        let expected = r#"<rdf:Description  xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'  xmlns:xmp='http://ns.adobe.com/xap/1.0/'  xmp:Rating = '5'  keep = 'A&amp;B'/>"#;
+
+        assert_eq!(update_rating_xml(xml, 5).unwrap(), expected);
+        assert_eq!(parse_rating(expected), Some(5));
     }
 
     #[test]
@@ -842,10 +952,13 @@ mod tests {
 
     #[test]
     fn update_rejects_truncated_attribute_and_element_documents() {
-        let attribute = r#"<root><rdf:Description
+        let attribute = r#"<root
+            xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description
             xmlns:p="http://ns.adobe.com/xap/1.0/" p:Rating="2">"#;
-        let element = r#"<root xmlns:p="http://ns.adobe.com/xap/1.0/">
-            <p:Rating>2"#;
+        let element = r#"<root
+            xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+            xmlns:p="http://ns.adobe.com/xap/1.0/">
+            <rdf:Description><p:Rating>2"#;
 
         assert!(matches!(
             update_rating_xml(attribute, 4),
