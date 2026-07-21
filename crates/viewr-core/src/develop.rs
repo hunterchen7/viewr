@@ -311,30 +311,39 @@ fn superpixel_demosaic(
     let mut output = Vec::<[f32; 3]>::with_capacity(out_len);
     {
         let spare = &mut output.spare_capacity_mut()[..out_len];
+        let fill_row = |out_y: usize, out_row: &mut [std::mem::MaybeUninit<[f32; 3]>]| {
+            let top_start = (roi.y() + out_y * 2) * mosaic.width + roi.x();
+            let bottom_start = top_start + mosaic.width;
+            let top = &mosaic.data[top_start..top_start + out_width * 2];
+            let bottom = &mosaic.data[bottom_start..bottom_start + out_width * 2];
+
+            for (out, (top_pair, bottom_pair)) in out_row
+                .iter_mut()
+                .zip(top.chunks_exact(2).zip(bottom.chunks_exact(2)))
+            {
+                let values = [top_pair[0], top_pair[1], bottom_pair[0], bottom_pair[1]];
+                out.write([
+                    values[red],
+                    (values[green_a] + values[green_b]) / 2.0,
+                    values[blue],
+                ]);
+            }
+        };
+        #[cfg(not(miri))]
         spare
             .par_chunks_exact_mut(out_width)
             .enumerate()
-            .for_each(|(out_y, out_row)| {
-                let top_start = (roi.y() + out_y * 2) * mosaic.width + roi.x();
-                let bottom_start = top_start + mosaic.width;
-                let top = &mosaic.data[top_start..top_start + out_width * 2];
-                let bottom = &mosaic.data[bottom_start..bottom_start + out_width * 2];
-
-                for (out, (top_pair, bottom_pair)) in out_row
-                    .iter_mut()
-                    .zip(top.chunks_exact(2).zip(bottom.chunks_exact(2)))
-                {
-                    let values = [top_pair[0], top_pair[1], bottom_pair[0], bottom_pair[1]];
-                    out.write([
-                        values[red],
-                        (values[green_a] + values[green_b]) / 2.0,
-                        values[blue],
-                    ]);
-                }
-            });
+            .for_each(|(out_y, out_row)| fill_row(out_y, out_row));
+        // Miri cannot execute Rayon's Crossbeam deque under its pointer model.
+        // A serial traversal validates the identical initialization contract.
+        #[cfg(miri)]
+        spare
+            .chunks_exact_mut(out_width)
+            .enumerate()
+            .for_each(|(out_y, out_row)| fill_row(out_y, out_row));
     }
 
-    // Every spare slot is initialized exactly once by the parallel loop above.
+    // Every spare slot is initialized exactly once by the traversal above.
     unsafe { output.set_len(out_len) };
     Color2D::new_with(output, out_width, out_height)
 }
@@ -455,6 +464,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "the rawler reference path uses Rayon")]
     fn direct_superpixel_matches_rawler_for_all_bayer_patterns_and_offset_roi() {
         let width = 14;
         let height = 12;
@@ -476,6 +486,29 @@ mod tests {
             assert_eq!(actual.height, expected.height, "{pattern} height");
             assert_eq!(actual.data, expected.data, "{pattern} pixels");
         }
+    }
+
+    #[cfg(miri)]
+    #[test]
+    fn superpixel_output_initialization_is_valid_under_miri() {
+        let mosaic = PixF32::new_with((0..16).map(|value| value as f32).collect(), 4, 4);
+        let actual = super::superpixel_demosaic(
+            &mosaic,
+            &CFA::new("RGGB"),
+            &PlaneColor::new("RGB"),
+            mosaic.rect(),
+        );
+
+        assert_eq!((actual.width, actual.height), (2, 2));
+        assert_eq!(
+            actual.data,
+            vec![
+                [0.0, 2.5, 5.0],
+                [2.0, 4.5, 7.0],
+                [8.0, 10.5, 13.0],
+                [10.0, 12.5, 15.0],
+            ]
+        );
     }
 
     #[test]
