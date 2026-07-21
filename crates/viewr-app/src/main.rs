@@ -4,6 +4,7 @@ mod config;
 mod filmstrip;
 mod loupe;
 mod settings;
+mod texture_lru;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;

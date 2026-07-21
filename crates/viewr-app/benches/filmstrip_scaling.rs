@@ -7,6 +7,9 @@ use eframe::egui;
 #[allow(dead_code, unused_imports)]
 #[path = "../src/filmstrip.rs"]
 mod filmstrip;
+#[allow(dead_code, unused_imports)]
+#[path = "../src/texture_lru.rs"]
+mod texture_lru;
 
 const SCREEN: egui::Vec2 = egui::vec2(1_500.0, 300.0);
 const CELL: egui::Vec2 = egui::vec2(140.0, 220.0);
@@ -108,5 +111,21 @@ fn bench_filmstrip_scaling(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_filmstrip_scaling);
+fn bench_thumbnail_lru(c: &mut Criterion) {
+    // 256 MiB holds roughly 773 360x241 RGBA corpus thumbnails. Exercise a
+    // deliberately wide 200-item grid viewport against a full resident set.
+    let mut cache = texture_lru::ByteLru::new(773);
+    for index in 0..773 {
+        assert!(cache.insert(index, index, 1));
+    }
+    c.bench_function("thumbnail_lru/touch_200_of_773", |b| {
+        b.iter(|| {
+            for index in 300..500 {
+                black_box(cache.touch(index));
+            }
+        });
+    });
+}
+
+criterion_group!(benches, bench_filmstrip_scaling, bench_thumbnail_lru);
 criterion_main!(benches);

@@ -123,6 +123,8 @@ impl CancelToken {
 struct QueuedState {
     epoch: u64,
     action: Action,
+    class: u8,
+    eff_dist: u32,
 }
 
 struct InFlight {
@@ -312,12 +314,14 @@ impl JobQueue {
         // index. This avoids a temporary HashSet on every navigation.
         state.queued.clear();
         state.queued.reserve(plan.len());
-        for (id, _, _, action) in &plan {
+        for (id, class, eff_dist, action) in &plan {
             state.queued.insert(
                 *id,
                 QueuedState {
                     epoch,
                     action: *action,
+                    class: *class,
+                    eff_dist: *eff_dist,
                 },
             );
         }
@@ -381,7 +385,15 @@ impl JobQueue {
                 eff_dist,
                 seq: state.seq,
             };
-            state.queued.insert(id, QueuedState { epoch, action });
+            state.queued.insert(
+                id,
+                QueuedState {
+                    epoch,
+                    action,
+                    class,
+                    eff_dist,
+                },
+            );
             state.heap.push(QueuedJob {
                 prio,
                 epoch,
@@ -391,6 +403,54 @@ impl JobQueue {
         }
         drop(state);
         self.cond.notify_all();
+    }
+
+    /// Insert or reprioritize one interactive request without rebuilding the
+    /// rest of the queue. A live matching job is reused; stale heap entries are
+    /// made inert by giving the replacement a unique epoch.
+    fn prioritize(&self, id: JobId, class: u8, eff_dist: u32, action: Action) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.closed {
+            return false;
+        }
+        if let Some(running) = state.in_flight.get(&id) {
+            if running.action == action && !running.token.cancelled() {
+                return true;
+            }
+            running.token.cancel();
+        }
+        if state.queued.get(&id).is_some_and(|queued| {
+            queued.action == action && (queued.class, queued.eff_dist) <= (class, eff_dist)
+        }) {
+            return true;
+        }
+
+        state.epoch += 1;
+        let epoch = state.epoch;
+        state.seq += 1;
+        let prio = Prio {
+            class,
+            eff_dist,
+            seq: state.seq,
+        };
+        state.queued.insert(
+            id,
+            QueuedState {
+                epoch,
+                action,
+                class,
+                eff_dist,
+            },
+        );
+        state.heap.push(QueuedJob {
+            prio,
+            epoch,
+            id,
+            action,
+        });
+        drop(state);
+        self.cond.notify_one();
+        true
     }
 
     /// Block until a valid job is available (or shutdown).
@@ -631,6 +691,20 @@ impl Engine {
     /// Call `navigate` afterwards to apply.
     pub fn set_sequence(&self, sequence: Vec<usize>) {
         *self.shared.sequence.lock().unwrap() = sequence;
+    }
+
+    /// Re-request a viewport thumbnail whose byte-bounded RAM copy was evicted.
+    /// Existing queued or live work is deduplicated and promoted ahead of the
+    /// folder-wide metadata wave.
+    pub fn request_thumbnail(&self, index: usize) -> bool {
+        if index >= self.shared.entries.len() {
+            return false;
+        }
+        let id = (index, Tier::Thumb);
+        if self.shared.cache.has_rgba(id) {
+            return true;
+        }
+        self.shared.light.prioritize(id, 0, 0, Action::Thumb)
     }
 
     pub fn cache(&self) -> &Arc<RamCache> {
@@ -1060,6 +1134,51 @@ mod tests {
                 state.queued.is_empty()
             }
         );
+    }
+
+    #[test]
+    fn interactive_request_reprioritizes_a_queued_thumbnail_without_duplication() {
+        let q = JobQueue::new();
+        let requested = (9, Tier::Thumb);
+        let other = (1, Tier::Thumb);
+        q.extend([job(requested, 5, 100), job(other, 5, 1)]);
+
+        assert!(q.prioritize(requested, 0, 0, Action::Thumb));
+        let heap_len_after_promotion = q.state.lock().unwrap().heap.len();
+        assert!(q.prioritize(requested, 0, 0, Action::Thumb));
+        assert_eq!(q.state.lock().unwrap().heap.len(), heap_len_after_promotion);
+        let (first, _, first_token) = q.pop().unwrap();
+        assert_eq!(first, requested);
+        q.finish(first, &first_token);
+
+        let (second, _, second_token) = q.pop().unwrap();
+        assert_eq!(second, other);
+        q.finish(second, &second_token);
+
+        let state = q.state.lock().unwrap();
+        assert!(state.queued.is_empty());
+        assert!(state.heap.iter().all(|job| job.id == requested));
+    }
+
+    #[test]
+    fn interactive_request_reuses_a_live_thumbnail_job() {
+        let q = JobQueue::new();
+        let id = (7, Tier::Thumb);
+        q.extend([job(id, 5, 10)]);
+        let (_, _, live_token) = q.pop().unwrap();
+
+        assert!(q.prioritize(id, 0, 0, Action::Thumb));
+        let state = q.state.lock().unwrap();
+        assert!(!live_token.cancelled());
+        assert!(!state.queued.contains_key(&id));
+        assert!(state.heap.is_empty());
+    }
+
+    #[test]
+    fn interactive_request_is_rejected_after_queue_shutdown() {
+        let q = JobQueue::new();
+        q.close();
+        assert!(!q.prioritize((0, Tier::Thumb), 0, 0, Action::Thumb));
     }
 
     #[test]

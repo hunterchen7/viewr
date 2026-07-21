@@ -6,11 +6,11 @@
 //! Refiltering applies lazily on navigation so rating an image below the
 //! threshold doesn't yank it out from under the cursor.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use eframe::egui::{self, vec2};
@@ -27,8 +27,16 @@ use crate::config::{Action, Config, ScrollMode};
 use crate::filmstrip;
 use crate::loupe::{self, Zoom};
 use crate::settings::SettingsState;
+use crate::texture_lru::ByteLru;
 
 const THUMB_BUDGET: u64 = 384 * 1024 * 1024;
+/// Logical RGBA bytes retained by thumbnail texture handles. Actual backend
+/// allocation can be slightly higher, but remains proportional to this cap.
+const THUMB_TEXTURE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+const THUMB_UPLOADS_PER_FRAME: usize = 8;
+const THUMB_REQUEST_POLL_AFTER: Duration = Duration::from_millis(16);
+const THUMB_REQUEST_STALE_AFTER: Duration = Duration::from_millis(500);
+const THUMB_FAILURE_RETRY_AFTER: Duration = Duration::from_secs(2);
 
 pub fn run(dir: &Path, select: Option<&Path>) -> Result<()> {
     let options = eframe::NativeOptions {
@@ -137,7 +145,11 @@ struct Session {
     library: Library,
     ratings: HashMap<usize, u8>,
     metas: HashMap<usize, FileMeta>,
-    thumbs: HashMap<usize, egui::TextureHandle>,
+    thumbs: ByteLru<egui::TextureHandle>,
+    /// Demand requests are bounded to the current viewport and time out so a
+    /// publish/worker-finish race cannot leave an evicted thumbnail stuck.
+    thumb_requests: HashMap<usize, Instant>,
+    thumb_retry_after: HashMap<usize, Instant>,
     textures: HashMap<(usize, Tier), egui::TextureHandle>,
 }
 
@@ -222,7 +234,9 @@ impl App {
             library,
             ratings,
             metas: HashMap::new(),
-            thumbs: HashMap::new(),
+            thumbs: ByteLru::new(THUMB_TEXTURE_BUDGET_BYTES),
+            thumb_requests: HashMap::new(),
+            thumb_retry_after: HashMap::new(),
             textures: HashMap::new(),
         });
         self.current = start;
@@ -342,7 +356,6 @@ impl App {
     }
 
     fn drain_events(&mut self) {
-        let ctx = self.ctx.clone();
         let current = self.current;
         let Some(session) = &mut self.session else {
             return;
@@ -352,16 +365,11 @@ impl App {
         while let Ok(event) = session.events.try_recv() {
             match event {
                 Event::ThumbReady { index, meta } => {
-                    if let Some(buf) = session.cache.get_rgba((index, Tier::Thumb)) {
-                        session.thumbs.insert(
-                            index,
-                            ctx.load_texture(
-                                format!("thumb{index}"),
-                                to_color_image(&buf),
-                                egui::TextureOptions::LINEAR,
-                            ),
-                        );
-                    }
+                    // Pixels stay in the byte-bounded RAM ring until a visible
+                    // viewport asks to upload them. If they were already evicted,
+                    // the demand path below safely queues a replacement decode.
+                    session.thumb_requests.remove(&index);
+                    session.thumb_retry_after.remove(&index);
                     if let Some(embedded) = meta.rating
                         && embedded > 0
                         && !session.ratings.contains_key(&index)
@@ -374,7 +382,11 @@ impl App {
                 }
                 Event::ImageReady { .. } => replan = true,
                 Event::ImageFailed { index, tier, error } => {
-                    if index == current && tier != Tier::Thumb {
+                    if tier == Tier::Thumb && session.thumb_requests.remove(&index).is_some() {
+                        session
+                            .thumb_retry_after
+                            .insert(index, Instant::now() + THUMB_FAILURE_RETRY_AFTER);
+                    } else if index == current && tier != Tier::Thumb {
                         self.status = format!("error: {error}");
                     } else {
                         eprintln!("job failed {index}/{tier:?}: {error}");
@@ -385,6 +397,103 @@ impl App {
         self.filter_dirty |= filter_dirty;
         if replan {
             self.replan();
+        }
+    }
+
+    /// Upload only thumbnails demanded by the current viewport. The byte LRU
+    /// drops old `TextureHandle`s (and therefore their GPU allocations), while
+    /// the upload budget prevents a newly opened grid from monopolizing a frame.
+    fn manage_thumbnail_textures(&mut self, demanded_indices: &[usize]) {
+        let ctx = self.ctx.clone();
+        let now = Instant::now();
+        let demanded: HashSet<usize> = demanded_indices.iter().copied().collect();
+        let Some(session) = &mut self.session else {
+            return;
+        };
+
+        // Scrolling must not leave bookkeeping proportional to folder size.
+        session
+            .thumb_requests
+            .retain(|index, _| demanded.contains(index));
+        session
+            .thumb_retry_after
+            .retain(|index, _| demanded.contains(index));
+
+        let mut upload_budget = THUMB_UPLOADS_PER_FRAME;
+        let mut uploaded = false;
+        let mut next_wakeup = None;
+        let mut seen = HashSet::with_capacity(demanded_indices.len());
+        for &index in demanded_indices {
+            if index >= session.entries.len() || !seen.insert(index) {
+                continue;
+            }
+            if session.thumbs.touch(index) {
+                continue;
+            }
+
+            if let Some(buf) = session.cache.get_rgba((index, Tier::Thumb)) {
+                if upload_budget > 0 {
+                    let bytes = buf.byte_len();
+                    let texture = ctx.load_texture(
+                        format!("thumb{index}"),
+                        to_color_image(&buf),
+                        egui::TextureOptions::LINEAR,
+                    );
+                    if session.thumbs.insert(index, texture, bytes) {
+                        upload_budget -= 1;
+                        uploaded = true;
+                        session.thumb_requests.remove(&index);
+                        session.thumb_retry_after.remove(&index);
+                    }
+                }
+                // The pixels are available and will be uploaded in a later
+                // frame if this frame's upload allowance is exhausted.
+                continue;
+            }
+
+            if let Some(retry_after) = session.thumb_retry_after.get(&index)
+                && now < *retry_after
+            {
+                let delay = retry_after.saturating_duration_since(now);
+                next_wakeup =
+                    Some(next_wakeup.map_or(delay, |current: Duration| current.min(delay)));
+                continue;
+            }
+            session.thumb_retry_after.remove(&index);
+
+            let request_is_stale = match session.thumb_requests.get(&index) {
+                Some(requested) => {
+                    let elapsed = now.duration_since(*requested);
+                    if elapsed < THUMB_REQUEST_STALE_AFTER {
+                        let delay = THUMB_REQUEST_STALE_AFTER - elapsed;
+                        next_wakeup =
+                            Some(next_wakeup.map_or(delay, |current: Duration| current.min(delay)));
+                        false
+                    } else {
+                        true
+                    }
+                }
+                None => true,
+            };
+            if request_is_stale && session.engine.request_thumbnail(index) {
+                session.thumb_requests.insert(index, now);
+                // Poll once to close the narrow race where pixels appeared
+                // between our cache probe and the engine's deduplicating probe.
+                next_wakeup = Some(next_wakeup.map_or(THUMB_REQUEST_POLL_AFTER, |current| {
+                    current.min(THUMB_REQUEST_POLL_AFTER)
+                }));
+            }
+        }
+
+        if uploaded {
+            // Uploads happen after the widgets are painted, so schedule the
+            // next frame that will actually display the new texture handles.
+            ctx.request_repaint();
+        }
+        if let Some(delay) = next_wakeup {
+            // Failure backoff and stale-request recovery must make progress
+            // even when no worker event or user input produces another frame.
+            ctx.request_repaint_after(delay);
         }
     }
 
@@ -787,6 +896,7 @@ impl App {
         let current = self.current;
         let scroll_to = self.scroll_to_current;
         let mut strip_height = None;
+        let mut demanded_thumbs = vec![current];
         if let Some(session) = &self.session {
             let inner = egui::Panel::bottom("filmstrip")
                 .resizable(true)
@@ -800,7 +910,9 @@ impl App {
                     let cell = vec2(thumb_h * 1.4, thumb_h + 18.0);
                     let spacing = ui.spacing().item_spacing.x;
                     let visible_pos = visible_position(&self.visible, current);
-                    let mut strip = egui::ScrollArea::horizontal().auto_shrink([false, false]);
+                    let mut strip = egui::ScrollArea::horizontal()
+                        .id_salt("filmstrip")
+                        .auto_shrink([false, false]);
                     if scroll_to {
                         strip = strip.horizontal_scroll_offset(filmstrip::centered_scroll_offset(
                             self.visible.len(),
@@ -820,6 +932,7 @@ impl App {
                             |columns_ui, range| {
                                 for visible_pos in range {
                                     let i = self.visible[visible_pos];
+                                    demanded_thumbs.push(i);
                                     let selected = i == current;
                                     let rating = session.ratings.get(&i).copied().unwrap_or(0);
                                     columns_ui.allocate_ui_with_layout(
@@ -884,6 +997,7 @@ impl App {
                 });
             strip_height = Some(inner.response.rect.height());
         }
+        self.manage_thumbnail_textures(&demanded_thumbs);
         // Persist a divider-drag once the mouse is released.
         if let Some(h) = strip_height
             && (h - self.config.filmstrip_height).abs() > 1.0
@@ -993,6 +1107,7 @@ impl App {
         let current = self.current;
         let scroll_to = self.scroll_to_current;
         let rect = ui.max_rect();
+        let mut demanded_thumbs = vec![current];
         if let Some(session) = &self.session {
             let rows = self.visible.len().div_ceil(cols);
             egui::ScrollArea::vertical()
@@ -1004,6 +1119,7 @@ impl App {
                                 let Some(&i) = self.visible.get(row * cols + col) else {
                                     break;
                                 };
+                                demanded_thumbs.push(i);
                                 let selected = i == current;
                                 let rating = session.ratings.get(&i).copied().unwrap_or(0);
                                 let tier_stroke = self.tier_stroke(session, i);
@@ -1012,13 +1128,16 @@ impl App {
                                     let response = match session.thumbs.get(&i) {
                                         Some(tex) => {
                                             let size = tex.size_vec2();
+                                            let padding = ui.spacing().button_padding * 2.0;
+                                            let inner = (cell - padding).max(vec2(1.0, 1.0));
                                             let scale =
-                                                (cell.x / size.x).min(cell.y / size.y).min(1.0);
-                                            ui.add(
-                                                egui::Button::image(egui::Image::new((
-                                                    tex.id(),
-                                                    size * scale,
-                                                )))
+                                                (inner.x / size.x).min(inner.y / size.y).min(1.0);
+                                            ui.add_sized(
+                                                cell,
+                                                egui::Button::new(
+                                                    egui::Image::new((tex.id(), size))
+                                                        .fit_to_exact_size(size * scale),
+                                                )
                                                 .selected(selected),
                                             )
                                         }
@@ -1061,6 +1180,7 @@ impl App {
                     }
                 });
         }
+        self.manage_thumbnail_textures(&demanded_thumbs);
         self.scroll_to_current = false;
         if let Some(i) = clicked {
             self.select(i);
