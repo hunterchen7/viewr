@@ -292,4 +292,34 @@ mod tests {
         let fresh = new_sidecar(4);
         assert_eq!(parse_rating(&fresh), Some(4));
     }
+
+    #[test]
+    fn file_update_preserves_develop_settings_and_replaces_rating() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.xmp");
+        std::fs::write(&path, LR_STYLE).unwrap();
+
+        write_rating(&path, 5).unwrap();
+
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(read_rating(&path), Some(5));
+        assert!(updated.contains(r#"crs:Exposure2012="+0.35""#));
+        assert!(updated.contains("<crs:ToneCurvePV2012>"));
+        assert!(updated.contains("<rdf:li>255, 255</rdf:li>"));
+        assert!(!path.with_extension("xmp.tmp").exists());
+    }
+
+    #[test]
+    fn malformed_sidecar_is_preserved_when_update_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.xmp");
+        let malformed = br#"<rdf:Description xmp:Rating="2"#;
+        std::fs::write(&path, malformed).unwrap();
+
+        let error = write_rating(&path, 4).unwrap_err();
+
+        assert!(matches!(error, XmpError::Xml(_)));
+        assert_eq!(std::fs::read(&path).unwrap(), malformed);
+        assert!(!path.with_extension("xmp.tmp").exists());
+    }
 }

@@ -617,6 +617,25 @@ pub fn decode_jpeg(bytes: &[u8]) -> Result<PixelBuf, String> {
 mod tests {
     use super::*;
 
+    fn patterned_buf(width: u32, height: u32) -> PixelBuf {
+        let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+        for y in 0..height {
+            for x in 0..width {
+                rgba.extend_from_slice(&[
+                    (x * 255 / width.max(1)) as u8,
+                    (y * 255 / height.max(1)) as u8,
+                    ((x + y) * 255 / (width + height).max(1)) as u8,
+                    255,
+                ]);
+            }
+        }
+        PixelBuf {
+            width,
+            height,
+            rgba,
+        }
+    }
+
     fn job(id: JobId, class: u8, dist: u32) -> (JobId, u8, u32, Action) {
         (id, class, dist, Action::Thumb)
     }
@@ -736,5 +755,76 @@ mod tests {
 
         q.finish(id, &replacement);
         assert!(!q.state.lock().unwrap().in_flight.contains_key(&id));
+    }
+
+    #[test]
+    fn equal_priority_jobs_are_fifo() {
+        let q = JobQueue::new();
+        let shutdown = AtomicBool::new(false);
+        q.set_plan(vec![
+            job((0, Tier::Browse), 1, 1),
+            job((1, Tier::Browse), 1, 1),
+            job((2, Tier::Browse), 1, 1),
+        ]);
+        assert_eq!(q.pop(&shutdown).unwrap().0.0, 0);
+        assert_eq!(q.pop(&shutdown).unwrap().0.0, 1);
+        assert_eq!(q.pop(&shutdown).unwrap().0.0, 2);
+    }
+
+    #[test]
+    fn cancel_token_is_monotonic_and_idempotent() {
+        let token = CancelToken::default();
+        assert!(!token.cancelled());
+        token.cancel();
+        token.cancel();
+        assert!(token.cancelled());
+    }
+
+    #[test]
+    fn jpeg_roundtrip_preserves_dimensions_alpha_and_visual_content() {
+        let source = patterned_buf(96, 64);
+        let encoded = encode_jpeg(&source, 90).unwrap();
+        assert!(!encoded.is_empty());
+        let decoded = decode_jpeg(&encoded).unwrap();
+        assert_eq!(
+            (decoded.width, decoded.height),
+            (source.width, source.height)
+        );
+        assert_eq!(decoded.rgba.len(), source.rgba.len());
+        assert!(decoded.rgba.chunks_exact(4).all(|pixel| pixel[3] == 255));
+
+        let total_error: u64 = source
+            .rgba
+            .chunks_exact(4)
+            .zip(decoded.rgba.chunks_exact(4))
+            .map(|(expected, actual)| {
+                (0..3)
+                    .map(|channel| expected[channel].abs_diff(actual[channel]) as u64)
+                    .sum::<u64>()
+            })
+            .sum();
+        let channel_count = source.width as u64 * source.height as u64 * 3;
+        assert!(
+            total_error / channel_count < 5,
+            "mean channel error was {}",
+            total_error / channel_count
+        );
+    }
+
+    #[test]
+    fn jpeg_codec_rejects_invalid_inputs() {
+        assert!(decode_jpeg(b"not a jpeg").is_err());
+        let malformed = PixelBuf {
+            width: 2,
+            height: 2,
+            rgba: vec![0; 15],
+        };
+        assert!(encode_jpeg(&malformed, 90).is_err());
+        let too_wide = PixelBuf {
+            width: u16::MAX as u32 + 1,
+            height: 1,
+            rgba: Vec::new(),
+        };
+        assert!(encode_jpeg(&too_wide, 90).is_err());
     }
 }

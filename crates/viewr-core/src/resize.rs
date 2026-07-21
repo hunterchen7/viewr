@@ -100,6 +100,21 @@ mod tests {
         }
     }
 
+    fn labelled(width: u32, height: u32) -> PixelBuf {
+        let rgba = (1..=width * height)
+            .flat_map(|value| [value as u8, value as u8, value as u8, 255])
+            .collect();
+        PixelBuf {
+            width,
+            height,
+            rgba,
+        }
+    }
+
+    fn labels(buf: &PixelBuf) -> Vec<u8> {
+        buf.rgba.chunks_exact(4).map(|pixel| pixel[0]).collect()
+    }
+
     #[test]
     fn rotate_90_cw() {
         // 2x1: [A B] → 1x2: [A] over [B]? For 90 CW, top row becomes right
@@ -122,5 +137,74 @@ mod tests {
         let out = apply_orient(pix(&[1, 1, 1, 1, 2, 2, 2, 2]), Orient::R180);
         assert_eq!((out.width, out.height), (2, 1));
         assert_eq!(&out.rgba, &[2, 2, 2, 2, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn rectangular_rotations_have_expected_layout() {
+        let source = labelled(3, 2); // [1 2 3] / [4 5 6]
+
+        let r90 = apply_orient(source.clone(), Orient::R90);
+        assert_eq!((r90.width, r90.height), (2, 3));
+        assert_eq!(labels(&r90), vec![4, 1, 5, 2, 6, 3]);
+
+        let r180 = apply_orient(source.clone(), Orient::R180);
+        assert_eq!((r180.width, r180.height), (3, 2));
+        assert_eq!(labels(&r180), vec![6, 5, 4, 3, 2, 1]);
+
+        let r270 = apply_orient(source, Orient::R270);
+        assert_eq!((r270.width, r270.height), (2, 3));
+        assert_eq!(labels(&r270), vec![3, 6, 2, 5, 1, 4]);
+    }
+
+    #[test]
+    fn inverse_and_full_turn_rotations_restore_every_pixel() {
+        for width in 1..=7 {
+            for height in 1..=7 {
+                let source = labelled(width, height);
+                let restored =
+                    apply_orient(apply_orient(source.clone(), Orient::R90), Orient::R270);
+                assert_eq!((restored.width, restored.height), (width, height));
+                assert_eq!(restored.rgba, source.rgba);
+
+                let mut full_turn = source.clone();
+                for _ in 0..4 {
+                    full_turn = apply_orient(full_turn, Orient::R90);
+                }
+                assert_eq!((full_turn.width, full_turn.height), (width, height));
+                assert_eq!(full_turn.rgba, source.rgba);
+            }
+        }
+    }
+
+    #[test]
+    fn no_op_orientation_and_downscale_preserve_input() {
+        let source = labelled(20, 10);
+        let oriented = apply_orient(source.clone(), Orient::R0);
+        assert_eq!(oriented.rgba, source.rgba);
+
+        let fitted = downscale_to_fit(source.clone(), 20).unwrap();
+        assert_eq!((fitted.width, fitted.height), (20, 10));
+        assert_eq!(fitted.rgba, source.rgba);
+    }
+
+    #[test]
+    fn downscale_preserves_aspect_and_storage_invariants() {
+        let fitted = downscale_to_fit(labelled(40, 20), 13).unwrap();
+        assert_eq!((fitted.width, fitted.height), (13, 7));
+        assert_eq!(fitted.rgba.len(), 13 * 7 * 4);
+
+        let portrait = downscale_to_fit(labelled(20, 40), 13).unwrap();
+        assert_eq!((portrait.width, portrait.height), (7, 13));
+        assert_eq!(portrait.rgba.len(), 7 * 13 * 4);
+    }
+
+    #[test]
+    fn resize_rejects_malformed_pixel_storage() {
+        let malformed = PixelBuf {
+            width: 2,
+            height: 2,
+            rgba: vec![0; 15],
+        };
+        assert!(resize_exact(malformed, 1, 1).is_err());
     }
 }

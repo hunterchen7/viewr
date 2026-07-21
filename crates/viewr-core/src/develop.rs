@@ -186,7 +186,8 @@ fn base_curve(v: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::base_curve;
+    use super::{DevelopTimings, base_curve, total};
+    use std::time::Duration;
 
     #[test]
     fn base_curve_is_monotonic_and_anchored() {
@@ -200,6 +201,26 @@ mod tests {
             let v = base_curve(i as f32 / 100.0);
             assert!(v >= prev);
             prev = v;
+        }
+    }
+
+    #[test]
+    fn total_includes_every_reported_develop_stage() {
+        let timings = DevelopTimings {
+            rescale: Duration::from_millis(1),
+            demosaic: Duration::from_millis(2),
+            calibrate: Duration::from_millis(3),
+            gamma_pack: Duration::from_millis(4),
+        };
+        assert_eq!(total(&timings), Duration::from_millis(10));
+    }
+
+    #[test]
+    fn base_curve_stays_in_display_range_for_dense_samples() {
+        for step in 0..=10_000 {
+            let input = step as f32 / 10_000.0;
+            let output = base_curve(input);
+            assert!((0.0..=1.0).contains(&output));
         }
     }
 }

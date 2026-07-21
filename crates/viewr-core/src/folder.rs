@@ -93,7 +93,45 @@ pub fn outward_order(len: usize, start: usize) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::outward_order;
+    use super::{outward_order, scan};
+
+    #[test]
+    fn scan_finds_supported_files_with_sorted_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("C003.ArW"), b"ccc").unwrap();
+        std::fs::write(dir.path().join("A001.DNG"), b"a").unwrap();
+        std::fs::write(dir.path().join("B002.arw"), b"bb").unwrap();
+
+        // Unsupported files, hidden files, AppleDouble files, and directories
+        // that merely have a raw extension must not enter the scan.
+        std::fs::write(dir.path().join("notes.txt"), b"not a raw").unwrap();
+        std::fs::write(dir.path().join(".hidden.ARW"), b"hidden").unwrap();
+        std::fs::write(dir.path().join("._A001.ARW"), b"metadata").unwrap();
+        std::fs::create_dir(dir.path().join("nested.dng")).unwrap();
+
+        let entries = scan(dir.path()).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.file_name.as_str())
+                .collect::<Vec<_>>(),
+            ["A001.DNG", "B002.arw", "C003.ArW"]
+        );
+        assert_eq!(
+            entries.iter().map(|entry| entry.size).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert!(entries.iter().all(|entry| entry.mtime_ns > 0));
+        assert_eq!(entries[0].path, dir.path().join("A001.DNG"));
+        assert_eq!(entries[0].sidecar_path(), dir.path().join("A001.xmp"));
+    }
+
+    #[test]
+    fn scan_reports_a_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = scan(&dir.path().join("missing")).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
 
     #[test]
     fn outward_is_forward_biased() {

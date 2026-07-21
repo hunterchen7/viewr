@@ -222,6 +222,61 @@ mod tests {
         }
     }
 
+    fn sidecar_mtime(entry: &FolderEntry) -> i64 {
+        std::fs::metadata(entry.sidecar_path())
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64
+    }
+
+    fn put_db_rating(db: &Db, entry: &FolderEntry, rating: Option<u8>, sidecar_mtime_ns: i64) {
+        db.upsert_rating(
+            &entry.path.to_string_lossy(),
+            entry.size,
+            entry.mtime_ns,
+            rating,
+            sidecar_mtime_ns,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn load_ratings_resolves_sidecar_database_and_missing_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries = [
+            entry(dir.path().join("current-sidecar.ARW")),
+            entry(dir.path().join("stale-sidecar.ARW")),
+            entry(dir.path().join("database-only.ARW")),
+            entry(dir.path().join("sidecar-only.ARW")),
+            entry(dir.path().join("invalid-sidecar.ARW")),
+            entry(dir.path().join("unrated.ARW")),
+        ];
+        let db = Db::open_in_memory().unwrap();
+
+        xmp::write_rating(&entries[0].sidecar_path(), 5).unwrap();
+        let current_mtime = sidecar_mtime(&entries[0]);
+        // Equality is the boundary at which the sidecar wins over the DB.
+        put_db_rating(&db, &entries[0], Some(2), current_mtime);
+
+        xmp::write_rating(&entries[1].sidecar_path(), 4).unwrap();
+        let stale_mtime = sidecar_mtime(&entries[1]);
+        put_db_rating(&db, &entries[1], Some(1), stale_mtime + 1);
+
+        put_db_rating(&db, &entries[2], Some(3), 0);
+        xmp::write_rating(&entries[3].sidecar_path(), 0).unwrap();
+
+        std::fs::write(entries[4].sidecar_path(), b"not xml").unwrap();
+        put_db_rating(&db, &entries[4], Some(2), sidecar_mtime(&entries[4]));
+
+        assert_eq!(
+            load_ratings(&entries, Some(&db)),
+            HashMap::from([(0, 5), (1, 1), (2, 3), (3, 0), (4, 2)])
+        );
+    }
+
     #[test]
     fn flush_waits_for_coalesced_sidecar_and_database_writes() {
         let dir = tempfile::tempdir().unwrap();

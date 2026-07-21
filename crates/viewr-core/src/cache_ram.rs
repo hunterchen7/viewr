@@ -187,6 +187,7 @@ impl RamCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
 
     fn buf(bytes: usize) -> Arc<PixelBuf> {
         Arc::new(PixelBuf {
@@ -248,5 +249,56 @@ mod tests {
         assert!(!cache.has_rgba((0, Tier::Browse)));
         assert!(cache.has_rgba((1, Tier::Browse)));
         assert_eq!(cache.stats().rgba_bytes, 60);
+    }
+
+    #[test]
+    fn cache_rings_have_independent_budgets_and_stats() {
+        let cache = RamCache::new(8, 12, 6);
+        cache.insert_rgba((0, Tier::Thumb), buf(8));
+        cache.insert_rgba((0, Tier::Browse), buf(12));
+        cache.insert_jpeg((0, Tier::Browse), Arc::new(vec![1; 6]));
+
+        let stats = cache.stats();
+        assert_eq!(stats.thumb_bytes, 8);
+        assert_eq!(stats.rgba_bytes, 12);
+        assert_eq!(stats.jpeg_bytes, 6);
+        assert!(cache.has_rgba((0, Tier::Thumb)));
+        assert!(cache.has_rgba((0, Tier::Browse)));
+        assert!(cache.has_jpeg((0, Tier::Browse)));
+    }
+
+    #[test]
+    fn oversized_unpinned_entry_is_immediately_evicted() {
+        let cache = RamCache::new(0, 10, 0);
+        cache.insert_rgba((0, Tier::Full), buf(11));
+        assert!(!cache.has_rgba((0, Tier::Full)));
+        assert_eq!(cache.stats().rgba_bytes, 0);
+    }
+
+    #[test]
+    fn concurrent_cache_access_preserves_budget_accounting() {
+        let cache = Arc::new(RamCache::new(0, 256, 128));
+        let workers: Vec<_> = (0..4)
+            .map(|worker| {
+                let cache = cache.clone();
+                thread::spawn(move || {
+                    for step in 0..500 {
+                        let index = (worker * 17 + step) % 32;
+                        let key = (index, Tier::Browse);
+                        cache.insert_rgba(key, buf(16));
+                        let _ = cache.get_rgba(key);
+                        cache.insert_jpeg(key, Arc::new(vec![step as u8; 8]));
+                        let _ = cache.get_jpeg(key);
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let stats = cache.stats();
+        assert!(stats.rgba_bytes <= 256);
+        assert!(stats.jpeg_bytes <= 128);
     }
 }

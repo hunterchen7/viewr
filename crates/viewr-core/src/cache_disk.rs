@@ -128,6 +128,7 @@ pub const DEFAULT_DISK_BUDGET: u64 = 20 * 1024 * 1024 * 1024;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
 
     fn entry(size: u64, mtime: i64) -> FolderEntry {
         FolderEntry {
@@ -136,6 +137,15 @@ mod tests {
             size,
             mtime_ns: mtime,
         }
+    }
+
+    fn set_object_mtime(cache: &DiskCache, key: &str, seconds_since_epoch: u64) {
+        let file = std::fs::File::options()
+            .write(true)
+            .open(cache.object_path(key))
+            .unwrap();
+        file.set_modified(UNIX_EPOCH + Duration::from_secs(seconds_since_epoch))
+            .unwrap();
     }
 
     #[test]
@@ -149,33 +159,48 @@ mod tests {
 
     #[test]
     fn gc_deletes_oldest_until_under_budget() {
-        let dir = std::env::temp_dir().join(format!("viewr-gc-test-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        let cache = DiskCache::open_at(dir.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open_at(dir.path().to_owned());
         let keys: Vec<String> = (0..3)
             .map(|i| DiskCache::key(&entry(10 + i, 1), Tier::Browse))
             .collect();
-        for key in &keys {
+        for (index, key) in keys.iter().enumerate() {
             cache.put(key, &[0u8; 1000]).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(15));
+            set_object_mtime(&cache, key, 10 + index as u64);
         }
         // Budget fits two objects: the oldest must go.
         let deleted = cache.gc(2500);
         assert_eq!(deleted, 1000);
         assert!(!cache.has(&keys[0]));
         assert!(cache.has(&keys[1]) && cache.has(&keys[2]));
-        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
-    fn put_get_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("viewr-test-{}", std::process::id()));
-        let cache = DiskCache::open_at(dir.clone());
+    fn put_replaces_an_existing_object_without_leaving_a_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open_at(dir.path().to_owned());
         let key = DiskCache::key(&entry(10, 1), Tier::Browse);
         assert!(!cache.has(&key));
-        cache.put(&key, b"hello").unwrap();
+
+        cache.put(&key, b"first").unwrap();
+        cache.put(&key, b"replacement").unwrap();
+
         assert!(cache.has(&key));
-        assert_eq!(cache.get(&key).unwrap(), b"hello");
-        std::fs::remove_dir_all(dir).ok();
+        assert_eq!(cache.get(&key).unwrap(), b"replacement");
+        assert!(!cache.object_path(&key).with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn gc_sweeps_orphaned_temp_files_even_when_under_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open_at(dir.path().to_owned());
+        let key = DiskCache::key(&entry(10, 1), Tier::Browse);
+        cache.put(&key, b"cached object").unwrap();
+        let tmp = cache.object_path(&key).with_extension("tmp");
+        std::fs::write(&tmp, b"interrupted write").unwrap();
+
+        assert_eq!(cache.gc(u64::MAX), 0);
+        assert!(!tmp.exists());
+        assert_eq!(cache.get(&key).unwrap(), b"cached object");
     }
 }

@@ -116,4 +116,30 @@ mod tests {
         assert_eq!(db.get_image("/p/a.arw").unwrap().rating, Some(2));
         assert!(db.get_image("/p/other.arw").is_none());
     }
+
+    #[test]
+    fn rows_survive_database_reopen_and_remain_updatable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("viewr.db");
+
+        {
+            let db = Db::open(&path).unwrap();
+            db.upsert_rating("/p/persistent.arw", 42, 7, Some(5), 123)
+                .unwrap();
+        }
+
+        {
+            let db = Db::open(&path).unwrap();
+            let row = db.get_image("/p/persistent.arw").unwrap();
+            assert_eq!(row.rating, Some(5));
+            assert_eq!(row.sidecar_mtime_ns, 123);
+            db.upsert_rating("/p/persistent.arw", 84, 8, None, 456)
+                .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        let row = db.get_image("/p/persistent.arw").unwrap();
+        assert_eq!(row.rating, None);
+        assert_eq!(row.sidecar_mtime_ns, 456);
+    }
 }
