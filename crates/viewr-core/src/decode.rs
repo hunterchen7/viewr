@@ -95,3 +95,26 @@ pub fn load(path: &Path) -> Result<DecodedRaw, DecodeError> {
         t_raw_decode,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Orient;
+
+    #[test]
+    #[ignore = "requires the local ignored portrait Sony RAW fixture"]
+    fn portrait_arw_thumbnail_uses_embedded_orientation() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/real-raw-corpus/HCA05417.ARW");
+
+        let result = thumb_and_meta(&path, 360).expect("portrait fixture decodes");
+
+        assert_eq!(result.meta.orient, Orient::R270);
+        assert_eq!(result.thumb.height, 360);
+        assert!(result.thumb.height > result.thumb.width);
+        assert_eq!(
+            result.thumb.rgba.len(),
+            result.thumb.width as usize * result.thumb.height as usize * 4
+        );
+    }
+}
