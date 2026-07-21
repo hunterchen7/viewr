@@ -3,10 +3,11 @@
 //! Lightroom reads `xmp:Rating` (namespace `http://ns.adobe.com/xap/1.0/`)
 //! from `.xmp` sidecars on import. It writes scalar properties as
 //! ATTRIBUTES on `rdf:Description`; other tools (darktable) use the
-//! ELEMENT form. We read both. Existing rating attributes use a byte-range
-//! splice so every non-value byte passes through untouched. Element updates
-//! and new-property injection use an XML event fallback that preserves
-//! semantic content but can change the document's lexical representation.
+//! ELEMENT form. We read both. Documents whose semantic ratings are attributes
+//! only use a byte-range splice so every non-value byte passes through
+//! untouched. If any rating is an element, or a property must be injected, an
+//! XML event fallback preserves semantic content but can change the document's
+//! lexical representation.
 
 use std::ops::Range;
 use std::path::Path;
@@ -215,10 +216,13 @@ fn parse_rating_value(value: &str) -> Option<u8> {
 /// Write `rating` into an XMP sidecar.
 ///
 /// Creates a minimal sidecar if the file does not exist. For an existing
-/// rating attribute, every byte outside the rating values is preserved.
-/// Updating an element-form rating or injecting a new property preserves the
-/// XML's semantic content but can reserialize its lexical representation.
-/// The destination is replaced atomically only after the update succeeds.
+/// document whose semantic ratings are attributes only, every byte outside the
+/// rating values is preserved. If any rating is an element, or a new property
+/// must be injected, the XML's semantic content is preserved but its lexical
+/// representation can be reserialized. Every semantic rating in the document
+/// is updated. No `0..=5` validation is applied; any `u8` is written as a
+/// decimal value. The destination is replaced atomically only after the update
+/// succeeds.
 ///
 /// # Errors
 ///
@@ -236,9 +240,11 @@ pub fn write_rating(path: &Path, rating: u8) -> Result<(), XmpError> {
 
 /// Update the semantic `xmp:Rating` property inside existing sidecar XML.
 ///
-/// Existing rating attributes are changed with byte-range splices that
-/// preserve every other input byte. Element updates and new-property
-/// injection preserve semantic content but can reserialize XML.
+/// When all existing semantic ratings are attributes, byte-range splices
+/// preserve every other input byte. If any rating is an element, or a new
+/// property must be injected, semantic content is preserved but the XML can be
+/// reserialized. Every semantic rating is updated. No `0..=5` validation is
+/// applied; any `u8` is written as a decimal value.
 ///
 /// # Errors
 ///

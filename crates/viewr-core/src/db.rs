@@ -15,12 +15,6 @@ pub enum DbError {
     /// SQLite returned an error.
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
-    /// The platform does not expose a suitable application-data directory.
-    ///
-    /// Current constructors do not emit this variant: [`default_db_path`]
-    /// represents this condition with `None`.
-    #[error("no data dir")]
-    NoDataDir,
 }
 
 /// SQLite-backed rating and sidecar recovery journal.
@@ -152,6 +146,11 @@ impl Db {
     /// Record a rating before the debounced sidecar write. Existing sidecar
     /// metadata stays intact, but the dirty flag makes this database value win
     /// if the process exits before the sidecar reaches disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::Sqlite`] if preparing or executing the database
+    /// update fails.
     pub fn record_rating_pending_sidecar(
         &self,
         path: &str,
@@ -177,6 +176,10 @@ impl Db {
 
     /// Return dirty ratings so a new persistence worker can resume sidecar
     /// writes that a prior process did not finish.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::Sqlite`] if preparing or reading the query fails.
     pub fn pending_sidecars(&self) -> Result<Vec<PendingSidecar>, DbError> {
         let mut statement = self.conn.prepare_cached(
             "SELECT path, size, mtime_ns, rating

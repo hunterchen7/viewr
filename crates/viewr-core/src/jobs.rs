@@ -2,10 +2,12 @@
 //! outward prefetch planning, and cache filling.
 //!
 //! Design (from the plan):
-//! - Declarative planning: on every navigation the desired job set is
-//!   recomputed and synced; queued jobs outside it vanish, in-flight jobs
-//!   outside it get their cancel token flipped, jobs still wanted keep
-//!   running. Epochs make stale heap entries inert — nothing toggles.
+//! - Declarative interactive planning: on every navigation the desired display
+//!   job set is recomputed and synced; queued interactive jobs outside it
+//!   vanish, in-flight jobs outside it get their cancel token flipped, and
+//!   jobs still wanted keep running. Epochs make stale heap entries inert.
+//!   Folder-wide Browse warming uses a separate persistent lane that survives
+//!   navigation replans.
 //! - Outward wave, ~3:1 forward-biased: priority sorts by
 //!   (class, effective distance, seq) where backward distance counts 3×.
 //! - Workers produce only PixelBufs/JPEG bytes into the RamCache and post
@@ -888,8 +890,10 @@ fn background_warm_jobs(len: usize, start: usize) -> impl Iterator<Item = (JobId
 impl Engine {
     /// Spawns the worker pool and queues the outward metadata wave.
     /// `notify` is called after every published result (the app passes
-    /// `ctx.request_repaint`). Container metadata is queued outward from
-    /// `start`; preview pixels remain demand-driven.
+    /// `ctx.request_repaint`). Calls run on engine worker threads, may overlap,
+    /// and should return quickly without blocking. Callback panics are caught
+    /// and logged so the worker can continue. Container metadata is queued
+    /// outward from `start`; preview pixels remain demand-driven.
     ///
     /// # Panics
     ///
@@ -1125,7 +1129,13 @@ fn worker(shared: &Shared, light: bool) {
 
 fn publish(shared: &Shared, event: Event) {
     let _ = shared.events.send(event);
-    (shared.notify)();
+    notify_safely(shared.notify.as_ref());
+}
+
+fn notify_safely(notify: &(dyn Fn() + Send + Sync)) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(notify)).is_err() {
+        eprintln!("engine notification callback panicked; worker is continuing");
+    }
 }
 
 fn retry_persistence_write(
@@ -1553,6 +1563,20 @@ pub fn decode_jpeg(bytes: &[u8]) -> Result<PixelBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn notification_callback_panic_is_contained() {
+        let calls = AtomicUsize::new(0);
+        let notify = || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            panic!("expected notification callback panic");
+        };
+
+        notify_safely(&notify);
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
 
     fn patterned_buf(width: u32, height: u32) -> PixelBuf {
         let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);

@@ -15,17 +15,20 @@ idle workers make a best-effort persistent pass to warm Browse renders across
 the folder. Metadata is scanned separately, without decoding every embedded
 preview.
 
-Residency is deliberately bounded:
+Residency uses hard accounting limits and soft targets:
 
 1. **GPU textures** — Browse for the current ±2 visible images, Full only for
    the current zoomed image, plus viewport thumbnails in an LRU accounting for
    at most 256 MiB of logical RGBA bytes (actual backend allocation can differ;
    at most eight new thumbnails upload per frame).
-2. **Decoded RGBA in RAM** — byte-budgeted exact LRU for instant display.
-3. **JPEG bytes in RAM** — byte-budgeted memoized develops, ~20× smaller and
-   cheap to re-inflate.
-4. **Disk** (`~/Library/Caches/viewr/`) — byte-budgeted developed JPEGs for
-   fast folder reopens; never written inside photo folders.
+2. **Decoded RGBA in RAM** — exact LRU with a target byte budget for instant
+   display. Pinned current and nearby images can keep a ring above its target
+   until they are unpinned.
+3. **JPEG bytes in RAM** — memoized develops with a target byte budget, ~20×
+   smaller and cheap to re-inflate. Pins have the same soft-budget behavior.
+4. **Disk** (`~/Library/Caches/viewr/`) — a target budget for developed JPEGs
+   used on fast folder reopens; cache GC enforces the target rather than every
+   write, and files are never written inside photo folders.
 
 Both develop tiers use real RAW data: half-res superpixel for browsing and
 full-res PPG demosaic for 100% zoom. Fit mode does not schedule, pin, or upload

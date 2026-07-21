@@ -1,4 +1,4 @@
-//! RAW → display-ready sRGB pipeline.
+//! RAW → gamma/tone-packed RGBA8 pipeline.
 //!
 //! Same stages as rawler's stock `RawDevelop` (rescale → demosaic → calibrate →
 //! crop → sRGB gamma), rebuilt from rawler's public pieces so that:
@@ -7,6 +7,10 @@
 //! - the CFA plane is moved, not cloned (stock `develop_intermediate` clones
 //!   the whole RawImage);
 //! - output is packed RGBA8 directly (no 16-bit DynamicImage detour).
+//!
+//! A usable camera color matrix produces display-sRGB samples. As in rawler's
+//! fallback, a missing or unusable matrix leaves samples in camera space before
+//! gamma/tone packing.
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -47,7 +51,7 @@ pub struct DevelopTimings {
     pub rescale: Duration,
     /// CFA-to-RGB demosaic.
     pub demosaic: Duration,
-    /// White balance and camera-to-linear-sRGB color conversion.
+    /// Optional white balance and camera-to-linear-sRGB color conversion.
     pub calibrate: Duration,
     /// Gamma, tone curve, and RGBA8 packing.
     pub gamma_pack: Duration,
@@ -64,11 +68,14 @@ pub enum DevelopError {
     Unsupported(String),
 }
 
-/// Develop a decoded raw into packed sRGB RGBA8.
+/// Develop a decoded raw into packed RGBA8.
 ///
 /// Consumes the RawImage (the CFA plane is moved into the pipeline).
 /// EXIF orientation is NOT applied here; the caller rotates.
-/// The returned [`PixelBuf`] is tightly packed RGBA8 in display sRGB.
+/// The returned [`PixelBuf`] is tightly packed RGBA8. A usable camera color
+/// matrix produces display sRGB; when that matrix is missing or unusable, the
+/// rawler-compatible fallback preserves camera-space samples before gamma and
+/// tone packing.
 ///
 /// # Errors
 ///

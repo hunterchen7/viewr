@@ -94,6 +94,10 @@ impl Library {
     /// The platform-default database is best-effort: failure to locate or open
     /// it does not prevent XMP sidecar writes. Journaled sidecar writes left by
     /// a prior process are resumed automatically when the database opens.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the operating system cannot spawn the persistence thread.
     pub fn start() -> Self {
         Self::start_with(default_db_path(), SIDECAR_DEBOUNCE)
     }
