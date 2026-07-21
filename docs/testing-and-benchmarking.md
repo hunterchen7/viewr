@@ -19,6 +19,7 @@ The test suite covers these areas:
 - Cache budgets, eviction, pin changes, concurrency, and disk replacement.
 - Folder scans, navigation waves, queue generations, and cancellation.
 - JPEG cache round-trips, resize geometry, rotation, and tone-curve invariants.
+- RAW crop layout, Bayer superpixels, transfer-table error, and persistence bounds.
 - XMP preservation, rating precedence, SQLite reopen behavior, and durable flushes.
 - Configuration parsing and loupe layout mathematics.
 
@@ -44,13 +45,14 @@ The suite measures these workloads:
 
 - Navigation planning for 100, 1,000, and 10,000 images.
 - Outward-order construction for up to 1,000,000 images.
-- Resize and rotation of a deterministic 12.2-megapixel image.
-- JPEG encoding, JPEG decoding, RAM-cache hits, and LRU churn.
+- Resize and rotation of deterministic 12.2-megapixel and 33-megapixel images.
+- JPEG encoding, JPEG decoding, RAM-cache hits, and eviction scaling.
 - XMP parsing, XMP updates, and disk-cache key generation.
 
 Criterion stores reports in `crates/viewr-core/target/criterion`.
 Git ignores this directory.
 See [the first reference run](benchmark-baseline-2026-07-21.md).
+See [the optimization campaign](performance-optimization-2026-07-21.md) for the current results and tradeoffs.
 
 ## Compare a change
 
