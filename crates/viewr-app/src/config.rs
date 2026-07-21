@@ -387,6 +387,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_bind_accepts_modifier_aliases_and_rejects_missing_keys() {
+        let bind = parse_bind(" Control + Option + Comma ").unwrap();
+        assert_eq!(bind.key, egui::Key::Comma);
+        assert!(bind.mods.ctrl && bind.mods.alt);
+        assert!(!bind.mods.command && !bind.mods.shift);
+
+        let bind = parse_bind("Super+Shift+0").unwrap();
+        assert_eq!(bind.key, egui::Key::Num0);
+        assert!(bind.mods.command && bind.mods.shift);
+
+        for invalid in ["", "Cmd", "Ctrl+DefinitelyNotAKey"] {
+            assert!(parse_bind(invalid).is_none(), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
     fn raw_overrides_merge_over_defaults() {
         let raw: RawConfig = toml::from_str(
             r#"
@@ -406,6 +422,116 @@ mod tests {
         assert_eq!(cfg.binds[&Action::Next].len(), 1);
         assert_eq!(cfg.binds[&Action::Next][0].key, egui::Key::D);
         assert_eq!(cfg.binds[&Action::Prev][0].key, egui::Key::ArrowLeft);
+    }
+
+    #[test]
+    fn values_are_clamped_to_supported_ranges() {
+        let too_low: RawConfig = toml::from_str(
+            r#"
+            [ui]
+            filmstrip_height = -10.0
+            grid_cell = -10.0
+            [cache]
+            ram_gb = -10.0
+            disk_gb = -10.0
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::from_raw(too_low);
+        assert_eq!(cfg.filmstrip_height, 70.0);
+        assert_eq!(cfg.grid_cell, 120.0);
+        assert_eq!(cfg.ram_gb, 1.0);
+        assert_eq!(cfg.disk_gb, 1.0);
+
+        let too_high: RawConfig = toml::from_str(
+            r#"
+            [ui]
+            filmstrip_height = 1000.0
+            grid_cell = 1000.0
+            [cache]
+            ram_gb = 1000.0
+            disk_gb = 1000.0
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::from_raw(too_high);
+        assert_eq!(cfg.filmstrip_height, 320.0);
+        assert_eq!(cfg.grid_cell, 400.0);
+        assert_eq!(cfg.ram_gb, 20.0);
+        assert_eq!(cfg.disk_gb, 500.0);
+    }
+
+    #[test]
+    fn explicit_bind_lists_replace_defaults_and_drop_invalid_entries() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [binds]
+            next = []
+            prev = ["DefinitelyNotAKey", "A"]
+            first = ["DefinitelyNotAKey"]
+            unknown_action = ["B"]
+            "#,
+        )
+        .unwrap();
+
+        let cfg = Config::from_raw(raw);
+
+        assert!(cfg.binds_of(Action::Next).is_empty());
+        assert_eq!(cfg.binds_of(Action::Prev), &[parse_bind("A").unwrap()]);
+        assert!(cfg.binds_of(Action::First).is_empty());
+        assert_eq!(
+            cfg.binds_of(Action::Grid),
+            &[parse_bind("G").unwrap()],
+            "unmentioned known actions retain their defaults"
+        );
+    }
+
+    #[test]
+    fn add_bind_deduplicates_and_remove_bind_matches_modifiers_exactly() {
+        let mut cfg = Config::from_raw(RawConfig::default());
+        let plain = parse_bind("D").unwrap();
+        let modified = parse_bind("Cmd+D").unwrap();
+
+        cfg.add_bind(Action::Next, plain);
+        cfg.add_bind(Action::Next, plain);
+        cfg.add_bind(Action::Next, modified);
+        assert_eq!(
+            cfg.binds_of(Action::Next),
+            &[parse_bind("ArrowRight").unwrap(), plain, modified,]
+        );
+
+        cfg.remove_bind(Action::Next, plain);
+        cfg.remove_bind(Action::Next, plain);
+        assert_eq!(
+            cfg.binds_of(Action::Next),
+            &[parse_bind("ArrowRight").unwrap(), modified]
+        );
+    }
+
+    #[test]
+    fn bind_mutation_handles_an_action_without_an_existing_entry() {
+        let mut cfg = Config::from_raw(RawConfig::default());
+        let bind = parse_bind("Q").unwrap();
+        cfg.binds.remove(&Action::Grid);
+
+        cfg.remove_bind(Action::Grid, bind);
+        assert!(cfg.binds_of(Action::Grid).is_empty());
+
+        cfg.add_bind(Action::Grid, bind);
+        assert_eq!(cfg.binds_of(Action::Grid), &[bind]);
+    }
+
+    #[test]
+    fn documented_template_parses_to_the_documented_defaults() {
+        let raw: RawConfig = toml::from_str(TEMPLATE).unwrap();
+        let cfg = Config::from_raw(raw);
+
+        assert_eq!(cfg.scroll, ScrollMode::Pan);
+        assert!(cfg.tier_border);
+        assert_eq!(cfg.filmstrip_height, 112.0);
+        assert_eq!(cfg.grid_cell, 200.0);
+        assert_eq!(cfg.ram_gb, 4.5);
+        assert_eq!(cfg.disk_gb, 20.0);
     }
 
     #[test]

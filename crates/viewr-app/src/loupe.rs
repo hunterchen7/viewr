@@ -211,3 +211,153 @@ fn layout(rect: Rect, img_size: Vec2, zoom: Zoom, fit_scale: f32) -> (Rect, Rect
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EPSILON: f32 = 1.0e-5;
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() <= EPSILON,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    fn assert_vec_close(actual: Vec2, expected: Vec2) {
+        assert_close(actual.x, expected.x);
+        assert_close(actual.y, expected.y);
+    }
+
+    fn assert_pos_close(actual: Pos2, expected: Pos2) {
+        assert_close(actual.x, expected.x);
+        assert_close(actual.y, expected.y);
+    }
+
+    fn assert_rect_close(actual: Rect, expected: Rect) {
+        assert_pos_close(actual.min, expected.min);
+        assert_pos_close(actual.max, expected.max);
+    }
+
+    #[test]
+    fn fit_layout_preserves_aspect_ratio_and_centers_letterbox() {
+        let viewport = Rect::from_min_size(pos2(10.0, 20.0), vec2(800.0, 600.0));
+        let image = vec2(400.0, 400.0);
+
+        let (draw, uv) = layout(viewport, image, Zoom::Fit, 1.5);
+
+        assert_rect_close(
+            draw,
+            Rect::from_min_max(pos2(110.0, 20.0), pos2(710.0, 620.0)),
+        );
+        assert_rect_close(uv, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)));
+    }
+
+    #[test]
+    fn anchored_layout_crops_large_axis_and_letterboxes_small_axis() {
+        let viewport = Rect::from_min_size(pos2(10.0, 20.0), vec2(800.0, 600.0));
+        let image = vec2(1000.0, 200.0);
+        let zoom = Zoom::Anchored {
+            scale: 1.0,
+            center: vec2(0.5, 0.5),
+        };
+
+        let (draw, uv) = layout(viewport, image, zoom, 0.8);
+
+        assert_rect_close(
+            draw,
+            Rect::from_min_max(pos2(10.0, 220.0), pos2(810.0, 420.0)),
+        );
+        assert_rect_close(uv, Rect::from_min_max(pos2(0.1, 0.0), pos2(0.9, 1.0)));
+    }
+
+    #[test]
+    fn uv_at_maps_fit_content_and_clamps_letterbox_positions() {
+        let viewport = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let image = vec2(400.0, 200.0);
+
+        assert_vec_close(
+            uv_at(viewport, image, Zoom::Fit, 2.0, pos2(200.0, 200.0)),
+            vec2(0.25, 0.25),
+        );
+        assert_vec_close(
+            uv_at(viewport, image, Zoom::Fit, 2.0, pos2(400.0, 0.0)),
+            vec2(0.5, 0.0),
+        );
+        assert_vec_close(
+            uv_at(viewport, image, Zoom::Fit, 2.0, pos2(400.0, 600.0)),
+            vec2(0.5, 1.0),
+        );
+    }
+
+    #[test]
+    fn anchored_keeping_places_requested_uv_under_anchor() {
+        let viewport = Rect::from_min_size(pos2(100.0, 50.0), vec2(800.0, 600.0));
+        let image = vec2(1600.0, 1200.0);
+        let requested_uv = vec2(0.7, 0.3);
+        let anchor = pos2(650.0, 300.0);
+        let zoom = anchored_keeping(viewport, image, 1.25, requested_uv, anchor);
+
+        assert_vec_close(uv_at(viewport, image, zoom, 0.5, anchor), requested_uv);
+    }
+
+    #[test]
+    fn clamp_center_clamps_cropped_axis_and_centers_small_axis() {
+        let viewport = vec2(800.0, 600.0);
+        let image = vec2(2000.0, 200.0);
+
+        assert_vec_close(
+            clamp_center(vec2(-2.0, 0.9), viewport, image, 1.0),
+            vec2(0.2, 0.5),
+        );
+        assert_vec_close(
+            clamp_center(vec2(2.0, 0.1), viewport, image, 1.0),
+            vec2(0.8, 0.5),
+        );
+    }
+
+    #[test]
+    fn toggle_100_preserves_anchor_then_returns_to_fit() {
+        let viewport = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let image = vec2(1600.0, 1200.0);
+        let anchor = pos2(600.0, 400.0);
+        let fit_scale = 0.5;
+        let expected_uv = uv_at(viewport, image, Zoom::Fit, fit_scale, anchor);
+        let mut zoom = Zoom::Fit;
+
+        toggle_100(&mut zoom, viewport, image, anchor);
+
+        assert!(matches!(
+            zoom,
+            Zoom::Anchored { scale, .. } if (scale - 1.0).abs() <= EPSILON
+        ));
+        assert_vec_close(uv_at(viewport, image, zoom, fit_scale, anchor), expected_uv);
+
+        toggle_100(&mut zoom, viewport, image, anchor);
+        assert_eq!(zoom, Zoom::Fit);
+    }
+
+    #[test]
+    fn toggle_100_centers_image_smaller_than_viewport() {
+        let viewport = Rect::from_min_size(pos2(10.0, 20.0), vec2(800.0, 600.0));
+        let image = vec2(200.0, 100.0);
+        let mut zoom = Zoom::Fit;
+
+        toggle_100(&mut zoom, viewport, image, viewport.min);
+
+        assert_eq!(
+            zoom,
+            Zoom::Anchored {
+                scale: 1.0,
+                center: vec2(0.5, 0.5),
+            }
+        );
+        let (draw, uv) = layout(viewport, image, zoom, 3.0);
+        assert_rect_close(
+            draw,
+            Rect::from_min_max(pos2(310.0, 270.0), pos2(510.0, 370.0)),
+        );
+        assert_rect_close(uv, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)));
+    }
+}
