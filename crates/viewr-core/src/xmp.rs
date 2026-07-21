@@ -4,8 +4,9 @@
 //! from `.xmp` sidecars on import. It writes scalar properties as
 //! ATTRIBUTES on `rdf:Description`; other tools (darktable) use the
 //! ELEMENT form. We read both. Existing rating attributes use a byte-range
-//! splice so every non-value byte passes through untouched; element updates
-//! and new-property injection use the XML event fallback.
+//! splice so every non-value byte passes through untouched. Element updates
+//! and new-property injection use an XML event fallback that preserves
+//! semantic content but can change the document's lexical representation.
 
 use std::ops::Range;
 use std::path::Path;
@@ -18,9 +19,12 @@ use quick_xml::name::{PrefixDeclaration, QName, ResolveResult};
 use crate::atomic_write;
 
 #[derive(Debug, thiserror::Error)]
+/// Errors produced while updating or writing an XMP rating.
 pub enum XmpError {
+    /// The sidecar could not be read, created, or atomically replaced.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// Existing sidecar XML could not be safely interpreted or updated.
     #[error("xml: {0}")]
     Xml(String),
 }
@@ -74,13 +78,25 @@ fn is_rdf_description(reader: &NsReader<&[u8]>, name: QName<'_>) -> bool {
         && matches!(namespace, ResolveResult::Bound(uri) if is_namespace(uri.as_ref(), RDF_NAMESPACE))
 }
 
-/// Read the rating from a sidecar (attribute or element form).
-/// Returns None if the file or the property is absent. 0 ⇒ unrated.
+/// Read the rating from a sidecar in attribute or element form.
+///
+/// Returns `None` when the file cannot be read as UTF-8, the XML is rejected,
+/// or no numeric rating exists in an RDF `Description`. A zero value means
+/// unrated. If the document contains several semantic ratings, the first one
+/// in document order wins.
 pub fn read_rating(path: &Path) -> Option<u8> {
     let content = std::fs::read_to_string(path).ok()?;
     parse_rating(&content)
 }
 
+/// Parse an XMP rating from a UTF-8 XML document.
+///
+/// Accepts an Adobe XMP `Rating` attribute on an RDF `Description`, or a
+/// direct `Rating` child element of that description. Returns `None` for a
+/// rejected document or missing/non-numeric rating. Negative numeric values
+/// become zero; positive values are converted to `u8` using Rust's saturating
+/// float-to-integer conversion. If several semantic ratings exist, the first
+/// one in document order wins.
 pub fn parse_rating(xml: &str) -> Option<u8> {
     let mut reader = NsReader::from_str(xml);
     reader.config_mut().trim_text(false);
@@ -196,8 +212,19 @@ fn parse_rating_value(value: &str) -> Option<u8> {
         .map(|rating| rating.max(0.0) as u8)
 }
 
-/// Write `rating` into the sidecar, preserving all other content.
-/// Creates a minimal sidecar if none exists. Atomic (tmp + rename).
+/// Write `rating` into an XMP sidecar.
+///
+/// Creates a minimal sidecar if the file does not exist. For an existing
+/// rating attribute, every byte outside the rating values is preserved.
+/// Updating an element-form rating or injecting a new property preserves the
+/// XML's semantic content but can reserialize its lexical representation.
+/// The destination is replaced atomically only after the update succeeds.
+///
+/// # Errors
+///
+/// Returns [`XmpError::Io`] when the sidecar cannot be read or replaced.
+/// Returns [`XmpError::Xml`] when existing XML is malformed or has no RDF
+/// `Description` that can own the rating property.
 pub fn write_rating(path: &Path, rating: u8) -> Result<(), XmpError> {
     let output = match std::fs::read_to_string(path) {
         Ok(existing) => update_rating_xml(&existing, rating)?,
@@ -207,7 +234,16 @@ pub fn write_rating(path: &Path, rating: u8) -> Result<(), XmpError> {
     atomic_write::replace_durable(path, output.as_bytes()).map_err(Into::into)
 }
 
-/// Update the semantic xmp:Rating property inside existing sidecar XML.
+/// Update the semantic `xmp:Rating` property inside existing sidecar XML.
+///
+/// Existing rating attributes are changed with byte-range splices that
+/// preserves every other input byte. Element updates and new-property
+/// injection preserve semantic content but can reserialize XML.
+///
+/// # Errors
+///
+/// Returns [`XmpError::Xml`] when `xml` is malformed or contains no RDF
+/// `Description` that can own the rating property.
 pub fn update_rating_xml(xml: &str, rating: u8) -> Result<String, XmpError> {
     if let Some(updated) = update_rating_attributes(xml, rating)? {
         return Ok(updated);
@@ -444,7 +480,11 @@ fn update_rating_xml_fallback(xml: &str, rating: u8) -> Result<String, XmpError>
     }
 
     // Neither form present: inject the attribute onto the first RDF Description.
-    if !wrote && let Some(target) = injection {
+    // Existing XML without an RDF subject cannot persist a semantic XMP rating;
+    // returning success would leave the caller's file silently unchanged.
+    if !wrote {
+        let target = injection
+            .ok_or_else(|| XmpError::Xml("no RDF Description available for XMP rating".into()))?;
         let (Event::Start(e) | Event::Empty(e)) = events[target.position].clone() else {
             unreachable!()
         };
@@ -770,7 +810,7 @@ mod tests {
         </root>"#;
 
         assert_eq!(parse_rating(xml), None);
-        assert_eq!(update_rating_xml(xml, 4).unwrap(), xml);
+        assert!(matches!(update_rating_xml(xml, 4), Err(XmpError::Xml(_))));
     }
 
     #[test]
@@ -927,6 +967,20 @@ mod tests {
     }
 
     #[test]
+    fn well_formed_sidecar_without_rdf_description_is_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.xmp");
+        let original = br#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><empty/></x:xmpmeta>"#;
+        std::fs::write(&path, original).unwrap();
+
+        let error = write_rating(&path, 4).unwrap_err();
+
+        assert!(matches!(error, XmpError::Xml(_)));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(!path.with_extension("xmp.tmp").exists());
+    }
+
+    #[test]
     fn update_rejects_malformed_and_semantically_duplicate_attributes() {
         let malformed = r#"<rdf:Description
             xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
@@ -948,6 +1002,19 @@ mod tests {
         ));
         assert_eq!(parse_rating(malformed), None);
         assert_eq!(parse_rating(duplicate), None);
+    }
+
+    #[test]
+    fn update_rejects_well_formed_xml_without_an_rdf_description() {
+        let original = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><empty/></x:xmpmeta>"#;
+
+        let error = update_rating_xml(original, 4).unwrap_err();
+
+        assert!(matches!(error, XmpError::Xml(_)));
+        assert_eq!(
+            original,
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><empty/></x:xmpmeta>"#
+        );
     }
 
     #[test]
