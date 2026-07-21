@@ -15,7 +15,7 @@ use crate::types::Tier;
 /// Bump when the develop pipeline's output changes; invalidates every
 /// cached render for free.
 /// v2: base tone curve added.
-pub const DEVELOP_VERSION: u32 = 2;
+pub const DEVELOP_VERSION: u32 = 3;
 
 #[derive(Clone)]
 pub struct DiskCache {
