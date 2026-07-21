@@ -30,12 +30,12 @@ the first campaign. Criterion results use release-like benchmark builds.
 
 | Workload | Before | After | Result |
 |---|---:|---:|---:|
-| Loupe filmstrip, 10,000 placeholder items | 7.221 ms | 14.905 µs | about 484 times faster |
-| Loupe filmstrip, 50,000 placeholder items | 47.817 ms | 15.693 µs | about 3,047 times faster |
-| Thumbnail texture LRU, touch 200 of 773 residents | not previously bounded | 37.247 µs | bounded maintenance cost |
-| 10,000-item disk-warm navigation plan | 11.863 µs | 83.919 ns | about 141 times faster |
-| Per-file background RAW work | 8.293 ms | 778 µs | about 10.7 times faster |
-| Canonical XMP rating update | 35.293 µs | 15.874 µs | about 2.22 times faster |
+| Loupe filmstrip, 10,000 placeholder items | 9.632 ms | 15.349 µs | about 628 times faster |
+| Loupe filmstrip, 50,000 placeholder items | 52.138 ms | 14.214 µs | about 3,668 times faster |
+| Thumbnail texture LRU, touch 200 of 773 residents | not previously bounded | 37.678 µs | bounded maintenance cost |
+| Bounded planner with disk configured, 10,000 items | 9.426 µs folder-wide reference | 78.627 ns | about 120 times faster |
+| Per-file background RAW work | 6.885 ms | 762 µs | about 9.0 times faster |
+| Canonical XMP rating update | 35.293 µs | 15.747 µs | about 2.24 times faster |
 
 The filmstrip benchmark is headless and excludes texture upload, tessellation,
 and GPU work. It isolates widget construction. Before virtualization, the lower
@@ -52,12 +52,21 @@ Disk warming now has a persistent, strictly lower-priority queue. Navigation
 rebuilds only the bounded interactive plan; it no longer reconstructs and
 heapifies a folder-wide warm set. The one-time outward order remains linear at
 folder open. Foreground replacement, canceled-generation retry, filter changes,
-and shutdown have focused queue tests.
+and shutdown have focused queue tests. The 120-times comparison is a pure
+planner measurement; it excludes Engine locks, cache probes, queue
+synchronization, and the one-time O(N) warm-order installation.
+
+Persistence backpressure parks size-aware warm jobs until capacity changes.
+Active or pending encodes absorb matching warm obligations, and a canceled job
+that already handed off pixels is not developed again. A mutex-busy enqueue has
+one short blocking fallback; saturation admits one fitting retry per completed
+persistence request. Oversized buffers and permanent writes after three bounded
+attempts remain explicitly best-effort.
 
 Folder-wide light work now extracts metadata only. Embedded preview JPEG decode
 and RGBA allocation happen on viewport demand. On `HCA04875.ARW`, the warm
-Criterion point estimate changed from 8.293 ms for thumbnail plus metadata to
-778 µs for metadata alone. Embedded rating and filter semantics remain intact.
+Criterion point estimate changed from 6.885 ms for thumbnail plus metadata to
+762 µs for metadata alone. Embedded rating and filter semantics remain intact.
 
 ### RAW profile
 
@@ -87,18 +96,21 @@ because it can make later RAW entropy decode slower.
 
 ### XMP tradeoff
 
-The named baseline assumed a literal `xmp` prefix. URI-aware aliases and
-fail-closed tag validation necessarily do more parsing. Final attribute reads
-measured about 877 ns, 174% above that baseline, and a late element read
-measured 15.305 µs, 40% above baseline. Both remain small beside RAW work.
+The named baseline assumed a literal `xmp` prefix and returned immediately from
+an early attribute. URI-aware RDF scoping and full-tail validation necessarily
+do more parsing. Final attribute reads measured 15.664 µs and late element
+reads measured 15.210 µs. The early-attribute case is about 64.5 times slower
+than its shortcut baseline; the late-element case is about 42% slower. These
+in-memory measurements exclude file I/O and remain small beside RAW work.
 
 The canonical write path now validates the complete XML document but replaces
 only the borrowed attribute-value byte range instead of owning and rewriting
-every event. Its stable focused estimate was 15.874 µs: 56% faster than the
-named baseline and about 70% faster than the initial hardened implementation.
-The slower reads are an explicit correctness tradeoff; the write optimization
+every event. Its focused estimate was 15.747 µs: 56% faster than the named
+baseline and about 71% faster than the initial hardened implementation. The
+slower reads are an explicit correctness tradeoff; the write optimization
 was promoted only after namespace-shadowing, escaped-URI, duplicate-attribute,
-reserved-binding, and truncated-document tests passed.
+reserved-binding, RDF-context, unrelated-element, formatting-preservation, and
+truncated-document tests passed.
 
 ## Correctness and resilience changes
 
@@ -116,8 +128,13 @@ reserved-binding, and truncated-document tests passed.
   after a debounce-window crash, failed writes remain retryable, and startup
   resumes unfinished sidecars.
 - XMP rating reads and writes resolve the Adobe namespace URI, including alias
-  prefixes. Empty, self-closing, text, and CDATA forms update without creating
-  duplicate semantic ratings. Malformed or duplicate attributes fail closed.
+  prefixes, and require an RDF `Description` context. Rating elements count
+  only as direct RDF properties. Empty, self-closing, text, and CDATA forms
+  update without creating duplicate attributes. Malformed tags, duplicate
+  attributes, invalid namespace bindings, and truncated tails fail closed.
+  Existing XML with no RDF rating subject now returns an error instead of
+  reporting success without changing the rating; file-level tests verify that
+  the original sidecar remains byte-for-byte intact on this failure.
 - Disk cache keys validate their digest input and hash native path bytes, so
   invalid UTF-8 Unix names do not collide through lossy conversion.
 - Folder entries are shared with the engine through one immutable `Arc`, so
@@ -131,6 +148,26 @@ reserved-binding, and truncated-document tests passed.
 - If a RAW has readable metadata but no usable embedded preview, a failed
   viewport thumbnail retains its failure event and performs one metadata-only
   fallback. Successful thumbnails never duplicate that metadata work.
+- Notification callback panics are caught at the worker boundary and logged,
+  so a UI repaint callback cannot strand an in-flight job or terminate a decode
+  worker.
+
+## Rustdoc and architecture documentation
+
+Both crates now deny missing public documentation and broken intra-doc links.
+The core crate landing page describes the scheduling, cache, and rating
+persistence architecture and includes a compiled navigation-planning example.
+Public APIs document error and panic conditions, pixel-storage invariants,
+cache budget and pin behavior, cancellation boundaries, worker ownership,
+rating precedence, sidecar recovery, and the byte-exact versus semantic XMP
+update paths.
+
+The README now matches the demand-driven thumbnail path, Fit-mode Full-work
+elimination, persistent Browse warming, logical GPU accounting, soft RAM and
+disk targets, native SQLite dependency, and dirty-journal precedence. The
+benchmark guide distinguishes pure planner proxies, operating-system page
+cache from viewr caches, and the complete RAW decode path. Historical milestone
+notes remain intact but point to this report as the current architecture.
 
 ## Unsafe-code checks
 
@@ -144,6 +181,23 @@ A broad resize Miri filter stopped in a third-party ARM NEON intrinsic that
 Miri does not implement. The original parallel superpixel reference test also
 stopped inside Crossbeam under Miri's experimental borrow model. These are tool
 limitations, not passing evidence, and are not reported as repository defects.
+
+## Final validation
+
+The final committed source tree passed these gates:
+
+- `cargo fmt --all -- --check` and `git diff --check`;
+- strict workspace Clippy across all targets with warnings denied;
+- 31 app unit tests, 131 core unit tests, and one compiled Rustdoc example;
+- all three ignored, private-RAW release tests when explicitly enabled;
+- workspace Rustdoc with warnings denied;
+- workspace release build and benchmark-target compilation; and
+- Miri's three rotation tests plus the direct superpixel initialization oracle
+  on pinned nightly `2026-07-21`.
+
+Three private-fixture tests remain ignored in an ordinary workspace run by
+design. Their four Sony ARW source files remain under ignored `testdata/`; Git
+tracks none of the photos.
 
 ## Rejected optimization
 
@@ -164,6 +218,10 @@ complexity around image color math.
   read-ahead, so a very large cold folder can still stream substantial data
   even though preview JPEG decode is now viewport-driven. A preview/metadata
   source API without global read-ahead likely belongs upstream.
+- The persistent warm order and its queue memory are O(N) once at folder open.
+  Continuous interactive work can intentionally starve warming. Oversized
+  buffers and disk writes that still fail after three attempts remain
+  best-effort cache misses rather than unbounded retry loops.
 - Cancellation cannot interrupt rawler while a demosaic call is active. Engine
   destruction now joins workers, so a folder switch can wait for active RAW
   work to reach the next boundary.
@@ -175,10 +233,10 @@ complexity around image color math.
 - Thumbnail `ByteLru::touch` is linear in resident textures. The measured
   200-touch/773-resident case is only 37 µs, but a materially larger GPU budget
   should prompt an intrusive or generation-based LRU.
-- A panic inside a decode worker terminates that worker and can leave its job
-  generation recorded as in flight. Panic containment or an unwind-safe finish
-  guard would improve recovery, but cannot repair a dependency panic that
-  poisons shared state.
+- Notification callback panics are contained. A panic elsewhere inside a
+  decode worker can still terminate that worker and leave its job generation
+  recorded as in flight. An unwind-safe finish guard would improve recovery,
+  but cannot repair a dependency panic that poisons shared state.
 - SQLite still identifies images with lossy path strings, while disk cache keys
   now use native path units. Non-UTF-8 Unix libraries can therefore still have
   database-key collisions even though render-cache keys do not.
@@ -189,6 +247,10 @@ complexity around image color math.
 - End-to-end input-to-present latency is not automated. The UI benchmarks
   isolate widget construction and texture-residency bookkeeping rather than a
   complete GPU frame.
+- XMP token scanning is not a full DTD/general-entity or single-root validator,
+  and UTF-16 sidecars are unsupported. Multiple semantic ratings use
+  first-read/all-updated behavior; element or injection fallbacks can
+  reserialize XML, while existing attribute updates are byte-spliced.
 - The private corpus contains one camera model. Add more codecs, sensor sizes,
   orientations, and DNG samples before treating RAW numbers as universal.
 
