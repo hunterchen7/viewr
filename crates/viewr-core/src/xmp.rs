@@ -7,6 +7,7 @@
 //! rating token — every other byte of an existing sidecar passes through
 //! untouched, so Lightroom develop settings/keywords survive.
 
+use std::ops::Range;
 use std::path::Path;
 
 use quick_xml::NsReader;
@@ -29,7 +30,18 @@ const XMP_NAMESPACE_STR: &str = "http://ns.adobe.com/xap/1.0/";
 
 fn is_xmp_rating(namespace: &ResolveResult<'_>, local_name: &[u8]) -> bool {
     local_name == b"Rating"
-        && matches!(namespace, ResolveResult::Bound(uri) if uri.as_ref() == XMP_NAMESPACE)
+        && matches!(namespace, ResolveResult::Bound(uri) if is_xmp_namespace(uri.as_ref()))
+}
+
+fn is_xmp_namespace(namespace: &[u8]) -> bool {
+    if namespace == XMP_NAMESPACE {
+        return true;
+    }
+    namespace.contains(&b'&')
+        && std::str::from_utf8(namespace)
+            .ok()
+            .and_then(|namespace| quick_xml::escape::unescape(namespace).ok())
+            .is_some_and(|namespace| namespace.as_bytes() == XMP_NAMESPACE)
 }
 
 fn is_xmp_rating_element(reader: &NsReader<&[u8]>, name: QName<'_>) -> bool {
@@ -70,15 +82,11 @@ pub fn parse_rating(xml: &str) -> Option<u8> {
             Event::Start(e) => {
                 let is_rating_element = is_xmp_rating_element(&reader, e.name());
                 if is_description(e.name().as_ref()) {
-                    for attr in e.attributes() {
-                        let attr = attr.ok()?;
-                        if is_xmp_rating_attribute(&reader, attr.key)
-                            && let Ok(value) = attr.unescape_value()
-                            && let Some(rating) = parse_rating_value(&value)
-                        {
-                            return Some(rating);
-                        }
+                    if let Some(rating) = parse_rating_attribute(&reader, &e).ok()? {
+                        return Some(rating);
                     }
+                } else if !e.attributes_raw().is_empty() {
+                    validate_attributes(&e).ok()?;
                 }
                 if is_rating_element {
                     captures.push(RatingCapture {
@@ -91,15 +99,11 @@ pub fn parse_rating(xml: &str) -> Option<u8> {
             }
             Event::Empty(e) => {
                 if is_description(e.name().as_ref()) {
-                    for attr in e.attributes() {
-                        let attr = attr.ok()?;
-                        if is_xmp_rating_attribute(&reader, attr.key)
-                            && let Ok(value) = attr.unescape_value()
-                            && let Some(rating) = parse_rating_value(&value)
-                        {
-                            return Some(rating);
-                        }
+                    if let Some(rating) = parse_rating_attribute(&reader, &e).ok()? {
+                        return Some(rating);
                     }
+                } else if !e.attributes_raw().is_empty() {
+                    validate_attributes(&e).ok()?;
                 }
                 // A self-closing rating element has no scalar value. Do not
                 // enter capture state that could consume a later text node.
@@ -139,6 +143,24 @@ pub fn parse_rating(xml: &str) -> Option<u8> {
     }
 }
 
+fn parse_rating_attribute(reader: &NsReader<&[u8]>, e: &BytesStart<'_>) -> Result<Option<u8>, ()> {
+    let mut found_rating = false;
+    let mut rating = None;
+    for attr in e.attributes() {
+        let attr = attr.map_err(|_| ())?;
+        if !is_xmp_rating_attribute(reader, attr.key) {
+            continue;
+        }
+        if found_rating {
+            return Err(());
+        }
+        found_rating = true;
+        let value = attr.unescape_value().map_err(|_| ())?;
+        rating = parse_rating_value(&value);
+    }
+    Ok(rating)
+}
+
 struct RatingCapture {
     depth: usize,
     content: String,
@@ -166,6 +188,127 @@ pub fn write_rating(path: &Path, rating: u8) -> Result<(), XmpError> {
 
 /// Rewrite only the xmp:Rating token inside existing sidecar XML.
 pub fn update_rating_xml(xml: &str, rating: u8) -> Result<String, XmpError> {
+    if xml.contains(":Rating=")
+        && let Some(updated) = update_rating_attributes(xml, rating)?
+    {
+        return Ok(updated);
+    }
+
+    update_rating_xml_fallback(xml, rating)
+}
+
+/// Validate the complete document and replace existing rating attribute values
+/// without owning and rewriting every XML event. Returns `None` when an XMP
+/// rating element is also present or no semantic rating attribute was found;
+/// those less common shapes use the general event-rewrite path below.
+fn update_rating_attributes(xml: &str, rating: u8) -> Result<Option<String>, XmpError> {
+    let mut reader = NsReader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut ranges = Vec::new();
+    let mut depth = 0usize;
+    let mut saw_rating_element = false;
+
+    loop {
+        match reader
+            .read_event()
+            .map_err(|error| XmpError::Xml(error.to_string()))?
+        {
+            Event::Eof => break,
+            Event::Start(e) => {
+                saw_rating_element |= is_xmp_rating_element(&reader, e.name());
+                if is_description(e.name().as_ref()) {
+                    collect_rating_attribute_ranges(&reader, &e, xml, &mut ranges)?;
+                } else {
+                    validate_attributes(&e)?;
+                }
+                depth += 1;
+            }
+            Event::Empty(e) => {
+                saw_rating_element |= is_xmp_rating_element(&reader, e.name());
+                if is_description(e.name().as_ref()) {
+                    collect_rating_attribute_ranges(&reader, &e, xml, &mut ranges)?;
+                } else {
+                    validate_attributes(&e)?;
+                }
+            }
+            Event::End(_) => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| XmpError::Xml("unexpected closing element".into()))?;
+            }
+            _ => {}
+        }
+    }
+
+    if depth != 0 {
+        return Err(XmpError::Xml("unexpected end of document".into()));
+    }
+
+    if saw_rating_element || ranges.is_empty() {
+        return Ok(None);
+    }
+
+    let value = rating.to_string();
+    let mut updated = String::with_capacity(xml.len() + value.len() * ranges.len());
+    let mut cursor = 0;
+    for range in ranges {
+        if range.start < cursor {
+            return Err(XmpError::Xml("overlapping rating attributes".into()));
+        }
+        updated.push_str(
+            xml.get(cursor..range.start)
+                .ok_or_else(|| XmpError::Xml("invalid rating attribute boundary".into()))?,
+        );
+        updated.push_str(&value);
+        cursor = range.end;
+    }
+    updated.push_str(
+        xml.get(cursor..)
+            .ok_or_else(|| XmpError::Xml("invalid rating attribute boundary".into()))?,
+    );
+    Ok(Some(updated))
+}
+
+fn collect_rating_attribute_ranges(
+    reader: &NsReader<&[u8]>,
+    e: &BytesStart<'_>,
+    xml: &str,
+    ranges: &mut Vec<Range<usize>>,
+) -> Result<(), XmpError> {
+    let mut found_rating = false;
+    for attr in e.attributes() {
+        let attr = attr.map_err(|error| XmpError::Xml(error.to_string()))?;
+        if !is_xmp_rating_attribute(reader, attr.key) {
+            continue;
+        }
+        if found_rating {
+            return Err(XmpError::Xml(
+                "duplicate XMP rating attributes on one element".into(),
+            ));
+        }
+        found_rating = true;
+        ranges.push(input_range(xml, attr.value.as_ref())?);
+    }
+    Ok(())
+}
+
+fn input_range(input: &str, value: &[u8]) -> Result<Range<usize>, XmpError> {
+    let input_start = input.as_ptr() as usize;
+    let start = (value.as_ptr() as usize)
+        .checked_sub(input_start)
+        .ok_or_else(|| XmpError::Xml("rating attribute is outside the input".into()))?;
+    let end = start
+        .checked_add(value.len())
+        .ok_or_else(|| XmpError::Xml("rating attribute range overflow".into()))?;
+    if input.as_bytes().get(start..end) != Some(value) {
+        return Err(XmpError::Xml(
+            "rating attribute is outside the input".into(),
+        ));
+    }
+    Ok(start..end)
+}
+
+fn update_rating_xml_fallback(xml: &str, rating: u8) -> Result<String, XmpError> {
     let mut reader = NsReader::from_str(xml);
     reader.config_mut().trim_text(false);
     let mut writer = Writer::new(Vec::new());
@@ -268,6 +411,10 @@ pub fn update_rating_xml(xml: &str, rating: u8) -> Result<String, XmpError> {
         }
     }
 
+    if depth != 0 {
+        return Err(XmpError::Xml("unexpected end of document".into()));
+    }
+
     // Neither form present: inject the attribute onto the first Description.
     if !wrote && let Some(target) = injection {
         let (Event::Start(e) | Event::Empty(e)) = events[target.position].clone() else {
@@ -349,7 +496,7 @@ fn injection_target(reader: &NsReader<&[u8]>, position: usize) -> InjectionTarge
             continue;
         };
         active_prefixes.push(prefix.to_vec());
-        if namespace.as_ref() == XMP_NAMESPACE
+        if is_xmp_namespace(namespace.as_ref())
             && let Ok(prefix) = std::str::from_utf8(prefix)
         {
             return InjectionTarget {
@@ -462,6 +609,85 @@ mod tests {
         assert!(element.contains("<photo:Rating>2</photo:Rating>"));
         assert_eq!(parse_rating(&attribute), Some(5));
         assert_eq!(parse_rating(&element), Some(2));
+    }
+
+    #[test]
+    fn namespace_scopes_shadow_and_restore_rating_aliases() {
+        let xml = r#"<root xmlns:p="http://ns.adobe.com/xap/1.0/">
+            <group xmlns:p="urn:not-xmp">
+                <rdf:Description p:Rating="5"/>
+            </group>
+            <rdf:Description p:Rating="3"/>
+        </root>"#;
+
+        assert_eq!(parse_rating(xml), Some(3));
+        let updated = update_rating_xml(xml, 4).unwrap();
+        assert!(updated.contains(r#"<rdf:Description p:Rating="5"/>"#));
+        assert!(updated.contains(r#"<rdf:Description p:Rating="4"/>"#));
+    }
+
+    #[test]
+    fn default_namespace_applies_to_elements_but_not_attributes() {
+        let attribute = r#"<Description xmlns="http://ns.adobe.com/xap/1.0/" Rating="4"/>"#;
+        let element = r#"<Rating xmlns="http://ns.adobe.com/xap/1.0/">4</Rating>"#;
+
+        assert_eq!(parse_rating(attribute), None);
+        assert_eq!(parse_rating(element), Some(4));
+        assert_eq!(
+            parse_rating(&update_rating_xml(element, 2).unwrap()),
+            Some(2)
+        );
+
+        let injected = update_rating_xml(attribute, 3).unwrap();
+        assert!(injected.contains(r#"Rating="4""#));
+        assert_eq!(parse_rating(&injected), Some(3));
+    }
+
+    #[test]
+    fn undeclared_rating_prefix_is_not_xmp() {
+        let xml = r#"<rdf:Description unknown:Rating="4"/>"#;
+
+        assert_eq!(parse_rating(xml), None);
+        let updated = update_rating_xml(xml, 2).unwrap();
+        assert!(updated.contains(r#"unknown:Rating="4""#));
+        assert_eq!(parse_rating(&updated), Some(2));
+    }
+
+    #[test]
+    fn escaped_namespace_uri_still_resolves_to_xmp() {
+        let xml = r#"<rdf:Description
+            xmlns:p="http://ns.adobe.com/xap/1.&#48;/"
+            p:Rating="4"/>"#;
+
+        assert_eq!(parse_rating(xml), Some(4));
+        let updated = update_rating_xml(xml, 1).unwrap();
+        assert!(updated.contains(r#"p:Rating="1""#));
+        assert_eq!(parse_rating(&updated), Some(1));
+    }
+
+    #[test]
+    fn malformed_non_description_and_invalid_namespace_bindings_fail_closed() {
+        let malformed = r#"<root broken><rdf:Description
+            xmlns:p="http://ns.adobe.com/xap/1.0/" p:Rating="4"/></root>"#;
+        let duplicate_namespace = r#"<root xmlns:p="urn:one" xmlns:p="urn:two">
+            <rdf:Description xmlns:x="http://ns.adobe.com/xap/1.0/" x:Rating="4"/>
+        </root>"#;
+        let invalid_xml_binding = r#"<root xmlns:xml="urn:not-xml">
+            <rdf:Description xmlns:x="http://ns.adobe.com/xap/1.0/" x:Rating="4"/>
+        </root>"#;
+        let invalid_xmlns_binding = r#"<root xmlns:xmlns="urn:not-xmlns">
+            <rdf:Description xmlns:x="http://ns.adobe.com/xap/1.0/" x:Rating="4"/>
+        </root>"#;
+
+        for xml in [
+            malformed,
+            duplicate_namespace,
+            invalid_xml_binding,
+            invalid_xmlns_binding,
+        ] {
+            assert_eq!(parse_rating(xml), None);
+            assert!(matches!(update_rating_xml(xml, 2), Err(XmpError::Xml(_))));
+        }
     }
 
     #[test]
@@ -608,6 +834,25 @@ mod tests {
         ));
         assert!(matches!(
             update_rating_xml(duplicate, 4),
+            Err(XmpError::Xml(_))
+        ));
+        assert_eq!(parse_rating(malformed), None);
+        assert_eq!(parse_rating(duplicate), None);
+    }
+
+    #[test]
+    fn update_rejects_truncated_attribute_and_element_documents() {
+        let attribute = r#"<root><rdf:Description
+            xmlns:p="http://ns.adobe.com/xap/1.0/" p:Rating="2">"#;
+        let element = r#"<root xmlns:p="http://ns.adobe.com/xap/1.0/">
+            <p:Rating>2"#;
+
+        assert!(matches!(
+            update_rating_xml(attribute, 4),
+            Err(XmpError::Xml(_))
+        ));
+        assert!(matches!(
+            update_rating_xml(element, 4),
             Err(XmpError::Xml(_))
         ));
     }
