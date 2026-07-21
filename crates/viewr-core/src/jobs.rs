@@ -225,8 +225,15 @@ impl JobQueue {
         }
     }
 
-    fn finish(&self, id: JobId) {
-        self.state.lock().unwrap().in_flight.remove(&id);
+    fn finish(&self, id: JobId, token: &Arc<CancelToken>) {
+        let mut state = self.state.lock().unwrap();
+        if state
+            .in_flight
+            .get(&id)
+            .is_some_and(|current| Arc::ptr_eq(current, token))
+        {
+            state.in_flight.remove(&id);
+        }
     }
 }
 
@@ -423,7 +430,7 @@ fn worker(shared: &Shared, light: bool) {
     let queue = if light { &shared.light } else { &shared.heavy };
     while let Some((id, action, token)) = queue.pop(&shared.shutdown) {
         run_job(shared, id, action, &token);
-        queue.finish(id);
+        queue.finish(id, &token);
     }
 }
 
@@ -696,5 +703,34 @@ mod tests {
                 .queued
                 .contains_key(&(7, Tier::Browse))
         );
+    }
+
+    #[test]
+    fn stale_completion_does_not_finish_replacement_generation() {
+        let q = JobQueue::new();
+        let shutdown = AtomicBool::new(false);
+        let id = (0, Tier::Browse);
+
+        q.set_plan(vec![job(id, 1, 0)]);
+        let (_, _, stale) = q.pop(&shutdown).unwrap();
+        q.set_plan(Vec::new());
+        assert!(stale.cancelled());
+
+        q.set_plan(vec![job(id, 1, 0)]);
+        let (_, _, replacement) = q.pop(&shutdown).unwrap();
+        assert!(!Arc::ptr_eq(&stale, &replacement));
+
+        q.finish(id, &stale);
+        assert!(
+            q.state
+                .lock()
+                .unwrap()
+                .in_flight
+                .get(&id)
+                .is_some_and(|current| Arc::ptr_eq(current, &replacement))
+        );
+
+        q.finish(id, &replacement);
+        assert!(!q.state.lock().unwrap().in_flight.contains_key(&id));
     }
 }

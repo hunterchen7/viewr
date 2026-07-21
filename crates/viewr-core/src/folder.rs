@@ -65,10 +65,14 @@ pub fn scan(dir: &Path) -> io::Result<Vec<FolderEntry>> {
 /// ~3:1 (three ahead for every one behind). This is the same expanding wave
 /// used by the prefetch scheduler.
 pub fn outward_order(len: usize, start: usize) -> Vec<usize> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let start = start.min(len - 1);
     let mut order = Vec::with_capacity(len);
     let mut fwd = start + 1;
     let mut back = start.checked_sub(1);
-    order.push(start.min(len.saturating_sub(1)));
+    order.push(start);
     while order.len() < len {
         for _ in 0..3 {
             if fwd < len {
@@ -105,11 +109,31 @@ mod tests {
 
     #[test]
     fn outward_handles_edges() {
+        assert!(outward_order(0, 0).is_empty());
+        assert!(outward_order(0, usize::MAX).is_empty());
         assert_eq!(outward_order(1, 0), vec![0]);
         let order = outward_order(5, 4);
         assert_eq!(order[0], 4);
         let mut sorted = order.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, (0..5).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn outward_is_a_permutation_for_all_small_inputs() {
+        for len in 0usize..=128 {
+            for start in 0..=len.saturating_add(2) {
+                let order = outward_order(len, start);
+                assert_eq!(order.len(), len, "len={len}, start={start}");
+                assert!(
+                    order.iter().all(|&index| index < len),
+                    "len={len}, start={start}, order={order:?}"
+                );
+                let mut sorted = order;
+                sorted.sort_unstable();
+                sorted.dedup();
+                assert_eq!(sorted, (0..len).collect::<Vec<_>>());
+            }
+        }
     }
 }
