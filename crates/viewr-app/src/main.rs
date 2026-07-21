@@ -1,6 +1,7 @@
 mod app;
 mod color;
 mod config;
+mod filmstrip;
 mod loupe;
 mod settings;
 

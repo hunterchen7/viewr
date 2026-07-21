@@ -24,6 +24,7 @@ use viewr_core::meta::FileMeta;
 use viewr_core::types::{PixelBuf, Tier};
 
 use crate::config::{Action, Config, ScrollMode};
+use crate::filmstrip;
 use crate::loupe::{self, Zoom};
 use crate::settings::SettingsState;
 
@@ -793,66 +794,93 @@ impl App {
                 .size_range(egui::Rangef::new(70.0, 320.0))
                 .show(ui, |ui| {
                     let thumb_h = (ui.available_height() - 24.0).clamp(46.0, 290.0);
-                    egui::ScrollArea::horizontal()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.horizontal_centered(|ui| {
-                                for &i in &self.visible {
+                    // Every column has a stable width so the strip can create only
+                    // the widgets intersecting the viewport. Previously this loop
+                    // built one widget tree per file even when almost all were clipped.
+                    let cell = vec2(thumb_h * 1.4, thumb_h + 18.0);
+                    let spacing = ui.spacing().item_spacing.x;
+                    let visible_pos = visible_position(&self.visible, current);
+                    let mut strip = egui::ScrollArea::horizontal().auto_shrink([false, false]);
+                    if scroll_to {
+                        strip = strip.horizontal_scroll_offset(filmstrip::centered_scroll_offset(
+                            self.visible.len(),
+                            visible_pos,
+                            cell.x,
+                            spacing,
+                            ui.available_width(),
+                        ));
+                    }
+                    strip.show_viewport(ui, |ui, viewport| {
+                        filmstrip::show_columns(
+                            ui,
+                            viewport,
+                            self.visible.len(),
+                            cell,
+                            filmstrip::OVERSCAN_COLUMNS,
+                            |columns_ui, range| {
+                                for visible_pos in range {
+                                    let i = self.visible[visible_pos];
                                     let selected = i == current;
                                     let rating = session.ratings.get(&i).copied().unwrap_or(0);
-                                    let response = match session.thumbs.get(&i) {
-                                        Some(tex) => {
-                                            let size = tex.size_vec2();
-                                            let w = (size.x / size.y * thumb_h)
-                                                .clamp(30.0, thumb_h * 2.2);
-                                            ui.vertical(|ui| {
-                                                let r = ui.add(
-                                                    egui::Button::image(egui::Image::new((
-                                                        tex.id(),
-                                                        vec2(w, thumb_h),
-                                                    )))
-                                                    .selected(selected),
-                                                );
-                                                if rating > 0 {
-                                                    ui.label(
-                                                        egui::RichText::new(
-                                                            "★".repeat(rating as usize),
+                                    columns_ui.allocate_ui_with_layout(
+                                        cell,
+                                        egui::Layout::top_down(egui::Align::Center),
+                                        |column_ui| {
+                                            let response = match session.thumbs.get(&i) {
+                                                Some(tex) => {
+                                                    let size = tex.size_vec2();
+                                                    let padding =
+                                                        column_ui.spacing().button_padding * 2.0;
+                                                    let inner = (vec2(cell.x, thumb_h) - padding)
+                                                        .max(vec2(1.0, 1.0));
+                                                    let scale =
+                                                        (inner.x / size.x).min(inner.y / size.y);
+                                                    column_ui.add_sized(
+                                                        vec2(cell.x, thumb_h),
+                                                        // `Button::image` caps image atoms at the
+                                                        // font height in egui 0.35. A regular button
+                                                        // intentionally preserves this exact size.
+                                                        egui::Button::new(
+                                                            egui::Image::new((tex.id(), size))
+                                                                .fit_to_exact_size(size * scale),
                                                         )
-                                                        .size(10.0)
-                                                        .color(egui::Color32::GOLD),
-                                                    );
+                                                        .selected(selected),
+                                                    )
                                                 }
-                                                r
-                                            })
-                                            .inner
-                                        }
-                                        None => ui.add_sized(
-                                            vec2(thumb_h * 1.4, thumb_h),
-                                            egui::Button::new(egui::RichText::new("…").weak())
-                                                .selected(selected),
-                                        ),
-                                    };
-                                    // Avoid synchronized cache probes for the many
-                                    // filmstrip entries clipped outside the viewport.
-                                    if ui.is_rect_visible(response.rect)
-                                        && let Some(color) = self.tier_stroke(session, i)
-                                    {
-                                        ui.painter().rect_stroke(
-                                            response.rect.expand(1.0),
-                                            3.0,
-                                            egui::Stroke::new(2.0, color),
-                                            egui::StrokeKind::Outside,
-                                        );
-                                    }
-                                    if response.clicked() {
-                                        clicked = Some(i);
-                                    }
-                                    if selected && scroll_to {
-                                        response.scroll_to_me(Some(egui::Align::Center));
-                                    }
+                                                None => column_ui.add_sized(
+                                                    vec2(cell.x, thumb_h),
+                                                    egui::Button::new(
+                                                        egui::RichText::new("…").weak(),
+                                                    )
+                                                    .selected(selected),
+                                                ),
+                                            };
+                                            if let Some(color) = self.tier_stroke(session, i) {
+                                                column_ui.painter().rect_stroke(
+                                                    response.rect.expand(1.0),
+                                                    3.0,
+                                                    egui::Stroke::new(2.0, color),
+                                                    egui::StrokeKind::Outside,
+                                                );
+                                            }
+                                            if rating > 0 {
+                                                column_ui.label(
+                                                    egui::RichText::new(
+                                                        "★".repeat(rating as usize),
+                                                    )
+                                                    .size(10.0)
+                                                    .color(egui::Color32::GOLD),
+                                                );
+                                            }
+                                            if response.clicked() {
+                                                clicked = Some(i);
+                                            }
+                                        },
+                                    );
                                 }
-                            });
-                        });
+                            },
+                        );
+                    });
                 });
             strip_height = Some(inner.response.rect.height());
         }
