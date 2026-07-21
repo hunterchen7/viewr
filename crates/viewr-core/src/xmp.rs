@@ -237,7 +237,7 @@ pub fn write_rating(path: &Path, rating: u8) -> Result<(), XmpError> {
 /// Update the semantic `xmp:Rating` property inside existing sidecar XML.
 ///
 /// Existing rating attributes are changed with byte-range splices that
-/// preserves every other input byte. Element updates and new-property
+/// preserve every other input byte. Element updates and new-property
 /// injection preserve semantic content but can reserialize XML.
 ///
 /// # Errors

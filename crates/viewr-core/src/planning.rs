@@ -9,21 +9,35 @@ const INTERACTIVE_TARGET_CAPACITY: usize =
     2 + BROWSE_WINDOW as usize + (BROWSE_WINDOW / 3) as usize + FULL_WINDOW as usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Purpose of a planned render target.
 pub enum PlanKind {
     /// A display candidate. The engine chooses develop versus rehydrate from
     /// current cache state.
     Display,
     /// A far browse render that should warm ring 2 and disk without entering
     /// the decoded RGBA ring.
+    ///
+    /// This variant is available to deterministic planning callers. Production
+    /// [`crate::jobs::Engine`] planning uses its separate persistent warm lane
+    /// instead of rebuilding these targets on every navigation.
     Warm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One desired render in a navigation wave.
 pub struct PlanTarget {
+    /// Folder index to render.
     pub index: usize,
+    /// Render quality/cache tier.
     pub tier: Tier,
+    /// Coarse priority class; lower values run first.
     pub class: u8,
+    /// Direction-weighted distance used within a priority class.
+    ///
+    /// Entries behind the navigation direction count three times farther than
+    /// entries ahead.
     pub effective_distance: u32,
+    /// Whether the render is for display or background warming.
     pub kind: PlanKind,
 }
 
@@ -31,7 +45,19 @@ pub struct PlanTarget {
 ///
 /// `sequence` is display order after filtering. An empty slice means identity
 /// order. `include_warm` adds browse-only work outside the interactive window
-/// for a configured disk cache.
+/// for a configured disk cache. That option deliberately builds an O(`len`)
+/// reference set; [`crate::jobs::Engine`] passes `false` and owns one persistent
+/// folder-warm lane instead.
+///
+/// `current` is clamped to `len - 1`, and any negative `direction` means
+/// backward while zero and positive values mean forward. If a nonempty
+/// `sequence` omits `current`, its first position is used as the navigation
+/// origin; out-of-range sequence entries are ignored. Callers should normally
+/// supply unique valid indices.
+///
+/// When `zoomed` is false, no Full targets are emitted. Without warm targets,
+/// allocation is bounded by the interactive windows, although locating the
+/// current item in a filtered sequence is linear in the sequence length.
 pub fn build_plan_targets(
     len: usize,
     current: usize,

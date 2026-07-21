@@ -26,26 +26,40 @@ use rayon::prelude::*;
 use crate::types::PixelBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Demosaic quality and output-size tier.
 pub enum Quality {
-    /// Superpixel demosaic: each RGGB quad → one RGB pixel, half resolution.
-    /// Real raw data, artifact-free, fast. The browse tier.
+    /// Superpixel demosaic: each 2×2 Bayer quad → one RGB pixel, half resolution.
+    /// Uses real RAW samples without interpolating neighboring quads. The
+    /// browse tier.
     Browse,
     /// PPG edge-directed demosaic at native resolution. The 100%-zoom tier.
     Full,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
+/// Wall-clock time spent in each stage of one RAW development.
+///
+/// These fields exclude file decode, EXIF orientation, caching, and JPEG
+/// encoding. Parallel stages are reported as elapsed wall time, not summed CPU
+/// time.
 pub struct DevelopTimings {
+    /// Black/white-level normalization of the CFA mosaic.
     pub rescale: Duration,
+    /// CFA-to-RGB demosaic.
     pub demosaic: Duration,
+    /// White balance and camera-to-linear-sRGB color conversion.
     pub calibrate: Duration,
+    /// Gamma, tone curve, and RGBA8 packing.
     pub gamma_pack: Duration,
 }
 
 #[derive(Debug, thiserror::Error)]
+/// Failure while converting a decoded CFA mosaic into display pixels.
 pub enum DevelopError {
+    /// A `rawler` image operation failed.
     #[error("rawler: {0}")]
     Rawler(#[from] rawler::RawlerError),
+    /// The sensor photometric interpretation or CFA layout is unsupported.
     #[error("unsupported sensor layout: {0}")]
     Unsupported(String),
 }
@@ -54,6 +68,12 @@ pub enum DevelopError {
 ///
 /// Consumes the RawImage (the CFA plane is moved into the pipeline).
 /// EXIF orientation is NOT applied here; the caller rotates.
+/// The returned [`PixelBuf`] is tightly packed RGBA8 in display sRGB.
+///
+/// # Errors
+///
+/// Returns [`DevelopError::Unsupported`] for non-CFA or non-RGB CFA sensors and
+/// [`DevelopError::Rawler`] when RAW normalization fails.
 pub fn develop(
     raw: RawImage,
     quality: Quality,
@@ -275,6 +295,10 @@ fn assert_region_within(image: &Color2D<f32, 3>, region: Rect) {
     assert!(region.x() + region.width() <= image.width);
 }
 
+/// Sums the stages measured by [`develop`].
+///
+/// This deliberately excludes RAW file decode, display rotation, cache work,
+/// and JPEG encoding.
 pub fn total(timings: &DevelopTimings) -> Duration {
     timings.rescale + timings.demosaic + timings.calibrate + timings.gamma_pack
 }
@@ -343,7 +367,8 @@ fn superpixel_demosaic(
             .for_each(|(out_y, out_row)| fill_row(out_y, out_row));
     }
 
-    // Every spare slot is initialized exactly once by the traversal above.
+    // SAFETY: `spare` covers exactly `out_len` slots and the row traversal
+    // initializes each slot once before the vector length becomes observable.
     unsafe { output.set_len(out_len) };
     Color2D::new_with(output, out_width, out_height)
 }

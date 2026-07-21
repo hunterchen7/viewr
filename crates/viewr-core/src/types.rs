@@ -1,3 +1,5 @@
+//! Shared value types passed between decoding, caching, scheduling, and the UI.
+
 /// Cache/display tier of a rendered image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Tier {
@@ -13,16 +15,23 @@ pub enum Tier {
 /// variants collapse onto the nearest rotation (cameras don't mirror).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Orient {
+    /// No display rotation.
     #[default]
     R0,
-    /// 90° clockwise
+    /// 90° clockwise.
     R90,
+    /// 180° clockwise.
     R180,
-    /// 270° clockwise
+    /// 270° clockwise.
     R270,
 }
 
 impl Orient {
+    /// Converts an EXIF orientation value into the supported display rotation.
+    ///
+    /// Mirrored EXIF values (`2`, `4`, `5`, and `7`) intentionally collapse to
+    /// their nearest rotation. Missing and unknown values are treated as
+    /// [`R0`](Self::R0).
     pub fn from_exif(value: Option<u16>) -> Self {
         match value {
             Some(3 | 4) => Self::R180,
@@ -32,6 +41,7 @@ impl Orient {
         }
     }
 
+    /// Returns whether applying this orientation exchanges width and height.
     pub fn swaps_axes(self) -> bool {
         matches!(self, Self::R90 | Self::R270)
     }
@@ -43,12 +53,24 @@ impl Orient {
 /// are constructed from this on the UI thread only.
 #[derive(Clone)]
 pub struct PixelBuf {
+    /// Image width in pixels.
     pub width: u32,
+    /// Image height in pixels.
     pub height: u32,
+    /// Row-major RGBA bytes, with four bytes per pixel.
+    ///
+    /// Pipeline-produced buffers satisfy
+    /// `rgba.len() == width * height * 4`. Public callers constructing the
+    /// struct directly must preserve that invariant before passing it to
+    /// resize or JPEG functions.
     pub rgba: Vec<u8>,
 }
 
 impl PixelBuf {
+    /// Returns the resident byte length of the pixel storage.
+    ///
+    /// This reports the actual vector length; it does not recompute or validate
+    /// the expected length from the dimensions.
     pub fn byte_len(&self) -> usize {
         self.rgba.len()
     }

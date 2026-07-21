@@ -12,25 +12,39 @@ use crate::resize;
 use crate::types::PixelBuf;
 
 #[derive(Debug, thiserror::Error)]
+/// Failure while opening a RAW container or extracting its data.
 pub enum DecodeError {
+    /// The file could not be read.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// `rawler` could not identify or decode the container.
     #[error("rawler: {0}")]
     Rawler(#[from] rawler::RawlerError),
+    /// The container exposes no preview, thumbnail, or full embedded image.
     #[error("no embedded preview or thumbnail")]
     NoThumb,
+    /// The extracted preview could not be resized.
     #[error("{0}")]
     Resize(#[from] resize::ResizeError),
 }
 
+/// Display-oriented embedded thumbnail and metadata returned by one container
+/// pass.
 pub struct ThumbResult {
+    /// Downscaled, orientation-corrected preview pixels.
     pub thumb: PixelBuf,
+    /// Metadata extracted from the same decoder instance.
     pub meta: FileMeta,
 }
 
 /// Extract container metadata without decoding an embedded preview or raw
 /// pixels. Folder-open background work uses this to discover in-camera
 /// ratings while thumbnail pixels remain demand-driven.
+///
+/// # Errors
+///
+/// Returns [`DecodeError::Io`] for file access failures and
+/// [`DecodeError::Rawler`] for unsupported or malformed RAW containers.
 pub fn metadata(path: &Path) -> Result<FileMeta, DecodeError> {
     let source = RawSource::new(path)?;
     let decoder = rawler::get_decoder(&source)?;
@@ -40,8 +54,18 @@ pub fn metadata(path: &Path) -> Result<FileMeta, DecodeError> {
 }
 
 /// Light pass: metadata + a display-oriented thumbnail from the embedded
-/// preview JPEG. No raw pixel decode. (Embedded previews are allowed for
-/// thumbnails only — the main view always renders from raw.)
+/// preview JPEG. No raw pixel decode. The main view can use this demanded
+/// thumbnail as a temporary stand-in; its final Browse and Full images are
+/// developed from RAW sensor data.
+///
+/// `max_edge` bounds the long edge after EXIF rotation. A value of zero still
+/// produces at least one pixel along each nonzero source dimension.
+///
+/// # Errors
+///
+/// In addition to file and RAW-decoder errors, returns [`DecodeError::NoThumb`]
+/// when no embedded image exists and [`DecodeError::Resize`] when the decoded
+/// pixel buffer cannot be resized.
 pub fn thumb_and_meta(path: &Path, max_edge: u32) -> Result<ThumbResult, DecodeError> {
     let source = RawSource::new(path)?;
     let decoder = rawler::get_decoder(&source)?;
@@ -71,8 +95,11 @@ pub fn thumb_and_meta(path: &Path, max_edge: u32) -> Result<ThumbResult, DecodeE
     Ok(ThumbResult { thumb, meta })
 }
 
+/// Decoded CFA mosaic, container metadata, and per-stage wall-clock timings.
 pub struct DecodedRaw {
+    /// Sensor-space CFA mosaic and calibration data consumed by development.
     pub raw: RawImage,
+    /// Container metadata extracted before the mosaic decode.
     pub metadata: RawMetadata,
     /// Wall time for file read + container parse + decoder construction.
     pub t_open: Duration,
@@ -83,6 +110,14 @@ pub struct DecodedRaw {
 }
 
 /// Decode a raw file into its CFA mosaic plus metadata.
+///
+/// Timing fields measure consecutive stages within this call and are intended
+/// for diagnostics rather than stable benchmarking.
+///
+/// # Errors
+///
+/// Returns [`DecodeError::Io`] for file access failures or
+/// [`DecodeError::Rawler`] when the container cannot be parsed or decoded.
 pub fn load(path: &Path) -> Result<DecodedRaw, DecodeError> {
     let t = Instant::now();
     let source = RawSource::new(path)?;

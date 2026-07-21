@@ -1,39 +1,66 @@
-//! SQLite mirror: ratings + per-file metadata so folder reopens paint
-//! instantly with zero raw-file reads. One connection, used only from
-//! the library's persist thread.
+//! SQLite rating mirror and unfinished-sidecar recovery journal.
+//!
+//! Startup can restore rating precedence from this database without waiting
+//! for the metadata wave, but EXIF and in-camera metadata still come from RAW
+//! container reads. Each [`Db`] owns one connection; startup reads and the
+//! persistence worker may use separate instances.
 
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
 #[derive(Debug, thiserror::Error)]
+/// Failure while opening, migrating, or updating the metadata database.
 pub enum DbError {
+    /// SQLite returned an error.
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// The platform does not expose a suitable application-data directory.
+    ///
+    /// Current constructors do not emit this variant: [`default_db_path`]
+    /// represents this condition with `None`.
     #[error("no data dir")]
     NoDataDir,
 }
 
+/// SQLite-backed rating and sidecar recovery journal.
+///
+/// A `Db` owns one connection and does not provide its own synchronization.
+/// Opening enables WAL mode and applies additive schema migrations before
+/// returning.
 pub struct Db {
     conn: Connection,
 }
 
 #[derive(Debug, Clone, Default)]
+/// Rating state mirrored for one RAW path.
 pub struct ImageRow {
+    /// Last recorded rating, normally in `0..=5`.
     pub rating: Option<u8>,
+    /// Modification time of the sidecar represented by this row, or zero when
+    /// no completed sidecar write has been recorded.
     pub sidecar_mtime_ns: i64,
     /// The database rating is newer than the sidecar and must win on load.
     pub sidecar_dirty: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// A journaled rating whose XMP sidecar write must be resumed.
 pub struct PendingSidecar {
+    /// RAW path; its sidecar is the same path with an `xmp` extension.
     pub path: PathBuf,
+    /// RAW size captured when the rating was set.
     pub size: u64,
+    /// RAW modification time captured when the rating was set.
     pub mtime_ns: i64,
+    /// Rating to persist, normally in `0..=5`.
     pub rating: u8,
 }
 
+/// Returns the platform-default database path, creating its parent directory.
+///
+/// Returns `None` when no platform configuration directory is available or
+/// the parent cannot be created.
 pub fn default_db_path() -> Option<PathBuf> {
     let dir = dirs::config_dir()?.join("viewr");
     std::fs::create_dir_all(&dir).ok()?;
@@ -41,6 +68,12 @@ pub fn default_db_path() -> Option<PathBuf> {
 }
 
 impl Db {
+    /// Opens or creates a database, enables WAL mode, and initializes its
+    /// schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::Sqlite`] for open, pragma, or migration failures.
     pub fn open(path: &Path) -> Result<Self, DbError> {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -49,12 +82,18 @@ impl Db {
     }
 
     #[cfg(test)]
+    /// Creates an in-memory database with the production schema for tests.
     pub fn open_in_memory() -> Result<Self, DbError> {
         let conn = Connection::open_in_memory()?;
         initialize_schema(&conn)?;
         Ok(Self { conn })
     }
 
+    /// Looks up a row by its database path string.
+    ///
+    /// Missing rows and SQLite prepare/query failures both return `None`. This
+    /// makes the database a best-effort metadata accelerator rather than a
+    /// requirement for opening a photo folder.
     pub fn get_image(&self, path: &str) -> Option<ImageRow> {
         self.conn
             .prepare_cached(
@@ -71,6 +110,14 @@ impl Db {
             .ok()
     }
 
+    /// Records rating state after a sidecar has been successfully synchronized.
+    ///
+    /// This clears any pending-sidecar marker for `path`. Rating ranges are not
+    /// validated by the database layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::Sqlite`] when the insert or update fails.
     pub fn upsert_rating(
         &self,
         path: &str,

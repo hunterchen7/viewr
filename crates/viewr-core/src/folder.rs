@@ -5,12 +5,21 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
+/// Immutable identity and display metadata for one scanned RAW file.
+///
+/// `size` and `mtime_ns` are a fast cache identity, not proof of content
+/// equality. A file replaced while preserving both values can retain a stale
+/// render-cache key.
 pub struct FolderEntry {
+    /// Native filesystem path to the RAW file.
     pub path: PathBuf,
+    /// Lossy display name used for deterministic lexical sorting.
     pub file_name: String,
     /// File size + mtime feed the disk-cache key: any change to the raw
     /// invalidates its cached develops.
     pub size: u64,
+    /// Modification time in nanoseconds since the Unix epoch, or zero when the
+    /// filesystem does not provide a usable timestamp.
     pub mtime_ns: i64,
 }
 
@@ -25,6 +34,16 @@ impl FolderEntry {
 /// rawler path so it comes for free.
 const RAW_EXTENSIONS: &[&str] = &["arw", "dng"];
 
+/// Scans one directory for regular ARW and DNG files in filename order.
+///
+/// Extension matching is ASCII case-insensitive. Hidden entries, AppleDouble
+/// files, non-files, unsupported extensions, and entries whose metadata cannot
+/// be read are skipped. The function does not recurse.
+///
+/// # Errors
+///
+/// Returns the error from opening the directory itself. Per-entry iterator and
+/// metadata errors are treated as skipped entries.
 pub fn scan(dir: &Path) -> io::Result<Vec<FolderEntry>> {
     let mut entries: Vec<FolderEntry> = std::fs::read_dir(dir)?
         .filter_map(Result::ok)

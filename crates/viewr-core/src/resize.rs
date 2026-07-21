@@ -6,13 +6,21 @@ use rayon::prelude::*;
 use crate::types::{Orient, PixelBuf};
 
 #[derive(Debug, thiserror::Error)]
+/// Failure while constructing or resizing an RGBA image.
 pub enum ResizeError {
+    /// `fast_image_resize` rejected the dimensions, storage, or resize.
     #[error("resize: {0}")]
     Fir(String),
 }
 
 /// Downscale so the long edge is at most `max_edge`, preserving aspect.
 /// Returns the input unchanged if it already fits.
+/// The no-op path does not validate that RGBA storage matches the dimensions.
+///
+/// # Errors
+///
+/// When resizing is required, returns [`ResizeError::Fir`] if source RGBA
+/// storage is malformed or the resize operation fails.
 pub fn downscale_to_fit(buf: PixelBuf, max_edge: u32) -> Result<PixelBuf, ResizeError> {
     let long = buf.width.max(buf.height);
     if long <= max_edge {
@@ -24,6 +32,16 @@ pub fn downscale_to_fit(buf: PixelBuf, max_edge: u32) -> Result<PixelBuf, Resize
     resize_exact(buf, dst_w, dst_h)
 }
 
+/// Resizes an RGBA8 buffer to exact dimensions with a Catmull-Rom filter.
+///
+/// Alpha is not interpreted during filtering because pipeline images are
+/// opaque. The input allocation is consumed and the output remains tightly
+/// packed RGBA8.
+///
+/// # Errors
+///
+/// Returns [`ResizeError::Fir`] when the source storage does not match its
+/// dimensions or `fast_image_resize` rejects the operation.
 pub fn resize_exact(buf: PixelBuf, dst_w: u32, dst_h: u32) -> Result<PixelBuf, ResizeError> {
     let src =
         fir::images::Image::from_vec_u8(buf.width, buf.height, buf.rgba, fir::PixelType::U8x4)
@@ -42,7 +60,16 @@ pub fn resize_exact(buf: PixelBuf, dst_w: u32, dst_h: u32) -> Result<PixelBuf, R
     })
 }
 
-/// Rotate to display orientation. No-op for `R0`.
+/// Rotates a buffer to display orientation, consuming its allocation.
+///
+/// [`Orient::R0`] is allocation-free and [`Orient::R180`] reverses pixels in
+/// place. Quarter turns allocate a destination and exchange dimensions.
+///
+/// # Panics
+///
+/// Malformed storage can panic: [`Orient::R180`] checks four-byte divisibility
+/// in debug builds, while a quarter turn can index beyond a short buffer.
+/// Callers must preserve [`PixelBuf`]'s storage invariant.
 pub fn apply_orient(buf: PixelBuf, orient: Orient) -> PixelBuf {
     match orient {
         Orient::R0 => buf,
@@ -127,6 +154,8 @@ pub fn apply_orient(buf: PixelBuf, orient: Orient) -> PixelBuf {
 
 /// View a byte vec as pixel quads without unsafe.
 fn bytemuck_cast(rgba: &mut [u8]) -> &mut [[u8; 4]] {
+    // SAFETY: every bit pattern is valid for `[u8; 4]`, whose alignment is one.
+    // The pixel-buffer invariant makes the byte length a multiple of four.
     let (head, mid, tail) = unsafe { rgba.align_to_mut::<[u8; 4]>() };
     debug_assert!(head.is_empty() && tail.is_empty());
     mid

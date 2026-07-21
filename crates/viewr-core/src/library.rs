@@ -1,6 +1,11 @@
-//! Ratings orchestration: load precedence (sidecar > DB > embedded),
-//! and a persist thread that writes the DB immediately and debounces
-//! sidecar writes (~400ms per image, coalescing re-rating churn).
+//! Ratings orchestration and best-effort persistence.
+//!
+//! An unfinished dirty database journal entry remains authoritative regardless
+//! of sidecar modification time until it is flushed. Otherwise, a current
+//! sidecar wins over the clean database row.
+//! Embedded ratings arrive later through the metadata wave and fill only
+//! entries still missing a rating. The persistence thread attempts to journal
+//! updates before debouncing XMP sidecar writes (~400 ms per image).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -29,6 +34,15 @@ enum Cmd {
     Shutdown,
 }
 
+/// Asynchronous rating persistence service.
+///
+/// [`set_rating`](Self::set_rating) queues the update on a dedicated thread,
+/// which attempts to journal it and coalesces repeated changes to the same RAW
+/// before writing its XMP sidecar. The optional SQLite database is an
+/// accelerator and crash-recovery journal; sidecars remain the interoperable
+/// source of truth. Dropping the service makes one best-effort flush attempt
+/// and joins its worker. A failed sidecar remains recoverable on restart only
+/// if its dirty database journal write succeeded.
 pub struct Library {
     tx: Sender<Cmd>,
     worker: Option<JoinHandle<()>>,
@@ -37,9 +51,13 @@ pub struct Library {
     dirty: AtomicBool,
 }
 
-/// Initial per-index ratings resolved with full precedence. Embedded
-/// camera ratings arrive later via thumb metadata; apply them only where
-/// this map has no entry.
+/// Initial persisted per-index ratings resolved across the journal, sidecars,
+/// and clean database rows. Embedded camera ratings arrive later via the
+/// metadata wave; apply them only where this map has no entry.
+///
+/// A journal row marked dirty wins over any sidecar because it represents a
+/// rating accepted before an interrupted sidecar write. Database lookup is
+/// best-effort when `db` is `None` or contains no matching row.
 pub fn load_ratings(entries: &[FolderEntry], db: Option<&Db>) -> HashMap<usize, u8> {
     let mut out = HashMap::new();
     for (i, entry) in entries.iter().enumerate() {
@@ -71,8 +89,11 @@ pub fn load_ratings(entries: &[FolderEntry], db: Option<&Db>) -> HashMap<usize, 
 }
 
 impl Library {
-    /// Spawn the persist thread. Uses the default DB path (best-effort:
-    /// rating persistence degrades gracefully without a DB).
+    /// Spawns the persistence thread.
+    ///
+    /// The platform-default database is best-effort: failure to locate or open
+    /// it does not prevent XMP sidecar writes. Journaled sidecar writes left by
+    /// a prior process are resumed automatically when the database opens.
     pub fn start() -> Self {
         Self::start_with(default_db_path(), SIDECAR_DEBOUNCE)
     }
@@ -90,6 +111,12 @@ impl Library {
         }
     }
 
+    /// Queues a rating for attempted journaling and debounced sidecar writing.
+    ///
+    /// The method is non-blocking and repeated ratings for the same path
+    /// coalesce. Values are not range-checked; the UI convention is `0..=5`,
+    /// where zero means unrated. If the worker has already stopped, the update
+    /// is silently ignored.
     pub fn set_rating(&self, entry: &FolderEntry, rating: u8) {
         if self
             .tx
@@ -105,8 +132,14 @@ impl Library {
         }
     }
 
-    /// Force pending sidecar writes out now (navigate-away, quit), waiting
-    /// until both the sidecar and DB update have completed.
+    /// Requests one immediate attempt for locally dirty sidecars and waits for
+    /// that attempt to finish.
+    ///
+    /// A failed sidecar or database synchronization remains locally dirty and
+    /// is retried by a later flush or the worker's retry timer. Recovery after
+    /// process exit additionally requires a successful dirty database journal
+    /// write. Errors are logged because this best-effort API intentionally does
+    /// not return a `Result`.
     pub fn flush(&self) {
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return;

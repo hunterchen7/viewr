@@ -4,7 +4,7 @@
 //! `~/Library/Caches/viewr/objects/xx/<blake3>.jpg`. Keyed by
 //! (path, size, mtime, DEVELOP_VERSION, tier) so edited files and
 //! pipeline changes self-invalidate — stale objects simply never hit
-//! and are swept by GC later.
+//! and become eligible for budget GC later.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -17,10 +17,17 @@ use crate::types::Tier;
 
 /// Bump when the develop pipeline's output changes; invalidates every
 /// cached render for free.
-/// v2: base tone curve added.
+/// Version 3 invalidated renders after the crop, gamma, and RGBA-packing
+/// pipeline was streamlined.
 pub const DEVELOP_VERSION: u32 = 3;
 
 #[derive(Clone)]
+/// Persistent, file-identity-keyed cache of developed JPEG renders.
+///
+/// Clones share an in-process GC lock for the same canonical cache root, so
+/// concurrent engines cannot run conflicting snapshot-based sweeps. Normal
+/// reads and atomic writes may proceed while GC runs. Serialization does not
+/// extend across processes.
 pub struct DiskCache {
     root: PathBuf,
     budget_bytes: u64,
@@ -69,6 +76,12 @@ fn hash_path_identity(hasher: &mut blake3::Hasher, path: &Path) {
 }
 
 impl DiskCache {
+    /// Opens the platform-default `viewr/objects` cache directory.
+    ///
+    /// Returns `None` when the platform has no cache directory or the cache
+    /// root cannot be created. The budget is enforced only when
+    /// [`gc_to_budget`](Self::gc_to_budget) is called; opening is otherwise
+    /// non-destructive.
     pub fn open_default(budget_bytes: u64) -> Option<Self> {
         let root = dirs::cache_dir()?.join("viewr").join("objects");
         std::fs::create_dir_all(&root).ok()?;
@@ -81,6 +94,7 @@ impl DiskCache {
     }
 
     #[cfg(test)]
+    /// Opens a cache at an explicit root for unit tests.
     pub fn open_at(root: PathBuf) -> Self {
         std::fs::create_dir_all(&root).unwrap();
         let gc_lock = shared_gc_lock(&root);
@@ -91,6 +105,11 @@ impl DiskCache {
         }
     }
 
+    /// Derives the persistent object key for an entry and render tier.
+    ///
+    /// The digest includes the native path representation, file size,
+    /// nanosecond modification time, [`DEVELOP_VERSION`], and tier. It avoids
+    /// lossy path conversion, but deliberately does not hash file contents.
     pub fn key(entry: &FolderEntry, tier: Tier) -> String {
         let mut hasher = blake3::Hasher::new();
         hash_path_identity(&mut hasher, &entry.path);
@@ -115,10 +134,18 @@ impl DiskCache {
         Ok(self.root.join(&key[..2]).join(format!("{key}.jpg")))
     }
 
+    /// Returns whether a regular cache object exists for `key`.
+    ///
+    /// Invalid keys and filesystem errors are reported as `false`.
     pub fn has(&self, key: &str) -> bool {
         self.object_path(key).is_ok_and(|path| path.is_file())
     }
 
+    /// Reads a cache object into memory.
+    ///
+    /// Returns `None` for invalid keys, missing objects, and read failures.
+    /// Callers that decode the bytes should treat corrupt JPEG data as a cache
+    /// miss; [`crate::jobs::Engine`] removes corrupt objects before rebuilding.
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
         std::fs::read(self.object_path(key).ok()?).ok()
     }
@@ -131,7 +158,13 @@ impl DiskCache {
         }
     }
 
-    /// Atomic write: tmp in the same directory, then rename.
+    /// Atomically stores an object using a temporary file in the same shard.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`std::io::ErrorKind::InvalidInput`] if `key` is not a
+    /// 64-character hexadecimal digest. Other errors report directory
+    /// creation, temporary-file, write, or rename failures.
     pub fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<()> {
         let path = self.object_path(key)?;
         if let Some(parent) = path.parent() {
@@ -140,13 +173,17 @@ impl DiskCache {
         atomic_write::replace(&path, bytes)
     }
 
-    /// Enforce the configured byte budget.
+    /// Enforces the byte budget supplied to [`open_default`](Self::open_default).
+    ///
+    /// Returns the number of object bytes successfully deleted. Filesystem
+    /// failures are best-effort and do not surface as errors.
     pub fn gc_to_budget(&self) -> u64 {
         self.gc(self.budget_bytes)
     }
 
-    /// Enforce the byte budget by deleting oldest objects first
-    /// (age-approximated LRU; stale-keyed objects age out naturally).
+    /// Enforce the byte budget by deleting the oldest-written objects first.
+    /// Cache reads do not refresh file modification times, so this is not LRU.
+    /// Stale-keyed objects age out naturally.
     /// Also sweeps `.tmp` files old enough to be abandoned. Returns bytes
     /// deleted; recent temporary files may belong to active atomic writers.
     pub fn gc(&self, budget_bytes: u64) -> u64 {

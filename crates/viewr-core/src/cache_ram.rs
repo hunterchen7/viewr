@@ -11,6 +11,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::types::{PixelBuf, Tier};
 
+/// Cache identity as `(folder index, render tier)`.
+///
+/// An index is meaningful only for the immutable folder entry list associated
+/// with the cache's engine.
 pub type Key = (usize, Tier);
 
 struct Entry<V> {
@@ -298,13 +302,27 @@ impl<V: Clone> ByteLru<V> {
     }
 }
 
+/// Current payload-byte usage for each in-memory cache ring.
+///
+/// Values exclude allocator, hash-table, `Arc`, and entry metadata overhead.
 pub struct RamCacheStats {
+    /// Decoded Browse and Full RGBA payload bytes.
     pub rgba_bytes: u64,
+    /// Encoded JPEG payload bytes.
     pub jpeg_bytes: u64,
+    /// Decoded thumbnail RGBA payload bytes.
     pub thumb_bytes: u64,
 }
 
-/// Shared between UI thread and workers.
+/// Thread-safe, byte-budgeted cache shared by UI and worker threads.
+///
+/// Thumbnails, developed RGBA buffers, and developed JPEGs occupy independent
+/// exact-LRU rings. Reads through `get_*` promote an entry; `has_*` probes do
+/// not. Pinned entries cannot be evicted, so a ring may temporarily exceed its
+/// configured budget when all possible victims are pinned.
+///
+/// All operations serialize through one mutex. A panic while that mutex is
+/// held poisons the cache and causes later operations to panic.
 pub struct RamCache {
     inner: Mutex<Inner>,
 }
@@ -317,6 +335,10 @@ struct Inner {
 }
 
 impl RamCache {
+    /// Creates empty thumbnail, developed-RGBA, and JPEG rings with independent
+    /// byte budgets.
+    ///
+    /// A zero budget is valid: unpinned inserts are immediately evicted.
     pub fn new(thumb_budget: u64, rgba_budget: u64, jpeg_budget: u64) -> Self {
         Self {
             inner: Mutex::new(Inner {
@@ -328,8 +350,11 @@ impl RamCache {
         }
     }
 
-    /// Pin keys against eviction (the current image and its neighbors).
-    /// Replaces the previous pin set.
+    /// Replaces the set of keys protected against eviction.
+    ///
+    /// Pins apply to all rings and also affect entries inserted later. Removing
+    /// pins immediately evicts the oldest newly eligible entries if a ring is
+    /// over budget.
     pub fn set_pins(&self, keys: impl IntoIterator<Item = Key>) {
         let mut inner = self.inner.lock().unwrap();
         let new_pins: HashSet<_> = keys.into_iter().collect();
@@ -352,6 +377,11 @@ impl RamCache {
         inner.jpeg.evict_over_budget();
     }
 
+    /// Returns and promotes the decoded RGBA entry for `key`.
+    ///
+    /// [`Tier::Thumb`] addresses the thumbnail ring; other tiers address the
+    /// developed-RGBA ring. The returned `Arc` keeps the payload alive even if
+    /// it is subsequently evicted.
     pub fn get_rgba(&self, key: Key) -> Option<Arc<PixelBuf>> {
         let mut inner = self.inner.lock().unwrap();
         match key.1 {
@@ -360,6 +390,7 @@ impl RamCache {
         }
     }
 
+    /// Tests for a decoded RGBA entry without changing LRU recency.
     pub fn has_rgba(&self, key: Key) -> bool {
         let inner = self.inner.lock().unwrap();
         match key.1 {
@@ -368,14 +399,20 @@ impl RamCache {
         }
     }
 
+    /// Returns and promotes an encoded JPEG entry.
     pub fn get_jpeg(&self, key: Key) -> Option<Arc<Vec<u8>>> {
         self.inner.lock().unwrap().jpeg.get(&key)
     }
 
+    /// Tests for an encoded JPEG entry without changing LRU recency.
     pub fn has_jpeg(&self, key: Key) -> bool {
         self.inner.lock().unwrap().jpeg.contains(&key)
     }
 
+    /// Inserts or replaces a decoded RGBA entry and enforces its ring budget.
+    ///
+    /// Payload size is the buffer's actual [`PixelBuf::byte_len`], even if its
+    /// dimensions and storage length are inconsistent.
     pub fn insert_rgba(&self, key: Key, buf: Arc<PixelBuf>) {
         let bytes = buf.byte_len() as u64;
         let mut inner = self.inner.lock().unwrap();
@@ -386,6 +423,7 @@ impl RamCache {
         }
     }
 
+    /// Inserts or replaces an encoded JPEG entry and enforces the JPEG budget.
     pub fn insert_jpeg(&self, key: Key, bytes_vec: Arc<Vec<u8>>) {
         let bytes = bytes_vec.len() as u64;
         let mut inner = self.inner.lock().unwrap();
@@ -397,6 +435,7 @@ impl RamCache {
         self.inner.lock().unwrap().jpeg.remove(&key)
     }
 
+    /// Returns a payload-byte snapshot for all three rings.
     pub fn stats(&self) -> RamCacheStats {
         let inner = self.inner.lock().unwrap();
         RamCacheStats {

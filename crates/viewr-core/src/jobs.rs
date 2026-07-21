@@ -1,4 +1,4 @@
-//! The engine: worker pool, priority scheduling with real cancellation,
+//! The engine: worker pool, priority scheduling with cooperative cancellation,
 //! outward prefetch planning, and cache filling.
 //!
 //! Design (from the plan):
@@ -29,6 +29,7 @@ use crate::planning::{PlanKind, build_plan_targets};
 use crate::resize::apply_orient;
 use crate::types::{PixelBuf, Tier};
 
+/// Scheduler identity as `(folder index, render tier)`.
 pub type JobId = (usize, Tier);
 
 const HEAVY_WORKERS: usize = 3;
@@ -44,35 +45,63 @@ const PERSIST_WRITE_ATTEMPTS: usize = 3;
 const PERSIST_RETRY_BASE_DELAY: Duration = Duration::from_millis(2);
 
 #[derive(Debug)]
+/// Result notification published by [`Engine`] workers.
+///
+/// Pixel payloads are installed in [`RamCache`] before their ready event is
+/// sent, keeping channel messages small. Events do not lease cache entries: a
+/// later worker can evict an unpinned payload before the receiver handles the
+/// message, so the receiver must tolerate a cache miss and replan.
 pub enum Event {
+    /// Container metadata became available without decoding a thumbnail.
     MetadataReady {
+        /// Index in the engine's immutable folder entry list.
         index: usize,
+        /// Extracted container metadata.
         meta: Box<FileMeta>,
     },
+    /// A viewport-demanded thumbnail was produced and its metadata is ready.
     ThumbReady {
+        /// Index in the engine's immutable folder entry list.
         index: usize,
+        /// Metadata extracted during the thumbnail pass.
         meta: Box<FileMeta>,
     },
+    /// A developed or rehydrated image was installed in the RAM cache.
     ImageReady {
+        /// Index in the engine's immutable folder entry list.
         index: usize,
+        /// Resident render tier.
         tier: Tier,
     },
+    /// An image decode, development, or rehydration attempt failed.
     ImageFailed {
+        /// Index in the engine's immutable folder entry list.
         index: usize,
+        /// Tier whose production failed.
         tier: Tier,
+        /// Human-readable underlying error.
         error: String,
     },
+    /// Metadata extraction failed.
     MetadataFailed {
+        /// Index in the engine's immutable folder entry list.
         index: usize,
+        /// Human-readable underlying error.
         error: String,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Current navigation state used to reprioritize image work.
 pub struct NavState {
+    /// Current folder index. [`Engine::navigate`] clamps it to the last entry.
     pub current: usize,
     /// +1 browsing forward, -1 backward.
+    ///
+    /// [`Engine::navigate`] normalizes every negative value to `-1` and all
+    /// other values to `1`.
     pub direction: i8,
+    /// Whether the current view needs Full-tier renders.
     pub zoomed: bool,
 }
 
@@ -120,12 +149,19 @@ impl Ord for QueuedJob {
 }
 
 #[derive(Default)]
+/// Cooperative cancellation flag shared between a queue and one worker.
+///
+/// Cancellation suppresses stale publication and is checked between expensive
+/// pipeline stages. It cannot interrupt a `rawler` decode or demosaic that is
+/// already executing.
 pub struct CancelToken(AtomicBool);
 
 impl CancelToken {
+    /// Marks the associated work as cancelled.
     pub fn cancel(&self) {
         self.0.store(true, Ordering::Relaxed);
     }
+    /// Returns whether cancellation has been requested.
     pub fn cancelled(&self) -> bool {
         self.0.load(Ordering::Relaxed)
     }
@@ -787,6 +823,16 @@ struct Shared {
     navigation: Mutex<NavigationOrder>,
 }
 
+/// Owned worker engine for prioritized RAW, thumbnail, and cache work.
+///
+/// The folder entry list is immutable for the engine's lifetime, making its
+/// indices stable across events and cache keys. Interactive navigation plans
+/// replace one another, viewport thumbnail demand is replaceable, and
+/// folder-wide Browse warming occupies a persistent lowest-priority lane.
+/// Dropping the engine cancels queued work and joins decode, persistence, and
+/// disk-GC threads; no worker may outlive the engine. Drop can block until an
+/// active non-interruptible `rawler` decode or demosaic finishes and until
+/// accepted persistence and GC work has joined.
 pub struct Engine {
     shared: Arc<Shared>,
     workers: Vec<std::thread::JoinHandle<()>>,
@@ -842,7 +888,12 @@ fn background_warm_jobs(len: usize, start: usize) -> impl Iterator<Item = (JobId
 impl Engine {
     /// Spawns the worker pool and queues the outward metadata wave.
     /// `notify` is called after every published result (the app passes
-    /// `ctx.request_repaint`).
+    /// `ctx.request_repaint`). Container metadata is queued outward from
+    /// `start`; preview pixels remain demand-driven.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an operating-system thread cannot be spawned.
     pub fn new(
         entries: Arc<Vec<FolderEntry>>,
         start: usize,
@@ -923,8 +974,13 @@ impl Engine {
         )
     }
 
-    /// Recompute and sync the heavy plan for a navigation state. Cheap;
-    /// call on every nav/zoom change and on job completion events.
+    /// Recomputes and synchronizes the heavy plan for a navigation state.
+    ///
+    /// Call this after navigation or zoom changes and after image completion
+    /// events. Obsolete jobs are cooperatively cancelled. Fit mode omits and
+    /// unpins Full-tier work; zoom mode requests Full for the current and near
+    /// entries. The first call with a disk cache also installs the one-shot
+    /// folder-wide Browse warm lane.
     pub fn navigate(&self, nav: NavState) {
         let len = self.shared.entries.len();
         if len == 0 {
@@ -995,8 +1051,12 @@ impl Engine {
         }
     }
 
-    /// Set the display order (filtered view) the wave follows.
-    /// Call `navigate` afterwards to apply.
+    /// Sets the display order followed by navigation and pinning.
+    ///
+    /// An empty vector restores identity order. Out-of-range entries are
+    /// ignored by planning, but callers should normally provide unique valid
+    /// indices. Call [`navigate`](Self::navigate) afterwards to apply the new
+    /// order.
     pub fn set_sequence(&self, sequence: Vec<usize>) {
         let mut navigation = self.shared.navigation.lock().unwrap();
         navigation.replace_indices(sequence);
@@ -1006,6 +1066,9 @@ impl Engine {
     /// separate from the folder-wide metadata wave so rapid scrolling drops
     /// stale urgency. Claiming a thumbnail displaces queued metadata for that
     /// file because the thumbnail decode returns the same metadata.
+    ///
+    /// Invalid indices and duplicates are discarded. Returns `false` only
+    /// after engine shutdown has closed the light-work queue.
     pub fn set_thumbnail_demand(&self, indices: &[usize]) -> bool {
         self.shared.light.set_urgent(
             indices
@@ -1016,6 +1079,7 @@ impl Engine {
         )
     }
 
+    /// Returns the shared RAM cache populated by this engine.
     pub fn cache(&self) -> &Arc<RamCache> {
         &self.shared.cache
     }
@@ -1440,6 +1504,14 @@ fn develop_cache_miss(shared: &Shared, index: usize, tier: Tier, token: &CancelT
     run_develop(shared, index, tier, quality, token, false);
 }
 
+/// Encodes a tightly packed RGBA8 buffer as a JPEG.
+///
+/// `quality` is passed directly to `jpeg-encoder`. The output discards alpha.
+///
+/// # Errors
+///
+/// Returns a string error if either dimension exceeds `u16`, the RGBA storage
+/// is inconsistent with the dimensions, or JPEG encoding fails.
 pub fn encode_jpeg(buf: &PixelBuf, quality: u8) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     let encoder = jpeg_encoder::Encoder::new(&mut out, quality);
@@ -1454,6 +1526,12 @@ pub fn encode_jpeg(buf: &PixelBuf, quality: u8) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Decodes JPEG bytes into a tightly packed RGBA8 buffer.
+///
+/// # Errors
+///
+/// Returns a human-readable string for malformed or unsupported JPEG data, or
+/// when the decoder does not report dimensions.
 pub fn decode_jpeg(bytes: &[u8]) -> Result<PixelBuf, String> {
     use zune_jpeg::JpegDecoder;
     use zune_jpeg::zune_core::colorspace::ColorSpace;
