@@ -65,16 +65,14 @@ impl Db {
 
     pub fn get_image(&self, path: &str) -> Option<ImageRow> {
         self.conn
-            .query_row(
-                "SELECT rating, sidecar_mtime_ns FROM images WHERE path = ?1",
-                [path],
-                |row| {
-                    Ok(ImageRow {
-                        rating: row.get::<_, Option<u8>>(0)?,
-                        sidecar_mtime_ns: row.get(1)?,
-                    })
-                },
-            )
+            .prepare_cached("SELECT rating, sidecar_mtime_ns FROM images WHERE path = ?1")
+            .ok()?
+            .query_row([path], |row| {
+                Ok(ImageRow {
+                    rating: row.get::<_, Option<u8>>(0)?,
+                    sidecar_mtime_ns: row.get(1)?,
+                })
+            })
             .ok()
     }
 
@@ -86,8 +84,9 @@ impl Db {
         rating: Option<u8>,
         sidecar_mtime_ns: i64,
     ) -> Result<(), DbError> {
-        self.conn.execute(
-            "INSERT INTO images (path, size, mtime_ns, rating, sidecar_mtime_ns, last_seen)
+        self.conn
+            .prepare_cached(
+                "INSERT INTO images (path, size, mtime_ns, rating, sidecar_mtime_ns, last_seen)
              VALUES (?1, ?2, ?3, ?4, ?5, unixepoch())
              ON CONFLICT(path) DO UPDATE SET
                size = excluded.size,
@@ -95,8 +94,14 @@ impl Db {
                rating = excluded.rating,
                sidecar_mtime_ns = excluded.sidecar_mtime_ns,
                last_seen = excluded.last_seen",
-            rusqlite::params![path, size, mtime_ns, rating, sidecar_mtime_ns],
-        )?;
+            )?
+            .execute(rusqlite::params![
+                path,
+                size,
+                mtime_ns,
+                rating,
+                sidecar_mtime_ns
+            ])?;
         Ok(())
     }
 }

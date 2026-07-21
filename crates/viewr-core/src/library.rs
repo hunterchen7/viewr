@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -30,6 +31,9 @@ enum Cmd {
 pub struct Library {
     tx: Sender<Cmd>,
     worker: Option<JoinHandle<()>>,
+    /// Avoid a channel allocation and worker round-trip on ordinary
+    /// navigation when no rating has changed since the last flush.
+    dirty: AtomicBool,
 }
 
 /// Initial per-index ratings resolved with full precedence. Embedded
@@ -79,21 +83,31 @@ impl Library {
         Self {
             tx,
             worker: Some(worker),
+            dirty: AtomicBool::new(false),
         }
     }
 
     pub fn set_rating(&self, entry: &FolderEntry, rating: u8) {
-        let _ = self.tx.send(Cmd::SetRating {
-            path: entry.path.clone(),
-            size: entry.size,
-            mtime_ns: entry.mtime_ns,
-            rating,
-        });
+        if self
+            .tx
+            .send(Cmd::SetRating {
+                path: entry.path.clone(),
+                size: entry.size,
+                mtime_ns: entry.mtime_ns,
+                rating,
+            })
+            .is_ok()
+        {
+            self.dirty.store(true, Ordering::Release);
+        }
     }
 
     /// Force pending sidecar writes out now (navigate-away, quit), waiting
     /// until both the sidecar and DB update have completed.
     pub fn flush(&self) {
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return;
+        }
         let (done, wait) = std::sync::mpsc::channel();
         if self.tx.send(Cmd::Flush { done }).is_ok() {
             let _ = wait.recv();
@@ -297,6 +311,16 @@ mod tests {
             .expect("flush must make the DB row visible");
         assert_eq!(row.rating, Some(2));
         assert!(row.sidecar_mtime_ns > 0);
+        assert!(!library.dirty.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn flush_without_a_new_rating_is_a_local_noop() {
+        let library = Library::start_with(None, Duration::from_secs(60));
+
+        assert!(!library.dirty.load(Ordering::Acquire));
+        library.flush();
+        assert!(!library.dirty.load(Ordering::Acquire));
     }
 
     #[test]
