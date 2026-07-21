@@ -45,6 +45,8 @@ cargo bench -p viewr-core --bench core_hot_paths --locked -- jpeg
 The suite measures these workloads:
 
 - Navigation planning for 100, 1,000, and 10,000 images.
+- Bounded navigation planning with persistent disk warming configured, plus
+  the former folder-wide planner as an explicitly labeled reference.
 - Outward-order construction for up to 1,000,000 images.
 - Resize and rotation of deterministic 12.2-megapixel and 33-megapixel images.
 - JPEG encoding, JPEG decoding, RAM-cache hits, and eviction scaling.
@@ -55,6 +57,23 @@ Criterion stores reports in `target/criterion`.
 Git ignores this directory.
 See [the first reference run](benchmark-baseline-2026-07-21.md).
 See [the optimization campaign](performance-optimization-2026-07-21.md) for the current results and tradeoffs.
+See [the second performance and adversarial pass](performance-adversarial-pass-2026-07-21.md)
+for UI scaling, cold-thumbnail probes, native sampling, and Miri coverage.
+
+## Unsafe image-path checks
+
+CI pins a nightly toolchain and runs the repository-owned unsafe rotation and
+superpixel initialization paths under Miri. Run the same focused checks with:
+
+```sh
+cargo +nightly-2026-07-21 miri test -p viewr-core --lib resize::tests::rotate_ --locked
+cargo +nightly-2026-07-21 miri test -p viewr-core --lib \
+  develop::tests::superpixel_output_initialization_is_valid_under_miri --locked
+```
+
+The filters are intentional. A broader image-path run reaches unsupported
+third-party ARM NEON or Crossbeam/Rayon internals before it can test more
+repository code.
 
 ## Compare a change
 
@@ -102,7 +121,8 @@ $env:VIEWR_BENCH_RAW = "C:\Photos\photo.ARW"
 cargo bench -p viewr-core --bench core_hot_paths --locked -- raw_opt_in
 ```
 
-The RAW suite measures thumbnail extraction, entropy decode, and both develop qualities.
+The RAW suite measures metadata-only extraction, thumbnail extraction, entropy
+decode, and both develop qualities.
 The develop benchmark excludes decode setup.
 Criterion warm-up makes these results warm-cache measurements.
 

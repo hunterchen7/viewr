@@ -5,6 +5,10 @@ The measured implementation commit is `a3578568ef3b236d085cec88e122cdd30acc539f`
 Commit `ee688a7` adds a zero-size rotation guard found during the final audit.
 The work is on branch `codex/deep-testing-benchmarks`.
 
+The later [second performance and adversarial pass](performance-adversarial-pass-2026-07-21.md)
+supersedes this campaign's worker-lifecycle notes and remaining-work list. This
+document remains the reference for the first named benchmark comparison.
+
 ## Result summary
 
 Lower time is better.
@@ -110,11 +114,9 @@ The pixels remain available in the RGBA RAM cache when a display request complet
 The system can develop the image again after a dropped cache request.
 A dropped warm-only request discards its developed pixels and can repeat that work later.
 
-Engine shutdown drains requests that the persistence lane accepted before it closed.
-Develop workers are detached.
-A develop worker that completes after the lane closes cannot enqueue persistence work.
-This can delay application shutdown or any operation that replaces the engine.
-The delay is bounded by the active request and the accepted pending work.
+At the measured implementation commit, develop workers were detached and could
+outlive the engine. The second pass changed the engine to own and join decode,
+persistence, and GC workers behind a mutex-coherent shutdown predicate.
 
 The earlier synthetic baseline measured 12.2 MP JPEG encoding at 47.94 ms for quality 80 and 110.17 ms for quality 92.
 Moving this work removes that encode time from develop-worker occupancy.
@@ -209,10 +211,12 @@ VIEWR_BENCH_RAW=/absolute/path/photo.ARW \
   cargo bench -p viewr-core --bench core_hot_paths --locked -- raw_opt_in --noplot
 ```
 
-## Remaining work
+## Remaining work after the first campaign
 
-- The app still creates filmstrip widgets for the full visible sequence.
-  Cache probes now scale with the viewport, but full widget virtualization needs a separate UI change.
-- The disk-warm navigation plan still scales linearly with the number of warm targets.
-- The thumbnail comparison needs a repeated isolated run before optimization work.
+- The second pass completed filmstrip virtualization and added a scaling
+  benchmark; see its report for the measured 10,000- and 50,000-item results.
+- The second pass moved disk warming into persistent queue state, removing the
+  folder-wide rebuild from navigation.
+- The second pass measured cold thumbnail behavior and split folder-wide
+  metadata extraction from viewport-driven preview decode.
 - End-to-end interaction latency needs an app-level benchmark with input-to-frame timing.
