@@ -75,6 +75,33 @@ impl Filter {
     }
 }
 
+/// Rebuild `visible` in source order. Returns whether that order is the
+/// identity sequence understood by the engine.
+fn rebuild_visible(
+    visible: &mut Vec<usize>,
+    len: usize,
+    ratings: &HashMap<usize, u8>,
+    filter: Filter,
+) -> bool {
+    visible.clear();
+    if filter.active() {
+        visible.extend((0..len).filter(|i| filter.passes(ratings.get(i).copied().unwrap_or(0))));
+    }
+    if visible.is_empty() {
+        visible.extend(0..len);
+    }
+    visible.len() == len
+}
+
+/// Position of `current` in a sorted visible sequence, or the next visible
+/// item when the current one has just been filtered out.
+fn visible_position(visible: &[usize], current: usize) -> usize {
+    match visible.binary_search(&current) {
+        Ok(pos) => pos,
+        Err(pos) => pos.min(visible.len().saturating_sub(1)),
+    }
+}
+
 /// Per-folder session state, rebuilt by open_folder.
 struct Session {
     dir: PathBuf,
@@ -101,6 +128,8 @@ pub struct App {
     mode: Mode,
     filter: Filter,
     visible: Vec<usize>,
+    /// Ratings only affect the visible sequence lazily, on navigation.
+    filter_dirty: bool,
     fullscreen: bool,
     show_metadata: bool,
 
@@ -125,6 +154,7 @@ impl App {
             mode: Mode::Loupe,
             filter: Filter::default(),
             visible: Vec::new(),
+            filter_dirty: true,
             fullscreen: false,
             show_metadata: false,
             nav_started: None,
@@ -174,6 +204,7 @@ impl App {
         self.direction = 1;
         self.zoom = Zoom::Fit;
         self.filter = Filter::default();
+        self.filter_dirty = true;
         self.nav_started = Some(Instant::now());
         self.scroll_to_current = true;
         self.apply_filter();
@@ -197,22 +228,27 @@ impl App {
     /// Rebuild the visible sequence from the filter. Falls back to "all"
     /// when nothing matches so navigation never dead-ends.
     fn apply_filter(&mut self) {
+        if !self.filter_dirty {
+            return;
+        }
         let Some(session) = &self.session else {
             return;
         };
-        let all = || (0..session.entries.len()).collect::<Vec<_>>();
-        self.visible = if self.filter.active() {
-            let v: Vec<usize> = (0..session.entries.len())
-                .filter(|i| {
-                    self.filter
-                        .passes(session.ratings.get(i).copied().unwrap_or(0))
-                })
-                .collect();
-            if v.is_empty() { all() } else { v }
+        let identity = rebuild_visible(
+            &mut self.visible,
+            session.entries.len(),
+            &session.ratings,
+            self.filter,
+        );
+        // The engine treats an empty sequence as the identity order, avoiding
+        // another full-size allocation for the common unfiltered case.
+        let engine_sequence = if identity {
+            Vec::new()
         } else {
-            all()
+            self.visible.clone()
         };
-        session.engine.set_sequence(self.visible.clone());
+        session.engine.set_sequence(engine_sequence);
+        self.filter_dirty = false;
     }
 
     fn replan(&self) {
@@ -228,15 +264,7 @@ impl App {
     /// Position of `current` within the visible sequence (nearest if the
     /// current image was filtered out).
     fn visible_pos(&self) -> usize {
-        self.visible
-            .iter()
-            .position(|&i| i == self.current)
-            .unwrap_or_else(|| {
-                self.visible
-                    .iter()
-                    .position(|&i| i > self.current)
-                    .unwrap_or(self.visible.len().saturating_sub(1))
-            })
+        visible_position(&self.visible, self.current)
     }
 
     fn navigate(&mut self, delta: isize) {
@@ -276,12 +304,16 @@ impl App {
         let Some(session) = &mut self.session else {
             return;
         };
+        let old_rating = session.ratings.get(&index).copied().unwrap_or(0);
         if rating == 0 {
             session.ratings.remove(&index);
         } else {
             session.ratings.insert(index, rating);
         }
         session.library.set_rating(&session.entries[index], rating);
+        if self.filter.passes(old_rating) != self.filter.passes(rating) {
+            self.filter_dirty = true;
+        }
     }
 
     fn drain_events(&mut self) {
@@ -291,6 +323,7 @@ impl App {
             return;
         };
         let mut replan = false;
+        let mut filter_dirty = false;
         while let Ok(event) = session.events.try_recv() {
             match event {
                 Event::ThumbReady { index, meta } => {
@@ -308,7 +341,9 @@ impl App {
                         && embedded > 0
                         && !session.ratings.contains_key(&index)
                     {
-                        session.ratings.insert(index, embedded.min(5) as u8);
+                        let rating = embedded.min(5) as u8;
+                        session.ratings.insert(index, rating);
+                        filter_dirty |= self.filter.passes(0) != self.filter.passes(rating);
                     }
                     session.metas.insert(index, *meta);
                 }
@@ -322,6 +357,7 @@ impl App {
                 }
             }
         }
+        self.filter_dirty |= filter_dirty;
         if replan {
             self.replan();
         }
@@ -651,9 +687,10 @@ impl App {
             });
         });
         if filter_changed {
+            self.filter_dirty = true;
             self.apply_filter();
             // If the current image fell out of view, jump to the nearest.
-            if !self.visible.contains(&self.current)
+            if self.visible.binary_search(&self.current).is_err()
                 && let Some(&target) = self.visible.get(self.visible_pos())
             {
                 self.select(target);
@@ -738,7 +775,6 @@ impl App {
                                 for &i in &self.visible {
                                     let selected = i == current;
                                     let rating = session.ratings.get(&i).copied().unwrap_or(0);
-                                    let tier_stroke = self.tier_stroke(session, i);
                                     let response = match session.thumbs.get(&i) {
                                         Some(tex) => {
                                             let size = tex.size_vec2();
@@ -771,7 +807,11 @@ impl App {
                                                 .selected(selected),
                                         ),
                                     };
-                                    if let Some(color) = tier_stroke {
+                                    // Avoid synchronized cache probes for the many
+                                    // filmstrip entries clipped outside the viewport.
+                                    if ui.is_rect_visible(response.rect)
+                                        && let Some(color) = self.tier_stroke(session, i)
+                                    {
                                         ui.painter().rect_stroke(
                                             response.rect.expand(1.0),
                                             3.0,
@@ -981,4 +1021,78 @@ impl App {
 
 fn to_color_image(buf: &PixelBuf) -> egui::ColorImage {
     egui::ColorImage::from_rgba_unmultiplied([buf.width as usize, buf.height as usize], &buf.rgba)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visible_position_finds_exact_and_nearest_items() {
+        let visible = [1, 4, 8, 12];
+        assert_eq!(visible_position(&visible, 4), 1);
+        assert_eq!(visible_position(&visible, 0), 0);
+        assert_eq!(visible_position(&visible, 5), 2);
+        assert_eq!(visible_position(&visible, 99), 3);
+        assert_eq!(visible_position(&[], 5), 0);
+    }
+
+    #[test]
+    fn rebuild_visible_filters_in_source_order() {
+        let ratings = HashMap::from([(0, 1), (2, 4), (3, 5), (5, 3)]);
+        let mut visible = Vec::new();
+        let identity = rebuild_visible(
+            &mut visible,
+            6,
+            &ratings,
+            Filter {
+                min_rating: 4,
+                unrated_only: false,
+            },
+        );
+        assert_eq!(visible, [2, 3]);
+        assert!(!identity);
+    }
+
+    #[test]
+    fn rebuild_visible_falls_back_to_identity_when_filter_matches_nothing() {
+        let ratings = HashMap::from([(1, 2)]);
+        let mut visible = vec![99];
+        let identity = rebuild_visible(
+            &mut visible,
+            3,
+            &ratings,
+            Filter {
+                min_rating: 5,
+                unrated_only: false,
+            },
+        );
+        assert_eq!(visible, [0, 1, 2]);
+        assert!(identity);
+    }
+
+    #[test]
+    fn rebuild_visible_handles_unfiltered_and_unrated_views() {
+        let ratings = HashMap::from([(1, 3)]);
+        let mut visible = Vec::new();
+        assert!(rebuild_visible(
+            &mut visible,
+            3,
+            &ratings,
+            Filter::default()
+        ));
+        assert_eq!(visible, [0, 1, 2]);
+
+        let identity = rebuild_visible(
+            &mut visible,
+            3,
+            &ratings,
+            Filter {
+                min_rating: 0,
+                unrated_only: true,
+            },
+        );
+        assert_eq!(visible, [0, 2]);
+        assert!(!identity);
+    }
 }
