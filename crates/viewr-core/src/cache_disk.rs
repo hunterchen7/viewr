@@ -6,7 +6,10 @@
 //! pipeline changes self-invalidate — stale objects simply never hit
 //! and are swept by GC later.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::Duration;
 
 use crate::atomic_write;
 use crate::folder::FolderEntry;
@@ -21,21 +24,47 @@ pub const DEVELOP_VERSION: u32 = 3;
 pub struct DiskCache {
     root: PathBuf,
     budget_bytes: u64,
+    gc_lock: Arc<Mutex<()>>,
+}
+
+static GC_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+const ORPHAN_TEMP_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn shared_gc_lock(root: &Path) -> Arc<Mutex<()>> {
+    let identity = root.canonicalize().unwrap_or_else(|_| root.to_owned());
+    let locks = GC_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(lock) = locks.get(&identity).and_then(Weak::upgrade) {
+        return lock;
+    }
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(identity, Arc::downgrade(&lock));
+    lock
 }
 
 impl DiskCache {
     pub fn open_default(budget_bytes: u64) -> Option<Self> {
         let root = dirs::cache_dir()?.join("viewr").join("objects");
         std::fs::create_dir_all(&root).ok()?;
-        Some(Self { root, budget_bytes })
+        let gc_lock = shared_gc_lock(&root);
+        Some(Self {
+            root,
+            budget_bytes,
+            gc_lock,
+        })
     }
 
     #[cfg(test)]
     pub fn open_at(root: PathBuf) -> Self {
         std::fs::create_dir_all(&root).unwrap();
+        let gc_lock = shared_gc_lock(&root);
         Self {
             root,
             budget_bytes: DEFAULT_DISK_BUDGET,
+            gc_lock,
         }
     }
 
@@ -53,20 +82,26 @@ impl DiskCache {
         hasher.finalize().to_hex().to_string()
     }
 
-    fn object_path(&self, key: &str) -> PathBuf {
-        self.root.join(&key[..2]).join(format!("{key}.jpg"))
+    fn object_path(&self, key: &str) -> std::io::Result<PathBuf> {
+        if key.len() != blake3::OUT_LEN * 2 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "disk cache key must be a 64-character hexadecimal digest",
+            ));
+        }
+        Ok(self.root.join(&key[..2]).join(format!("{key}.jpg")))
     }
 
     pub fn has(&self, key: &str) -> bool {
-        self.object_path(key).is_file()
+        self.object_path(key).is_ok_and(|path| path.is_file())
     }
 
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
-        std::fs::read(self.object_path(key)).ok()
+        std::fs::read(self.object_path(key).ok()?).ok()
     }
 
     pub(crate) fn remove(&self, key: &str) -> std::io::Result<bool> {
-        match std::fs::remove_file(self.object_path(key)) {
+        match std::fs::remove_file(self.object_path(key)?) {
             Ok(()) => Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error),
@@ -75,7 +110,7 @@ impl DiskCache {
 
     /// Atomic write: tmp in the same directory, then rename.
     pub fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<()> {
-        let path = self.object_path(key);
+        let path = self.object_path(key)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -89,8 +124,16 @@ impl DiskCache {
 
     /// Enforce the byte budget by deleting oldest objects first
     /// (age-approximated LRU; stale-keyed objects age out naturally).
-    /// Also sweeps orphaned .tmp files. Returns bytes deleted.
+    /// Also sweeps `.tmp` files old enough to be abandoned. Returns bytes
+    /// deleted; recent temporary files may belong to active atomic writers.
     pub fn gc(&self, budget_bytes: u64) -> u64 {
+        // Engines opened for the same cache root share this lock. It prevents
+        // snapshot-based GC passes from racing and independently deleting the
+        // same budget excess.
+        let _gc_guard = self
+            .gc_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut objects: Vec<(std::path::PathBuf, std::time::SystemTime, u64)> = Vec::new();
         let mut total: u64 = 0;
         let Ok(shards) = std::fs::read_dir(&self.root) else {
@@ -104,7 +147,14 @@ impl DiskCache {
                 let path = file.path();
                 let Ok(md) = file.metadata() else { continue };
                 if path.extension().is_some_and(|e| e == "tmp") {
-                    let _ = std::fs::remove_file(&path);
+                    let is_stale = md
+                        .modified()
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age >= ORPHAN_TEMP_MIN_AGE);
+                    if is_stale {
+                        let _ = std::fs::remove_file(&path);
+                    }
                     continue;
                 }
                 let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
@@ -149,7 +199,7 @@ mod tests {
     fn set_object_mtime(cache: &DiskCache, key: &str, seconds_since_epoch: u64) {
         let file = std::fs::File::options()
             .write(true)
-            .open(cache.object_path(key))
+            .open(cache.object_path(key).unwrap())
             .unwrap();
         file.set_modified(UNIX_EPOCH + Duration::from_secs(seconds_since_epoch))
             .unwrap();
@@ -194,7 +244,13 @@ mod tests {
 
         assert!(cache.has(&key));
         assert_eq!(cache.get(&key).unwrap(), b"replacement");
-        assert!(!cache.object_path(&key).with_extension("tmp").exists());
+        assert!(
+            !cache
+                .object_path(&key)
+                .unwrap()
+                .with_extension("tmp")
+                .exists()
+        );
     }
 
     #[test]
@@ -210,16 +266,54 @@ mod tests {
     }
 
     #[test]
-    fn gc_sweeps_orphaned_temp_files_even_when_under_budget() {
+    fn gc_sweeps_only_stale_temp_files_even_when_under_budget() {
         let dir = tempfile::tempdir().unwrap();
         let cache = DiskCache::open_at(dir.path().to_owned());
         let key = DiskCache::key(&entry(10, 1), Tier::Browse);
         cache.put(&key, b"cached object").unwrap();
-        let tmp = cache.object_path(&key).with_extension("tmp");
-        std::fs::write(&tmp, b"interrupted write").unwrap();
+        let stale = cache
+            .object_path(&key)
+            .unwrap()
+            .with_file_name(".viewr-stale.tmp");
+        let recent = cache
+            .object_path(&key)
+            .unwrap()
+            .with_file_name(".viewr-active.tmp");
+        std::fs::write(&stale, b"interrupted write").unwrap();
+        std::fs::write(&recent, b"active write").unwrap();
+        let stale_file = std::fs::File::options().write(true).open(&stale).unwrap();
+        stale_file
+            .set_modified(
+                std::time::SystemTime::now() - ORPHAN_TEMP_MIN_AGE - Duration::from_secs(1),
+            )
+            .unwrap();
 
         assert_eq!(cache.gc(u64::MAX), 0);
-        assert!(!tmp.exists());
+        assert!(!stale.exists());
+        assert!(recent.exists());
         assert_eq!(cache.get(&key).unwrap(), b"cached object");
+    }
+
+    #[test]
+    fn cache_instances_for_one_root_share_gc_serialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = DiskCache::open_at(dir.path().to_owned());
+        let second = DiskCache::open_at(dir.path().to_owned());
+        assert!(Arc::ptr_eq(&first.gc_lock, &second.gc_lock));
+    }
+
+    #[test]
+    fn public_operations_reject_non_digest_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open_at(dir.path().to_owned());
+        for key in ["", "a", "../outside", &"g".repeat(64)] {
+            assert!(!cache.has(key));
+            assert!(cache.get(key).is_none());
+            assert_eq!(
+                cache.put(key, b"data").unwrap_err().kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        }
+        assert!(!dir.path().join("outside.jpg").exists());
     }
 }
