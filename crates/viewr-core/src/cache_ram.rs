@@ -14,74 +14,245 @@ use crate::types::{PixelBuf, Tier};
 pub type Key = (usize, Tier);
 
 struct Entry<V> {
+    key: Key,
     value: V,
     bytes: u64,
     last_use: u64,
+    prev: Option<usize>,
+    next: Option<usize>,
+    pinned: bool,
 }
 
 struct ByteLru<V> {
-    map: HashMap<Key, Entry<V>>,
+    map: HashMap<Key, usize>,
+    entries: Vec<Option<Entry<V>>>,
+    vacant: Vec<usize>,
     budget: u64,
     bytes: u64,
     clock: u64,
+    lru: Option<usize>,
+    mru: Option<usize>,
+    oldest_unpinned: Option<usize>,
+    unpinned: usize,
 }
 
 impl<V: Clone> ByteLru<V> {
     fn new(budget: u64) -> Self {
         Self {
             map: HashMap::new(),
+            entries: Vec::new(),
+            vacant: Vec::new(),
             budget,
             bytes: 0,
             clock: 0,
+            lru: None,
+            mru: None,
+            oldest_unpinned: None,
+            unpinned: 0,
         }
     }
 
     fn get(&mut self, key: &Key) -> Option<V> {
         self.clock += 1;
         let clock = self.clock;
-        self.map.get_mut(key).map(|e| {
-            e.last_use = clock;
-            e.value.clone()
-        })
+        let index = self.map.get(key).copied()?;
+
+        self.move_to_mru(index);
+        let entry = self.entry_mut(index);
+        entry.last_use = clock;
+        Some(entry.value.clone())
     }
 
     fn contains(&self, key: &Key) -> bool {
         self.map.contains_key(key)
     }
 
-    fn insert(&mut self, key: Key, value: V, bytes: u64, pinned: &HashSet<Key>) {
+    fn insert(&mut self, key: Key, value: V, bytes: u64, pinned: bool) {
         self.clock += 1;
-        if let Some(old) = self.map.insert(
-            key,
-            Entry {
+        let clock = self.clock;
+
+        if let Some(index) = self.map.get(&key).copied() {
+            self.move_to_mru(index);
+            let old_bytes = self.entry(index).bytes;
+            self.bytes -= old_bytes;
+            let entry = self.entry_mut(index);
+            debug_assert_eq!(entry.pinned, pinned);
+            entry.value = value;
+            entry.bytes = bytes;
+            entry.last_use = clock;
+        } else {
+            let previous_mru = self.mru;
+            let entry = Entry {
+                key,
                 value,
                 bytes,
-                last_use: self.clock,
-            },
-        ) {
-            self.bytes -= old.bytes;
-        }
-        self.bytes += bytes;
-        self.evict_over_budget(pinned);
-    }
+                last_use: clock,
+                prev: previous_mru,
+                next: None,
+                pinned,
+            };
+            let index = if let Some(index) = self.vacant.pop() {
+                debug_assert!(self.entries[index].is_none());
+                self.entries[index] = Some(entry);
+                index
+            } else {
+                let index = self.entries.len();
+                self.entries.push(Some(entry));
+                index
+            };
+            self.map.insert(key, index);
+            if let Some(previous_mru) = previous_mru {
+                self.entry_mut(previous_mru).next = Some(index);
+            } else {
+                self.lru = Some(index);
+            }
+            self.mru = Some(index);
 
-    fn evict_over_budget(&mut self, pinned: &HashSet<Key>) {
-        while self.bytes > self.budget {
-            let victim = self
-                .map
-                .iter()
-                .filter(|(k, _)| !pinned.contains(k))
-                .min_by_key(|(_, e)| e.last_use)
-                .map(|(k, _)| *k);
-            match victim {
-                Some(k) => {
-                    if let Some(e) = self.map.remove(&k) {
-                        self.bytes -= e.bytes;
-                    }
+            if !pinned {
+                self.unpinned += 1;
+                if self.oldest_unpinned.is_none() {
+                    self.oldest_unpinned = Some(index);
                 }
-                None => break, // everything pinned
             }
         }
+        self.bytes += bytes;
+        self.evict_over_budget();
+    }
+
+    /// Marks an existing entry as (un)pinned without changing its recency.
+    ///
+    /// `oldest_unpinned` makes the eviction hot path constant-time. Finding its
+    /// successor can walk over pinned nodes, but those nodes are never searched
+    /// from the start of the map and the walk is amortized across LRU progress.
+    fn set_pinned(&mut self, key: &Key, pinned: bool) {
+        let Some(index) = self.map.get(key).copied() else {
+            return;
+        };
+        let entry = self.entry(index);
+        if entry.pinned == pinned {
+            return;
+        }
+
+        let next = entry.next;
+        let last_use = entry.last_use;
+        self.entry_mut(index).pinned = pinned;
+
+        if pinned {
+            self.unpinned -= 1;
+            if self.oldest_unpinned == Some(index) {
+                self.oldest_unpinned = if self.unpinned == 0 {
+                    None
+                } else {
+                    Some(self.find_next_unpinned(next))
+                };
+            }
+        } else {
+            self.unpinned += 1;
+            let becomes_oldest = self
+                .oldest_unpinned
+                .is_none_or(|oldest| last_use < self.entry(oldest).last_use);
+            if becomes_oldest {
+                self.oldest_unpinned = Some(index);
+            }
+        }
+    }
+
+    fn evict_over_budget(&mut self) {
+        while self.bytes > self.budget {
+            let Some(victim) = self.oldest_unpinned else {
+                break; // everything pinned
+            };
+            self.remove_unpinned(victim);
+        }
+    }
+
+    fn move_to_mru(&mut self, index: usize) {
+        if self.mru == Some(index) {
+            return;
+        }
+
+        let (prev, next, pinned) = {
+            let entry = self.entry(index);
+            (entry.prev, entry.next, entry.pinned)
+        };
+
+        if !pinned && self.oldest_unpinned == Some(index) && self.unpinned > 1 {
+            self.oldest_unpinned = Some(self.find_next_unpinned(next));
+        }
+
+        if let Some(prev) = prev {
+            self.entry_mut(prev).next = next;
+        } else {
+            self.lru = next;
+        }
+        if let Some(next) = next {
+            self.entry_mut(next).prev = prev;
+        }
+
+        let previous_mru = self.mru;
+        let entry = self.entry_mut(index);
+        entry.prev = previous_mru;
+        entry.next = None;
+        if let Some(previous_mru) = previous_mru {
+            self.entry_mut(previous_mru).next = Some(index);
+        }
+        self.mru = Some(index);
+    }
+
+    fn remove_unpinned(&mut self, index: usize) {
+        debug_assert_eq!(self.oldest_unpinned, Some(index));
+        let (key, prev, next, bytes, pinned) = {
+            let entry = self.entry(index);
+            (entry.key, entry.prev, entry.next, entry.bytes, entry.pinned)
+        };
+        debug_assert!(!pinned);
+
+        self.unpinned -= 1;
+        self.oldest_unpinned = if self.unpinned == 0 {
+            None
+        } else {
+            Some(self.find_next_unpinned(next))
+        };
+
+        if let Some(prev) = prev {
+            self.entry_mut(prev).next = next;
+        } else {
+            self.lru = next;
+        }
+        if let Some(next) = next {
+            self.entry_mut(next).prev = prev;
+        } else {
+            self.mru = prev;
+        }
+
+        let removed = self.map.remove(&key);
+        debug_assert_eq!(removed, Some(index));
+        self.entries[index] = None;
+        self.vacant.push(index);
+        self.bytes -= bytes;
+    }
+
+    fn find_next_unpinned(&self, mut index: Option<usize>) -> usize {
+        while let Some(candidate) = index {
+            let entry = self.entry(candidate);
+            if !entry.pinned {
+                return candidate;
+            }
+            index = entry.next;
+        }
+        unreachable!("unpinned count guarantees a successor")
+    }
+
+    fn entry(&self, index: usize) -> &Entry<V> {
+        self.entries[index]
+            .as_ref()
+            .expect("LRU index must point to a resident entry")
+    }
+
+    fn entry_mut(&mut self, index: usize) -> &mut Entry<V> {
+        self.entries[index]
+            .as_mut()
+            .expect("LRU index must point to a resident entry")
     }
 
     fn used_bytes(&self) -> u64 {
@@ -123,12 +294,24 @@ impl RamCache {
     /// Replaces the previous pin set.
     pub fn set_pins(&self, keys: impl IntoIterator<Item = Key>) {
         let mut inner = self.inner.lock().unwrap();
-        inner.pinned = keys.into_iter().collect();
-        let pinned = std::mem::take(&mut inner.pinned);
-        inner.thumbs.evict_over_budget(&pinned);
-        inner.rgba.evict_over_budget(&pinned);
-        inner.jpeg.evict_over_budget(&pinned);
-        inner.pinned = pinned;
+        let new_pins: HashSet<_> = keys.into_iter().collect();
+        let removed: Vec<_> = inner.pinned.difference(&new_pins).copied().collect();
+        let added: Vec<_> = new_pins.difference(&inner.pinned).copied().collect();
+
+        for key in removed {
+            inner.thumbs.set_pinned(&key, false);
+            inner.rgba.set_pinned(&key, false);
+            inner.jpeg.set_pinned(&key, false);
+        }
+        for key in added {
+            inner.thumbs.set_pinned(&key, true);
+            inner.rgba.set_pinned(&key, true);
+            inner.jpeg.set_pinned(&key, true);
+        }
+        inner.pinned = new_pins;
+        inner.thumbs.evict_over_budget();
+        inner.rgba.evict_over_budget();
+        inner.jpeg.evict_over_budget();
     }
 
     pub fn get_rgba(&self, key: Key) -> Option<Arc<PixelBuf>> {
@@ -158,20 +341,18 @@ impl RamCache {
     pub fn insert_rgba(&self, key: Key, buf: Arc<PixelBuf>) {
         let bytes = buf.byte_len() as u64;
         let mut inner = self.inner.lock().unwrap();
-        let pinned = std::mem::take(&mut inner.pinned);
+        let pinned = inner.pinned.contains(&key);
         match key.1 {
-            Tier::Thumb => inner.thumbs.insert(key, buf, bytes, &pinned),
-            _ => inner.rgba.insert(key, buf, bytes, &pinned),
+            Tier::Thumb => inner.thumbs.insert(key, buf, bytes, pinned),
+            _ => inner.rgba.insert(key, buf, bytes, pinned),
         }
-        inner.pinned = pinned;
     }
 
     pub fn insert_jpeg(&self, key: Key, bytes_vec: Arc<Vec<u8>>) {
         let bytes = bytes_vec.len() as u64;
         let mut inner = self.inner.lock().unwrap();
-        let pinned = std::mem::take(&mut inner.pinned);
-        inner.jpeg.insert(key, bytes_vec, bytes, &pinned);
-        inner.pinned = pinned;
+        let pinned = inner.pinned.contains(&key);
+        inner.jpeg.insert(key, bytes_vec, bytes, pinned);
     }
 
     pub fn stats(&self) -> RamCacheStats {
@@ -188,6 +369,79 @@ impl RamCache {
 mod tests {
     use super::*;
     use std::thread;
+
+    #[derive(Clone, Copy, Debug)]
+    struct ModelEntry {
+        value: u64,
+        bytes: u64,
+        last_use: u64,
+        pinned: bool,
+    }
+
+    struct ModelLru {
+        map: HashMap<Key, ModelEntry>,
+        budget: u64,
+        bytes: u64,
+        clock: u64,
+    }
+
+    impl ModelLru {
+        fn new(budget: u64) -> Self {
+            Self {
+                map: HashMap::new(),
+                budget,
+                bytes: 0,
+                clock: 0,
+            }
+        }
+
+        fn get(&mut self, key: &Key) -> Option<u64> {
+            self.clock += 1;
+            self.map.get_mut(key).map(|entry| {
+                entry.last_use = self.clock;
+                entry.value
+            })
+        }
+
+        fn insert(&mut self, key: Key, value: u64, bytes: u64, pinned: bool) {
+            self.clock += 1;
+            if let Some(old) = self.map.insert(
+                key,
+                ModelEntry {
+                    value,
+                    bytes,
+                    last_use: self.clock,
+                    pinned,
+                },
+            ) {
+                self.bytes -= old.bytes;
+            }
+            self.bytes += bytes;
+            self.evict_over_budget();
+        }
+
+        fn set_pins(&mut self, pins: &HashSet<Key>) {
+            for (key, entry) in &mut self.map {
+                entry.pinned = pins.contains(key);
+            }
+            self.evict_over_budget();
+        }
+
+        fn evict_over_budget(&mut self) {
+            while self.bytes > self.budget {
+                let victim = self
+                    .map
+                    .iter()
+                    .filter(|(_, entry)| !entry.pinned)
+                    .min_by_key(|(_, entry)| entry.last_use)
+                    .map(|(key, _)| *key);
+                let Some(victim) = victim else {
+                    break;
+                };
+                self.bytes -= self.map.remove(&victim).unwrap().bytes;
+            }
+        }
+    }
 
     fn buf(bytes: usize) -> Arc<PixelBuf> {
         Arc::new(PixelBuf {
@@ -252,6 +506,91 @@ mod tests {
     }
 
     #[test]
+    fn stale_pinned_recency_is_preserved_for_later_eviction() {
+        let cache = RamCache::new(0, 20, 0);
+        cache.insert_rgba((0, Tier::Browse), buf(10));
+        cache.insert_rgba((1, Tier::Browse), buf(10));
+        cache.set_pins([(0, Tier::Browse)]);
+
+        cache.get_rgba((1, Tier::Browse));
+        cache.insert_rgba((2, Tier::Browse), buf(10));
+        assert!(cache.has_rgba((0, Tier::Browse)));
+        assert!(!cache.has_rgba((1, Tier::Browse)));
+
+        cache.set_pins([]);
+        cache.insert_rgba((3, Tier::Browse), buf(10));
+        assert!(!cache.has_rgba((0, Tier::Browse)));
+        assert!(cache.has_rgba((2, Tier::Browse)));
+        assert!(cache.has_rgba((3, Tier::Browse)));
+    }
+
+    #[test]
+    fn access_while_pinned_still_refreshes_recency() {
+        let cache = RamCache::new(0, 20, 0);
+        cache.insert_rgba((0, Tier::Browse), buf(10));
+        cache.insert_rgba((1, Tier::Browse), buf(10));
+        cache.set_pins([(0, Tier::Browse)]);
+
+        cache.get_rgba((0, Tier::Browse));
+        cache.set_pins([]);
+        cache.insert_rgba((2, Tier::Browse), buf(10));
+
+        assert!(cache.has_rgba((0, Tier::Browse)));
+        assert!(!cache.has_rgba((1, Tier::Browse)));
+        assert!(cache.has_rgba((2, Tier::Browse)));
+    }
+
+    #[test]
+    fn optimized_lru_matches_full_scan_reference_model() {
+        let mut actual = ByteLru::new(512);
+        let mut model = ModelLru::new(512);
+        let mut pins = HashSet::new();
+        let mut random = 0x4d59_5df4_d0f3_3173_u64;
+
+        for step in 0..20_000_u64 {
+            // Fixed-seed xorshift64 makes failures exactly reproducible without
+            // adding a random-number dependency to the crate.
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+
+            let key = model_key((random as usize) % 257);
+            match random % 7 {
+                0..=2 => {
+                    let bytes = (random.rotate_left(19) % 47) + 1;
+                    let value = step ^ random;
+                    let pinned = pins.contains(&key);
+                    actual.insert(key, value, bytes, pinned);
+                    model.insert(key, value, bytes, pinned);
+                }
+                3..=4 => assert_eq!(actual.get(&key), model.get(&key)),
+                5 => {
+                    let mut new_pins = HashSet::new();
+                    for offset in 0_u32..8 {
+                        let candidate = model_key(
+                            ((random.rotate_left(offset * 7) as usize) + offset as usize) % 257,
+                        );
+                        new_pins.insert(candidate);
+                    }
+
+                    for removed in pins.difference(&new_pins) {
+                        actual.set_pinned(removed, false);
+                    }
+                    for added in new_pins.difference(&pins) {
+                        actual.set_pinned(added, true);
+                    }
+                    actual.evict_over_budget();
+                    pins = new_pins;
+                    model.set_pins(&pins);
+                }
+                _ => assert_eq!(actual.contains(&key), model.map.contains_key(&key)),
+            }
+
+            assert_lru_matches_model(&actual, &model, step);
+        }
+    }
+
+    #[test]
     fn cache_rings_have_independent_budgets_and_stats() {
         let cache = RamCache::new(8, 12, 6);
         cache.insert_rgba((0, Tier::Thumb), buf(8));
@@ -300,5 +639,121 @@ mod tests {
         let stats = cache.stats();
         assert!(stats.rgba_bytes <= 256);
         assert!(stats.jpeg_bytes <= 128);
+    }
+
+    fn model_key(value: usize) -> Key {
+        let tier = match value % 3 {
+            0 => Tier::Thumb,
+            1 => Tier::Browse,
+            _ => Tier::Full,
+        };
+        (value / 3, tier)
+    }
+
+    fn assert_lru_matches_model(actual: &ByteLru<u64>, model: &ModelLru, step: u64) {
+        assert_eq!(actual.bytes, model.bytes, "byte count at step {step}");
+        assert_eq!(actual.clock, model.clock, "clock at step {step}");
+        assert_eq!(actual.map.len(), model.map.len(), "length at step {step}");
+
+        let summed_bytes = actual
+            .entries
+            .iter()
+            .flatten()
+            .map(|entry| entry.bytes)
+            .sum::<u64>();
+        assert_eq!(actual.bytes, summed_bytes, "byte sum at step {step}");
+        for (key, expected) in &model.map {
+            let index = *actual
+                .map
+                .get(key)
+                .unwrap_or_else(|| panic!("missing key {key:?} at step {step}"));
+            let found = actual.entry(index);
+            assert_eq!(found.key, *key, "stored key for {key:?} at {step}");
+            assert_eq!(found.value, expected.value, "value for {key:?} at {step}");
+            assert_eq!(found.bytes, expected.bytes, "bytes for {key:?} at {step}");
+            assert_eq!(
+                found.last_use, expected.last_use,
+                "recency for {key:?} at {step}"
+            );
+            assert_eq!(
+                found.pinned, expected.pinned,
+                "pin state for {key:?} at {step}"
+            );
+        }
+
+        let expected_oldest = model
+            .map
+            .iter()
+            .filter(|(_, entry)| !entry.pinned)
+            .min_by_key(|(_, entry)| entry.last_use)
+            .map(|(key, _)| *key);
+        let actual_oldest = actual.oldest_unpinned.map(|index| actual.entry(index).key);
+        assert_eq!(
+            actual_oldest, expected_oldest,
+            "oldest unpinned key at step {step}"
+        );
+        assert_eq!(
+            actual.unpinned,
+            actual
+                .entries
+                .iter()
+                .flatten()
+                .filter(|entry| !entry.pinned)
+                .count(),
+            "unpinned count at step {step}"
+        );
+
+        let mut seen = HashSet::new();
+        let mut previous = None;
+        let mut previous_use = None;
+        let mut cursor = actual.lru;
+        while let Some(index) = cursor {
+            let entry = actual.entry(index);
+            assert!(
+                seen.insert(index),
+                "LRU cycle through {:?} at step {step}",
+                entry.key
+            );
+            assert_eq!(
+                actual.map.get(&entry.key),
+                Some(&index),
+                "map index for {:?} at {step}",
+                entry.key
+            );
+            assert_eq!(
+                entry.prev, previous,
+                "back-link for {:?} at {step}",
+                entry.key
+            );
+            if let Some(previous_use) = previous_use {
+                assert!(
+                    previous_use < entry.last_use,
+                    "recency order for {:?} at step {step}",
+                    entry.key
+                );
+            }
+            previous = Some(index);
+            previous_use = Some(entry.last_use);
+            cursor = entry.next;
+        }
+        assert_eq!(previous, actual.mru, "MRU at step {step}");
+        assert_eq!(seen.len(), actual.map.len(), "linked keys at step {step}");
+        assert_eq!(
+            actual.entries.iter().flatten().count(),
+            actual.map.len(),
+            "resident arena slots at step {step}"
+        );
+        let vacant: HashSet<_> = actual.vacant.iter().copied().collect();
+        assert_eq!(
+            vacant.len(),
+            actual.vacant.len(),
+            "duplicate vacant slot at step {step}"
+        );
+        assert!(
+            vacant.iter().all(|&index| actual.entries[index].is_none()),
+            "occupied vacant slot at step {step}"
+        );
+        assert_eq!(actual.lru.is_none(), actual.map.is_empty());
+        assert_eq!(actual.mru.is_none(), actual.map.is_empty());
     }
 }
