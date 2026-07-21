@@ -76,10 +76,8 @@ jobs:
         with:
           shared-key: builds
           cache-on-failure: true
-      - name: Build release
-        run: cargo build --release --locked
-      - name: Compile benchmark harnesses
-        run: cargo bench --workspace --features benchmarks --no-run --locked
+      - name: Build release and benchmark targets
+        run: cargo build --workspace --release --all-targets --all-features --locked
 
   miri:
     name: Miri unsafe-path checks

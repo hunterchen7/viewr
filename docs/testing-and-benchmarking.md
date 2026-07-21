@@ -28,6 +28,10 @@ formatting, Clippy, Rustdoc, benchmark compilation, and release compilation run
 once on Linux. Miri uses one pinned Linux nightly job. The independent quality,
 test, optimized-build, and Miri jobs run in parallel.
 
+The optimized-build job uses one release-profile, all-targets Cargo invocation.
+This builds the application and both benchmark harnesses with one unified
+dependency graph instead of repeating release code generation.
+
 Normal test builds exclude Criterion and use an unoptimized test profile. This
 keeps correctness feedback fast without changing the optimized development,
 benchmark, or release profiles. The `benchmarks` feature opts into Criterion and
