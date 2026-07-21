@@ -45,6 +45,29 @@ fn shared_gc_lock(root: &Path) -> Arc<Mutex<()>> {
     lock
 }
 
+fn hash_path_identity(hasher: &mut blake3::Hasher, path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        hasher.update(path.as_os_str().as_bytes());
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        for code_unit in path.as_os_str().encode_wide() {
+            hasher.update(&code_unit.to_le_bytes());
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        hasher.update(path.as_os_str().as_encoded_bytes());
+    }
+}
+
 impl DiskCache {
     pub fn open_default(budget_bytes: u64) -> Option<Self> {
         let root = dirs::cache_dir()?.join("viewr").join("objects");
@@ -70,7 +93,7 @@ impl DiskCache {
 
     pub fn key(entry: &FolderEntry, tier: Tier) -> String {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(entry.path.to_string_lossy().as_bytes());
+        hash_path_identity(&mut hasher, &entry.path);
         hasher.update(&entry.size.to_le_bytes());
         hasher.update(&entry.mtime_ns.to_le_bytes());
         hasher.update(&DEVELOP_VERSION.to_le_bytes());
@@ -212,6 +235,49 @@ mod tests {
         assert_ne!(a, DiskCache::key(&entry(10, 2), Tier::Browse));
         assert_ne!(a, DiskCache::key(&entry(10, 1), Tier::Full));
         assert_eq!(a, DiskCache::key(&entry(10, 1), Tier::Browse));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_distinguishes_non_utf8_paths_with_the_same_lossy_text() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let make_entry = |invalid_byte| {
+            let mut path = b"/photos/a_.arw".to_vec();
+            path[9] = invalid_byte;
+            FolderEntry {
+                path: PathBuf::from(OsString::from_vec(path)),
+                file_name: "non-utf8.arw".into(),
+                size: 10,
+                mtime_ns: 1,
+            }
+        };
+        let first = make_entry(0x80);
+        let second = make_entry(0x81);
+        assert_eq!(first.path.to_string_lossy(), second.path.to_string_lossy());
+
+        assert_ne!(
+            DiskCache::key(&first, Tier::Browse),
+            DiskCache::key(&second, Tier::Browse)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn valid_utf8_path_preserves_the_existing_cache_key() {
+        let entry = entry(10, 1);
+        let mut legacy = blake3::Hasher::new();
+        legacy.update(entry.path.to_string_lossy().as_bytes());
+        legacy.update(&entry.size.to_le_bytes());
+        legacy.update(&entry.mtime_ns.to_le_bytes());
+        legacy.update(&DEVELOP_VERSION.to_le_bytes());
+        legacy.update(b"b");
+
+        assert_eq!(
+            DiskCache::key(&entry, Tier::Browse),
+            legacy.finalize().to_hex().to_string()
+        );
     }
 
     #[test]
