@@ -978,27 +978,55 @@ fn run_warm_develop(
 }
 
 fn run_thumb(shared: &Shared, index: usize) {
-    match decode::thumb_and_meta(&shared.entries[index].path, 360) {
-        Ok(result) => {
+    let path = &shared.entries[index].path;
+    complete_thumb_attempt(
+        index,
+        decode::thumb_and_meta(path, 360),
+        || decode::metadata(path),
+        |thumb| {
             shared
                 .cache
-                .insert_rgba((index, Tier::Thumb), Arc::new(result.thumb));
-            publish(
-                shared,
-                Event::ThumbReady {
-                    index,
-                    meta: Box::new(result.meta),
-                },
-            );
+                .insert_rgba((index, Tier::Thumb), Arc::new(thumb));
+        },
+        |event| publish(shared, event),
+    );
+}
+
+/// Publish a thumbnail attempt while preserving metadata coverage when a RAW
+/// container has readable metadata but no usable embedded preview. The
+/// fallback is lazy so a successful thumbnail never parses metadata twice.
+fn complete_thumb_attempt(
+    index: usize,
+    attempt: Result<decode::ThumbResult, decode::DecodeError>,
+    fallback_metadata: impl FnOnce() -> Result<FileMeta, decode::DecodeError>,
+    install_thumb: impl FnOnce(PixelBuf),
+    mut emit: impl FnMut(Event),
+) {
+    match attempt {
+        Ok(result) => {
+            install_thumb(result.thumb);
+            emit(Event::ThumbReady {
+                index,
+                meta: Box::new(result.meta),
+            });
         }
-        Err(e) => publish(
-            shared,
-            Event::ImageFailed {
+        Err(error) => {
+            emit(Event::ImageFailed {
                 index,
                 tier: Tier::Thumb,
-                error: e.to_string(),
-            },
-        ),
+                error: error.to_string(),
+            });
+            match fallback_metadata() {
+                Ok(meta) => emit(Event::MetadataReady {
+                    index,
+                    meta: Box::new(meta),
+                }),
+                Err(error) => emit(Event::MetadataFailed {
+                    index,
+                    error: error.to_string(),
+                }),
+            }
+        }
     }
 }
 
@@ -1226,6 +1254,98 @@ mod tests {
             size,
             mtime_ns: 456,
         }
+    }
+
+    #[test]
+    fn successful_thumbnail_emits_one_ready_event_without_metadata_fallback() {
+        let mut fallback_called = false;
+        let mut installed = None;
+        let mut events = Vec::new();
+        complete_thumb_attempt(
+            7,
+            Ok(decode::ThumbResult {
+                thumb: patterned_buf(3, 2),
+                meta: FileMeta {
+                    camera: "success camera".into(),
+                    ..FileMeta::default()
+                },
+            }),
+            || {
+                fallback_called = true;
+                Err(decode::DecodeError::NoThumb)
+            },
+            |thumb| installed = Some(thumb),
+            |event| events.push(event),
+        );
+
+        assert!(!fallback_called);
+        assert_eq!(installed.as_ref().map(|thumb| thumb.width), Some(3));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            Event::ThumbReady { index: 7, meta } if meta.camera == "success camera"
+        ));
+    }
+
+    #[test]
+    fn failed_thumbnail_still_emits_failure_and_recovers_metadata() {
+        let mut fallback_called = false;
+        let mut install_called = false;
+        let mut events = Vec::new();
+        complete_thumb_attempt(
+            11,
+            Err(decode::DecodeError::NoThumb),
+            || {
+                fallback_called = true;
+                Ok(FileMeta {
+                    rating: Some(4),
+                    camera: "metadata camera".into(),
+                    ..FileMeta::default()
+                })
+            },
+            |_| install_called = true,
+            |event| events.push(event),
+        );
+
+        assert!(fallback_called);
+        assert!(!install_called);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            Event::ImageFailed {
+                index: 11,
+                tier: Tier::Thumb,
+                error,
+            } if error == "no embedded preview or thumbnail"
+        ));
+        assert!(matches!(
+            &events[1],
+            Event::MetadataReady { index: 11, meta }
+                if meta.rating == Some(4) && meta.camera == "metadata camera"
+        ));
+    }
+
+    #[test]
+    fn failed_thumbnail_reports_metadata_fallback_failure() {
+        let mut events = Vec::new();
+        complete_thumb_attempt(
+            13,
+            Err(decode::DecodeError::NoThumb),
+            || Err(decode::DecodeError::NoThumb),
+            |_| panic!("a failed thumbnail must not be installed"),
+            |event| events.push(event),
+        );
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0],
+            Event::ImageFailed {
+                index: 13,
+                tier: Tier::Thumb,
+                ..
+            }
+        ));
+        assert!(matches!(events[1], Event::MetadataFailed { index: 13, .. }));
     }
 
     #[test]
