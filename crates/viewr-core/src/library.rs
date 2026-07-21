@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::db::{Db, default_db_path};
@@ -20,12 +21,15 @@ enum Cmd {
         mtime_ns: i64,
         rating: u8,
     },
-    Flush,
+    Flush {
+        done: Sender<()>,
+    },
     Shutdown,
 }
 
 pub struct Library {
     tx: Sender<Cmd>,
+    worker: Option<JoinHandle<()>>,
 }
 
 /// Initial per-index ratings resolved with full precedence. Embedded
@@ -63,9 +67,19 @@ impl Library {
     /// Spawn the persist thread. Uses the default DB path (best-effort:
     /// rating persistence degrades gracefully without a DB).
     pub fn start() -> Self {
+        Self::start_with(default_db_path(), SIDECAR_DEBOUNCE)
+    }
+
+    fn start_with(db_path: Option<PathBuf>, debounce: Duration) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || persist_thread(&rx));
-        Self { tx }
+        let worker = std::thread::spawn(move || {
+            let db = db_path.and_then(|path| Db::open(&path).ok());
+            persist_thread(&rx, db.as_ref(), debounce);
+        });
+        Self {
+            tx,
+            worker: Some(worker),
+        }
     }
 
     pub fn set_rating(&self, entry: &FolderEntry, rating: u8) {
@@ -77,15 +91,22 @@ impl Library {
         });
     }
 
-    /// Force pending sidecar writes out now (navigate-away, quit).
+    /// Force pending sidecar writes out now (navigate-away, quit), waiting
+    /// until both the sidecar and DB update have completed.
     pub fn flush(&self) {
-        let _ = self.tx.send(Cmd::Flush);
+        let (done, wait) = std::sync::mpsc::channel();
+        if self.tx.send(Cmd::Flush { done }).is_ok() {
+            let _ = wait.recv();
+        }
     }
 }
 
 impl Drop for Library {
     fn drop(&mut self) {
         let _ = self.tx.send(Cmd::Shutdown);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -96,8 +117,7 @@ struct Pending {
     due: Instant,
 }
 
-fn persist_thread(rx: &Receiver<Cmd>) {
-    let db = default_db_path().and_then(|p| Db::open(&p).ok());
+fn persist_thread(rx: &Receiver<Cmd>, db: Option<&Db>, debounce: Duration) {
     let mut pending: HashMap<PathBuf, Pending> = HashMap::new();
 
     loop {
@@ -127,16 +147,19 @@ fn persist_thread(rx: &Receiver<Cmd>) {
                         size,
                         mtime_ns,
                         rating,
-                        due: Instant::now() + SIDECAR_DEBOUNCE,
+                        due: Instant::now() + debounce,
                     },
                 );
             }
-            Ok(Cmd::Flush) => flush_due(&mut pending, db.as_ref(), true),
+            Ok(Cmd::Flush { done }) => {
+                flush_due(&mut pending, db, true);
+                let _ = done.send(());
+            }
             Ok(Cmd::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
-                flush_due(&mut pending, db.as_ref(), true);
+                flush_due(&mut pending, db, true);
                 return;
             }
-            Err(RecvTimeoutError::Timeout) => flush_due(&mut pending, db.as_ref(), false),
+            Err(RecvTimeoutError::Timeout) => flush_due(&mut pending, db, false),
         }
     }
 }
@@ -174,5 +197,69 @@ fn flush_due(pending: &mut HashMap<PathBuf, Pending>, db: Option<&Db>, all: bool
                 mtime,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    fn entry(path: PathBuf) -> FolderEntry {
+        std::fs::write(&path, b"raw").unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let mtime_ns = metadata
+            .modified()
+            .unwrap()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        FolderEntry {
+            file_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+            path,
+            size: metadata.len(),
+            mtime_ns,
+        }
+    }
+
+    #[test]
+    fn flush_waits_for_coalesced_sidecar_and_database_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("viewr.db");
+        let entry = entry(dir.path().join("photo.ARW"));
+        let library = Library::start_with(Some(db_path.clone()), Duration::from_secs(60));
+
+        library.set_rating(&entry, 1);
+        library.set_rating(&entry, 5);
+        library.set_rating(&entry, 2);
+        library.flush();
+
+        assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(2));
+        assert!(!entry.sidecar_path().with_extension("xmp.tmp").exists());
+        let db = Db::open(&db_path).unwrap();
+        let row = db
+            .get_image(&entry.path.to_string_lossy())
+            .expect("flush must make the DB row visible");
+        assert_eq!(row.rating, Some(2));
+        assert!(row.sidecar_mtime_ns > 0);
+    }
+
+    #[test]
+    fn drop_flushes_pending_rating_and_joins_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("viewr.db");
+        let entry = entry(dir.path().join("photo.ARW"));
+
+        {
+            let library = Library::start_with(Some(db_path.clone()), Duration::from_secs(60));
+            library.set_rating(&entry, 4);
+        }
+
+        assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(4));
+        let db = Db::open(&db_path).unwrap();
+        assert_eq!(
+            db.get_image(&entry.path.to_string_lossy()).unwrap().rating,
+            Some(4)
+        );
     }
 }
