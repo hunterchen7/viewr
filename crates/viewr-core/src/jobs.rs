@@ -502,7 +502,7 @@ impl JobQueue {
 }
 
 struct Shared {
-    entries: Vec<FolderEntry>,
+    entries: Arc<Vec<FolderEntry>>,
     cache: Arc<RamCache>,
     disk: Option<DiskCache>,
     events: Sender<Event>,
@@ -523,15 +523,37 @@ pub struct Engine {
     gc_worker: Option<std::thread::JoinHandle<()>>,
 }
 
-fn navigation_pins(len: usize, current: usize, include_full: bool) -> Vec<JobId> {
+fn navigation_pins(
+    len: usize,
+    current: usize,
+    include_full: bool,
+    sequence: &[usize],
+) -> Vec<JobId> {
     if len == 0 {
         return Vec::new();
     }
     let current = current.min(len - 1);
-    let first = current.saturating_sub(1);
-    let last = (current + 1).min(len - 1);
-    let mut pins = Vec::with_capacity((last - first + 1) * (2 + usize::from(include_full)));
-    for index in first..=last {
+    let indices: Vec<usize> = if sequence.is_empty() {
+        (current.saturating_sub(1)..=(current + 1).min(len - 1)).collect()
+    } else {
+        let position = sequence
+            .iter()
+            .position(|&index| index == current)
+            .unwrap_or_default();
+        let first = position.saturating_sub(1);
+        let last = (position + 1).min(sequence.len() - 1);
+        let mut indices: Vec<_> = sequence[first..=last]
+            .iter()
+            .copied()
+            .filter(|&index| index < len)
+            .collect();
+        if !indices.contains(&current) {
+            indices.push(current);
+        }
+        indices
+    };
+    let mut pins = Vec::with_capacity(indices.len() * (2 + usize::from(include_full)));
+    for index in indices {
         pins.extend([(index, Tier::Thumb), (index, Tier::Browse)]);
         if include_full {
             pins.push((index, Tier::Full));
@@ -545,7 +567,7 @@ impl Engine {
     /// `notify` is called after every published result (the app passes
     /// `ctx.request_repaint`).
     pub fn new(
-        entries: Vec<FolderEntry>,
+        entries: Arc<Vec<FolderEntry>>,
         start: usize,
         cache: Arc<RamCache>,
         disk: Option<DiskCache>,
@@ -632,15 +654,17 @@ impl Engine {
         let current = nav.current.min(len - 1);
         let cache = &self.shared.cache;
 
-        // Full buffers are useful only while inspecting at zoom. In Fit mode,
-        // leaving them unpinned lets the byte budget favor browse navigation.
-        cache.set_pins(navigation_pins(len, current, nav.zoomed));
-
         let disk = &self.shared.disk;
-        let targets = {
+        let (pins, targets) = {
             let s = self.shared.sequence.lock().unwrap();
-            build_plan_targets(len, current, nav.direction, nav.zoomed, &s, disk.is_some())
+            (
+                navigation_pins(len, current, nav.zoomed, &s),
+                build_plan_targets(len, current, nav.direction, nav.zoomed, &s, disk.is_some()),
+            )
         };
+        // Full buffers are useful only while inspecting at zoom. Filtered
+        // navigation pins visible neighbors rather than unrelated raw indices.
+        cache.set_pins(pins);
         let mut plan: Vec<(JobId, u8, u32, Action)> = Vec::with_capacity(targets.len());
         for target in targets {
             let id = (target.index, target.tier);
@@ -1014,7 +1038,7 @@ mod tests {
     ) -> Arc<Shared> {
         let (events, _receiver) = std::sync::mpsc::channel();
         Arc::new(Shared {
-            entries,
+            entries: Arc::new(entries),
             cache,
             disk,
             events,
@@ -1042,17 +1066,29 @@ mod tests {
 
     #[test]
     fn fit_pins_skip_full_while_zoomed_pins_preserve_the_near_window() {
-        let fit = navigation_pins(5, 2, false);
+        let fit = navigation_pins(5, 2, false, &[]);
         assert_eq!(fit.len(), 6);
         assert!(fit.iter().all(|(_, tier)| *tier != Tier::Full));
 
-        let zoomed = navigation_pins(5, 2, true);
+        let zoomed = navigation_pins(5, 2, true, &[]);
         let full: Vec<_> = zoomed
             .iter()
             .filter(|(_, tier)| *tier == Tier::Full)
             .copied()
             .collect();
         assert_eq!(full, [(1, Tier::Full), (2, Tier::Full), (3, Tier::Full)]);
+    }
+
+    #[test]
+    fn filtered_pins_follow_visible_neighbors() {
+        let pins = navigation_pins(10, 4, false, &[1, 4, 8]);
+        let browse: Vec<_> = pins
+            .iter()
+            .filter(|(_, tier)| *tier == Tier::Browse)
+            .map(|(index, _)| *index)
+            .collect();
+        assert_eq!(browse, [1, 4, 8]);
+        assert!(!pins.iter().any(|(index, _)| [3, 5].contains(index)));
     }
 
     #[test]
@@ -1339,7 +1375,7 @@ mod tests {
         disk.put(&key, b"already warm").unwrap();
         let (events, receiver) = std::sync::mpsc::channel();
         let shared = Shared {
-            entries: vec![entry],
+            entries: Arc::new(vec![entry]),
             cache: Arc::new(RamCache::new(0, 0, 0)),
             disk: Some(disk.clone()),
             events,
@@ -1536,7 +1572,7 @@ mod tests {
         cache.insert_jpeg((0, Tier::Browse), Arc::new(b"not a jpeg".to_vec()));
         let (events, receiver) = std::sync::mpsc::channel();
         let shared = Shared {
-            entries: vec![raw_entry],
+            entries: Arc::new(vec![raw_entry]),
             cache: cache.clone(),
             disk: Some(disk.clone()),
             events,

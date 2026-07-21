@@ -217,13 +217,15 @@ impl App {
             ram_bytes / 3,
         ));
         let disk = DiskCache::open_default((self.config.disk_gb as f64 * 1e9) as u64);
-        let ctx = self.ctx.clone();
-        let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
-        let (engine, events) = Engine::new((*entries).clone(), start, cache.clone(), disk, notify);
-
+        // Resolve persisted ratings before decode workers can publish embedded
+        // metadata, so startup precedence does not depend on worker timing.
         let db = default_db_path().and_then(|p| Db::open(&p).ok());
         let ratings = load_ratings(&entries, db.as_ref());
         let library = Library::start();
+
+        let ctx = self.ctx.clone();
+        let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
+        let (engine, events) = Engine::new(entries.clone(), start, cache.clone(), disk, notify);
 
         self.session = Some(Session {
             dir: dir.to_owned(),
