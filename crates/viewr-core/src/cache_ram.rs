@@ -124,6 +124,11 @@ impl RamCache {
     pub fn set_pins(&self, keys: impl IntoIterator<Item = Key>) {
         let mut inner = self.inner.lock().unwrap();
         inner.pinned = keys.into_iter().collect();
+        let pinned = std::mem::take(&mut inner.pinned);
+        inner.thumbs.evict_over_budget(&pinned);
+        inner.rgba.evict_over_budget(&pinned);
+        inner.jpeg.evict_over_budget(&pinned);
+        inner.pinned = pinned;
     }
 
     pub fn get_rgba(&self, key: Key) -> Option<Arc<PixelBuf>> {
@@ -228,5 +233,20 @@ mod tests {
         cache.insert_rgba((0, Tier::Browse), buf(80));
         cache.insert_rgba((0, Tier::Browse), buf(90)); // replace, not add
         assert_eq!(cache.stats().rgba_bytes, 90);
+    }
+
+    #[test]
+    fn unpinning_evicts_entries_that_exceed_the_budget() {
+        let cache = RamCache::new(0, 100, 0);
+        cache.set_pins([(0, Tier::Browse), (1, Tier::Browse)]);
+        cache.insert_rgba((0, Tier::Browse), buf(60));
+        cache.insert_rgba((1, Tier::Browse), buf(60));
+        assert_eq!(cache.stats().rgba_bytes, 120);
+
+        cache.set_pins([(1, Tier::Browse)]);
+
+        assert!(!cache.has_rgba((0, Tier::Browse)));
+        assert!(cache.has_rgba((1, Tier::Browse)));
+        assert_eq!(cache.stats().rgba_bytes, 60);
     }
 }

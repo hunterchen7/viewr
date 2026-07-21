@@ -521,7 +521,11 @@ fn run_develop(
 
     // Ring-2 + ring-3 insurance: encode the developed result so future
     // evictions demote instead of discarding, and folder reopens are warm.
-    if warm_only || (!token.cancelled() && !shared.cache.has_jpeg((index, tier))) {
+    // Once the expensive develop has completed, always finish its cache
+    // insurance. ImageReady can trigger a replan that cancels this token
+    // while JPEG encoding is starting; cancellation suppresses stale UI
+    // events, but must not discard already-completed work from rings 2/3.
+    if warm_only || !shared.cache.has_jpeg((index, tier)) {
         let quality_jpeg = match tier {
             Tier::Full => JPEG_QUALITY_FULL,
             _ => JPEG_QUALITY_BROWSE,
