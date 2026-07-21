@@ -422,6 +422,7 @@ impl App {
         let mut upload_budget = THUMB_UPLOADS_PER_FRAME;
         let mut uploaded = false;
         let mut next_wakeup = None;
+        let mut requested_thumbs = Vec::with_capacity(demanded_indices.len());
         let mut seen = HashSet::with_capacity(demanded_indices.len());
         for &index in demanded_indices {
             if index >= session.entries.len() || !seen.insert(index) {
@@ -460,6 +461,7 @@ impl App {
                 continue;
             }
             session.thumb_retry_after.remove(&index);
+            requested_thumbs.push(index);
 
             let request_is_stale = match session.thumb_requests.get(&index) {
                 Some(requested) => {
@@ -475,15 +477,16 @@ impl App {
                 }
                 None => true,
             };
-            if request_is_stale && session.engine.request_thumbnail(index) {
+            if request_is_stale {
                 session.thumb_requests.insert(index, now);
                 // Poll once to close the narrow race where pixels appeared
-                // between our cache probe and the engine's deduplicating probe.
+                // between our cache probe and the worker claiming demand.
                 next_wakeup = Some(next_wakeup.map_or(THUMB_REQUEST_POLL_AFTER, |current| {
                     current.min(THUMB_REQUEST_POLL_AFTER)
                 }));
             }
         }
+        let _ = session.engine.set_thumbnail_demand(&requested_thumbs);
 
         if uploaded {
             // Uploads happen after the widgets are painted, so schedule the

@@ -13,7 +13,7 @@
 //! - Encoded ring-2 JPEGs are written post-orientation, so rehydrates
 //!   never rotate.
 
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, TryLockError};
@@ -123,8 +123,6 @@ impl CancelToken {
 struct QueuedState {
     epoch: u64,
     action: Action,
-    class: u8,
-    eff_dist: u32,
 }
 
 struct InFlight {
@@ -138,6 +136,10 @@ struct QueueState {
     /// id → epoch of its live heap entry. Entries with a different epoch
     /// are inert and skipped on pop.
     queued: HashMap<JobId, QueuedState>,
+    /// Replaceable interactive lane, consumed before the background heap.
+    /// Thumbnail viewport updates replace this deque wholesale, so offscreen
+    /// requests cannot accumulate ahead of the newest visible items.
+    urgent: VecDeque<(JobId, Action)>,
     in_flight: HashMap<JobId, InFlight>,
     epoch: u64,
     seq: u64,
@@ -314,14 +316,12 @@ impl JobQueue {
         // index. This avoids a temporary HashSet on every navigation.
         state.queued.clear();
         state.queued.reserve(plan.len());
-        for (id, class, eff_dist, action) in &plan {
+        for (id, _, _, action) in &plan {
             state.queued.insert(
                 *id,
                 QueuedState {
                     epoch,
                     action: *action,
-                    class: *class,
-                    eff_dist: *eff_dist,
                 },
             );
         }
@@ -385,15 +385,7 @@ impl JobQueue {
                 eff_dist,
                 seq: state.seq,
             };
-            state.queued.insert(
-                id,
-                QueuedState {
-                    epoch,
-                    action,
-                    class,
-                    eff_dist,
-                },
-            );
+            state.queued.insert(id, QueuedState { epoch, action });
             state.heap.push(QueuedJob {
                 prio,
                 epoch,
@@ -405,51 +397,31 @@ impl JobQueue {
         self.cond.notify_all();
     }
 
-    /// Insert or reprioritize one interactive request without rebuilding the
-    /// rest of the queue. A live matching job is reused; stale heap entries are
-    /// made inert by giving the replacement a unique epoch.
-    fn prioritize(&self, id: JobId, class: u8, eff_dist: u32, action: Action) -> bool {
+    /// Replace the bounded interactive lane without disturbing background
+    /// priorities. A queued background copy remains valid until the urgent job
+    /// actually starts; dropping an item from this lane therefore demotes it
+    /// for free on the next viewport update.
+    fn set_urgent(&self, jobs: impl IntoIterator<Item = (JobId, Action)>) -> bool {
         let mut state = self.state.lock().unwrap();
         if state.closed {
             return false;
         }
-        if let Some(running) = state.in_flight.get(&id) {
-            if running.action == action && !running.token.cancelled() {
-                return true;
+        state.urgent.clear();
+        let mut seen = HashSet::new();
+        for (id, action) in jobs {
+            if state
+                .in_flight
+                .get(&id)
+                .is_some_and(|running| running.action == action && !running.token.cancelled())
+            {
+                continue;
             }
-            running.token.cancel();
+            if seen.insert(id) {
+                state.urgent.push_back((id, action));
+            }
         }
-        if state.queued.get(&id).is_some_and(|queued| {
-            queued.action == action && (queued.class, queued.eff_dist) <= (class, eff_dist)
-        }) {
-            return true;
-        }
-
-        state.epoch += 1;
-        let epoch = state.epoch;
-        state.seq += 1;
-        let prio = Prio {
-            class,
-            eff_dist,
-            seq: state.seq,
-        };
-        state.queued.insert(
-            id,
-            QueuedState {
-                epoch,
-                action,
-                class,
-                eff_dist,
-            },
-        );
-        state.heap.push(QueuedJob {
-            prio,
-            epoch,
-            id,
-            action,
-        });
         drop(state);
-        self.cond.notify_one();
+        self.cond.notify_all();
         true
     }
 
@@ -459,6 +431,28 @@ impl JobQueue {
         loop {
             if state.closed {
                 return None;
+            }
+            while let Some((id, action)) = state.urgent.pop_front() {
+                if state
+                    .in_flight
+                    .get(&id)
+                    .is_some_and(|running| running.action == action && !running.token.cancelled())
+                {
+                    continue;
+                }
+                // Invalidate a background copy only when this urgent copy is
+                // actually claimed. Until then, replacing the urgent viewport
+                // leaves the original background priority untouched.
+                state.queued.remove(&id);
+                let token = Arc::new(CancelToken::default());
+                state.in_flight.insert(
+                    id,
+                    InFlight {
+                        action,
+                        token: token.clone(),
+                    },
+                );
+                return Some((id, action, token));
             }
             while let Some(job) = state.heap.pop() {
                 if state.queued.get(&job.id).map(|queued| queued.epoch) != Some(job.epoch) {
@@ -498,6 +492,7 @@ impl JobQueue {
         state.closed = true;
         state.heap.clear();
         state.queued.clear();
+        state.urgent.clear();
         for running in state.in_flight.values() {
             running.token.cancel();
         }
@@ -693,18 +688,17 @@ impl Engine {
         *self.shared.sequence.lock().unwrap() = sequence;
     }
 
-    /// Re-request a viewport thumbnail whose byte-bounded RAM copy was evicted.
-    /// Existing queued or live work is deduplicated and promoted ahead of the
-    /// folder-wide metadata wave.
-    pub fn request_thumbnail(&self, index: usize) -> bool {
-        if index >= self.shared.entries.len() {
-            return false;
-        }
-        let id = (index, Tier::Thumb);
-        if self.shared.cache.has_rgba(id) {
-            return true;
-        }
-        self.shared.light.prioritize(id, 0, 0, Action::Thumb)
+    /// Replace the thumbnail viewport demand lane. It is intentionally
+    /// separate from the folder-wide metadata wave so rapid scrolling drops
+    /// stale urgency without cancelling useful background work.
+    pub fn set_thumbnail_demand(&self, indices: &[usize]) -> bool {
+        self.shared.light.set_urgent(
+            indices
+                .iter()
+                .copied()
+                .filter(|index| *index < self.shared.entries.len())
+                .map(|index| ((index, Tier::Thumb), Action::Thumb)),
+        )
     }
 
     pub fn cache(&self) -> &Arc<RamCache> {
@@ -1137,16 +1131,15 @@ mod tests {
     }
 
     #[test]
-    fn interactive_request_reprioritizes_a_queued_thumbnail_without_duplication() {
+    fn urgent_thumbnail_precedes_background_without_rewriting_the_heap() {
         let q = JobQueue::new();
         let requested = (9, Tier::Thumb);
         let other = (1, Tier::Thumb);
         q.extend([job(requested, 5, 100), job(other, 5, 1)]);
+        let background_heap_len = q.state.lock().unwrap().heap.len();
 
-        assert!(q.prioritize(requested, 0, 0, Action::Thumb));
-        let heap_len_after_promotion = q.state.lock().unwrap().heap.len();
-        assert!(q.prioritize(requested, 0, 0, Action::Thumb));
-        assert_eq!(q.state.lock().unwrap().heap.len(), heap_len_after_promotion);
+        assert!(q.set_urgent([(requested, Action::Thumb)]));
+        assert_eq!(q.state.lock().unwrap().heap.len(), background_heap_len);
         let (first, _, first_token) = q.pop().unwrap();
         assert_eq!(first, requested);
         q.finish(first, &first_token);
@@ -1161,24 +1154,46 @@ mod tests {
     }
 
     #[test]
-    fn interactive_request_reuses_a_live_thumbnail_job() {
+    fn replacing_urgent_viewport_drops_old_urgency_without_starvation() {
+        let q = JobQueue::new();
+        let old_viewport: Vec<_> = (0..50).map(|index| (index, Tier::Thumb)).collect();
+        let newest = (999, Tier::Thumb);
+        q.extend(
+            old_viewport
+                .iter()
+                .enumerate()
+                .map(|(distance, id)| job(*id, 5, distance as u32))
+                .chain([job(newest, 5, 999)]),
+        );
+
+        assert!(q.set_urgent(old_viewport.iter().copied().map(|id| (id, Action::Thumb))));
+        assert!(q.set_urgent([(newest, Action::Thumb)]));
+        assert_eq!(q.state.lock().unwrap().urgent.len(), 1);
+
+        let (first, _, token) = q.pop().unwrap();
+        assert_eq!(first, newest);
+        q.finish(first, &token);
+    }
+
+    #[test]
+    fn urgent_viewport_reuses_a_live_thumbnail_job() {
         let q = JobQueue::new();
         let id = (7, Tier::Thumb);
         q.extend([job(id, 5, 10)]);
         let (_, _, live_token) = q.pop().unwrap();
 
-        assert!(q.prioritize(id, 0, 0, Action::Thumb));
+        assert!(q.set_urgent([(id, Action::Thumb)]));
         let state = q.state.lock().unwrap();
         assert!(!live_token.cancelled());
-        assert!(!state.queued.contains_key(&id));
+        assert!(state.urgent.is_empty());
         assert!(state.heap.is_empty());
     }
 
     #[test]
-    fn interactive_request_is_rejected_after_queue_shutdown() {
+    fn urgent_viewport_is_rejected_after_queue_shutdown() {
         let q = JobQueue::new();
         q.close();
-        assert!(!q.prioritize((0, Tier::Thumb), 0, 0, Action::Thumb));
+        assert!(!q.set_urgent([((0, Tier::Thumb), Action::Thumb)]));
     }
 
     #[test]
