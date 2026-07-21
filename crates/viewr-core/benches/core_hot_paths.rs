@@ -90,6 +90,27 @@ fn bench_navigation_plan(c: &mut Criterion) {
                 ))
             });
         });
+        // Disk warming is now persistent queue state, so its repeated
+        // navigation cost is the same bounded interactive planner. Keep this
+        // case separate to catch an accidental return to folder-wide rebuilds.
+        group.bench_with_input(
+            BenchmarkId::new("persistent_disk_warm", len),
+            &len,
+            |b, &len| {
+                b.iter(|| {
+                    black_box(build_plan_targets(
+                        black_box(len),
+                        black_box(len / 2),
+                        black_box(1),
+                        black_box(false),
+                        black_box(&[]),
+                        black_box(false),
+                    ))
+                });
+            },
+        );
+        // Retain the former O(N) planner as a reference measurement. The
+        // engine no longer calls this path during navigation.
         group.bench_with_input(
             BenchmarkId::new("identity_with_disk_warm", len),
             &len,

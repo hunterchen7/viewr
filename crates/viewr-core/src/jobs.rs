@@ -150,6 +150,15 @@ struct QueueState {
     /// requests cannot accumulate ahead of the newest visible items.
     urgent: VecDeque<(JobId, Action)>,
     in_flight: HashMap<JobId, InFlight>,
+    /// One-shot folder-wide work. Unlike `heap`, this lane survives
+    /// navigation replans and is consumed only when no interactive job is
+    /// queued.
+    background: VecDeque<(JobId, Action)>,
+    /// Background generations remain tracked after a foreground replacement
+    /// takes over the same ID. A cancelled generation is requeued when its
+    /// worker exits, preserving eventual folder coverage.
+    background_in_flight: HashMap<JobId, InFlight>,
+    background_initialized: bool,
     epoch: u64,
     seq: u64,
     closed: bool,
@@ -311,9 +320,12 @@ impl JobQueue {
         }
     }
 
-    /// Replace the desired job set. In-flight jobs no longer wanted are
-    /// cancelled; in-flight jobs still wanted keep running (not duplicated).
-    fn set_plan(&self, plan: Vec<(JobId, u8, u32, Action)>) {
+    /// Replace the interactive job set. In-flight interactive jobs no longer
+    /// wanted are cancelled; in-flight jobs still wanted keep running (not
+    /// duplicated). A real navigation change can also cancel active
+    /// background generations so newly interactive work reaches a worker at
+    /// the next cancellation point.
+    fn set_plan(&self, plan: Vec<(JobId, u8, u32, Action)>, cancel_background: bool) {
         let mut state = self.state.lock().unwrap();
         if state.closed {
             return;
@@ -334,19 +346,26 @@ impl JobQueue {
                 },
             );
         }
+        if cancel_background {
+            for running in state.background_in_flight.values() {
+                running.token.cancel();
+            }
+        }
         for (id, running) in &state.in_flight {
-            if state
-                .queued
+            let is_background = state
+                .background_in_flight
                 .get(id)
-                .is_none_or(|wanted| wanted.action != running.action)
+                .is_some_and(|background| Arc::ptr_eq(&background.token, &running.token));
+            let wanted_action = state.queued.get(id).map(|wanted| wanted.action);
+            if (!is_background && wanted_action != Some(running.action))
+                || (is_background && wanted_action.is_some_and(|action| action != running.action))
             {
                 running.token.cancel();
             }
         }
 
         // Reuse the heap's backing allocation, then heapify once in O(P).
-        // Repeated push would make each navigation O(P log P), which is
-        // noticeable when the folder-wide warm wave contains many images.
+        // Repeated push would make each navigation O(P log P).
         let mut jobs = std::mem::take(&mut state.heap).into_vec();
         jobs.clear();
         jobs.reserve(plan.len());
@@ -379,8 +398,25 @@ impl JobQueue {
         self.cond.notify_all();
     }
 
+    /// Install persistent background work exactly once. The closure keeps the
+    /// O(N) folder ordering allocation off every later navigation call.
+    fn initialize_background<I>(&self, jobs: impl FnOnce() -> I) -> bool
+    where
+        I: IntoIterator<Item = (JobId, Action)>,
+    {
+        let mut state = self.state.lock().unwrap();
+        if state.closed || state.background_initialized {
+            return false;
+        }
+        state.background_initialized = true;
+        state.background.extend(jobs());
+        drop(state);
+        self.cond.notify_all();
+        true
+    }
+
     /// Append jobs without disturbing the existing plan (used for the
-    /// one-shot thumb wave).
+    /// one-shot metadata wave).
     fn extend(&self, jobs: impl IntoIterator<Item = (JobId, u8, u32, Action)>) {
         let mut state = self.state.lock().unwrap();
         if state.closed {
@@ -481,12 +517,51 @@ impl JobQueue {
                 );
                 return Some((job.id, job.action, token));
             }
+            // Persistent folder warming is strictly below both replaceable
+            // lanes. Rotate candidates whose foreground generation is still
+            // active; `finish` wakes us when one becomes runnable.
+            let background_len = state.background.len();
+            for _ in 0..background_len {
+                let (id, action) = state
+                    .background
+                    .pop_front()
+                    .expect("background length was captured under the queue lock");
+                if state.in_flight.contains_key(&id) {
+                    state.background.push_back((id, action));
+                    continue;
+                }
+                let token = Arc::new(CancelToken::default());
+                state.background_in_flight.insert(
+                    id,
+                    InFlight {
+                        action,
+                        token: token.clone(),
+                    },
+                );
+                state.in_flight.insert(
+                    id,
+                    InFlight {
+                        action,
+                        token: token.clone(),
+                    },
+                );
+                return Some((id, action, token));
+            }
             state = self.cond.wait(state).unwrap();
         }
     }
 
     fn finish(&self, id: JobId, token: &Arc<CancelToken>) {
         let mut state = self.state.lock().unwrap();
+        let retry_action = state.background_in_flight.get(&id).and_then(|background| {
+            Arc::ptr_eq(&background.token, token).then_some(background.action)
+        });
+        if let Some(action) = retry_action {
+            state.background_in_flight.remove(&id);
+            if token.cancelled() && !state.closed {
+                state.background.push_back((id, action));
+            }
+        }
         if state
             .in_flight
             .get(&id)
@@ -494,6 +569,8 @@ impl JobQueue {
         {
             state.in_flight.remove(&id);
         }
+        drop(state);
+        self.cond.notify_one();
     }
 
     /// Cancel active work, discard queued work, and wake every waiter.
@@ -505,11 +582,39 @@ impl JobQueue {
         state.heap.clear();
         state.queued.clear();
         state.urgent.clear();
+        state.background.clear();
         for running in state.in_flight.values() {
             running.token.cancel();
         }
+        for running in state.background_in_flight.values() {
+            running.token.cancel();
+        }
+        state.background_in_flight.clear();
         drop(state);
         self.cond.notify_all();
+    }
+}
+
+#[derive(Default)]
+struct NavigationOrder {
+    /// Display order after filtering. Empty means identity order.
+    indices: Vec<usize>,
+    /// The last normalized state planned against `indices`. Keeping both
+    /// values under one mutex makes a sequence change atomically invalidate
+    /// the cancellation generation.
+    last_nav: Option<NavState>,
+}
+
+impl NavigationOrder {
+    fn update_navigation(&mut self, nav: NavState) -> bool {
+        let changed = self.last_nav != Some(nav);
+        self.last_nav = Some(nav);
+        changed
+    }
+
+    fn replace_indices(&mut self, indices: Vec<usize>) {
+        self.indices = indices;
+        self.last_nav = None;
     }
 }
 
@@ -522,10 +627,8 @@ struct Shared {
     heavy: JobQueue,
     light: JobQueue,
     persistence: PersistenceQueue,
-    /// Display order the prefetch wave follows (filtered view). Empty ⇒
-    /// identity. Distances are positions in this sequence, so with a
-    /// rating filter active the wave targets the next *visible* images.
-    sequence: Mutex<Vec<usize>>,
+    /// Display order and its last navigation generation.
+    navigation: Mutex<NavigationOrder>,
 }
 
 pub struct Engine {
@@ -574,6 +677,12 @@ fn navigation_pins(
     pins
 }
 
+fn background_warm_jobs(len: usize, start: usize) -> impl Iterator<Item = (JobId, Action)> {
+    outward_order(len, start)
+        .into_iter()
+        .map(|index| ((index, Tier::Browse), Action::WarmDevelop(Quality::Browse)))
+}
+
 impl Engine {
     /// Spawns the worker pool and queues the outward metadata wave.
     /// `notify` is called after every published result (the app passes
@@ -595,7 +704,7 @@ impl Engine {
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             persistence: PersistenceQueue::new(),
-            sequence: Mutex::new(Vec::new()),
+            navigation: Mutex::new(NavigationOrder::default()),
         });
 
         let persistence_worker = {
@@ -665,15 +774,29 @@ impl Engine {
         if len == 0 {
             return;
         }
-        let current = nav.current.min(len - 1);
+        let nav = NavState {
+            current: nav.current.min(len - 1),
+            direction: if nav.direction < 0 { -1 } else { 1 },
+            zoomed: nav.zoomed,
+        };
+        let current = nav.current;
         let cache = &self.shared.cache;
 
         let disk = &self.shared.disk;
-        let (pins, targets) = {
-            let s = self.shared.sequence.lock().unwrap();
+        let (pins, targets, navigation_changed) = {
+            let mut navigation = self.shared.navigation.lock().unwrap();
+            let navigation_changed = navigation.update_navigation(nav);
             (
-                navigation_pins(len, current, nav.zoomed, &s),
-                build_plan_targets(len, current, nav.direction, nav.zoomed, &s, disk.is_some()),
+                navigation_pins(len, current, nav.zoomed, &navigation.indices),
+                build_plan_targets(
+                    len,
+                    current,
+                    nav.direction,
+                    nav.zoomed,
+                    &navigation.indices,
+                    false,
+                ),
+                navigation_changed,
             )
         };
         // Full buffers are useful only while inspecting at zoom. Filtered
@@ -701,29 +824,26 @@ impl Engine {
                     plan.push((id, target.class, target.effective_distance, action));
                 }
                 PlanKind::Warm => {
-                    if disk.is_some() {
-                        // RAM and disk presence are checked when this
-                        // background job reaches a worker. Besides removing
-                        // synchronous filesystem probes, this avoids taking
-                        // the RAM-cache mutex once per file during navigation.
-                        plan.push((
-                            id,
-                            target.class,
-                            target.effective_distance,
-                            Action::WarmDevelop(Quality::Browse),
-                        ));
-                    }
+                    // Folder warming lives in the persistent background lane,
+                    // so navigation never contributes this O(N) target set.
                 }
             }
         }
 
-        self.shared.heavy.set_plan(plan);
+        let cancel_background = navigation_changed && !plan.is_empty();
+        self.shared.heavy.set_plan(plan, cancel_background);
+        if disk.is_some() {
+            self.shared
+                .heavy
+                .initialize_background(|| background_warm_jobs(len, current));
+        }
     }
 
     /// Set the display order (filtered view) the wave follows.
     /// Call `navigate` afterwards to apply.
     pub fn set_sequence(&self, sequence: Vec<usize>) {
-        *self.shared.sequence.lock().unwrap() = sequence;
+        let mut navigation = self.shared.navigation.lock().unwrap();
+        navigation.replace_indices(sequence);
     }
 
     /// Replace the thumbnail viewport demand lane. It is intentionally
@@ -1058,6 +1178,10 @@ mod tests {
         (id, class, dist, Action::Thumb)
     }
 
+    fn warm(id: JobId) -> (JobId, Action) {
+        (id, Action::WarmDevelop(Quality::Browse))
+    }
+
     fn persistence_request(
         id: JobId,
         pixels: Arc<PixelBuf>,
@@ -1086,7 +1210,7 @@ mod tests {
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             persistence: PersistenceQueue::with_budget(pending_budget_bytes),
-            sequence: Mutex::new(Vec::new()),
+            navigation: Mutex::new(NavigationOrder::default()),
         })
     }
 
@@ -1132,13 +1256,153 @@ mod tests {
     }
 
     #[test]
+    fn persistent_warm_jobs_are_a_valid_folder_permutation() {
+        for len in 0_usize..=32 {
+            for start in 0..=len.saturating_add(1) {
+                let jobs: Vec<_> = background_warm_jobs(len, start).collect();
+                assert_eq!(jobs.len(), len);
+                assert!(jobs.iter().all(|((index, tier), action)| {
+                    *index < len
+                        && *tier == Tier::Browse
+                        && *action == Action::WarmDevelop(Quality::Browse)
+                }));
+                let mut indices: Vec<_> = jobs.into_iter().map(|(id, _)| id.0).collect();
+                indices.sort_unstable();
+                indices.dedup();
+                assert_eq!(indices, (0..len).collect::<Vec<_>>());
+            }
+        }
+    }
+
+    #[test]
+    fn filter_sequence_change_invalidates_navigation_generation() {
+        let mut order = NavigationOrder::default();
+        let nav = NavState {
+            current: 4,
+            direction: 1,
+            zoomed: false,
+        };
+        assert!(order.update_navigation(nav));
+        assert!(!order.update_navigation(nav));
+
+        order.replace_indices(vec![1, 4, 8]);
+        assert_eq!(order.indices, [1, 4, 8]);
+        assert!(order.update_navigation(nav));
+    }
+
+    #[test]
+    fn interactive_plan_precedes_persistent_background_initialized_once() {
+        let q = JobQueue::new();
+        let background = (7, Tier::Browse);
+        let ignored = (8, Tier::Browse);
+        let interactive = (1, Tier::Browse);
+        assert!(q.initialize_background(|| [warm(background)]));
+        assert!(!q.initialize_background(|| [warm(ignored)]));
+        q.set_plan(vec![job(interactive, 0, 0)], false);
+
+        let (first, action, first_token) = q.pop().unwrap();
+        assert_eq!((first, action), (interactive, Action::Thumb));
+        q.finish(first, &first_token);
+
+        let (second, action, second_token) = q.pop().unwrap();
+        assert_eq!(
+            (second, action),
+            (background, Action::WarmDevelop(Quality::Browse))
+        );
+        q.finish(second, &second_token);
+        assert!(q.state.lock().unwrap().background.is_empty());
+    }
+
+    #[test]
+    fn foreground_replacement_requeues_cancelled_background_generation() {
+        let q = JobQueue::new();
+        let displaced = (7, Tier::Browse);
+        let other = (8, Tier::Browse);
+        assert!(q.initialize_background(|| [warm(displaced), warm(other)]));
+
+        let (id, action, background_token) = q.pop().unwrap();
+        assert_eq!(
+            (id, action),
+            (displaced, Action::WarmDevelop(Quality::Browse))
+        );
+
+        // Even a same-navigation replan must replace a warm action when this
+        // exact image becomes interactive.
+        q.set_plan(vec![(id, 0, 0, Action::Develop(Quality::Browse))], false);
+        assert!(background_token.cancelled());
+        let (foreground_id, foreground_action, foreground_token) = q.pop().unwrap();
+        assert_eq!(foreground_id, id);
+        assert_eq!(foreground_action, Action::Develop(Quality::Browse));
+
+        // The stale warm completion cannot erase the foreground generation,
+        // and its canceled item returns behind the untouched background item.
+        q.finish(id, &background_token);
+        assert!(
+            q.state
+                .lock()
+                .unwrap()
+                .in_flight
+                .get(&id)
+                .is_some_and(|current| Arc::ptr_eq(&current.token, &foreground_token))
+        );
+        q.finish(foreground_id, &foreground_token);
+
+        let (next, _, next_token) = q.pop().unwrap();
+        assert_eq!(next, other);
+        q.finish(next, &next_token);
+        let (retried, retry_action, retry_token) = q.pop().unwrap();
+        assert_eq!(
+            (retried, retry_action),
+            (displaced, Action::WarmDevelop(Quality::Browse))
+        );
+        q.finish(retried, &retry_token);
+    }
+
+    #[test]
+    fn same_navigation_replan_keeps_unrelated_background_running() {
+        let q = JobQueue::new();
+        let background = (7, Tier::Browse);
+        let interactive = (1, Tier::Browse);
+        assert!(q.initialize_background(|| [warm(background)]));
+        let (_, _, background_token) = q.pop().unwrap();
+
+        q.set_plan(vec![job(interactive, 0, 0)], false);
+        assert!(!background_token.cancelled());
+        let (id, _, interactive_token) = q.pop().unwrap();
+        assert_eq!(id, interactive);
+        q.finish(id, &interactive_token);
+        q.finish(background, &background_token);
+    }
+
+    #[test]
+    fn shutdown_discards_cancelled_background_retry() {
+        let q = JobQueue::new();
+        let id = (3, Tier::Browse);
+        assert!(q.initialize_background(|| [warm(id)]));
+        let (_, _, token) = q.pop().unwrap();
+
+        q.close();
+        assert!(token.cancelled());
+        q.finish(id, &token);
+        let state = q.state.lock().unwrap();
+        assert!(state.closed);
+        assert!(state.background.is_empty());
+        assert!(state.background_in_flight.is_empty());
+        drop(state);
+        assert!(q.pop().is_none());
+    }
+
+    #[test]
     fn pops_in_priority_order() {
         let q = JobQueue::new();
-        q.set_plan(vec![
-            job((2, Tier::Browse), 4, 6),
-            job((0, Tier::Browse), 0, 0),
-            job((1, Tier::Browse), 2, 1),
-        ]);
+        q.set_plan(
+            vec![
+                job((2, Tier::Browse), 4, 6),
+                job((0, Tier::Browse), 0, 0),
+                job((1, Tier::Browse), 2, 1),
+            ],
+            true,
+        );
         assert_eq!(q.pop().unwrap().0, (0, Tier::Browse));
         assert_eq!(q.pop().unwrap().0, (1, Tier::Browse));
         assert_eq!(q.pop().unwrap().0, (2, Tier::Browse));
@@ -1163,7 +1427,7 @@ mod tests {
             .collect();
         expected.sort_unstable();
 
-        q.set_plan(plan);
+        q.set_plan(plan, true);
 
         for (_, _, _, expected_id) in expected {
             assert_eq!(q.pop().unwrap().0, expected_id);
@@ -1177,11 +1441,14 @@ mod tests {
     fn forward_bias_orders_wave() {
         // Same class: eff_dist decides; backward×3 means +1,+2,+3 beat -1.
         let q = JobQueue::new();
-        q.set_plan(vec![
-            job((9, Tier::Browse), 4, 3), // backward dist 1 → eff 3
-            job((11, Tier::Browse), 4, 1),
-            job((12, Tier::Browse), 4, 2),
-        ]);
+        q.set_plan(
+            vec![
+                job((9, Tier::Browse), 4, 3), // backward dist 1 → eff 3
+                job((11, Tier::Browse), 4, 1),
+                job((12, Tier::Browse), 4, 2),
+            ],
+            true,
+        );
         assert_eq!(q.pop().unwrap().0.0, 11);
         assert_eq!(q.pop().unwrap().0.0, 12);
         assert_eq!(q.pop().unwrap().0.0, 9);
@@ -1190,12 +1457,12 @@ mod tests {
     #[test]
     fn replan_supersedes_queued_jobs() {
         let q = JobQueue::new();
-        q.set_plan(vec![
-            job((0, Tier::Browse), 1, 0),
-            job((1, Tier::Browse), 2, 0),
-        ]);
+        q.set_plan(
+            vec![job((0, Tier::Browse), 1, 0), job((1, Tier::Browse), 2, 0)],
+            true,
+        );
         // New plan drops job 0 entirely.
-        q.set_plan(vec![job((1, Tier::Browse), 1, 0)]);
+        q.set_plan(vec![job((1, Tier::Browse), 1, 0)], true);
         assert_eq!(q.pop().unwrap().0, (1, Tier::Browse));
         assert!(
             q.state.lock().unwrap().heap.is_empty() || {
@@ -1320,19 +1587,19 @@ mod tests {
     #[test]
     fn replan_cancels_unwanted_in_flight_and_keeps_wanted() {
         let q = JobQueue::new();
-        q.set_plan(vec![
-            job((0, Tier::Browse), 1, 0),
-            job((1, Tier::Browse), 2, 0),
-        ]);
+        q.set_plan(
+            vec![job((0, Tier::Browse), 1, 0), job((1, Tier::Browse), 2, 0)],
+            true,
+        );
         let (id0, _, token0) = q.pop().unwrap();
         assert_eq!(id0, (0, Tier::Browse));
         // Job 0 is now in flight. Replan wants only job 1 → 0 cancelled.
-        q.set_plan(vec![job((1, Tier::Browse), 1, 0)]);
+        q.set_plan(vec![job((1, Tier::Browse), 1, 0)], true);
         assert!(token0.cancelled());
 
         // Re-wanting job 0 while its cancelled instance is still in flight:
         // a fresh instance must be queued (the dying one won't publish).
-        q.set_plan(vec![job((0, Tier::Browse), 1, 0)]);
+        q.set_plan(vec![job((0, Tier::Browse), 1, 0)], true);
         assert!(
             q.state
                 .lock()
@@ -1343,9 +1610,9 @@ mod tests {
 
         // But a LIVE in-flight job is never duplicated.
         let q2 = JobQueue::new();
-        q2.set_plan(vec![job((7, Tier::Browse), 1, 0)]);
+        q2.set_plan(vec![job((7, Tier::Browse), 1, 0)], true);
         let _live = q2.pop().unwrap();
-        q2.set_plan(vec![job((7, Tier::Browse), 1, 0)]);
+        q2.set_plan(vec![job((7, Tier::Browse), 1, 0)], true);
         assert!(
             !q2.state
                 .lock()
@@ -1359,11 +1626,14 @@ mod tests {
     fn replan_replaces_live_job_when_action_changes() {
         let q = JobQueue::new();
         let id = (7, Tier::Browse);
-        q.set_plan(vec![(id, 6, 20, Action::WarmDevelop(Quality::Browse))]);
+        q.set_plan(
+            vec![(id, 6, 20, Action::WarmDevelop(Quality::Browse))],
+            true,
+        );
         let (_, action, warm_token) = q.pop().unwrap();
         assert_eq!(action, Action::WarmDevelop(Quality::Browse));
 
-        q.set_plan(vec![(id, 0, 0, Action::Develop(Quality::Browse))]);
+        q.set_plan(vec![(id, 0, 0, Action::Develop(Quality::Browse))], true);
         assert!(warm_token.cancelled());
 
         let (_, action, display_token) = q.pop().unwrap();
@@ -1392,7 +1662,7 @@ mod tests {
         q.close();
         assert!(waiter.join().unwrap().is_none());
 
-        q.set_plan(vec![job((0, Tier::Browse), 0, 0)]);
+        q.set_plan(vec![job((0, Tier::Browse), 0, 0)], true);
         assert!(q.pop().is_none());
     }
 
@@ -1401,12 +1671,12 @@ mod tests {
         let q = JobQueue::new();
         let id = (0, Tier::Browse);
 
-        q.set_plan(vec![job(id, 1, 0)]);
+        q.set_plan(vec![job(id, 1, 0)], true);
         let (_, _, stale) = q.pop().unwrap();
-        q.set_plan(Vec::new());
+        q.set_plan(Vec::new(), true);
         assert!(stale.cancelled());
 
-        q.set_plan(vec![job(id, 1, 0)]);
+        q.set_plan(vec![job(id, 1, 0)], true);
         let (_, _, replacement) = q.pop().unwrap();
         assert!(!Arc::ptr_eq(&stale, &replacement));
 
@@ -1427,11 +1697,14 @@ mod tests {
     #[test]
     fn equal_priority_jobs_are_fifo() {
         let q = JobQueue::new();
-        q.set_plan(vec![
-            job((0, Tier::Browse), 1, 1),
-            job((1, Tier::Browse), 1, 1),
-            job((2, Tier::Browse), 1, 1),
-        ]);
+        q.set_plan(
+            vec![
+                job((0, Tier::Browse), 1, 1),
+                job((1, Tier::Browse), 1, 1),
+                job((2, Tier::Browse), 1, 1),
+            ],
+            true,
+        );
         assert_eq!(q.pop().unwrap().0.0, 0);
         assert_eq!(q.pop().unwrap().0.0, 1);
         assert_eq!(q.pop().unwrap().0.0, 2);
@@ -1468,7 +1741,7 @@ mod tests {
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             persistence: PersistenceQueue::new(),
-            sequence: Mutex::new(Vec::new()),
+            navigation: Mutex::new(NavigationOrder::default()),
         };
 
         run_warm_develop(
@@ -1623,7 +1896,9 @@ mod tests {
         let cache = Arc::new(RamCache::new(0, 0, 1024 * 1024));
         let shared = persistence_shared(entries, cache.clone(), Some(disk.clone()), 1024 * 1024);
 
-        shared.heavy.set_plan(vec![job((0, Tier::Browse), 1, 0)]);
+        shared
+            .heavy
+            .set_plan(vec![job((0, Tier::Browse), 1, 0)], true);
         let (_, _, token) = shared.heavy.pop().unwrap();
         assert_eq!(
             shared.persistence.try_enqueue(persistence_request(
@@ -1634,7 +1909,7 @@ mod tests {
             PersistenceEnqueue::Queued
         );
 
-        shared.heavy.set_plan(Vec::new());
+        shared.heavy.set_plan(Vec::new(), true);
         assert!(token.cancelled());
         let worker_shared = shared.clone();
         let worker = std::thread::spawn(move || persistence_worker(&worker_shared));
@@ -1665,7 +1940,7 @@ mod tests {
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             persistence: PersistenceQueue::new(),
-            sequence: Mutex::new(Vec::new()),
+            navigation: Mutex::new(NavigationOrder::default()),
         };
 
         run_rehydrate(&shared, 0, Tier::Browse, &CancelToken::default());
