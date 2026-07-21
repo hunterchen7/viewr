@@ -1,0 +1,34 @@
+name: Benchmarks
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmarks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  synthetic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96
+      - uses: Swatinem/rust-cache@v2
+      - name: Record environment
+        run: |
+          rustc -Vv
+          uname -a
+          lscpu
+      - name: Run synthetic benchmarks
+        run: cargo bench -p viewr-core --bench core_hot_paths --locked -- --noplot
+      - name: Upload Criterion results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-${{ github.run_id }}
+          path: crates/viewr-core/target/criterion
+          if-no-files-found: warn
+          retention-days: 14

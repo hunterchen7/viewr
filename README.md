@@ -57,7 +57,7 @@ cargo build --release        # binary at target/release/viewr
 cargo test --workspace
 ```
 
-Rust stable; pure Rust throughout (egui/wgpu → Metal on macOS,
+Rust 1.96 is pinned; pure Rust throughout (egui/wgpu → Metal on macOS,
 DX12/Vulkan on Windows, Vulkan on Linux). CI builds and tests all three.
 Linux builds need `libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev
 libxcb-xfixes0-dev libxkbcommon-dev`. RAW decoding by
@@ -71,7 +71,8 @@ including lossless compressed; DNG comes along for free.
   Lightroom develop settings/keywords in a sidecar are untouched).
 - The local DB lives at `~/Library/Application Support/viewr/viewr.db`
   (platform-equivalent config dir elsewhere).
-- Design/implementation notes: `docs/m0-notes.md`.
+- [Testing and benchmark procedures](docs/testing-and-benchmarking.md).
+- [Design and implementation notes](docs/m0-notes.md).
 
 ## License
 
@@ -84,4 +85,4 @@ component, whose source and license are available at the link above.
 Automated with release-please: commits to `main` using
 [Conventional Commits](https://www.conventionalcommits.org) (`feat:`,
 `fix:`, …) accumulate into a release PR; merging it tags a version,
-generates the changelog, and CI attaches macOS/Windows binaries.
+generates the changelog, and CI attaches macOS, Windows, and Linux binaries.

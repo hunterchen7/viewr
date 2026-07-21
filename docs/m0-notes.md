@@ -1,5 +1,8 @@
 # M0 spike results — 2026-07-20
 
+> This file is a historical spike snapshot. Some pending notes are now
+> implemented. Use `docs/testing-and-benchmarking.md` for current procedures.
+
 Machine: Apple M4 (10-core, 24GB). Release build.
 File: Sony A7C II (ILCE-7CM2), 33MP lossless-compressed ARW, 49MB
 (`HCA04696.ARW`, 7168×5120 sensor → 7008×4672 delivered).
