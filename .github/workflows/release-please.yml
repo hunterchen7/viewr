@@ -4,14 +4,59 @@ on:
     branches: [main]
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
+
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   release-please:
     runs-on: ubuntu-latest
     steps:
-      - uses: googleapis/release-please-action@v4
+      - id: release
+        uses: googleapis/release-please-action@v4
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+      - name: Check out release pull request
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+      - name: Install Rust
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        uses: dtolnay/rust-toolchain@1.96
+      - name: Sync release lockfile
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        env:
+          RELEASE_BRANCH: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+        run: |
+          case "$RELEASE_BRANCH" in
+            release-please--branches--*) ;;
+            *)
+              echo "::error::Unexpected release branch: $RELEASE_BRANCH"
+              exit 1
+              ;;
+          esac
+
+          cargo update --workspace
+
+          if git diff --quiet -- Cargo.lock; then
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "chore: sync Cargo.lock for release"
+          git push origin "HEAD:refs/heads/$RELEASE_BRANCH"
+      - name: Run CI for release pull request
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_BRANCH: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+        # GITHUB_TOKEN pushes do not trigger push workflows, but dispatches do.
+        run: gh workflow run ci.yml --ref "$RELEASE_BRANCH"
