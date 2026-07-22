@@ -65,6 +65,9 @@ jobs:
     name: Release and benchmark builds
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@v7
       - name: Linux build deps
@@ -72,12 +75,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
       - uses: dtolnay/rust-toolchain@1.96
+      - name: Configure compiler cache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: builds
+          shared-key: cargo-sources
+          cache-targets: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build release and benchmark targets
         run: cargo build --workspace --release --bins --benches --all-features --locked
+      - name: Compiler cache statistics
+        if: always()
+        run: sccache --show-stats
 
   miri:
     name: Miri unsafe-path checks
