@@ -44,7 +44,12 @@ not on the critical path.
 Workspace crate outputs are intentionally excluded from the shared cache.
 Fresh hosted checkouts can invalidate local-source artifacts by modification
 time, and release/LTO outputs are large. Add a compiler cache or workspace-crate
-cache only after a hosted cold/warm comparison shows a net benefit.
+cache only after a hosted cold/warm comparison shows a net benefit. A July 2026
+hosted comparison rejected `sccache`: its fully warm build had a 100% cache-hit
+rate but took 10m34, only eight seconds less than the Cargo target cache's
+10m42 warm build, while its cold build took 17m11 and created hundreds of cache
+objects. The optimized-build job therefore retains the simpler Cargo target
+cache.
 
 Normal test builds exclude Criterion and use an unoptimized test profile. This
 keeps correctness feedback fast without changing the optimized development,
