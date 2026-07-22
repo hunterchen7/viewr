@@ -28,7 +28,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: quality
-          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Format
         run: cargo fmt --all --check
       - name: Lint all targets and features
@@ -57,7 +57,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: tests
-          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test workspace
         run: cargo test --workspace --locked
 
@@ -75,9 +75,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: builds
-          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build release and benchmark targets
-        run: cargo build --workspace --release --all-targets --all-features --locked
+        run: cargo build --workspace --release --bins --benches --all-features --locked
 
   miri:
     name: Miri unsafe-path checks
@@ -91,8 +91,9 @@ jobs:
           components: miri
       - uses: Swatinem/rust-cache@v2
         with:
-          key: miri
-          cache-on-failure: true
+          shared-key: miri
+          cache-targets: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check pixel rotations
         run: cargo +nightly-2026-07-21 miri test -p viewr-core --lib resize::tests::rotate_ --locked
       - name: Check superpixel output initialization

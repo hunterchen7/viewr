@@ -28,9 +28,23 @@ formatting, Clippy, Rustdoc, benchmark compilation, and release compilation run
 once on Linux. Miri uses one pinned Linux nightly job. The independent quality,
 test, optimized-build, and Miri jobs run in parallel.
 
-The optimized-build job uses one release-profile, all-targets Cargo invocation.
-This builds the application and both benchmark harnesses with one unified
-dependency graph instead of repeating release code generation.
+The optimized-build job uses one release-profile Cargo invocation with
+`--bins --benches --all-features`. This builds the application and both
+benchmark harnesses with one unified dependency graph. It does not duplicate
+the three test jobs by linking unit-test harnesses again in release mode.
+
+CI caches downloaded Cargo registry and Git sources plus compiled dependency
+artifacts. Quality, test, optimized-build, benchmark, and Miri jobs use separate
+keys because their toolchains and profiles are not interchangeable. Pull
+request jobs can restore default-branch caches, but only `main` writes new
+caches. This avoids filling the repository cache quota with merge-ref caches
+that cannot seed `main`. Miri caches sources only because its focused checks are
+not on the critical path.
+
+Workspace crate outputs are intentionally excluded from the shared cache.
+Fresh hosted checkouts can invalidate local-source artifacts by modification
+time, and release/LTO outputs are large. Add a compiler cache or workspace-crate
+cache only after a hosted cold/warm comparison shows a net benefit.
 
 Normal test builds exclude Criterion and use an unoptimized test profile. This
 keeps correctness feedback fast without changing the optimized development,
