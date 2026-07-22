@@ -21,18 +21,30 @@ jobs:
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+      - name: Resolve release branch
+        id: release_pr
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        env:
+          RELEASE_PR: ${{ steps.release.outputs.pr }}
+        run: |
+          release_branch="$(
+            jq -er \
+              '.headBranchName | strings | select(startswith("release-please--branches--"))' \
+              <<< "$RELEASE_PR"
+          )"
+          printf 'branch=%s\n' "$release_branch" >> "$GITHUB_OUTPUT"
       - name: Check out release pull request
         if: ${{ steps.release.outputs.prs_created == 'true' }}
         uses: actions/checkout@v7
         with:
-          ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+          ref: ${{ steps.release_pr.outputs.branch }}
       - name: Install Rust
         if: ${{ steps.release.outputs.prs_created == 'true' }}
         uses: dtolnay/rust-toolchain@1.96
       - name: Sync release lockfile
         if: ${{ steps.release.outputs.prs_created == 'true' }}
         env:
-          RELEASE_BRANCH: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+          RELEASE_BRANCH: ${{ steps.release_pr.outputs.branch }}
         run: |
           case "$RELEASE_BRANCH" in
             release-please--branches--*) ;;
@@ -57,6 +69,6 @@ jobs:
         if: ${{ steps.release.outputs.prs_created == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_BRANCH: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+          RELEASE_BRANCH: ${{ steps.release_pr.outputs.branch }}
         # GITHUB_TOKEN pushes do not trigger push workflows, but dispatches do.
         run: gh workflow run ci.yml --ref "$RELEASE_BRANCH"
