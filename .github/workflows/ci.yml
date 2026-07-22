@@ -3,6 +3,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Release Please dispatches CI after it updates Cargo.lock with GITHUB_TOKEN.
+  workflow_dispatch:
 
 permissions:
   contents: read
