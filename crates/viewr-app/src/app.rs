@@ -6,11 +6,11 @@
 //! Refiltering applies lazily on navigation so rating an image below the
 //! threshold doesn't yank it out from under the cursor.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use eframe::egui::{self, vec2};
@@ -24,10 +24,19 @@ use viewr_core::meta::FileMeta;
 use viewr_core::types::{PixelBuf, Tier};
 
 use crate::config::{Action, Config, ScrollMode};
+use crate::filmstrip;
 use crate::loupe::{self, Zoom};
 use crate::settings::SettingsState;
+use crate::texture_lru::ByteLru;
 
 const THUMB_BUDGET: u64 = 384 * 1024 * 1024;
+/// Logical RGBA bytes retained by thumbnail texture handles. Actual backend
+/// allocation can be slightly higher, but remains proportional to this cap.
+const THUMB_TEXTURE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+const THUMB_UPLOADS_PER_FRAME: usize = 8;
+const THUMB_REQUEST_POLL_AFTER: Duration = Duration::from_millis(16);
+const THUMB_REQUEST_STALE_AFTER: Duration = Duration::from_millis(500);
+const THUMB_FAILURE_RETRY_AFTER: Duration = Duration::from_secs(2);
 
 pub fn run(dir: &Path, select: Option<&Path>) -> Result<()> {
     let options = eframe::NativeOptions {
@@ -75,6 +84,86 @@ impl Filter {
     }
 }
 
+/// Rebuild `visible` in source order. Returns whether that order is the
+/// identity sequence understood by the engine.
+fn rebuild_visible(
+    visible: &mut Vec<usize>,
+    len: usize,
+    ratings: &HashMap<usize, u8>,
+    filter: Filter,
+) -> bool {
+    visible.clear();
+    if filter.active() {
+        visible.extend((0..len).filter(|i| filter.passes(ratings.get(i).copied().unwrap_or(0))));
+    }
+    if visible.is_empty() {
+        visible.extend(0..len);
+    }
+    visible.len() == len
+}
+
+/// Position of `current` in a sorted visible sequence, or the next visible
+/// item when the current one has just been filtered out.
+fn visible_position(visible: &[usize], current: usize) -> usize {
+    match visible.binary_search(&current) {
+        Ok(pos) => pos,
+        Err(pos) => pos.min(visible.len().saturating_sub(1)),
+    }
+}
+
+fn full_texture_work_enabled(zoom: Zoom) -> bool {
+    !matches!(zoom, Zoom::Fit)
+}
+
+fn current_texture_candidates(current: usize, zoom: Zoom) -> impl Iterator<Item = (usize, Tier)> {
+    let include_full = full_texture_work_enabled(zoom);
+    [(current, Tier::Browse), (current, Tier::Full)]
+        .into_iter()
+        .filter(move |(_, tier)| include_full || *tier != Tier::Full)
+}
+
+fn main_texture_should_be_kept(
+    index: usize,
+    tier: Tier,
+    current: usize,
+    near: &[usize],
+    zoom: Zoom,
+) -> bool {
+    match tier {
+        Tier::Full => full_texture_work_enabled(zoom) && index == current,
+        _ => near.contains(&index),
+    }
+}
+
+fn install_metadata(
+    ratings: &mut HashMap<usize, u8>,
+    metas: &mut HashMap<usize, FileMeta>,
+    index: usize,
+    meta: FileMeta,
+    filter: Filter,
+) -> bool {
+    let mut filter_dirty = false;
+    if let Some(embedded) = meta.rating
+        && embedded > 0
+        && !ratings.contains_key(&index)
+    {
+        let rating = embedded.min(5) as u8;
+        ratings.insert(index, rating);
+        filter_dirty = filter.passes(0) != filter.passes(rating);
+    }
+    metas.insert(index, meta);
+    filter_dirty
+}
+
+/// Store every explicit user choice, including zero. Absence means that no
+/// higher-precedence rating source has been observed yet, so removing a zero
+/// would let a delayed embedded-metadata event resurrect the camera rating.
+fn install_user_rating(ratings: &mut HashMap<usize, u8>, index: usize, rating: u8) -> u8 {
+    let old_rating = ratings.get(&index).copied().unwrap_or(0);
+    ratings.insert(index, rating);
+    old_rating
+}
+
 /// Per-folder session state, rebuilt by open_folder.
 struct Session {
     dir: PathBuf,
@@ -85,7 +174,11 @@ struct Session {
     library: Library,
     ratings: HashMap<usize, u8>,
     metas: HashMap<usize, FileMeta>,
-    thumbs: HashMap<usize, egui::TextureHandle>,
+    thumbs: ByteLru<egui::TextureHandle>,
+    /// Demand requests are bounded to the current viewport and time out so a
+    /// publish/worker-finish race cannot leave an evicted thumbnail stuck.
+    thumb_requests: HashMap<usize, Instant>,
+    thumb_retry_after: HashMap<usize, Instant>,
     textures: HashMap<(usize, Tier), egui::TextureHandle>,
 }
 
@@ -101,6 +194,8 @@ pub struct App {
     mode: Mode,
     filter: Filter,
     visible: Vec<usize>,
+    /// Ratings only affect the visible sequence lazily, on navigation.
+    filter_dirty: bool,
     fullscreen: bool,
     show_metadata: bool,
 
@@ -125,6 +220,7 @@ impl App {
             mode: Mode::Loupe,
             filter: Filter::default(),
             visible: Vec::new(),
+            filter_dirty: true,
             fullscreen: false,
             show_metadata: false,
             nav_started: None,
@@ -150,13 +246,15 @@ impl App {
             ram_bytes / 3,
         ));
         let disk = DiskCache::open_default((self.config.disk_gb as f64 * 1e9) as u64);
-        let ctx = self.ctx.clone();
-        let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
-        let (engine, events) = Engine::new((*entries).clone(), start, cache.clone(), disk, notify);
-
+        // Resolve persisted ratings before decode workers can publish embedded
+        // metadata, so startup precedence does not depend on worker timing.
         let db = default_db_path().and_then(|p| Db::open(&p).ok());
         let ratings = load_ratings(&entries, db.as_ref());
         let library = Library::start();
+
+        let ctx = self.ctx.clone();
+        let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
+        let (engine, events) = Engine::new(entries.clone(), start, cache.clone(), disk, notify);
 
         self.session = Some(Session {
             dir: dir.to_owned(),
@@ -167,13 +265,16 @@ impl App {
             library,
             ratings,
             metas: HashMap::new(),
-            thumbs: HashMap::new(),
+            thumbs: ByteLru::new(THUMB_TEXTURE_BUDGET_BYTES),
+            thumb_requests: HashMap::new(),
+            thumb_retry_after: HashMap::new(),
             textures: HashMap::new(),
         });
         self.current = start;
         self.direction = 1;
         self.zoom = Zoom::Fit;
         self.filter = Filter::default();
+        self.filter_dirty = true;
         self.nav_started = Some(Instant::now());
         self.scroll_to_current = true;
         self.apply_filter();
@@ -197,22 +298,27 @@ impl App {
     /// Rebuild the visible sequence from the filter. Falls back to "all"
     /// when nothing matches so navigation never dead-ends.
     fn apply_filter(&mut self) {
+        if !self.filter_dirty {
+            return;
+        }
         let Some(session) = &self.session else {
             return;
         };
-        let all = || (0..session.entries.len()).collect::<Vec<_>>();
-        self.visible = if self.filter.active() {
-            let v: Vec<usize> = (0..session.entries.len())
-                .filter(|i| {
-                    self.filter
-                        .passes(session.ratings.get(i).copied().unwrap_or(0))
-                })
-                .collect();
-            if v.is_empty() { all() } else { v }
+        let identity = rebuild_visible(
+            &mut self.visible,
+            session.entries.len(),
+            &session.ratings,
+            self.filter,
+        );
+        // The engine treats an empty sequence as the identity order, avoiding
+        // another full-size allocation for the common unfiltered case.
+        let engine_sequence = if identity {
+            Vec::new()
         } else {
-            all()
+            self.visible.clone()
         };
-        session.engine.set_sequence(self.visible.clone());
+        session.engine.set_sequence(engine_sequence);
+        self.filter_dirty = false;
     }
 
     fn replan(&self) {
@@ -228,15 +334,7 @@ impl App {
     /// Position of `current` within the visible sequence (nearest if the
     /// current image was filtered out).
     fn visible_pos(&self) -> usize {
-        self.visible
-            .iter()
-            .position(|&i| i == self.current)
-            .unwrap_or_else(|| {
-                self.visible
-                    .iter()
-                    .position(|&i| i > self.current)
-                    .unwrap_or(self.visible.len().saturating_sub(1))
-            })
+        visible_position(&self.visible, self.current)
     }
 
     fn navigate(&mut self, delta: isize) {
@@ -276,62 +374,174 @@ impl App {
         let Some(session) = &mut self.session else {
             return;
         };
-        if rating == 0 {
-            session.ratings.remove(&index);
-        } else {
-            session.ratings.insert(index, rating);
-        }
+        let old_rating = install_user_rating(&mut session.ratings, index, rating);
         session.library.set_rating(&session.entries[index], rating);
+        if self.filter.passes(old_rating) != self.filter.passes(rating) {
+            self.filter_dirty = true;
+        }
     }
 
     fn drain_events(&mut self) {
-        let ctx = self.ctx.clone();
         let current = self.current;
         let Some(session) = &mut self.session else {
             return;
         };
         let mut replan = false;
+        let mut filter_dirty = false;
         while let Ok(event) = session.events.try_recv() {
             match event {
                 Event::ThumbReady { index, meta } => {
-                    if let Some(buf) = session.cache.get_rgba((index, Tier::Thumb)) {
-                        session.thumbs.insert(
-                            index,
-                            ctx.load_texture(
-                                format!("thumb{index}"),
-                                to_color_image(&buf),
-                                egui::TextureOptions::LINEAR,
-                            ),
-                        );
-                    }
-                    if let Some(embedded) = meta.rating
-                        && embedded > 0
-                        && !session.ratings.contains_key(&index)
-                    {
-                        session.ratings.insert(index, embedded.min(5) as u8);
-                    }
-                    session.metas.insert(index, *meta);
+                    // Pixels stay in the byte-bounded RAM ring until a visible
+                    // viewport asks to upload them. If they were already evicted,
+                    // the demand path below safely queues a replacement decode.
+                    session.thumb_requests.remove(&index);
+                    session.thumb_retry_after.remove(&index);
+                    filter_dirty |= install_metadata(
+                        &mut session.ratings,
+                        &mut session.metas,
+                        index,
+                        *meta,
+                        self.filter,
+                    );
+                }
+                Event::MetadataReady { index, meta } => {
+                    filter_dirty |= install_metadata(
+                        &mut session.ratings,
+                        &mut session.metas,
+                        index,
+                        *meta,
+                        self.filter,
+                    );
                 }
                 Event::ImageReady { .. } => replan = true,
                 Event::ImageFailed { index, tier, error } => {
-                    if index == current && tier != Tier::Thumb {
+                    if tier == Tier::Thumb && session.thumb_requests.remove(&index).is_some() {
+                        session
+                            .thumb_retry_after
+                            .insert(index, Instant::now() + THUMB_FAILURE_RETRY_AFTER);
+                    } else if index == current && tier != Tier::Thumb {
                         self.status = format!("error: {error}");
                     } else {
                         eprintln!("job failed {index}/{tier:?}: {error}");
                     }
                 }
+                Event::MetadataFailed { index, error } => {
+                    eprintln!("metadata failed {index}: {error}");
+                }
             }
         }
+        self.filter_dirty |= filter_dirty;
         if replan {
             self.replan();
         }
     }
 
-    /// Upload policy: current image first (Browse then Full), then one
-    /// neighbor browse per frame; prune outside the keep window.
+    /// Upload only thumbnails demanded by the current viewport. The byte LRU
+    /// drops old `TextureHandle`s (and therefore their GPU allocations), while
+    /// the upload budget prevents a newly opened grid from monopolizing a frame.
+    fn manage_thumbnail_textures(&mut self, demanded_indices: &[usize]) {
+        let ctx = self.ctx.clone();
+        let now = Instant::now();
+        let demanded: HashSet<usize> = demanded_indices.iter().copied().collect();
+        let Some(session) = &mut self.session else {
+            return;
+        };
+
+        // Scrolling must not leave bookkeeping proportional to folder size.
+        session
+            .thumb_requests
+            .retain(|index, _| demanded.contains(index));
+        session
+            .thumb_retry_after
+            .retain(|index, _| demanded.contains(index));
+
+        let mut upload_budget = THUMB_UPLOADS_PER_FRAME;
+        let mut uploaded = false;
+        let mut next_wakeup = None;
+        let mut requested_thumbs = Vec::with_capacity(demanded_indices.len());
+        let mut seen = HashSet::with_capacity(demanded_indices.len());
+        for &index in demanded_indices {
+            if index >= session.entries.len() || !seen.insert(index) {
+                continue;
+            }
+            if session.thumbs.touch(index) {
+                continue;
+            }
+
+            if let Some(buf) = session.cache.get_rgba((index, Tier::Thumb)) {
+                if upload_budget > 0 {
+                    let bytes = buf.byte_len();
+                    let texture = ctx.load_texture(
+                        format!("thumb{index}"),
+                        to_color_image(&buf),
+                        egui::TextureOptions::LINEAR,
+                    );
+                    if session.thumbs.insert(index, texture, bytes) {
+                        upload_budget -= 1;
+                        uploaded = true;
+                        session.thumb_requests.remove(&index);
+                        session.thumb_retry_after.remove(&index);
+                    }
+                }
+                // The pixels are available and will be uploaded in a later
+                // frame if this frame's upload allowance is exhausted.
+                continue;
+            }
+
+            if let Some(retry_after) = session.thumb_retry_after.get(&index)
+                && now < *retry_after
+            {
+                let delay = retry_after.saturating_duration_since(now);
+                next_wakeup =
+                    Some(next_wakeup.map_or(delay, |current: Duration| current.min(delay)));
+                continue;
+            }
+            session.thumb_retry_after.remove(&index);
+            requested_thumbs.push(index);
+
+            let request_is_stale = match session.thumb_requests.get(&index) {
+                Some(requested) => {
+                    let elapsed = now.duration_since(*requested);
+                    if elapsed < THUMB_REQUEST_STALE_AFTER {
+                        let delay = THUMB_REQUEST_STALE_AFTER - elapsed;
+                        next_wakeup =
+                            Some(next_wakeup.map_or(delay, |current: Duration| current.min(delay)));
+                        false
+                    } else {
+                        true
+                    }
+                }
+                None => true,
+            };
+            if request_is_stale {
+                session.thumb_requests.insert(index, now);
+                // Poll once to close the narrow race where pixels appeared
+                // between our cache probe and the worker claiming demand.
+                next_wakeup = Some(next_wakeup.map_or(THUMB_REQUEST_POLL_AFTER, |current| {
+                    current.min(THUMB_REQUEST_POLL_AFTER)
+                }));
+            }
+        }
+        let _ = session.engine.set_thumbnail_demand(&requested_thumbs);
+
+        if uploaded {
+            // Uploads happen after the widgets are painted, so schedule the
+            // next frame that will actually display the new texture handles.
+            ctx.request_repaint();
+        }
+        if let Some(delay) = next_wakeup {
+            // Failure backoff and stale-request recovery must make progress
+            // even when no worker event or user input produces another frame.
+            ctx.request_repaint_after(delay);
+        }
+    }
+
+    /// Upload policy: current Browse first, current Full only while zoomed,
+    /// then one neighbor Browse per frame. Prune outside the keep window.
     fn manage_textures(&mut self) {
         let ctx = self.ctx.clone();
         let current = self.current;
+        let zoom = self.zoom;
         // Keep-window over the visible sequence.
         let pos = self.visible_pos();
         let near: Vec<usize> = (-2isize..=2)
@@ -345,10 +555,9 @@ impl App {
         let Some(session) = &mut self.session else {
             return;
         };
-        session.textures.retain(|(i, tier), _| match tier {
-            Tier::Full => *i == current,
-            _ => near.contains(i),
-        });
+        session
+            .textures
+            .retain(|(i, tier), _| main_texture_should_be_kept(*i, *tier, current, &near, zoom));
 
         let mut upload = |key: (usize, Tier), budget: &mut i32| {
             if *budget <= 0 || session.textures.contains_key(&key) {
@@ -365,8 +574,9 @@ impl App {
             }
         };
         let mut budget = 2;
-        upload((current, Tier::Browse), &mut budget);
-        upload((current, Tier::Full), &mut budget);
+        for key in current_texture_candidates(current, zoom) {
+            upload(key, &mut budget);
+        }
         let mut neighbor_budget = 1;
         for &i in near.iter().filter(|&&i| i != current) {
             upload((i, Tier::Browse), &mut neighbor_budget);
@@ -651,9 +861,10 @@ impl App {
             });
         });
         if filter_changed {
+            self.filter_dirty = true;
             self.apply_filter();
             // If the current image fell out of view, jump to the nearest.
-            if !self.visible.contains(&self.current)
+            if self.visible.binary_search(&self.current).is_err()
                 && let Some(&target) = self.visible.get(self.visible_pos())
             {
                 self.select(target);
@@ -724,6 +935,7 @@ impl App {
         let current = self.current;
         let scroll_to = self.scroll_to_current;
         let mut strip_height = None;
+        let mut demanded_thumbs = vec![current];
         if let Some(session) = &self.session {
             let inner = egui::Panel::bottom("filmstrip")
                 .resizable(true)
@@ -731,66 +943,100 @@ impl App {
                 .size_range(egui::Rangef::new(70.0, 320.0))
                 .show(ui, |ui| {
                     let thumb_h = (ui.available_height() - 24.0).clamp(46.0, 290.0);
-                    egui::ScrollArea::horizontal()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.horizontal_centered(|ui| {
-                                for &i in &self.visible {
+                    // Every column has a stable width so the strip can create only
+                    // the widgets intersecting the viewport. Previously this loop
+                    // built one widget tree per file even when almost all were clipped.
+                    let cell = vec2(thumb_h * 1.4, thumb_h + 18.0);
+                    let spacing = ui.spacing().item_spacing.x;
+                    let visible_pos = visible_position(&self.visible, current);
+                    let mut strip = egui::ScrollArea::horizontal()
+                        .id_salt("filmstrip")
+                        .auto_shrink([false, false]);
+                    if scroll_to {
+                        strip = strip.horizontal_scroll_offset(filmstrip::centered_scroll_offset(
+                            self.visible.len(),
+                            visible_pos,
+                            cell.x,
+                            spacing,
+                            ui.available_width(),
+                        ));
+                    }
+                    strip.show_viewport(ui, |ui, viewport| {
+                        filmstrip::show_columns(
+                            ui,
+                            viewport,
+                            self.visible.len(),
+                            cell,
+                            filmstrip::OVERSCAN_COLUMNS,
+                            |columns_ui, range| {
+                                for visible_pos in range {
+                                    let i = self.visible[visible_pos];
+                                    demanded_thumbs.push(i);
                                     let selected = i == current;
                                     let rating = session.ratings.get(&i).copied().unwrap_or(0);
-                                    let tier_stroke = self.tier_stroke(session, i);
-                                    let response = match session.thumbs.get(&i) {
-                                        Some(tex) => {
-                                            let size = tex.size_vec2();
-                                            let w = (size.x / size.y * thumb_h)
-                                                .clamp(30.0, thumb_h * 2.2);
-                                            ui.vertical(|ui| {
-                                                let r = ui.add(
-                                                    egui::Button::image(egui::Image::new((
-                                                        tex.id(),
-                                                        vec2(w, thumb_h),
-                                                    )))
-                                                    .selected(selected),
-                                                );
-                                                if rating > 0 {
-                                                    ui.label(
-                                                        egui::RichText::new(
-                                                            "★".repeat(rating as usize),
+                                    columns_ui.allocate_ui_with_layout(
+                                        cell,
+                                        egui::Layout::top_down(egui::Align::Center),
+                                        |column_ui| {
+                                            let response = match session.thumbs.get(&i) {
+                                                Some(tex) => {
+                                                    let size = tex.size_vec2();
+                                                    let padding =
+                                                        column_ui.spacing().button_padding * 2.0;
+                                                    let inner = (vec2(cell.x, thumb_h) - padding)
+                                                        .max(vec2(1.0, 1.0));
+                                                    let scale =
+                                                        (inner.x / size.x).min(inner.y / size.y);
+                                                    column_ui.add_sized(
+                                                        vec2(cell.x, thumb_h),
+                                                        // `Button::image` caps image atoms at the
+                                                        // font height in egui 0.35. A regular button
+                                                        // intentionally preserves this exact size.
+                                                        egui::Button::new(
+                                                            egui::Image::new((tex.id(), size))
+                                                                .fit_to_exact_size(size * scale),
                                                         )
-                                                        .size(10.0)
-                                                        .color(egui::Color32::GOLD),
-                                                    );
+                                                        .selected(selected),
+                                                    )
                                                 }
-                                                r
-                                            })
-                                            .inner
-                                        }
-                                        None => ui.add_sized(
-                                            vec2(thumb_h * 1.4, thumb_h),
-                                            egui::Button::new(egui::RichText::new("…").weak())
-                                                .selected(selected),
-                                        ),
-                                    };
-                                    if let Some(color) = tier_stroke {
-                                        ui.painter().rect_stroke(
-                                            response.rect.expand(1.0),
-                                            3.0,
-                                            egui::Stroke::new(2.0, color),
-                                            egui::StrokeKind::Outside,
-                                        );
-                                    }
-                                    if response.clicked() {
-                                        clicked = Some(i);
-                                    }
-                                    if selected && scroll_to {
-                                        response.scroll_to_me(Some(egui::Align::Center));
-                                    }
+                                                None => column_ui.add_sized(
+                                                    vec2(cell.x, thumb_h),
+                                                    egui::Button::new(
+                                                        egui::RichText::new("…").weak(),
+                                                    )
+                                                    .selected(selected),
+                                                ),
+                                            };
+                                            if let Some(color) = self.tier_stroke(session, i) {
+                                                column_ui.painter().rect_stroke(
+                                                    response.rect.expand(1.0),
+                                                    3.0,
+                                                    egui::Stroke::new(2.0, color),
+                                                    egui::StrokeKind::Outside,
+                                                );
+                                            }
+                                            if rating > 0 {
+                                                column_ui.label(
+                                                    egui::RichText::new(
+                                                        "★".repeat(rating as usize),
+                                                    )
+                                                    .size(10.0)
+                                                    .color(egui::Color32::GOLD),
+                                                );
+                                            }
+                                            if response.clicked() {
+                                                clicked = Some(i);
+                                            }
+                                        },
+                                    );
                                 }
-                            });
-                        });
+                            },
+                        );
+                    });
                 });
             strip_height = Some(inner.response.rect.height());
         }
+        self.manage_thumbnail_textures(&demanded_thumbs);
         // Persist a divider-drag once the mouse is released.
         if let Some(h) = strip_height
             && (h - self.config.filmstrip_height).abs() > 1.0
@@ -900,6 +1146,7 @@ impl App {
         let current = self.current;
         let scroll_to = self.scroll_to_current;
         let rect = ui.max_rect();
+        let mut demanded_thumbs = vec![current];
         if let Some(session) = &self.session {
             let rows = self.visible.len().div_ceil(cols);
             egui::ScrollArea::vertical()
@@ -911,6 +1158,7 @@ impl App {
                                 let Some(&i) = self.visible.get(row * cols + col) else {
                                     break;
                                 };
+                                demanded_thumbs.push(i);
                                 let selected = i == current;
                                 let rating = session.ratings.get(&i).copied().unwrap_or(0);
                                 let tier_stroke = self.tier_stroke(session, i);
@@ -919,13 +1167,16 @@ impl App {
                                     let response = match session.thumbs.get(&i) {
                                         Some(tex) => {
                                             let size = tex.size_vec2();
+                                            let padding = ui.spacing().button_padding * 2.0;
+                                            let inner = (cell - padding).max(vec2(1.0, 1.0));
                                             let scale =
-                                                (cell.x / size.x).min(cell.y / size.y).min(1.0);
-                                            ui.add(
-                                                egui::Button::image(egui::Image::new((
-                                                    tex.id(),
-                                                    size * scale,
-                                                )))
+                                                (inner.x / size.x).min(inner.y / size.y).min(1.0);
+                                            ui.add_sized(
+                                                cell,
+                                                egui::Button::new(
+                                                    egui::Image::new((tex.id(), size))
+                                                        .fit_to_exact_size(size * scale),
+                                                )
                                                 .selected(selected),
                                             )
                                         }
@@ -968,6 +1219,7 @@ impl App {
                     }
                 });
         }
+        self.manage_thumbnail_textures(&demanded_thumbs);
         self.scroll_to_current = false;
         if let Some(i) = clicked {
             self.select(i);
@@ -981,4 +1233,200 @@ impl App {
 
 fn to_color_image(buf: &PixelBuf) -> egui::ColorImage {
     egui::ColorImage::from_rgba_unmultiplied([buf.width as usize, buf.height as usize], &buf.rgba)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metadata_with_rating(rating: Option<u32>) -> FileMeta {
+        FileMeta {
+            rating,
+            camera: "Test Camera".into(),
+            ..FileMeta::default()
+        }
+    }
+
+    #[test]
+    fn metadata_only_events_preserve_rating_precedence_and_filter_updates() {
+        let mut ratings = HashMap::from([(1, 5)]);
+        let mut metas = HashMap::new();
+        let filter = Filter {
+            min_rating: 4,
+            unrated_only: false,
+        };
+
+        assert!(install_metadata(
+            &mut ratings,
+            &mut metas,
+            0,
+            metadata_with_rating(Some(4)),
+            filter,
+        ));
+        assert_eq!(ratings.get(&0), Some(&4));
+        assert_eq!(
+            metas.get(&0).map(|meta| meta.camera.as_str()),
+            Some("Test Camera")
+        );
+
+        assert!(!install_metadata(
+            &mut ratings,
+            &mut metas,
+            1,
+            metadata_with_rating(Some(2)),
+            filter,
+        ));
+        assert_eq!(ratings.get(&1), Some(&5), "persisted rating must win");
+    }
+
+    #[test]
+    fn delayed_metadata_and_thumbnail_events_do_not_resurrect_a_cleared_rating() {
+        let mut ratings = HashMap::from([(0, 5)]);
+        let mut metas = HashMap::new();
+        let filter = Filter {
+            min_rating: 0,
+            unrated_only: true,
+        };
+
+        assert_eq!(install_user_rating(&mut ratings, 0, 0), 5);
+        assert_eq!(ratings.get(&0), Some(&0), "zero remains authoritative");
+
+        // Models a MetadataReady event that was decoded before the user's
+        // clear-rating command reached the sidecar.
+        assert!(!install_metadata(
+            &mut ratings,
+            &mut metas,
+            0,
+            metadata_with_rating(Some(4)),
+            filter,
+        ));
+        assert_eq!(ratings.get(&0), Some(&0));
+
+        // Models the duplicate metadata carried by a later ThumbReady event.
+        assert!(!install_metadata(
+            &mut ratings,
+            &mut metas,
+            0,
+            metadata_with_rating(Some(3)),
+            filter,
+        ));
+        assert_eq!(ratings.get(&0), Some(&0));
+
+        let mut visible = Vec::new();
+        assert!(rebuild_visible(&mut visible, 1, &ratings, filter));
+        assert_eq!(
+            visible,
+            [0],
+            "explicit zero still passes the unrated filter"
+        );
+    }
+
+    #[test]
+    fn visible_position_finds_exact_and_nearest_items() {
+        let visible = [1, 4, 8, 12];
+        assert_eq!(visible_position(&visible, 4), 1);
+        assert_eq!(visible_position(&visible, 0), 0);
+        assert_eq!(visible_position(&visible, 5), 2);
+        assert_eq!(visible_position(&visible, 99), 3);
+        assert_eq!(visible_position(&[], 5), 0);
+    }
+
+    #[test]
+    fn fit_texture_policy_omits_full_while_zoomed_preserves_current_full() {
+        let near = [6, 7, 8];
+        assert_eq!(
+            current_texture_candidates(7, Zoom::Fit).collect::<Vec<_>>(),
+            [(7, Tier::Browse)]
+        );
+        assert!(!main_texture_should_be_kept(
+            7,
+            Tier::Full,
+            7,
+            &near,
+            Zoom::Fit
+        ));
+
+        let zoomed = Zoom::Anchored {
+            scale: 1.0,
+            center: vec2(0.5, 0.5),
+        };
+        assert_eq!(
+            current_texture_candidates(7, zoomed).collect::<Vec<_>>(),
+            [(7, Tier::Browse), (7, Tier::Full)]
+        );
+        assert!(main_texture_should_be_kept(7, Tier::Full, 7, &near, zoomed));
+        assert!(!main_texture_should_be_kept(
+            8,
+            Tier::Full,
+            7,
+            &near,
+            zoomed
+        ));
+        assert!(main_texture_should_be_kept(
+            8,
+            Tier::Browse,
+            7,
+            &near,
+            Zoom::Fit
+        ));
+    }
+
+    #[test]
+    fn rebuild_visible_filters_in_source_order() {
+        let ratings = HashMap::from([(0, 1), (2, 4), (3, 5), (5, 3)]);
+        let mut visible = Vec::new();
+        let identity = rebuild_visible(
+            &mut visible,
+            6,
+            &ratings,
+            Filter {
+                min_rating: 4,
+                unrated_only: false,
+            },
+        );
+        assert_eq!(visible, [2, 3]);
+        assert!(!identity);
+    }
+
+    #[test]
+    fn rebuild_visible_falls_back_to_identity_when_filter_matches_nothing() {
+        let ratings = HashMap::from([(1, 2)]);
+        let mut visible = vec![99];
+        let identity = rebuild_visible(
+            &mut visible,
+            3,
+            &ratings,
+            Filter {
+                min_rating: 5,
+                unrated_only: false,
+            },
+        );
+        assert_eq!(visible, [0, 1, 2]);
+        assert!(identity);
+    }
+
+    #[test]
+    fn rebuild_visible_handles_unfiltered_and_unrated_views() {
+        let ratings = HashMap::from([(1, 3)]);
+        let mut visible = Vec::new();
+        assert!(rebuild_visible(
+            &mut visible,
+            3,
+            &ratings,
+            Filter::default()
+        ));
+        assert_eq!(visible, [0, 1, 2]);
+
+        let identity = rebuild_visible(
+            &mut visible,
+            3,
+            &ratings,
+            Filter {
+                min_rating: 0,
+                unrated_only: true,
+            },
+        );
+        assert_eq!(visible, [0, 2]);
+        assert!(!identity);
+    }
 }

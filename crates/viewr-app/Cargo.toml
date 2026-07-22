@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+benchmarks = ["dep:criterion"]
+
 [[bin]]
 name = "viewr"
 path = "src/main.rs"
@@ -19,6 +22,12 @@ rfd.workspace = true
 serde.workspace = true
 toml.workspace = true
 dirs.workspace = true
+criterion = { workspace = true, optional = true }
+
+[[bench]]
+name = "filmstrip_scaling"
+harness = false
+required-features = ["benchmarks"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true

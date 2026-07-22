@@ -5,23 +5,33 @@ use rawler::decoders::RawMetadata;
 use crate::types::Orient;
 
 #[derive(Debug, Clone, Default)]
+/// Compact UI-facing metadata derived from `rawler` container metadata.
 pub struct FileMeta {
+    /// Display rotation derived from EXIF orientation.
     pub orient: Orient,
     /// In-camera rating, if the body wrote one (lowest precedence source).
     pub rating: Option<u32>,
+    /// Trimmed camera make and model.
     pub camera: String,
+    /// Lens name from decoded lens metadata, falling back to EXIF LensModel.
     pub lens: Option<String>,
+    /// ISO speed rating.
     pub iso: Option<u16>,
     /// e.g. "1/1600"
     pub shutter: Option<String>,
     /// e.g. "f/6.3"
     pub aperture: Option<String>,
+    /// Focal length in millimetres.
     pub focal_mm: Option<f32>,
     /// EXIF DateTimeOriginal, as written by the camera.
     pub taken: Option<String>,
 }
 
 impl FileMeta {
+    /// Extracts and formats the subset of RAW metadata used by the viewer.
+    ///
+    /// Invalid zero-denominator aperture and focal-length rationals are
+    /// omitted. No file or pixel decoding is performed by this conversion.
     pub fn from_metadata(md: &RawMetadata) -> Self {
         let exif = &md.exif;
         Self {

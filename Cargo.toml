@@ -30,8 +30,13 @@ quick-xml = "0.36"
 dirs = "5"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+tempfile = "3.27"
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [profile.release]
+lto = "thin"
+
+[profile.bench]
 lto = "thin"
 
 # Keep our own code fast to compile, but dependencies (rawler, zune, eframe)
@@ -41,3 +46,11 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# Unit and integration tests prioritize compile latency. Performance-sensitive
+# behavior is measured separately with the optimized benchmark profile.
+[profile.test]
+opt-level = 0
+
+[profile.test.package."*"]
+opt-level = 0

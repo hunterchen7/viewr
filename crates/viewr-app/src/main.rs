@@ -1,8 +1,18 @@
+//! Desktop entry point for `viewr`, a low-latency RAW culling viewer.
+//!
+//! The default command opens a folder or RAW file in the graphical viewer. The
+//! `dev` command decodes one file, writes diagnostic JPEGs, and prints timing
+//! information for pipeline investigation.
+#![deny(missing_docs)]
+#![deny(rustdoc::broken_intra_doc_links)]
+
 mod app;
 mod color;
 mod config;
+mod filmstrip;
 mod loupe;
 mod settings;
+mod texture_lru;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
