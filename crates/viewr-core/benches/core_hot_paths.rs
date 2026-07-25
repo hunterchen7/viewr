@@ -190,8 +190,14 @@ fn bench_rating_db_lookup(c: &mut Criterion) {
             .map(|index| PathBuf::from(format!("/benchmark/photo-{index:08}.arw")))
             .collect::<Vec<_>>();
         for (index, path) in paths.iter().enumerate() {
-            db.upsert_rating(path, index as u64, index as i64, Some(4), 1)
-                .expect("benchmark row inserts");
+            db.upsert_rating(
+                path.to_str().expect("synthetic benchmark paths are UTF-8"),
+                index as u64,
+                index as i64,
+                Some(4),
+                1,
+            )
+            .expect("benchmark row inserts");
         }
 
         group.throughput(Throughput::Elements(len as u64));

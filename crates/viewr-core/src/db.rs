@@ -40,6 +40,12 @@ pub struct ImageRow {
     pub sidecar_dirty: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImageRevisionSnapshot {
+    Missing { revision: i64 },
+    Present { revision: i64 },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A journaled rating whose XMP sidecar write must be resumed.
 pub struct PendingSidecar {
@@ -101,13 +107,16 @@ impl Db {
         Ok(Self { conn })
     }
 
-    /// Looks up a row by its native filesystem path.
+    /// Looks up a row by its UTF-8 filesystem path.
     ///
     /// Missing rows and SQLite prepare/query failures both return `None`. This
     /// makes the database a best-effort metadata accelerator rather than a
     /// requirement for opening a photo folder.
-    pub fn get_image(&self, path: impl AsRef<Path>) -> Option<ImageRow> {
-        let path = path.as_ref();
+    pub fn get_image(&self, path: &str) -> Option<ImageRow> {
+        self.get_image_path(Path::new(path))
+    }
+
+    pub(crate) fn get_image_path(&self, path: &Path) -> Option<ImageRow> {
         self.conn
             .prepare_cached(
                 "SELECT rating, sidecar_mtime_ns, sidecar_dirty
@@ -158,13 +167,23 @@ impl Db {
     /// Returns [`DbError::Sqlite`] when the insert or update fails.
     pub fn upsert_rating(
         &self,
-        path: impl AsRef<Path>,
+        path: &str,
         size: u64,
         mtime_ns: i64,
         rating: Option<u8>,
         sidecar_mtime_ns: i64,
     ) -> Result<(), DbError> {
-        let path = path.as_ref();
+        self.upsert_rating_path(Path::new(path), size, mtime_ns, rating, sidecar_mtime_ns)
+    }
+
+    pub(crate) fn upsert_rating_path(
+        &self,
+        path: &Path,
+        size: u64,
+        mtime_ns: i64,
+        rating: Option<u8>,
+        sidecar_mtime_ns: i64,
+    ) -> Result<(), DbError> {
         self.conn
             .prepare_cached(
                 "INSERT INTO images
@@ -198,12 +217,21 @@ impl Db {
     /// update fails.
     pub fn record_rating_pending_sidecar(
         &self,
-        path: impl AsRef<Path>,
+        path: &str,
         size: u64,
         mtime_ns: i64,
         rating: u8,
     ) -> Result<(), DbError> {
-        let path = path.as_ref();
+        self.record_rating_pending_sidecar_path(Path::new(path), size, mtime_ns, rating)
+    }
+
+    pub(crate) fn record_rating_pending_sidecar_path(
+        &self,
+        path: &Path,
+        size: u64,
+        mtime_ns: i64,
+        rating: u8,
+    ) -> Result<(), DbError> {
         self.conn
             .prepare_cached(
                 "INSERT INTO images
@@ -218,6 +246,81 @@ impl Db {
             )?
             .execute(rusqlite::params![path_value(path), size, mtime_ns, rating])?;
         Ok(())
+    }
+
+    pub(crate) fn rating_revision_snapshot(
+        &self,
+        path: &Path,
+    ) -> Result<ImageRevisionSnapshot, DbError> {
+        let (revision, present) = self.conn.query_row(
+            "SELECT
+                 COALESCE(
+                     (SELECT revision FROM image_revisions WHERE path = ?1),
+                     0
+                 ),
+                 EXISTS(SELECT 1 FROM images WHERE path = ?1)",
+            [path_value(path)],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+        )?;
+        Ok(if present {
+            ImageRevisionSnapshot::Present { revision }
+        } else {
+            ImageRevisionSnapshot::Missing { revision }
+        })
+    }
+
+    pub(crate) fn record_rating_pending_sidecar_if_unchanged(
+        &self,
+        path: &Path,
+        size: u64,
+        mtime_ns: i64,
+        rating: u8,
+        predecessor: ImageRevisionSnapshot,
+    ) -> Result<bool, DbError> {
+        let changed = match predecessor {
+            ImageRevisionSnapshot::Present { revision } => self
+                .conn
+                .prepare_cached(
+                    "UPDATE images
+                        SET size = ?2,
+                            mtime_ns = ?3,
+                            rating = ?4,
+                            sidecar_dirty = 1,
+                            last_seen = unixepoch()
+                      WHERE path = ?1
+                        AND revision = ?5",
+                )?
+                .execute(rusqlite::params![
+                    path_value(path),
+                    size,
+                    mtime_ns,
+                    rating,
+                    revision
+                ])?,
+            ImageRevisionSnapshot::Missing { revision } => self
+                .conn
+                .prepare_cached(
+                    "INSERT INTO images
+                       (path, size, mtime_ns, rating, sidecar_mtime_ns, sidecar_dirty, last_seen)
+                     SELECT ?1, ?2, ?3, ?4, 0, 1, unixepoch()
+                      WHERE NOT EXISTS(SELECT 1 FROM images WHERE path = ?1)
+                        AND COALESCE(
+                                (SELECT revision
+                                   FROM image_revisions
+                                  WHERE path = ?1),
+                                0
+                            ) = ?5
+                     ON CONFLICT(path) DO NOTHING",
+                )?
+                .execute(rusqlite::params![
+                    path_value(path),
+                    size,
+                    mtime_ns,
+                    rating,
+                    revision
+                ])?,
+        };
+        Ok(changed == 1)
     }
 
     /// Mark one exact dirty rating as synchronized with its sidecar.
@@ -378,7 +481,7 @@ impl Db {
 pub fn benchmark_rating_lookup(db: &Db, paths: &[PathBuf]) -> usize {
     paths
         .iter()
-        .filter(|path| db.get_image(path).is_some())
+        .filter(|path| db.get_image_path(path).is_some())
         .count()
 }
 
@@ -458,6 +561,7 @@ fn initialize_schema(conn: &Connection) -> Result<(), DbError> {
             rating INTEGER,
             sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
             sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+            revision INTEGER NOT NULL DEFAULT 0,
             last_seen INTEGER NOT NULL DEFAULT 0
         );",
     )?;
@@ -474,6 +578,104 @@ fn initialize_schema(conn: &Connection) -> Result<(), DbError> {
             return Err(error.into());
         }
     }
+    if !has_column(conn, "images", "revision")?
+        && let Err(error) = conn.execute(
+            "ALTER TABLE images ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+    {
+        // Another process can complete the migration after our check but
+        // before ALTER obtains SQLite's schema lock.
+        if !has_column(conn, "images", "revision")? {
+            return Err(error.into());
+        }
+    }
+
+    // `images.revision` makes ordinary compare-and-swap retries cheap. The
+    // companion ledger retains the last revision after a row is deleted, so a
+    // missing -> present -> missing ABA cycle cannot revive a stale retry.
+    // Triggers keep both values atomic with every successful row mutation,
+    // including direct SQL used by migrations or diagnostic tooling.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS image_revisions (
+            path TEXT PRIMARY KEY,
+            revision INTEGER NOT NULL
+        );
+
+        INSERT OR IGNORE INTO image_revisions (path, revision)
+        SELECT path, revision FROM images;
+
+        UPDATE image_revisions
+           SET revision = MAX(
+                   revision,
+                   COALESCE(
+                       (SELECT images.revision
+                          FROM images
+                         WHERE images.path = image_revisions.path),
+                       revision
+                   )
+               );
+
+        UPDATE images
+           SET revision = (
+                   SELECT image_revisions.revision
+                     FROM image_revisions
+                    WHERE image_revisions.path = images.path
+               )
+         WHERE revision < (
+                   SELECT image_revisions.revision
+                     FROM image_revisions
+                    WHERE image_revisions.path = images.path
+               );
+
+        CREATE TRIGGER IF NOT EXISTS images_revision_after_insert
+        AFTER INSERT ON images
+        BEGIN
+            INSERT INTO image_revisions (path, revision)
+            VALUES (NEW.path, MAX(NEW.revision, 0) + 1)
+            ON CONFLICT(path) DO UPDATE SET
+                revision = MAX(image_revisions.revision, NEW.revision) + 1;
+            UPDATE images
+               SET revision = (
+                       SELECT image_revisions.revision
+                         FROM image_revisions
+                        WHERE path = NEW.path
+                   )
+             WHERE path = NEW.path;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS images_revision_after_update
+        AFTER UPDATE OF
+            size,
+            mtime_ns,
+            rating,
+            sidecar_mtime_ns,
+            sidecar_dirty,
+            last_seen
+        ON images
+        BEGIN
+            INSERT INTO image_revisions (path, revision)
+            VALUES (NEW.path, MAX(OLD.revision, 0) + 1)
+            ON CONFLICT(path) DO UPDATE SET
+                revision = MAX(image_revisions.revision, OLD.revision) + 1;
+            UPDATE images
+               SET revision = (
+                       SELECT image_revisions.revision
+                         FROM image_revisions
+                        WHERE path = NEW.path
+                   )
+             WHERE path = NEW.path;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS images_revision_after_delete
+        AFTER DELETE ON images
+        BEGIN
+            INSERT INTO image_revisions (path, revision)
+            VALUES (OLD.path, MAX(OLD.revision, 0) + 1)
+            ON CONFLICT(path) DO UPDATE SET
+                revision = MAX(image_revisions.revision, OLD.revision) + 1;
+        END;",
+    )?;
     Ok(())
 }
 
@@ -493,19 +695,123 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::type_complexity)]
+    fn legacy_string_method_signatures_remain_compatible() {
+        let _: fn(&Db, &str) -> Option<ImageRow> = Db::get_image;
+        let _: fn(&Db, &str, u64, i64, Option<u8>, i64) -> Result<(), DbError> = Db::upsert_rating;
+        let _: fn(&Db, &str, u64, i64, u8) -> Result<(), DbError> =
+            Db::record_rating_pending_sidecar;
+    }
+
+    #[test]
+    fn revision_cas_rejects_present_and_missing_aba() {
+        let db = Db::open_in_memory().unwrap();
+        let path = Path::new("/p/aba.arw");
+        let initially_missing = db.rating_revision_snapshot(path).unwrap();
+        assert_eq!(
+            initially_missing,
+            ImageRevisionSnapshot::Missing { revision: 0 }
+        );
+
+        assert!(
+            db.record_rating_pending_sidecar_if_unchanged(path, 10, 1, 2, initially_missing)
+                .unwrap()
+        );
+        let rating_two = db.rating_revision_snapshot(path).unwrap();
+        assert_eq!(rating_two, ImageRevisionSnapshot::Present { revision: 1 });
+
+        db.record_rating_pending_sidecar_path(path, 10, 1, 5)
+            .unwrap();
+        db.record_rating_pending_sidecar_path(path, 10, 1, 2)
+            .unwrap();
+        assert!(
+            !db.record_rating_pending_sidecar_if_unchanged(path, 10, 1, 4, rating_two)
+                .unwrap()
+        );
+        assert_eq!(db.get_image_path(path).unwrap().rating, Some(2));
+
+        assert!(db.discard_pending_sidecar(path, 10, 1, 2).unwrap());
+        assert_eq!(
+            db.rating_revision_snapshot(path).unwrap(),
+            ImageRevisionSnapshot::Missing { revision: 4 }
+        );
+        assert!(
+            !db.record_rating_pending_sidecar_if_unchanged(path, 10, 1, 3, initially_missing)
+                .unwrap()
+        );
+
+        let currently_missing = db.rating_revision_snapshot(path).unwrap();
+        assert!(
+            db.record_rating_pending_sidecar_if_unchanged(path, 10, 1, 3, currently_missing)
+                .unwrap()
+        );
+        assert_eq!(
+            db.rating_revision_snapshot(path).unwrap(),
+            ImageRevisionSnapshot::Present { revision: 5 }
+        );
+    }
+
+    #[test]
+    fn revision_advances_for_each_supported_row_mutation() {
+        let db = Db::open_in_memory().unwrap();
+        let path = Path::new("/p/revisions.arw");
+
+        db.upsert_rating_path(path, 10, 1, Some(1), 10).unwrap();
+        assert_eq!(
+            db.rating_revision_snapshot(path).unwrap(),
+            ImageRevisionSnapshot::Present { revision: 1 }
+        );
+        db.upsert_rating_path(path, 10, 1, Some(2), 11).unwrap();
+        assert_eq!(
+            db.rating_revision_snapshot(path).unwrap(),
+            ImageRevisionSnapshot::Present { revision: 2 }
+        );
+        db.record_rating_pending_sidecar_path(path, 10, 1, 3)
+            .unwrap();
+        assert_eq!(
+            db.rating_revision_snapshot(path).unwrap(),
+            ImageRevisionSnapshot::Present { revision: 3 }
+        );
+        assert!(db.complete_pending_sidecar(path, 10, 1, 3, 12).unwrap());
+        assert_eq!(
+            db.rating_revision_snapshot(path).unwrap(),
+            ImageRevisionSnapshot::Present { revision: 4 }
+        );
+        db.record_rating_pending_sidecar_path(path, 10, 1, 4)
+            .unwrap();
+        assert!(matches!(
+            db.synchronize_pending_sidecar(path, 10, 1, 4, || Ok::<_, ()>(13))
+                .unwrap(),
+            PendingSidecarSync::Written
+        ));
+        assert_eq!(
+            db.rating_revision_snapshot(path).unwrap(),
+            ImageRevisionSnapshot::Present { revision: 6 }
+        );
+        db.record_rating_pending_sidecar_path(path, 10, 1, 5)
+            .unwrap();
+        assert!(db.discard_pending_sidecar(path, 10, 1, 5).unwrap());
+        assert_eq!(
+            db.rating_revision_snapshot(path).unwrap(),
+            ImageRevisionSnapshot::Missing { revision: 8 }
+        );
+    }
+
+    #[test]
     fn upsert_and_read_rating() {
         let db = Db::open_in_memory().unwrap();
         let path = Path::new("/p/a.arw");
-        db.upsert_rating(path, 10, 1, Some(4), 99).unwrap();
-        let row = db.get_image(path).unwrap();
+        db.upsert_rating_path(path, 10, 1, Some(4), 99).unwrap();
+        let row = db.get_image_path(path).unwrap();
         assert!(db.get_image_for_identity(path, 10, 1).is_some());
         assert!(db.get_image_for_identity(path, 11, 1).is_none());
         assert_eq!(row.rating, Some(4));
         assert_eq!(row.sidecar_mtime_ns, 99);
         assert!(!row.sidecar_dirty);
 
-        db.record_rating_pending_sidecar(path, 10, 1, 5).unwrap();
-        let row = db.get_image(path).unwrap();
+        db.record_rating_pending_sidecar_path(path, 10, 1, 5)
+            .unwrap();
+        let row = db.get_image_path(path).unwrap();
         assert_eq!(row.rating, Some(5));
         assert_eq!(row.sidecar_mtime_ns, 99);
         assert!(row.sidecar_dirty);
@@ -519,13 +825,13 @@ mod tests {
             }]
         );
 
-        db.upsert_rating(path, 10, 1, Some(2), 100).unwrap();
-        let row = db.get_image(path).unwrap();
+        db.upsert_rating_path(path, 10, 1, Some(2), 100).unwrap();
+        let row = db.get_image_path(path).unwrap();
         assert_eq!(row.rating, Some(2));
         assert_eq!(row.sidecar_mtime_ns, 100);
         assert!(!row.sidecar_dirty);
         assert!(db.pending_sidecars().unwrap().is_empty());
-        assert!(db.get_image(Path::new("/p/other.arw")).is_none());
+        assert!(db.get_image_path(Path::new("/p/other.arw")).is_none());
     }
 
     #[test]
@@ -535,22 +841,22 @@ mod tests {
 
         {
             let db = Db::open(&path).unwrap();
-            db.upsert_rating(Path::new("/p/persistent.arw"), 42, 7, Some(5), 123)
+            db.upsert_rating_path(Path::new("/p/persistent.arw"), 42, 7, Some(5), 123)
                 .unwrap();
         }
 
         {
             let db = Db::open(&path).unwrap();
-            let row = db.get_image(Path::new("/p/persistent.arw")).unwrap();
+            let row = db.get_image_path(Path::new("/p/persistent.arw")).unwrap();
             assert_eq!(row.rating, Some(5));
             assert_eq!(row.sidecar_mtime_ns, 123);
             assert!(!row.sidecar_dirty);
-            db.upsert_rating(Path::new("/p/persistent.arw"), 84, 8, None, 456)
+            db.upsert_rating_path(Path::new("/p/persistent.arw"), 84, 8, None, 456)
                 .unwrap();
         }
 
         let db = Db::open(&path).unwrap();
-        let row = db.get_image(Path::new("/p/persistent.arw")).unwrap();
+        let row = db.get_image_path(Path::new("/p/persistent.arw")).unwrap();
         assert!(
             db.get_image_for_identity(Path::new("/p/persistent.arw"), 84, 8)
                 .is_some()
@@ -564,7 +870,8 @@ mod tests {
     fn sidecar_compare_and_swap_requires_every_identity_field() {
         let db = Db::open_in_memory().unwrap();
         let path = Path::new("/p/concurrent.arw");
-        db.record_rating_pending_sidecar(path, 10, 1, 5).unwrap();
+        db.record_rating_pending_sidecar_path(path, 10, 1, 5)
+            .unwrap();
 
         for (size, mtime_ns, rating) in [(11, 1, 5), (10, 2, 5), (10, 1, 4)] {
             assert!(
@@ -575,13 +882,13 @@ mod tests {
                 !db.discard_pending_sidecar(path, size, mtime_ns, rating)
                     .unwrap()
             );
-            let row = db.get_image(path).unwrap();
+            let row = db.get_image_path(path).unwrap();
             assert_eq!(row.rating, Some(5));
             assert!(row.sidecar_dirty);
         }
 
         assert!(db.complete_pending_sidecar(path, 10, 1, 5, 100).unwrap());
-        let row = db.get_image(path).unwrap();
+        let row = db.get_image_path(path).unwrap();
         assert_eq!(row.rating, Some(5));
         assert_eq!(row.sidecar_mtime_ns, 100);
         assert!(!row.sidecar_dirty);
@@ -601,7 +908,7 @@ mod tests {
         let owner = Db::open(&database_path).unwrap();
         let contender = Db::open(&database_path).unwrap();
         owner
-            .record_rating_pending_sidecar(&path, 10, 1, 2)
+            .record_rating_pending_sidecar_path(&path, 10, 1, 2)
             .unwrap();
 
         let (entered, entered_wait) = std::sync::mpsc::channel();
@@ -625,7 +932,7 @@ mod tests {
             .busy_timeout(std::time::Duration::ZERO)
             .unwrap();
         let error = contender
-            .record_rating_pending_sidecar(&path, 10, 1, 5)
+            .record_rating_pending_sidecar_path(&path, 10, 1, 5)
             .unwrap_err();
         assert!(matches!(
             error,
@@ -643,7 +950,7 @@ mod tests {
         ));
 
         contender
-            .record_rating_pending_sidecar(&path, 10, 1, 5)
+            .record_rating_pending_sidecar_path(&path, 10, 1, 5)
             .unwrap();
         assert!(matches!(
             contender
@@ -651,7 +958,7 @@ mod tests {
                 .unwrap(),
             PendingSidecarSync::Written
         ));
-        let row = contender.get_image(&path).unwrap();
+        let row = contender.get_image_path(&path).unwrap();
         assert_eq!(row.rating, Some(5));
         assert_eq!(row.sidecar_mtime_ns, 100);
         assert!(!row.sidecar_dirty);
@@ -661,7 +968,8 @@ mod tests {
     fn failed_sidecar_publication_rolls_back_ownership_for_a_retry() {
         let db = Db::open_in_memory().unwrap();
         let path = Path::new("/p/retry.arw");
-        db.record_rating_pending_sidecar(path, 10, 1, 4).unwrap();
+        db.record_rating_pending_sidecar_path(path, 10, 1, 4)
+            .unwrap();
 
         let result = db
             .synchronize_pending_sidecar(path, 10, 1, 4, || {
@@ -673,19 +981,19 @@ mod tests {
             result,
             PendingSidecarSync::WriteFailed("injected sidecar failure")
         ));
-        assert!(db.get_image(path).unwrap().sidecar_dirty);
+        assert!(db.get_image_path(path).unwrap().sidecar_dirty);
         assert!(matches!(
             db.synchronize_pending_sidecar(path, 10, 1, 4, || Ok::<_, ()>(101))
                 .unwrap(),
             PendingSidecarSync::Written
         ));
-        let row = db.get_image(path).unwrap();
+        let row = db.get_image_path(path).unwrap();
         assert_eq!(row.sidecar_mtime_ns, 101);
         assert!(!row.sidecar_dirty);
     }
 
     #[test]
-    fn opening_a_legacy_database_adds_the_dirty_column_without_changing_rows() {
+    fn opening_a_legacy_database_adds_journal_columns_without_changing_rows() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.db");
         {
@@ -708,19 +1016,29 @@ mod tests {
 
         {
             let db = Db::open(&path).unwrap();
-            let row = db.get_image(Path::new("/p/legacy.arw")).unwrap();
+            let row = db.get_image("/p/legacy.arw").unwrap();
             assert_eq!(row.rating, Some(3));
             assert_eq!(row.sidecar_mtime_ns, 123);
             assert!(!row.sidecar_dirty);
-            db.record_rating_pending_sidecar(Path::new("/p/legacy.arw"), 42, 7, 4)
+            assert_eq!(
+                db.rating_revision_snapshot(Path::new("/p/legacy.arw"))
+                    .unwrap(),
+                ImageRevisionSnapshot::Present { revision: 0 }
+            );
+            db.record_rating_pending_sidecar("/p/legacy.arw", 42, 7, 4)
                 .unwrap();
         }
 
         let db = Db::open(&path).unwrap();
-        let row = db.get_image(Path::new("/p/legacy.arw")).unwrap();
+        let row = db.get_image("/p/legacy.arw").unwrap();
         assert_eq!(row.rating, Some(4));
         assert_eq!(row.sidecar_mtime_ns, 123);
         assert!(row.sidecar_dirty);
+        assert_eq!(
+            db.rating_revision_snapshot(Path::new("/p/legacy.arw"))
+                .unwrap(),
+            ImageRevisionSnapshot::Present { revision: 1 }
+        );
     }
 
     #[cfg(unix)]
@@ -733,11 +1051,13 @@ mod tests {
         let second = PathBuf::from(OsString::from_vec(b"/p/photo-\x81.arw".to_vec()));
         assert_eq!(first.to_string_lossy(), second.to_string_lossy());
 
-        db.record_rating_pending_sidecar(&first, 10, 1, 3).unwrap();
-        db.record_rating_pending_sidecar(&second, 20, 2, 5).unwrap();
+        db.record_rating_pending_sidecar_path(&first, 10, 1, 3)
+            .unwrap();
+        db.record_rating_pending_sidecar_path(&second, 20, 2, 5)
+            .unwrap();
 
-        assert_eq!(db.get_image(&first).unwrap().rating, Some(3));
-        assert_eq!(db.get_image(&second).unwrap().rating, Some(5));
+        assert_eq!(db.get_image_path(&first).unwrap().rating, Some(3));
+        assert_eq!(db.get_image_path(&second).unwrap().rating, Some(5));
         let mut pending = db.pending_sidecars().unwrap();
         pending.sort_by_key(|item| item.size);
         assert_eq!(
@@ -775,11 +1095,13 @@ mod tests {
         assert_eq!(first.to_string_lossy(), second.to_string_lossy());
 
         let db = Db::open_in_memory().unwrap();
-        db.record_rating_pending_sidecar(&first, 10, 1, 3).unwrap();
-        db.record_rating_pending_sidecar(&second, 20, 2, 5).unwrap();
+        db.record_rating_pending_sidecar_path(&first, 10, 1, 3)
+            .unwrap();
+        db.record_rating_pending_sidecar_path(&second, 20, 2, 5)
+            .unwrap();
 
-        assert_eq!(db.get_image(&first).unwrap().rating, Some(3));
-        assert_eq!(db.get_image(&second).unwrap().rating, Some(5));
+        assert_eq!(db.get_image_path(&first).unwrap().rating, Some(3));
+        assert_eq!(db.get_image_path(&second).unwrap().rating, Some(5));
         let mut pending = db.pending_sidecars().unwrap();
         pending.sort_by_key(|item| item.size);
         assert_eq!(pending[0].path, first);
