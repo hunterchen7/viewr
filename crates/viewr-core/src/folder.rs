@@ -6,6 +6,9 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 
+use icu_casemap::CaseMapper;
+use icu_normalizer::DecomposingNormalizerBorrowed;
+
 #[derive(Debug, Clone)]
 /// Immutable identity and display metadata for one scanned RAW file.
 ///
@@ -112,13 +115,15 @@ pub fn normalize_physical_path(path: &Path) -> PathBuf {
 pub(crate) fn sidecar_owner_key(path: &Path) -> io::Result<PathBuf> {
     let raw = resolve_physical_path(path)?;
     let case_insensitive = directory_is_case_insensitive(&raw)?;
-    Ok(owner_from_raw(&raw, case_insensitive))
+    owner_from_raw(&raw, case_insensitive)
 }
 
 /// Resolves sidecar owners for a scanned folder with one physical-directory
-/// and case-semantics probe per distinct parent spelling.
+/// and ASCII case-semantics probe per distinct parent spelling. Non-ASCII
+/// transformations are verified against each exact RAW before they become an
+/// ownership key.
 pub(crate) fn sidecar_owner_keys(entries: &[FolderEntry]) -> Vec<Option<PathBuf>> {
-    let mut parents: HashMap<PathBuf, (PathBuf, bool)> = HashMap::new();
+    let mut parents: HashMap<PathBuf, (PathBuf, Option<bool>)> = HashMap::new();
     entries
         .iter()
         .map(|entry| {
@@ -126,15 +131,23 @@ pub(crate) fn sidecar_owner_keys(entries: &[FolderEntry]) -> Vec<Option<PathBuf>
             let name = entry.path.file_name()?;
             if !parents.contains_key(&parent) {
                 let physical_parent = std::fs::canonicalize(&parent).ok()?;
-                let raw = physical_parent.join(name);
-                let case_insensitive = directory_is_case_insensitive(&raw).ok()?;
-                parents.insert(parent.clone(), (physical_parent, case_insensitive));
+                parents.insert(parent.clone(), (physical_parent, None));
             }
-            let (physical_parent, case_insensitive) = parents.get(&parent)?;
-            Some(owner_from_raw(
-                &physical_parent.join(name),
-                *case_insensitive,
-            ))
+            let (physical_parent, cached_case_insensitive) = parents.get_mut(&parent)?;
+            let raw = physical_parent.join(name);
+            let case_insensitive = if name.to_str().is_none() {
+                // Some casefolding filesystems treat invalid native text as
+                // opaque even when valid Unicode names are case-insensitive.
+                // Probe this exact spelling and do not cache the result.
+                directory_is_case_insensitive(&raw).ok()?
+            } else if let Some(case_insensitive) = *cached_case_insensitive {
+                case_insensitive
+            } else {
+                let case_insensitive = directory_is_case_insensitive(&raw).ok()?;
+                *cached_case_insensitive = Some(case_insensitive);
+                case_insensitive
+            };
+            owner_from_raw(&raw, case_insensitive).ok()
         })
         .collect()
 }
@@ -146,40 +159,117 @@ pub fn benchmark_sidecar_owner_keys(entries: &[FolderEntry]) -> usize {
     sidecar_owner_keys(entries).into_iter().flatten().count()
 }
 
-fn owner_from_raw(raw: &Path, case_insensitive: bool) -> PathBuf {
-    let sidecar = raw.with_extension("xmp");
-    if case_insensitive && let (Some(parent), Some(name)) = (sidecar.parent(), sidecar.file_name())
-    {
-        return parent.join(fold_owner_name(name));
-    }
-    sidecar
-}
-
-fn directory_is_case_insensitive(path: &Path) -> io::Result<bool> {
-    let parent = path
+fn owner_from_raw(raw: &Path, case_insensitive: bool) -> io::Result<PathBuf> {
+    let parent = raw
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "RAW path has no parent"))?;
-    let name = path
+    let name = raw
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "RAW path has no file name"))?;
-    // Requiring the RAW to resolve is intentional. If it vanished before a
-    // queued rating reached the worker, guessing its case semantics could
-    // merge distinct XMP targets on a case-sensitive volume.
-    let canonical = std::fs::canonicalize(path)?;
-    let alternate = toggled_ascii_case(name).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "cannot case-probe RAW filename",
-        )
-    })?;
-    let alternate = parent.join(alternate);
+    let mut owner = parent.join(owner_raw_name(raw, name, case_insensitive)?);
+    owner.set_extension("xmp");
+    Ok(owner)
+}
+
+/// Produces an internal owner spelling without changing the RAW or XMP path
+/// used for I/O. Native names that are not valid Unicode preserve every
+/// non-ASCII byte or code unit; ASCII is folded only after an exact
+/// filesystem spelling probe establishes case insensitivity.
+fn owner_raw_name(raw: &Path, name: &OsStr, case_insensitive: bool) -> io::Result<OsString> {
+    let Some(name) = name.to_str() else {
+        return Ok(if case_insensitive {
+            ascii_lower_native_name(name)
+        } else {
+            name.to_os_string()
+        });
+    };
+    if name.is_ascii() {
+        return Ok(if case_insensitive {
+            name.to_ascii_lowercase().into()
+        } else {
+            name.into()
+        });
+    }
+
+    let mut owner_name = if case_insensitive {
+        let folded = CaseMapper::new().fold_string(name);
+        if folded == name || alternate_spelling_resolves_to_raw(raw, folded.as_ref())? {
+            folded.into_owned()
+        } else {
+            // Some filesystems use a simple case map rather than Unicode's
+            // full fold (for example, sharp-s can map to sharp-s rather than
+            // `ss`). Accept that spelling only when the filesystem proves it.
+            let lowercase = name.to_lowercase();
+            if lowercase == name || alternate_spelling_resolves_to_raw(raw, &lowercase)? {
+                lowercase
+            } else {
+                name.to_ascii_lowercase()
+            }
+        }
+    } else {
+        name.to_owned()
+    };
+
+    let decomposed = DecomposingNormalizerBorrowed::new_nfd().normalize(&owner_name);
+    if decomposed != owner_name && alternate_spelling_resolves_to_raw(raw, decomposed.as_ref())? {
+        owner_name = decomposed.into_owned();
+    }
+    Ok(owner_name.into())
+}
+
+#[cfg(unix)]
+fn ascii_lower_native_name(name: &OsStr) -> OsString {
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+    OsString::from_vec(name.as_bytes().iter().map(u8::to_ascii_lowercase).collect())
+}
+
+#[cfg(windows)]
+fn ascii_lower_native_name(name: &OsStr) -> OsString {
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+
+    OsString::from_wide(
+        &name
+            .encode_wide()
+            .map(|unit| {
+                if unit <= u16::from(u8::MAX) {
+                    u16::from((unit as u8).to_ascii_lowercase())
+                } else {
+                    unit
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn ascii_lower_native_name(name: &OsStr) -> OsString {
+    name.to_os_string()
+}
+
+fn alternate_spelling_resolves_to_raw(raw: &Path, alternate_name: &str) -> io::Result<bool> {
+    let original_name = raw
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "RAW path has no file name"))?;
+    if original_name == OsStr::new(alternate_name) {
+        return Ok(true);
+    }
+    spelling_resolves_to_raw(raw, OsStr::new(alternate_name))
+}
+
+fn spelling_resolves_to_raw(raw: &Path, alternate_name: &OsStr) -> io::Result<bool> {
+    let parent = raw
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "RAW path has no parent"))?;
+    let original_name = raw
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "RAW path has no file name"))?;
+    let canonical = std::fs::canonicalize(raw)?;
+    let alternate = parent.join(alternate_name);
     match std::fs::symlink_metadata(&alternate) {
-        // A separately named symlink on a case-sensitive filesystem can
-        // resolve to the original RAW without making the directory itself
-        // case-insensitive.
+        // A separately named symlink on a spelling-sensitive filesystem can
+        // resolve to the original RAW without making the spellings aliases.
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            let original_name = path.file_name().expect("validated RAW name");
-            let alternate_name = alternate.file_name().expect("constructed alternate name");
             let mut has_original = false;
             let mut has_alternate = false;
             for entry in std::fs::read_dir(parent)?.filter_map(Result::ok) {
@@ -192,6 +282,22 @@ fn directory_is_case_insensitive(path: &Path) -> io::Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+fn directory_is_case_insensitive(path: &Path) -> io::Result<bool> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "RAW path has no file name"))?;
+    // Requiring the RAW to resolve is intentional. If it vanished before a
+    // queued rating reached the worker, guessing its case semantics could
+    // merge distinct XMP targets on a case-sensitive volume.
+    let alternate = toggled_ascii_case(name).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cannot case-probe RAW filename",
+        )
+    })?;
+    spelling_resolves_to_raw(path, &alternate)
 }
 
 #[cfg(unix)]
@@ -235,37 +341,6 @@ fn toggled_ascii_case(name: &OsStr) -> Option<OsString> {
     };
     name.replace_range(index..=index, std::str::from_utf8(&[replacement]).ok()?);
     Some(name.into())
-}
-
-fn fold_owner_name(name: &OsStr) -> OsString {
-    if let Some(name) = name.to_str() {
-        return name.to_lowercase().into();
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
-
-        OsString::from_vec(name.as_bytes().iter().map(u8::to_ascii_lowercase).collect())
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
-
-        OsString::from_wide(
-            &name
-                .encode_wide()
-                .map(|unit| {
-                    if unit <= u16::from(u8::MAX) {
-                        u16::from((unit as u8).to_ascii_lowercase())
-                    } else {
-                        unit
-                    }
-                })
-                .collect::<Vec<_>>(),
-        )
-    }
-    #[cfg(not(any(unix, windows)))]
-    name.to_string_lossy().to_lowercase().into()
 }
 
 /// Scans one directory for regular ARW and DNG files in filename order.
@@ -352,7 +427,9 @@ pub fn outward_order(len: usize, start: usize) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_physical_path, outward_order, scan};
+    use super::{
+        normalize_physical_path, outward_order, scan, sidecar_owner_key, sidecar_owner_keys,
+    };
 
     #[test]
     fn scan_finds_supported_files_with_sorted_metadata() {
@@ -456,9 +533,176 @@ mod tests {
         );
     }
 
+    #[test]
+    fn canonically_equivalent_sidecars_follow_the_filesystem_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let composed = dir.path().join("\u{e9}.ARW");
+        let decomposed = dir.path().join("e\u{301}.DNG");
+        std::fs::write(&composed, b"raw").unwrap();
+        std::fs::write(&decomposed, b"raw").unwrap();
+
+        let composed_sidecar = composed.with_extension("xmp");
+        let decomposed_sidecar = decomposed.with_extension("xmp");
+        std::fs::write(&composed_sidecar, b"probe").unwrap();
+        let sidecars_alias = decomposed_sidecar.exists();
+        std::fs::remove_file(&composed_sidecar).unwrap();
+
+        let composed_owner = sidecar_owner_key(&composed).unwrap();
+        let decomposed_owner = sidecar_owner_key(&decomposed).unwrap();
+        if sidecars_alias {
+            assert_eq!(composed_owner, decomposed_owner);
+        } else {
+            assert_ne!(composed_owner, decomposed_owner);
+        }
+        let entries = scan(dir.path()).unwrap();
+        let owners = sidecar_owner_keys(&entries);
+        if sidecars_alias {
+            assert_eq!(owners[0], owners[1]);
+        } else {
+            assert_ne!(owners[0], owners[1]);
+        }
+        assert_eq!(composed.with_extension("xmp"), composed_sidecar);
+        assert_eq!(decomposed.with_extension("xmp"), decomposed_sidecar);
+    }
+
+    #[test]
+    fn unicode_casefold_aliases_follow_the_filesystem_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let sigma = dir.path().join("\u{3a3}.ARW");
+        let final_sigma = dir.path().join("\u{3c2}.DNG");
+        std::fs::write(&sigma, b"raw").unwrap();
+        std::fs::write(&final_sigma, b"raw").unwrap();
+
+        let sigma_sidecar = sigma.with_extension("xmp");
+        let final_sigma_sidecar = final_sigma.with_extension("xmp");
+        std::fs::write(&sigma_sidecar, b"probe").unwrap();
+        let sidecars_alias = final_sigma_sidecar.exists();
+        std::fs::remove_file(&sigma_sidecar).unwrap();
+
+        let sigma_owner = sidecar_owner_key(&sigma).unwrap();
+        let final_sigma_owner = sidecar_owner_key(&final_sigma).unwrap();
+        if sidecars_alias {
+            assert_eq!(sigma_owner, final_sigma_owner);
+        } else {
+            assert_ne!(sigma_owner, final_sigma_owner);
+        }
+        let entries = scan(dir.path()).unwrap();
+        let owners = sidecar_owner_keys(&entries);
+        if sidecars_alias {
+            assert_eq!(owners[0], owners[1]);
+        } else {
+            assert_ne!(owners[0], owners[1]);
+        }
+    }
+
+    #[test]
+    fn unicode_simple_case_aliases_follow_the_filesystem_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let capital_sharp_s = dir.path().join("\u{1e9e}.ARW");
+        let sharp_s = dir.path().join("\u{df}.DNG");
+        std::fs::write(&capital_sharp_s, b"raw").unwrap();
+        std::fs::write(&sharp_s, b"raw").unwrap();
+
+        let capital_sidecar = capital_sharp_s.with_extension("xmp");
+        let lowercase_sidecar = sharp_s.with_extension("xmp");
+        std::fs::write(&capital_sidecar, b"probe").unwrap();
+        let sidecars_alias = lowercase_sidecar.exists();
+        std::fs::remove_file(&capital_sidecar).unwrap();
+
+        let capital_owner = sidecar_owner_key(&capital_sharp_s).unwrap();
+        let lowercase_owner = sidecar_owner_key(&sharp_s).unwrap();
+        if sidecars_alias {
+            assert_eq!(capital_owner, lowercase_owner);
+        } else {
+            assert_ne!(capital_owner, lowercase_owner);
+        }
+        let owners = sidecar_owner_keys(&scan(dir.path()).unwrap());
+        if sidecars_alias {
+            assert_eq!(owners[0], owners[1]);
+        } else {
+            assert_ne!(owners[0], owners[1]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalization_probe_rejects_a_separately_named_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let composed = dir.path().join("\u{e9}.ARW");
+        let decomposed = dir.path().join("e\u{301}.ARW");
+        std::fs::write(&composed, b"raw").unwrap();
+        if let Err(error) = symlink(&composed, &decomposed) {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::AlreadyExists,
+                "unexpected normalization-probe setup failure: {error}"
+            );
+            return;
+        }
+
+        assert_eq!(
+            sidecar_owner_key(&composed).unwrap(),
+            composed.with_extension("xmp")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_owner_keys_fold_only_ascii_in_invalid_utf8() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let name = std::ffi::OsString::from_vec(b"Photo-\xff.ARW".to_vec());
+        let owner = super::owner_raw_name(std::path::Path::new("unused"), &name, true).unwrap();
+        assert_eq!(
+            owner,
+            std::ffi::OsString::from_vec(b"photo-\xff.arw".to_vec())
+        );
+        assert_eq!(
+            super::owner_raw_name(std::path::Path::new("unused"), &name, false).unwrap(),
+            name
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batched_invalid_name_does_not_cache_semantics_for_a_later_valid_name() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let invalid = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"Photo-\xff.ARW".to_vec()));
+        let valid = dir.path().join("Photo.ARW");
+        std::fs::write(&valid, b"raw").unwrap();
+        let invalid_exists = std::fs::write(&invalid, b"raw").is_ok();
+        let entries = vec![
+            super::FolderEntry {
+                path: invalid.clone(),
+                file_name: "invalid".to_owned(),
+                size: 3,
+                mtime_ns: 0,
+            },
+            super::FolderEntry {
+                path: valid.clone(),
+                file_name: "valid".to_owned(),
+                size: 3,
+                mtime_ns: 0,
+            },
+        ];
+
+        let owners = sidecar_owner_keys(&entries);
+        assert_eq!(
+            owners[0],
+            invalid_exists.then(|| sidecar_owner_key(&invalid).unwrap())
+        );
+        assert_eq!(owners[1], Some(sidecar_owner_key(&valid).unwrap()));
+    }
+
     #[cfg(windows)]
     #[test]
-    fn native_owner_folding_preserves_unpaired_utf16_units() {
+    fn native_owner_keys_fold_only_ascii_around_unpaired_utf16_units() {
         use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 
         let first = std::ffi::OsString::from_wide(&[
@@ -478,10 +722,28 @@ mod tests {
             0xd801,
         ]);
 
-        let first = super::fold_owner_name(&first);
-        let second = super::fold_owner_name(&second);
-        assert_ne!(first, second);
-        assert_eq!(first.encode_wide().next(), Some(u16::from(b'p')));
+        let first_owner =
+            super::owner_raw_name(std::path::Path::new("unused"), &first, true).unwrap();
+        let second_owner =
+            super::owner_raw_name(std::path::Path::new("unused"), &second, true).unwrap();
+        let first_units = first_owner.encode_wide().collect::<Vec<_>>();
+        let second_units = second_owner.encode_wide().collect::<Vec<_>>();
+        let lowercase_photo = [
+            u16::from(b'p'),
+            u16::from(b'h'),
+            u16::from(b'o'),
+            u16::from(b't'),
+            u16::from(b'o'),
+        ];
+        assert_eq!(&first_units[..5], &lowercase_photo);
+        assert_eq!(&second_units[..5], &lowercase_photo);
+        assert_eq!(first_units[5], 0xd800);
+        assert_eq!(second_units[5], 0xd801);
+        assert_ne!(first_owner, second_owner);
+        assert_eq!(
+            super::owner_raw_name(std::path::Path::new("unused"), &first, false).unwrap(),
+            first
+        );
     }
 
     #[test]
