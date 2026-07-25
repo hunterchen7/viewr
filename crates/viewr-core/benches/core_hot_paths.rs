@@ -9,7 +9,7 @@ use viewr_core::cache_ram::RamCache;
 use viewr_core::decode;
 use viewr_core::develop::{self, Quality};
 use viewr_core::folder::{FolderEntry, outward_order};
-use viewr_core::jobs::{decode_jpeg, encode_jpeg};
+use viewr_core::jobs::{benchmark_metadata_queue_setup, decode_jpeg, encode_jpeg};
 use viewr_core::planning::build_plan_targets;
 use viewr_core::resize::{apply_orient, downscale_to_fit, resize_exact};
 use viewr_core::types::{Orient, PixelBuf, Tier};
@@ -148,6 +148,24 @@ fn bench_navigation_plan(c: &mut Criterion) {
                 });
             },
         );
+    }
+
+    group.finish();
+}
+
+fn bench_metadata_queue_setup(c: &mut Criterion) {
+    let mut group = c.benchmark_group("metadata_queue_setup");
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+
+    for len in [1_000_usize, 10_000, 100_000] {
+        group.throughput(Throughput::Elements(len as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, &len| {
+            b.iter(|| {
+                black_box(benchmark_metadata_queue_setup(black_box(len)));
+            });
+        });
     }
 
     group.finish();
@@ -531,6 +549,7 @@ criterion_group! {
     targets =
         bench_outward_order,
         bench_navigation_plan,
+        bench_metadata_queue_setup,
         bench_resize,
         bench_orientation,
         bench_jpeg,

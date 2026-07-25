@@ -1106,6 +1106,26 @@ impl Drop for Engine {
     }
 }
 
+/// Builds the production metadata queue and returns its resident job count.
+///
+/// This is exposed only to the Criterion harness so folder-open queue
+/// construction can be measured without starting decoder threads or touching
+/// the filesystem.
+#[cfg(feature = "benchmarks")]
+#[doc(hidden)]
+pub fn benchmark_metadata_queue_setup(len: usize) -> usize {
+    let queue = JobQueue::new();
+    queue.extend((0..len).map(|index| {
+        (
+            (index, Tier::Thumb),
+            5,
+            index.min(u32::MAX as usize) as u32,
+            Action::Metadata,
+        )
+    }));
+    queue.state.lock().unwrap().heap.len()
+}
+
 fn worker(shared: &Shared, light: bool) {
     let queue = if light { &shared.light } else { &shared.heavy };
     while let Some((id, action, token)) = queue.pop() {
