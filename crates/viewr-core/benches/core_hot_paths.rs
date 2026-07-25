@@ -97,6 +97,10 @@ fn bench_navigation_plan(c: &mut Criterion) {
         // This includes the production heap/index synchronization but keeps
         // decoder threads and filesystem cache probes out of the measurement.
         let queue = BenchmarkNavigationQueue::new(len);
+        assert!(
+            queue.navigate(len / 2) > 0,
+            "navigation benchmark must install production queue work"
+        );
         let mut queue_current = len / 2;
         group.bench_with_input(
             BenchmarkId::new("production_queue_sync", len),
@@ -158,6 +162,11 @@ fn bench_metadata_queue_setup(c: &mut Criterion) {
     group.measurement_time(Duration::from_millis(1_500));
 
     for len in [1_000_usize, 10_000, 100_000] {
+        assert_eq!(
+            benchmark_metadata_queue_setup(len),
+            len,
+            "metadata benchmark must retain every production queue item"
+        );
         group.throughput(Throughput::Elements(len as u64));
         group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, &len| {
             b.iter(|| {
@@ -443,6 +452,12 @@ fn realistic_xmp(element_rating: bool) -> String {
 fn bench_xmp(c: &mut Criterion) {
     let attribute_xmp = realistic_xmp(false);
     let element_xmp = realistic_xmp(true);
+    assert_eq!(parse_rating(&attribute_xmp), Some(3));
+    assert_eq!(parse_rating(&element_xmp), Some(3));
+    assert_eq!(
+        parse_rating(&update_rating_xml(&attribute_xmp, 5).unwrap()),
+        Some(5)
+    );
     let mut group = c.benchmark_group("xmp");
     group.sample_size(20);
     group.warm_up_time(Duration::from_millis(300));
