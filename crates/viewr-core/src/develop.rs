@@ -68,6 +68,21 @@ pub enum DevelopError {
     Unsupported(String),
 }
 
+fn usable_color_matrix(matrix: &[f32]) -> bool {
+    matches!(matrix.len(), 9 | 12) && matrix.iter().all(|value| value.is_finite())
+}
+
+fn sanitize_white_balance(coefficients: [f32; 4]) -> [f32; 4] {
+    if coefficients[..3]
+        .iter()
+        .all(|value| value.is_finite() && *value > 0.0)
+    {
+        coefficients
+    } else {
+        [1.0; 4]
+    }
+}
+
 /// Develop a decoded raw into packed RGBA8.
 ///
 /// Consumes the RawImage (the CFA plane is moved into the pipeline).
@@ -175,7 +190,7 @@ fn develop_with_layout(
         .find(|(illuminant, _)| **illuminant == Illuminant::D65)
         .or_else(|| raw.color_matrix.iter().next())
         .map(|(_, m)| m.clone());
-    if let Some(color_matrix) = xyz2cam.filter(|m| m.len() % 3 == 0) {
+    if let Some(color_matrix) = xyz2cam.filter(|matrix| usable_color_matrix(matrix)) {
         let mut matrix: [[f32; 3]; 4] = [[0.0; 3]; 4];
         for (i, row) in matrix.iter_mut().enumerate().take(color_matrix.len() / 3) {
             for (j, cell) in row.iter_mut().enumerate() {
@@ -183,22 +198,20 @@ fn develop_with_layout(
             }
         }
         let cam2rgb = pseudo_inverse(normalize(multiply(&matrix, &SRGB_TO_XYZ_D65)));
-        let wb = if raw.wb_coeffs[0].is_nan() {
-            [1.0; 4]
-        } else {
-            raw.wb_coeffs
-        };
-        for_each_region_pixel_mut(&mut image, region, |pix| {
-            let r = pix[0] * wb[0];
-            let g = pix[1] * wb[1];
-            let b = pix[2] * wb[2];
-            let srgb = [
-                cam2rgb[0][0] * r + cam2rgb[0][1] * g + cam2rgb[0][2] * b,
-                cam2rgb[1][0] * r + cam2rgb[1][1] * g + cam2rgb[1][2] * b,
-                cam2rgb[2][0] * r + cam2rgb[2][1] * g + cam2rgb[2][2] * b,
-            ];
-            *pix = clip_euclidean_norm_avg(&srgb);
-        });
+        if cam2rgb.iter().flatten().all(|value| value.is_finite()) {
+            let wb = sanitize_white_balance(raw.wb_coeffs);
+            for_each_region_pixel_mut(&mut image, region, |pix| {
+                let r = pix[0] * wb[0];
+                let g = pix[1] * wb[1];
+                let b = pix[2] * wb[2];
+                let srgb = [
+                    cam2rgb[0][0] * r + cam2rgb[0][1] * g + cam2rgb[0][2] * b,
+                    cam2rgb[1][0] * r + cam2rgb[1][1] * g + cam2rgb[1][2] * b,
+                    cam2rgb[2][0] * r + cam2rgb[2][1] * g + cam2rgb[2][2] * b,
+                ];
+                *pix = clip_euclidean_norm_avg(&srgb);
+            });
+        }
     }
     timings.calibrate = t.elapsed();
 
@@ -425,13 +438,37 @@ fn base_curve(v: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DevelopTimings, analytical_gamma_tone_pack, base_curve, gamma_tone_pack, total};
+    use super::{
+        DevelopTimings, analytical_gamma_tone_pack, base_curve, gamma_tone_pack,
+        sanitize_white_balance, total, usable_color_matrix,
+    };
     use rawler::CFA;
     use rawler::cfa::PlaneColor;
     use rawler::imgop::sensor::bayer::{Demosaic, superpixel::Superpixel3Channel};
     use rawler::imgop::{Dim2, Point, Rect};
     use rawler::pixarray::PixF32;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn malformed_color_calibration_values_fail_closed() {
+        assert!(usable_color_matrix(&[1.0; 9]));
+        assert!(usable_color_matrix(&[1.0; 12]));
+        assert!(!usable_color_matrix(&[1.0; 6]));
+        let mut non_finite_matrix = [1.0; 9];
+        non_finite_matrix[4] = f32::NAN;
+        assert!(!usable_color_matrix(&non_finite_matrix));
+
+        let valid = sanitize_white_balance([2.0, 1.0, 1.5, f32::NAN]);
+        assert_eq!(&valid[..3], &[2.0, 1.0, 1.5]);
+        assert!(valid[3].is_nan());
+        for invalid in [
+            [f32::NAN, 1.0, 1.0, 1.0],
+            [1.0, f32::INFINITY, 1.0, 1.0],
+            [1.0, 1.0, 0.0, 1.0],
+        ] {
+            assert_eq!(sanitize_white_balance(invalid), [1.0; 4]);
+        }
+    }
 
     #[test]
     fn base_curve_is_monotonic_and_anchored() {

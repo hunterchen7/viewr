@@ -30,8 +30,8 @@ pub struct FileMeta {
 impl FileMeta {
     /// Extracts and formats the subset of RAW metadata used by the viewer.
     ///
-    /// Invalid zero-denominator aperture and focal-length rationals are
-    /// omitted. No file or pixel decoding is performed by this conversion.
+    /// Invalid zero-denominator exposure, aperture, and focal-length rationals
+    /// are omitted. No file or pixel decoding is performed by this conversion.
     pub fn from_metadata(md: &RawMetadata) -> Self {
         let exif = &md.exif;
         Self {
@@ -44,7 +44,7 @@ impl FileMeta {
                 .map(|l| l.lens_name.clone())
                 .or_else(|| exif.lens_model.clone()),
             iso: exif.iso_speed_ratings,
-            shutter: exif.exposure_time.map(|r| {
+            shutter: exif.exposure_time.filter(|r| r.d != 0).map(|r| {
                 if r.n == 1 {
                     format!("1/{}", r.d)
                 } else if r.d == 1 {
