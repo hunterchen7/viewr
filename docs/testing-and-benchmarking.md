@@ -82,15 +82,17 @@ The suite measures these workloads:
   1,000, and 10,000 images, plus the former folder-wide planner as an
   explicitly labeled reference. The queue benchmark excludes decoder threads
   and filesystem cache probes.
-- Folder-open metadata queue construction and SQLite rating lookup for up to
-  100,000 and 50,000 entries, respectively.
+- Folder-open metadata queue construction for up to 100,000 entries.
+- Warm, in-memory, all-hit SQLite rating lookup for up to 50,000 entries.
+  This case excludes database-open and disk-read costs.
 - Outward-order construction for up to 1,000,000 images.
 - Resize of a deterministic 12.2-megapixel image, plus rotation at 12.2 and
   32.7 megapixels.
 - JPEG encoding and decoding at the production Browse and Full dimensions and
   qualities, plus RAM-cache hits and eviction scaling.
-- XMP parsing, XMP updates, disk-cache key generation, and cache-GC scans up
-  to 10,000 objects.
+- XMP parsing, XMP updates, and disk-cache key generation.
+- Warm, under-budget cache-GC scans for up to 10,000 objects.
+  This case does not sort or delete cache objects.
 - Loupe filmstrip widget scaling at 10,000 and 50,000 images.
 - Thumbnail texture-LRU maintenance for 200 touches among 773 residents.
 

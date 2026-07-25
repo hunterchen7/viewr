@@ -69,9 +69,11 @@ Navigation waited for durable XMP and SQLite work after a rating change.
 The wait included file synchronization and parent-directory synchronization.
 
 The application now sends an ordered asynchronous flush request.
-The FIFO channel journals the rating before it handles the flush.
-Shutdown remains the blocking durability boundary.
-Failure restores the dirty state for a later retry.
+The FIFO channel attempts the journal write before it handles the flush.
+Shutdown blocks for a bounded sequence of best-effort flush attempts.
+It reports any updates that remain unpersisted after those attempts.
+Persistent journal failure can still discard an unjournaled update at exit.
+A failed requested flush restores the dirty state while the process runs.
 
 ### Disk-cache GC
 
@@ -79,10 +81,13 @@ Engine destruction joined a complete cache scan and sort.
 A folder switch could wait for that work on the application thread.
 
 Cache maintenance now runs as detached, best-effort work.
-Only one scan for a cache root runs at one time.
+Within one Viewr process, at most one scan runs for a cache root.
+Separate Viewr processes can scan the same root at the same time.
 Engine destruction does not join the cache-maintenance thread.
 
-The new scan benchmark measured these local medians:
+The new scan benchmark measured warm, under-budget passes.
+Each pass scans object metadata but does not sort or delete objects.
+The benchmark measured these local medians:
 
 | Cache objects | Scan time |
 | ---: | ---: |
@@ -129,6 +134,9 @@ Path cloning, query creation, and result hashing made the batch version slower.
 
 The batch implementation was reverted.
 The rating-lookup benchmark remains.
+This benchmark uses a warm, in-memory database and an all-hit path set.
+It measures point-query and lookup CPU costs.
+It does not measure database-open or cold disk costs.
 
 ### Production reference measurements
 
@@ -152,9 +160,9 @@ Use them as scale evidence, not as regression limits.
 The benchmark suite now includes these production-adjacent costs:
 
 - Metadata queue construction for up to 100,000 entries.
-- Rating database lookup for up to 50,000 entries.
+- Warm, in-memory, all-hit rating database lookup for up to 50,000 entries.
 - Production priority-queue synchronization.
-- Disk-cache GC scans for up to 10,000 objects.
+- Warm, under-budget disk-cache GC scans for up to 10,000 objects.
 - Browse and Full JPEG work at production dimensions and quality values.
 
 The suite removed a duplicate planner benchmark.
@@ -181,7 +189,11 @@ has an advisory baseline and a policy for UI-heavy and private-RAW paths.
 The ownership transaction serializes Viewr processes that share the same
 SQLite database.
 Other applications do not participate in that transaction.
-Their later sidecar modification time still wins during the next folder load.
+A valid external sidecar rating wins when its modification time is at least the
+clean database value.
+An unfinished dirty journal stays authoritative.
+Startup recovery can replace an external change that occurred while that
+journal was dirty.
 
 ### RAW pipeline concurrency
 
