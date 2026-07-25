@@ -48,8 +48,12 @@ All promoted performance decisions use later isolated target runs.
 | P1 | A rating row did not verify the RAW size and modification time during folder load. | Fixed. A row applies only to the matching RAW identity. |
 | P1 | Startup recovery could write an old rating beside a replaced RAW file. | Fixed. Recovery checks the current RAW identity before each write. A conditional delete cannot remove a newer journal row. |
 | P1 | An old sidecar completion could clear a newer dirty rating. | Fixed. Completion uses a conditional compare operation on path, identity, and rating. |
-| P1 | An older Viewr process could replace XMP after a newer process completed its rating. | Fixed. An immediate SQLite ownership transaction now covers the exact-row check, durable XMP replacement, and database completion. |
+| P1 | A delayed current-version Viewr process could replace XMP after another process completed a newer rating. | Fixed. A physical sidecar-owner revision and an immediate SQLite ownership transaction now cover the ownership check, durable XMP replacement, and database completion. |
 | P1 | A transient initial journal failure could leave an older dirty rating authoritative. | Fixed. Unjournaled work remains pending and must establish database ownership before it can publish XMP. |
+| P1 | Parent symlinks, filesystem-verified case and Unicode aliases, and ARW/DNG siblings could name one XMP target through different database paths. | Fixed for the supported identity probes. Current writes use a filesystem-derived physical owner. Legacy histories are read conservatively, ambiguous dirty work is quarantined, and a retargeted parent symlink cannot redirect recovery. Linux bind mounts and distinct case-folded mount spellings remain an operational limit. |
+| P1 | A configured database directory or open failure could silently downgrade rating writes to database-free XMP publication. | Fixed. The configured database remains authoritative; work stays queued until it can journal safely. |
+| P1 | A damaged or interrupted schema repair could reuse an optimistic retry token or expose stale ownership through the read-only startup path. | Fixed. Repair intent is durable, every retry domain crosses a barrier, malformed counters fail closed before arithmetic, and read-only startup rejects incomplete repair state. |
+| P1 | SQLite can store same-name indexes and triggers, allowing a valid object to mask a hostile opposite-type object. | Fixed. Readiness checks both namespaces and repair removes both before installing canonical objects. |
 | P1 | A panic in one decode job left its ID in flight and removed one worker. | Fixed. Each claimed job now has a panic boundary. Cleanup occurs before failure publication, and the worker continues. |
 | P1 | `ByteLru::remove` performed a required map removal inside `debug_assert_eq!`. | Fixed. Release builds now perform the removal before the assertion. The new release test gate found this defect. |
 | P2 | A canceled decode generation could publish a stale panic failure. | Fixed. Only the current uncanceled generation can publish a panic event, and background warming remains invisible to the UI event channel. |
@@ -60,6 +64,38 @@ All promoted performance decisions use later isolated target runs.
 The rating journal now uses stronger local and database checks.
 Cooperating Viewr processes that use the same database serialize sidecar
 ownership before touching XMP.
+
+The latency-sensitive folder-open path can read the two supported legacy
+rating schemas without migrating them. It selects conservative candidates,
+then derives and verifies physical owners before applying a row. The background
+persistence worker remains the only migration writer. The app keeps folder
+open non-blocking and refreshes persisted ratings on a detached thread after
+the worker has completed its initial recovery pass. This reconciliation also
+runs for an initially readable current schema, because its first snapshot can
+race recovery. Explicit user ratings and already-arrived embedded metadata
+retain their precedence during that refresh.
+
+Current public clean upserts still accept an unresolved path and preserve its
+spelling. Dirty sidecar journaling now rejects an unresolved physical owner,
+`Db::open` requires a WAL-capable storage location, and the public exhaustive
+`DbError` enum adds `WalUnavailable`. Those are pre-1.0 behavioral and
+source-level breaking changes. The new `Db::try_open_for_read` API is additive:
+it returns `Result<Option<Db>, DbError>` so callers can distinguish
+read-compatible state from a database that needs background migration. The
+breaking commit and release configuration explicitly select release 0.2.0.
+
+Configured persistence does not downgrade to database-free XMP when opening,
+migrating, or enabling WAL fails. It retains in-process work and retries.
+SQLite files on network storage or managed profiles that decline WAL are
+therefore unsupported. On Windows, the current platform configuration path is
+Roaming AppData; managed deployments must ensure it remains local and
+WAL-capable.
+
+Viewr 0.1.x predates the journal gate and can write XMP after a database write
+fails. The v8 fence contains the exact current path when possible, but SQLite
+cannot make alternate sibling or alias paths safe. Close every older process
+that can write the same photo folders before the first 0.2.x launch, and do not
+relaunch or downgrade to 0.1.x for folders or databases already used by 0.2.x.
 
 ## Performance changes and measured decisions
 
@@ -138,6 +174,34 @@ This benchmark uses a warm, in-memory database and an all-hit path set.
 It measures point-query and lookup CPU costs.
 It does not measure database-open or cold disk costs.
 
+### Rating database lifecycle
+
+Folder startup now resolves current-schema ratings and owners in bounded
+queries instead of issuing one database query per entry. Current-schema
+readiness checks table and object metadata without scanning image or owner
+rows. Repair-only value validation remains linear because it must inspect
+counter storage classes before performing arithmetic.
+
+The expanded harness separates current reopen, legacy compatibility, repair
+stress, pending scans, and cold migration:
+
+| Workload | Local measured interval |
+| --- | ---: |
+| Current read-write reopen, through 50,000 rows | 0.44–0.62 ms |
+| Current read-only reopen, through 50,000 rows | 0.32–0.38 ms |
+| Selective legacy load with 50,000 history rows | 13.9–22.1 ms |
+| Full-scan legacy reference with 50,000 history rows | 94–115 ms |
+| Cold released-v0.1-to-v8 migration, 1,000/10,000 rows | Covered; stable baseline not yet recorded |
+| Cold v7-to-v8 migration, 1,000 rows | 17.9–19.1 ms |
+| Cold v7-to-v8 migration, 10,000 rows | 182.7–204.9 ms |
+
+The current reopen results remained flat across the measured row counts.
+Legacy dirty and repeated-stem histories are intentionally conservative and
+can approach a full scan. At 10,000 history rows those adversarial shapes
+measured approximately 102–138 ms, while zero-dirty histories measured
+approximately 2.7–3.6 ms. These are local scale measurements, not release
+thresholds.
+
 ### Production reference measurements
 
 The new queue benchmark includes the real priority heap and queued-ID index.
@@ -161,9 +225,23 @@ The benchmark suite now includes these production-adjacent costs:
 
 - Metadata queue construction for up to 100,000 entries.
 - Warm, in-memory, all-hit rating database lookup for up to 50,000 entries.
+- Complete current-schema folder rating hydration for up to 50,000 entries.
+- Current read-write/read-only database reopen through 50,000 image and owner
+  rows.
+- Selective legacy startup paired with a full-scan correctness reference,
+  including dense-dirty and repeated-stem adversarial histories.
+- Cold migration from the released v0.1 ownerless schema with existing and
+  missing RAWs, sparse unfinished work, correctness preflights, and a fresh
+  database copy for every timed iteration.
+- Cold v7-to-v8 migration from a fresh database copy on every measured
+  iteration.
+- Indexed pending-journal scans with zero and one dirty row, plus journal
+  updates against owner ledgers through 50,000 rows.
 - Production priority-queue synchronization.
 - Warm, under-budget disk-cache GC scans for up to 10,000 objects.
 - Browse and Full JPEG work at production dimensions and quality values.
+- Shared-owner rating propagation against prefilled maps through 100,000
+  entries, so the advertised sizes represent the timed map residency.
 
 The suite removed a duplicate planner benchmark.
 Navigation benchmarks now report latency instead of misleading folder-element throughput.
@@ -177,6 +255,8 @@ The optimized CI job now runs the complete workspace test suite with the release
 This gate executes optimized-only parallel code and detects release-only assertion mistakes.
 CI also reports that private RAW fixtures are absent instead of silently implying camera coverage.
 The same job smoke-runs both Criterion harnesses instead of only compiling them.
+The macOS and Windows test jobs compile every all-feature benchmark target;
+Linux remains the single optimized runtime-smoke host.
 Benchmark preflight assertions verify that queue and XMP workloads cannot
 silently become no-ops.
 The review rejected a hard source-coverage percentage gate until the project
@@ -194,6 +274,59 @@ clean database value.
 An unfinished dirty journal stays authoritative.
 Startup recovery can replace an external change that occurred while that
 journal was dirty.
+
+### Unresolved-path retry scope
+
+An unresolved RAW has no safe physical sidecar owner. Its optimistic retry
+therefore watches a global ownerless epoch. An unrelated ownerless clean update
+can conservatively discard that retry. This favors preventing a stale XMP
+publication over retaining a rare update made while the RAW or its containing
+filesystem is unavailable.
+
+### Database trust boundary
+
+Warm current-schema opens validate capability metadata in constant time.
+Migration and repair paths additionally scan counter storage classes and
+domains before arithmetic. Arbitrary row tampering performed outside Viewr
+while every schema object remains canonical is treated as external database
+corruption; continuously scanning every ledger row on normal startup was
+rejected because it would make warm open time proportional to library history.
+
+### Filesystem identity limits
+
+Physical-owner resolution covers ordinary parent symlinks and case or Unicode
+spellings that the filesystem probe can verify. Linux bind mounts and unusual
+case-folded mount aliases can still canonicalize to different paths for the
+same file. Viewr cannot safely unify those spellings without a durable,
+cross-platform file-identity layer. Use one mount spelling for a photo folder.
+
+When a pre-v8 parent alias is ambiguous, migration quarantines unfinished
+same-name histories across directories because the old schema has no
+historical owner or total order. This can discard an unrelated legacy DB
+fallback with the same normalized stem. The XMP file remains readable; the
+availability cost is deliberate to prevent an unordered legacy rating from
+being published.
+
+### Persistence storage, contention, and growth
+
+The configured database must support SQLite WAL and local locking. A location
+that declines WAL leaves updates queued and never falls back to unjournaled
+XMP. Windows currently uses Roaming AppData through the platform configuration
+API, so a network-backed managed profile is an operational risk.
+
+A durable XMP replacement occurs while an immediate SQLite transaction owns
+the rating. Slow external storage can therefore delay unrelated rating writers;
+the benchmark suite does not yet include multi-process or slow-filesystem
+contention. Revision ledgers and the quarantine table also have no automatic
+compaction, and the in-memory command backlog is not bounded while a configured
+database remains unavailable.
+
+### Startup refresh integration coverage
+
+Core tests verify that the readiness callback follows initial recovery, and app
+unit tests verify refresh backoff and rating-source precedence. There is not yet
+an end-to-end headless test that drives the egui session, background migration,
+folder replacement, and repaint loop together.
 
 ### RAW pipeline concurrency
 
@@ -259,9 +392,20 @@ The application changes are limited to these nonvisual operations:
 - Replace a blocking persistence call with an ordered asynchronous request.
 - Divide the configured RAM budget across the three backend cache rings.
 - Reject invalid numeric configuration values.
+- Normalize a selected file to the same physical spelling returned by folder
+  scanning.
+- Read rating state without migrating on the application thread, then
+  reconcile it after background startup recovery.
+- Keep rating state consistent for ARW/DNG or filesystem aliases that share one
+  physical XMP owner.
 
 No rendering function, widget tree, layout value, style value, control, or visible label changed.
 The loupe, filmstrip, settings, color, and texture-LRU source files are unchanged.
+The shared-owner correction can update multiple existing star displays and
+their filter membership after one rating because those entries persist to the
+same XMP file. This is a data-consistency correction, not a presentation or
+interaction-design change. The invariant is enforced by source-boundary review
+and behavior tests; the project does not yet have screenshot-golden coverage.
 
 ## Verification commands
 
@@ -284,9 +428,10 @@ The ordinary and release test output reports the three absent private-RAW fixtur
 
 Final verification passed:
 
-- The debug and release workspace suites each reported 198 passed unit tests
+- The debug and release workspace suites each reported 298 passed unit tests
   and three ignored private-RAW tests.
-- The core library reported 165 passed unit tests and three ignored private-RAW tests.
+- The app reported 39 passed unit tests.
+- The core library reported 259 passed unit tests and three ignored private-RAW tests.
 - The Rustdoc suite reported one passed documentation test.
 - Clippy reported no warnings across all targets and features.
 - Both optimized Criterion harnesses completed their runtime smoke checks.

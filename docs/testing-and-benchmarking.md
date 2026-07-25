@@ -24,10 +24,11 @@ The test suite covers these areas:
   SQLite reopen behavior, and durable flushes.
 - Configuration parsing and loupe layout mathematics.
 
-CI runs the full test suite on macOS, Windows, and Linux. Platform-independent
-formatting, Clippy, Rustdoc, benchmark compilation, and release compilation run
-once on Linux. Miri uses one pinned Linux nightly job. The independent quality,
-test, optimized-build, and Miri jobs run in parallel.
+CI runs the full test suite on macOS, Windows, and Linux. The macOS and Windows
+jobs also compile all-feature benchmark targets. Platform-independent
+formatting, Clippy, Rustdoc, optimized benchmark runtime smoke, and release
+compilation run once on Linux. Miri uses one pinned Linux nightly job. The
+independent quality, test, optimized-build, and Miri jobs run in parallel.
 
 The optimized-build job builds the application and both benchmark harnesses
 with one release-profile Cargo invocation using
@@ -83,8 +84,25 @@ The suite measures these workloads:
   explicitly labeled reference. The queue benchmark excludes decoder threads
   and filesystem cache probes.
 - Folder-open metadata queue construction for up to 100,000 entries.
-- Warm, in-memory, all-hit SQLite rating lookup for up to 50,000 entries.
-  This case excludes database-open and disk-read costs.
+- Warm, in-memory, all-hit SQLite point lookup and complete folder-startup
+  rating hydration for up to 50,000 entries.
+- Read-write and read-only reopen of current rating databases with 1,000,
+  10,000, and 50,000 image and owner-ledger rows. These are warm filesystem
+  measurements and verify that current-schema readiness does not scale with
+  row count.
+- Read-compatible legacy folder loads against 1,000, 10,000, and 50,000
+  history rows, paired with a full-scan reference implementation. A separate
+  stress group covers zero dirty rows, dense dirty rows, and repeated clean
+  filename stems for both supported legacy schemas.
+- Cold migration of copied 1,000- and 10,000-row templates from the released
+  v0.1 ownerless schema. The corpus combines existing and missing RAW paths
+  with sparse recoverable and quarantined dirty rows.
+- Cold v7-to-v8 migration of copied 1,000- and 10,000-row database templates.
+  Template creation and copy setup are outside the timed routine.
+- Rating journal updates against owner ledgers of up to 50,000 rows, plus
+  indexed pending-sidecar scans with zero and one dirty row.
+- Batched physical sidecar-owner discovery for up to 50,000 ordinary and
+  Unicode filenames.
 - Outward-order construction for up to 1,000,000 images.
 - Resize of a deterministic 12.2-megapixel image, plus rotation at 12.2 and
   32.7 megapixels.
@@ -95,6 +113,8 @@ The suite measures these workloads:
   This case does not sort or delete cache objects.
 - Loupe filmstrip widget scaling at 10,000 and 50,000 images.
 - Thumbnail texture-LRU maintenance for 200 touches among 773 residents.
+- Shared-owner rating propagation through a prefilled rating map at 1,000,
+  10,000, and 100,000 entries.
 
 Criterion stores reports in `target/criterion`.
 Git ignores this directory.
@@ -147,6 +167,21 @@ Download its Criterion artifact to inspect the complete report. The artifact
 also contains `benchmark-metadata.json` with the commit, Cargo.lock hash, Rust
 version, OS, CPU, logical-core count, memory, Rayon setting, cache condition,
 and fixture state. Benchmark artifacts are retained for 90 days.
+CI smoke-runs every benchmark case but does not compare Criterion estimates
+with a stored numeric baseline, so performance regressions still require a
+reviewer to run and interpret a controlled before/after comparison.
+
+The released-v0.1 migration corpus samples existing RAW files at a fixed
+stride and leaves the rest unresolved. It exercises both filesystem validation
+and quarantine without making every benchmark row a filesystem object. The
+cold v7 corpus intentionally uses only unresolved paths and therefore measures
+validation, removal, and ledger repair without depending on a particular host
+filesystem. Neither corpus represents a fully resident photo library that
+requires per-file case and Unicode probing.
+
+The suite also does not yet benchmark contended sidecar publication: a durable
+XMP write holds SQLite's immediate transaction, so a slow external volume can
+delay unrelated rating writers.
 
 ## Real RAW benchmarks
 
