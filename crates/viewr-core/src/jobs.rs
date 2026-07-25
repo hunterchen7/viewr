@@ -1779,7 +1779,7 @@ pub fn decode_jpeg(bytes: &[u8]) -> Result<PixelBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[test]
     fn notification_callback_panic_is_contained() {
@@ -1796,32 +1796,52 @@ mod tests {
 
     #[test]
     fn partial_engine_construction_joins_started_threads_during_unwind() {
-        let (weak_shared, weak_receiver) = std::sync::mpsc::channel();
-        let construction = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let shared = persistence_shared(Vec::new(), Arc::new(RamCache::new(0, 0, 0)), None, 0);
-            weak_shared.send(Arc::downgrade(&shared)).unwrap();
-            let mut engine = Engine {
-                shared,
-                workers: Vec::with_capacity(HEAVY_WORKERS + LIGHT_WORKERS),
-                persistence_worker: None,
-            };
-            let mut attempts = 0;
+        let spawn_count = 1 + HEAVY_WORKERS + LIGHT_WORKERS;
+        for failure_at in 1..=spawn_count {
+            let active_threads = Arc::new(AtomicUsize::new(0));
+            let active_for_construction = active_threads.clone();
+            let (weak_shared, weak_receiver) = std::sync::mpsc::channel();
+            let construction = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let shared =
+                    persistence_shared(Vec::new(), Arc::new(RamCache::new(0, 0, 0)), None, 0);
+                weak_shared.send(Arc::downgrade(&shared)).unwrap();
+                let mut engine = Engine {
+                    shared,
+                    workers: Vec::with_capacity(HEAVY_WORKERS + LIGHT_WORKERS),
+                    persistence_worker: None,
+                };
+                let mut attempts = 0;
 
-            spawn_engine_threads(&mut engine, |name, task| {
-                attempts += 1;
-                if attempts == 3 {
-                    return Err(std::io::Error::other("injected worker spawn failure"));
-                }
-                std::thread::Builder::new().name(name).spawn(task)
-            })
-            .expect("injected worker spawn failure must unwind construction");
-        }));
+                spawn_engine_threads(&mut engine, |name, task| {
+                    attempts += 1;
+                    if attempts == failure_at {
+                        return Err(std::io::Error::other("injected worker spawn failure"));
+                    }
+                    let active_threads = active_for_construction.clone();
+                    let (started, started_wait) = std::sync::mpsc::channel();
+                    let handle = std::thread::Builder::new().name(name).spawn(move || {
+                        active_threads.fetch_add(1, Ordering::SeqCst);
+                        started.send(()).unwrap();
+                        task();
+                        active_threads.fetch_sub(1, Ordering::SeqCst);
+                    })?;
+                    started_wait.recv().unwrap();
+                    Ok(handle)
+                })
+                .expect("injected worker spawn failure must unwind construction");
+            }));
 
-        assert!(construction.is_err());
-        assert!(
-            weak_receiver.recv().unwrap().upgrade().is_none(),
-            "a detached partial worker retained the engine after unwind"
-        );
+            assert!(construction.is_err(), "spawn {failure_at} must fail");
+            assert_eq!(
+                active_threads.load(Ordering::SeqCst),
+                0,
+                "spawn {failure_at} left a started worker running"
+            );
+            assert!(
+                weak_receiver.recv().unwrap().upgrade().is_none(),
+                "spawn {failure_at} left a worker retaining the engine"
+            );
+        }
     }
 
     #[test]
@@ -1974,6 +1994,63 @@ mod tests {
             receiver.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn ordinary_event_enqueue_precedes_reentrant_replan_notification() {
+        let queue = Arc::new(JobQueue::new());
+        let id = (3, Tier::Browse);
+        queue.extend([(id, 0, 0, Action::Metadata)]);
+        let (claimed_id, _, token) = queue.pop().unwrap();
+        let (events, receiver) = std::sync::mpsc::channel();
+        let notified = Arc::new(AtomicBool::new(false));
+        let notify_unlocked = Arc::new(AtomicBool::new(false));
+        let notify_queue = queue.clone();
+        let notified_callback = notified.clone();
+        let notify_unlocked_callback = notify_unlocked.clone();
+        let shared = Shared {
+            entries: Arc::new(Vec::new()),
+            cache: Arc::new(RamCache::new(0, 0, 0)),
+            disk: None,
+            events,
+            notify: Arc::new(move || {
+                notified_callback.store(true, Ordering::SeqCst);
+                notify_unlocked_callback
+                    .store(notify_queue.state.try_lock().is_ok(), Ordering::SeqCst);
+                notify_queue.set_plan(vec![(id, 0, 0, Action::Develop(Quality::Browse))], false);
+            }),
+            heavy: JobQueue::new(),
+            light: JobQueue::new(),
+            persistence: PersistenceQueue::new(),
+            navigation: Mutex::new(NavigationOrder::default()),
+        };
+
+        publish_claimed(
+            &shared,
+            queue.as_ref(),
+            claimed_id,
+            &token,
+            Event::ImageReady {
+                index: id.0,
+                tier: id.1,
+            },
+        );
+
+        assert!(notified.load(Ordering::SeqCst));
+        assert!(notify_unlocked.load(Ordering::SeqCst));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::ImageReady {
+                index: 3,
+                tier: Tier::Browse
+            })
+        ));
+        let (replacement_id, replacement_action, replacement_token) = queue.pop().unwrap();
+        assert_eq!(
+            (replacement_id, replacement_action),
+            (id, Action::Develop(Quality::Browse))
+        );
+        queue.finish(replacement_id, &replacement_token);
     }
 
     #[test]
