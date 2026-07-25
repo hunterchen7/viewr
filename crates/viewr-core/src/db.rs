@@ -1726,11 +1726,41 @@ fn migrate_legacy_dirty_ratings(conn: &Connection) -> Result<(usize, usize), rus
         row.unsafe_alias_history =
             normalize_physical_path(&row.path) != row.path || (row.dirty && row.owner.is_none());
     }
-    let unsafe_history_tokens = rows
+    let mut unsafe_history_tokens = rows
         .iter()
-        .filter(|row| row.unsafe_alias_history)
+        // A clean unresolved row cannot write during recovery, so it may
+        // remain useful as offline fallback state. It must still poison dirty
+        // same-name candidates: the missing spelling may have been an alias
+        // whose later completed write superseded their unfinished work.
+        .filter(|row| row.unsafe_alias_history || row.owner.is_none())
         .filter_map(|row| sidecar_owner_collision_token(&row.path))
         .collect::<HashSet<_>>();
+    let dirty_ownerless_tokens = rows
+        .iter()
+        .filter(|row| row.dirty)
+        .filter_map(|row| sidecar_owner_collision_token(&row.path))
+        .collect::<HashSet<_>>();
+    if !dirty_ownerless_tokens.is_empty() {
+        let mut statement = conn.prepare(
+            "SELECT path
+               FROM images
+              WHERE sidecar_owner IS NOT NULL
+                AND owner_key_version < 8",
+        )?;
+        let histories = statement
+            .query_map([], |row| row_path(row, 0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for path in histories {
+            let Some(token) = sidecar_owner_collision_token(&path) else {
+                continue;
+            };
+            if dirty_ownerless_tokens.contains(&token)
+                && (normalize_physical_path(&path) != path || sidecar_owner_key(&path).is_err())
+            {
+                unsafe_history_tokens.insert(token);
+            }
+        }
+    }
 
     // A partially migrated v6/v7 database can contain ownerless and owned
     // rows together. Resolve their ambiguity in one transaction: otherwise
@@ -1809,8 +1839,9 @@ fn migrate_legacy_dirty_ratings(conn: &Connection) -> Result<(usize, usize), rus
         // retargeted. Without a durable ordering key, publishing another
         // legacy row with that collision token could overwrite newer intent.
         let shares_unsafe_history = row.unsafe_alias_history
-            || sidecar_owner_collision_token(&row.path)
-                .is_some_and(|token| unsafe_history_tokens.contains(&token));
+            || (row.dirty
+                && sidecar_owner_collision_token(&row.path)
+                    .is_some_and(|token| unsafe_history_tokens.contains(&token)));
         if shares_unsafe_history {
             if row.dirty {
                 quarantine.push(row.path);
@@ -2576,7 +2607,7 @@ fn migrate_sidecar_owner_keys(
             .iter()
             .filter(|row| {
                 row.stored.owner_key_version < CURRENT_OWNER_KEY_VERSION
-                    && (!row.path_is_physical || (row.stored.sidecar_dirty && row.owner.is_none()))
+                    && (!row.path_is_physical || row.owner.is_none())
             })
             .filter_map(|row| sidecar_owner_collision_token(&row.path))
             .collect::<HashSet<_>>();
@@ -2796,45 +2827,73 @@ fn delete_stored_owner_key_row(
     )
 }
 
+#[cfg(test)]
 fn invalidate_owner_key_marker(conn: &Connection) -> Result<(), rusqlite::Error> {
     let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    transaction.execute(
-        "INSERT OR IGNORE INTO viewr_schema_migrations (name) VALUES (?1)",
-        [SIDECAR_OWNER_REPAIR_REQUIRED],
-    )?;
-    transaction.execute(
-        "DELETE FROM viewr_schema_migrations WHERE name = ?1",
-        [SIDECAR_OWNER_KEY_MIGRATION],
-    )?;
+    invalidate_owner_key_marker_on(&transaction)?;
     transaction.commit()
 }
 
+fn invalidate_owner_key_marker_on(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT OR IGNORE INTO viewr_schema_migrations (name) VALUES (?1)",
+        [SIDECAR_OWNER_REPAIR_REQUIRED],
+    )?;
+    conn.execute(
+        "DELETE FROM viewr_schema_migrations WHERE name = ?1",
+        [SIDECAR_OWNER_KEY_MIGRATION],
+    )?;
+    Ok(())
+}
+
 fn initialize_schema(conn: &Connection) -> Result<(), DbError> {
-    if current_owner_schema_is_ready(conn)? {
+    let snapshot = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
+    let ready = current_owner_schema_is_ready(&snapshot)?;
+    snapshot.commit()?;
+    if ready {
         return Ok(());
     }
-    if !rating_revision_storage_values_are_valid(conn)? {
-        // Repair and migration perform counter arithmetic. SQLite's INTEGER
-        // affinity does not prevent a manually damaged database from storing
-        // TEXT or REAL values, whose numeric coercion could recreate an old
-        // retry token. Fail before changing markers or reconciling rows.
-        return Err(rusqlite::Error::InvalidQuery.into());
+
+    // Capability checks span several SQLite catalog queries. Make each
+    // repair decision from one immediate transaction so concurrent first
+    // opens cannot combine pre- and post-migration observations. A waiter may
+    // still have decided to repeat a forced repair; retry final verification
+    // rather than treating its temporary sentinel as permanent corruption.
+    for _ in 0..32 {
+        let gate = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        if current_owner_schema_is_ready(&gate)? {
+            gate.commit()?;
+            return Ok(());
+        }
+        if !rating_revision_storage_values_are_valid(&gate)? {
+            // Repair and migration perform counter arithmetic. SQLite's
+            // INTEGER affinity does not prevent a manually damaged database
+            // from storing TEXT or REAL values, whose numeric coercion could
+            // recreate an old retry token.
+            gate.rollback()?;
+            return Err(rusqlite::Error::InvalidQuery.into());
+        }
+        let force_owner_repair = migration_is_complete(&gate, SIDECAR_OWNER_KEY_MIGRATION)?
+            || migration_is_complete(&gate, SIDECAR_OWNER_REPAIR_REQUIRED)?;
+        if force_owner_repair {
+            // The marker becomes false in the same snapshot that selected
+            // forced repair. A crash between phases therefore leaves durable
+            // repair intent for the next opener.
+            invalidate_owner_key_marker_on(&gate)?;
+        }
+        gate.commit()?;
+
+        initialize_rating_generation_schema(conn)?;
+        migrate_sidecar_owner_keys(conn, force_owner_repair)?;
+
+        let verification = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        if current_owner_schema_is_ready(&verification)? {
+            verification.commit()?;
+            return Ok(());
+        }
+        verification.rollback()?;
     }
-    let force_owner_repair = migration_is_complete(conn, SIDECAR_OWNER_KEY_MIGRATION)?
-        || migration_is_complete(conn, SIDECAR_OWNER_REPAIR_REQUIRED)?;
-    if force_owner_repair {
-        // The marker must become false before any capability repair can make
-        // the schema appear current. If this process exits between phases,
-        // the next opener will repeat owner-row validation instead of
-        // accepting a partially repaired v8 database.
-        invalidate_owner_key_marker(conn)?;
-    }
-    initialize_rating_generation_schema(conn)?;
-    migrate_sidecar_owner_keys(conn, force_owner_repair)?;
-    if !current_owner_schema_is_ready(conn)? {
-        return Err(rusqlite::Error::InvalidQuery.into());
-    }
-    Ok(())
+    Err(rusqlite::Error::InvalidQuery.into())
 }
 
 fn initialize_rating_generation_schema(conn: &Connection) -> Result<(), DbError> {
@@ -4555,6 +4614,87 @@ mod tests {
         assert!(!second_dir.join("photo.xmp").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn migration_clean_removed_alias_blocks_dirty_same_name_recovery() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = normalize_physical_path(directory.path());
+        let physical = root.join("physical");
+        let alias = root.join("alias");
+        std::fs::create_dir(&physical).unwrap();
+        let dirty_raw = physical.join("photo.ARW");
+        let clean_raw = physical.join("photo.DNG");
+        std::fs::write(&dirty_raw, b"dirty raw").unwrap();
+        std::fs::write(&clean_raw, b"clean raw").unwrap();
+        symlink(&physical, &alias).unwrap();
+        let clean_alias = alias.join("photo.DNG");
+        let dirty_identity = file_identity(&dirty_raw);
+        let clean_identity = file_identity(&clean_raw);
+        let database_path = root.join("removed-clean-alias.db");
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE images (
+                    path PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO images
+                    (path, size, mtime_ns, rating, sidecar_mtime_ns,
+                     sidecar_dirty, last_seen)
+                 VALUES
+                    (?1, ?2, ?3, 1, 0, 1, 1),
+                    (?4, ?5, ?6, 5, 10, 0, 2)",
+                rusqlite::params![
+                    path_value(&dirty_raw),
+                    dirty_identity.0,
+                    dirty_identity.1,
+                    path_value(&clean_alias),
+                    clean_identity.0,
+                    clean_identity.1,
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        std::fs::remove_file(&alias).unwrap();
+        let db = Db::open(&database_path).unwrap();
+
+        assert!(db.pending_sidecars().unwrap().is_empty());
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM images", [], |row| {
+                    row.get::<_, usize>(0)
+                })
+                .unwrap(),
+            1,
+            "clean unresolved fallback state may remain, but must block recovery"
+        );
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT rating
+                       FROM quarantined_legacy_ratings
+                      WHERE path = ?1",
+                    [path_value(&dirty_raw)],
+                    |row| row.get::<_, u8>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert!(!physical.join("photo.xmp").exists());
+    }
+
     #[test]
     fn migration_quarantines_a_dirty_owner_with_a_clean_legacy_alias() {
         let directory = tempfile::tempdir().unwrap();
@@ -5247,6 +5387,81 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn mixed_migration_quarantines_owned_alias_and_ownerless_physical_history() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = normalize_physical_path(directory.path());
+        let first_dir = root.join("first");
+        let second_dir = root.join("second");
+        let alias = root.join("alias");
+        std::fs::create_dir(&first_dir).unwrap();
+        std::fs::create_dir(&second_dir).unwrap();
+        let first_raw = first_dir.join("photo.ARW");
+        let second_raw = second_dir.join("photo.ARW");
+        let identity = write_equal_identity_raws(&first_raw, &second_raw);
+        symlink(&first_dir, &alias).unwrap();
+        let aliased_raw = alias.join("photo.ARW");
+        let aliased_owner = aliased_raw.with_extension("xmp");
+        let database_path = root.join("inverse-mixed-owner-history.db");
+        {
+            let db = Db::open(&database_path).unwrap();
+            remove_v8_marker_and_fence(&db.conn);
+            db.conn
+                .execute(
+                    "DELETE FROM viewr_schema_migrations WHERE name = ?1",
+                    [RATING_GENERATION_MIGRATION],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO images
+                        (path, size, mtime_ns, rating, sidecar_dirty,
+                         sidecar_owner, owner_key_version)
+                     VALUES
+                        (?1, ?2, ?3, 1, 1, NULL, 0),
+                        (?4, ?2, ?3, 5, 1, ?5, 0)",
+                    rusqlite::params![
+                        path_value(&first_raw),
+                        identity.0,
+                        identity.1,
+                        path_value(&aliased_raw),
+                        path_value(&aliased_owner),
+                    ],
+                )
+                .unwrap();
+        }
+
+        std::fs::remove_file(&alias).unwrap();
+        symlink(&second_dir, &alias).unwrap();
+        let db = Db::open(&database_path).unwrap();
+
+        assert!(db.pending_sidecars().unwrap().is_empty());
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM quarantined_legacy_ratings",
+                    [],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+            2,
+            "owned alias ambiguity must carry into ownerless-row migration"
+        );
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM images", [], |row| {
+                    row.get::<_, usize>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert!(!first_dir.join("photo.xmp").exists());
+        assert!(!second_dir.join("photo.xmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn owner_key_migration_discards_clean_alias_retarget_with_equal_identity() {
         use std::os::unix::fs::symlink;
 
@@ -5298,6 +5513,78 @@ mod tests {
             "clean fallback state is discarded rather than quarantined"
         );
         assert!(!second_dir.join("photo.xmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_key_migration_clean_removed_alias_blocks_dirty_same_name_recovery() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = normalize_physical_path(directory.path());
+        let physical = root.join("physical");
+        let alias = root.join("alias");
+        std::fs::create_dir(&physical).unwrap();
+        let dirty_raw = physical.join("photo.ARW");
+        let clean_raw = physical.join("photo.DNG");
+        std::fs::write(&dirty_raw, b"dirty raw").unwrap();
+        std::fs::write(&clean_raw, b"clean raw").unwrap();
+        symlink(&physical, &alias).unwrap();
+        let clean_alias = alias.join("photo.DNG");
+        let dirty_identity = file_identity(&dirty_raw);
+        let clean_identity = file_identity(&clean_raw);
+        let database_path = root.join("owned-removed-clean-alias.db");
+        {
+            let db = Db::open(&database_path).unwrap();
+            remove_v8_marker_and_fence(&db.conn);
+            db.conn
+                .execute(
+                    "INSERT INTO images
+                        (path, size, mtime_ns, rating, sidecar_dirty,
+                         sidecar_owner, owner_key_version)
+                     VALUES
+                        (?1, ?2, ?3, 1, 1, ?4, 0),
+                        (?5, ?6, ?7, 5, 0, ?8, 0)",
+                    rusqlite::params![
+                        path_value(&dirty_raw),
+                        dirty_identity.0,
+                        dirty_identity.1,
+                        path_value(&dirty_raw.with_extension("xmp")),
+                        path_value(&clean_alias),
+                        clean_identity.0,
+                        clean_identity.1,
+                        path_value(&clean_alias.with_extension("xmp")),
+                    ],
+                )
+                .unwrap();
+        }
+
+        std::fs::remove_file(&alias).unwrap();
+        let db = Db::open(&database_path).unwrap();
+
+        assert!(db.pending_sidecars().unwrap().is_empty());
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM images", [], |row| {
+                    row.get::<_, usize>(0)
+                })
+                .unwrap(),
+            0,
+            "the unresolved clean alias makes the dirty owner history unordered"
+        );
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT rating
+                       FROM quarantined_legacy_ratings
+                      WHERE path = ?1",
+                    [path_value(&dirty_raw)],
+                    |row| row.get::<_, u8>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert!(!physical.join("photo.xmp").exists());
     }
 
     #[test]
@@ -6627,52 +6914,60 @@ mod tests {
     #[test]
     fn independent_processes_share_one_sidecar_owner() {
         const WRITERS: usize = 8;
+        const ROUNDS: usize = 4;
 
         let directory = tempfile::tempdir().unwrap();
-        let database_path = directory.path().join("multi-process.db");
         let arw = directory.path().join("photo.ARW");
         let dng = directory.path().join("photo.DNG");
-        let gate_path = directory.path().join("start-writers");
         std::fs::write(&arw, b"raw").unwrap();
         std::fs::write(&dng, b"raw").unwrap();
         let executable = std::env::current_exe().unwrap();
-        let mut children = (0..WRITERS)
-            .map(|index| {
-                std::process::Command::new(&executable)
-                    .args([
-                        "--exact",
-                        "db::tests::multi_process_owner_writer_helper",
-                        "--nocapture",
-                    ])
-                    .env("VIEWR_TEST_WRITER_DATABASE", &database_path)
-                    .env(
-                        "VIEWR_TEST_WRITER_RAW",
-                        if index % 2 == 0 { &arw } else { &dng },
-                    )
-                    .env("VIEWR_TEST_WRITER_GATE", &gate_path)
-                    .env("VIEWR_TEST_WRITER_RATING", ((index % 5) + 1).to_string())
-                    .spawn()
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        std::fs::write(&gate_path, b"go").unwrap();
-        for child in &mut children {
-            assert!(child.wait().unwrap().success());
-        }
+        for round in 0..ROUNDS {
+            let database_path = directory.path().join(format!("multi-process-{round}.db"));
+            let gate_path = directory.path().join(format!("start-writers-{round}"));
+            let mut children = (0..WRITERS)
+                .map(|index| {
+                    std::process::Command::new(&executable)
+                        .args([
+                            "--exact",
+                            "db::tests::multi_process_owner_writer_helper",
+                            "--nocapture",
+                        ])
+                        .env("VIEWR_TEST_WRITER_DATABASE", &database_path)
+                        .env(
+                            "VIEWR_TEST_WRITER_RAW",
+                            if index % 2 == 0 { &arw } else { &dng },
+                        )
+                        .env("VIEWR_TEST_WRITER_GATE", &gate_path)
+                        .env("VIEWR_TEST_WRITER_RATING", ((index % 5) + 1).to_string())
+                        .spawn()
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            std::fs::write(&gate_path, b"go").unwrap();
+            let statuses = children
+                .iter_mut()
+                .map(|child| child.wait().unwrap())
+                .collect::<Vec<_>>();
+            assert!(
+                statuses.iter().all(std::process::ExitStatus::success),
+                "round {round} child statuses: {statuses:?}"
+            );
 
-        let db = Db::open(&database_path).unwrap();
-        let active_rows = db
-            .conn
-            .query_row(
-                "SELECT COUNT(*)
-                   FROM images
-                  WHERE sidecar_quarantined = 0",
-                [],
-                |row| row.get::<_, usize>(0),
-            )
-            .unwrap();
-        assert_eq!(active_rows, 1);
-        assert_eq!(db.pending_sidecars().unwrap().len(), 1);
+            let db = Db::open(&database_path).unwrap();
+            let active_rows = db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*)
+                       FROM images
+                      WHERE sidecar_quarantined = 0",
+                    [],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap();
+            assert_eq!(active_rows, 1);
+            assert_eq!(db.pending_sidecars().unwrap().len(), 1);
+        }
     }
 
     #[cfg(unix)]

@@ -66,11 +66,14 @@ enum Cmd {
 ///
 /// [`set_rating`](Self::set_rating) queues the update on a dedicated thread,
 /// which attempts to journal it and coalesces repeated changes to the same RAW
-/// before writing its XMP sidecar. The optional SQLite database is an
-/// accelerator and crash-recovery journal; sidecars remain the interoperable
-/// source of truth. Dropping the service makes a bounded sequence of
-/// best-effort flush attempts and joins its worker. A failed sidecar remains
-/// recoverable on restart only if its dirty database journal write succeeded.
+/// before writing its XMP sidecar. When a platform database path is configured,
+/// SQLite is the publication authority: updates wait for a successful journal
+/// write instead of bypassing an unavailable database. Systems without a
+/// platform configuration directory use explicit database-free XMP
+/// persistence. Sidecars remain the interoperable representation. Dropping
+/// the service makes a bounded sequence of best-effort flush attempts and
+/// joins its worker. A failed sidecar remains recoverable on restart only if
+/// its dirty database journal write succeeded.
 pub struct Library {
     tx: Sender<Cmd>,
     worker: Option<JoinHandle<()>>,
@@ -183,7 +186,7 @@ fn resolve_rating_snapshot(
     for row in snapshot.by_path.values() {
         if snapshot.legacy_owners_require_derivation
             && (normalize_physical_path(&row.path) != row.path
-                || (row.sidecar_dirty && sidecar_owner_key(&row.path).is_err()))
+                || sidecar_owner_key(&row.path).is_err())
         {
             // Legacy schemas did not retain proof of the physical owner seen
             // when a path-spelled rating was accepted. An alias can since
@@ -1600,6 +1603,64 @@ mod tests {
             load_ratings(&[first, second], Some(&db)),
             HashMap::from([(0, 2)]),
             "unordered legacy path histories must not override either current sidecar owner"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removed_clean_legacy_alias_suppresses_same_name_dirty_fallback() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let physical = directory.path().join("physical");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&physical).unwrap();
+        let dirty = entry(physical.join("photo.ARW"));
+        let clean = entry(physical.join("photo.DNG"));
+        xmp::write_rating(&dirty.sidecar_path(), 2).unwrap();
+        symlink(&physical, &alias).unwrap();
+        let clean_alias = alias.join("photo.DNG");
+        let database_path = directory.path().join("removed-clean-alias.db");
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE images (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO images
+                    (path, size, mtime_ns, rating, sidecar_mtime_ns,
+                     sidecar_dirty, last_seen)
+                 VALUES
+                    (?1, ?2, ?3, 1, 0, 1, 1),
+                    (?4, ?5, ?6, 5, 10, 0, 2)",
+                rusqlite::params![
+                    dirty.path.to_str().unwrap(),
+                    dirty.size,
+                    dirty.mtime_ns,
+                    clean_alias.to_str().unwrap(),
+                    clean.size,
+                    clean.mtime_ns,
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        std::fs::remove_file(&alias).unwrap();
+        let db = Db::try_open_for_read(&database_path).unwrap().unwrap();
+
+        assert_eq!(
+            load_ratings(std::slice::from_ref(&dirty), Some(&db)),
+            HashMap::from([(0, 2)]),
+            "an unresolved clean history must prevent an unordered dirty fallback"
         );
     }
 

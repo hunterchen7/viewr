@@ -7,11 +7,14 @@
 //! graphics textures on its own thread. Developed images can also pass through
 //! [`cache_disk::DiskCache`] so a cache hit can avoid repeating RAW work.
 //!
-//! Ratings use Lightroom-compatible XMP sidecars. When its optional SQLite
-//! database is available, [`library::Library`] attempts to journal a new rating
-//! before it debounces the sidecar write. A successful dirty journal entry lets
-//! a later launch resume an interrupted sidecar write. Cache and persistence
-//! I/O are best-effort where their APIs document suppressed errors.
+//! Ratings use Lightroom-compatible XMP sidecars. When a platform database path
+//! is configured, [`library::Library`] treats SQLite as the publication
+//! authority and journals a new rating before it debounces the sidecar write.
+//! It does not bypass an unavailable configured database. A successful dirty
+//! journal entry lets a later launch resume an interrupted sidecar write.
+//! Systems without a platform configuration directory use explicit
+//! database-free XMP persistence. Cache and persistence I/O are best-effort
+//! where their APIs document suppressed errors.
 //!
 //! # Planning example
 //!
