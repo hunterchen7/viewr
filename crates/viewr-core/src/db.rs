@@ -5,9 +5,11 @@
 //! container reads. Each [`Db`] owns one connection; startup reads and the
 //! persistence worker may use separate instances.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-use rusqlite::Connection;
+use rusqlite::types::{Type, Value, ValueRef};
+use rusqlite::{Connection, Row};
 
 #[derive(Debug, thiserror::Error)]
 /// Failure while opening, migrating, or updating the metadata database.
@@ -29,6 +31,10 @@ pub struct Db {
 #[derive(Debug, Clone, Default)]
 /// Rating state mirrored for one RAW path.
 pub struct ImageRow {
+    /// RAW size captured when this row was last updated.
+    pub size: u64,
+    /// RAW modification time captured when this row was last updated.
+    pub mtime_ns: i64,
     /// Last recorded rating, normally in `0..=5`.
     pub rating: Option<u8>,
     /// Modification time of the sidecar represented by this row, or zero when
@@ -83,22 +89,26 @@ impl Db {
         Ok(Self { conn })
     }
 
-    /// Looks up a row by its database path string.
+    /// Looks up a row by its native filesystem path.
     ///
     /// Missing rows and SQLite prepare/query failures both return `None`. This
     /// makes the database a best-effort metadata accelerator rather than a
     /// requirement for opening a photo folder.
-    pub fn get_image(&self, path: &str) -> Option<ImageRow> {
+    pub fn get_image(&self, path: &Path) -> Option<ImageRow> {
         self.conn
             .prepare_cached(
-                "SELECT rating, sidecar_mtime_ns, sidecar_dirty FROM images WHERE path = ?1",
+                "SELECT size, mtime_ns, rating, sidecar_mtime_ns, sidecar_dirty
+                   FROM images
+                  WHERE path = ?1",
             )
             .ok()?
-            .query_row([path], |row| {
+            .query_row([path_value(path)], |row| {
                 Ok(ImageRow {
-                    rating: row.get::<_, Option<u8>>(0)?,
-                    sidecar_mtime_ns: row.get(1)?,
-                    sidecar_dirty: row.get(2)?,
+                    size: row.get(0)?,
+                    mtime_ns: row.get(1)?,
+                    rating: row.get::<_, Option<u8>>(2)?,
+                    sidecar_mtime_ns: row.get(3)?,
+                    sidecar_dirty: row.get(4)?,
                 })
             })
             .ok()
@@ -114,7 +124,7 @@ impl Db {
     /// Returns [`DbError::Sqlite`] when the insert or update fails.
     pub fn upsert_rating(
         &self,
-        path: &str,
+        path: &Path,
         size: u64,
         mtime_ns: i64,
         rating: Option<u8>,
@@ -134,7 +144,7 @@ impl Db {
                last_seen = excluded.last_seen",
             )?
             .execute(rusqlite::params![
-                path,
+                path_value(path),
                 size,
                 mtime_ns,
                 rating,
@@ -153,7 +163,7 @@ impl Db {
     /// update fails.
     pub fn record_rating_pending_sidecar(
         &self,
-        path: &str,
+        path: &Path,
         size: u64,
         mtime_ns: i64,
         rating: u8,
@@ -170,7 +180,7 @@ impl Db {
                sidecar_dirty = 1,
                last_seen = excluded.last_seen",
             )?
-            .execute(rusqlite::params![path, size, mtime_ns, rating])?;
+            .execute(rusqlite::params![path_value(path), size, mtime_ns, rating])?;
         Ok(())
     }
 
@@ -188,13 +198,80 @@ impl Db {
         )?;
         let rows = statement.query_map([], |row| {
             Ok(PendingSidecar {
-                path: PathBuf::from(row.get::<_, String>(0)?),
+                path: row_path(row, 0)?,
                 size: row.get(1)?,
                 mtime_ns: row.get(2)?,
                 rating: row.get(3)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+}
+
+fn path_value(path: &Path) -> Value {
+    match path.to_str() {
+        Some(path) => Value::Text(path.to_owned()),
+        None => Value::Blob(encode_native_path(path.as_os_str())),
+    }
+}
+
+#[cfg(unix)]
+fn encode_native_path(path: &OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    path.as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn encode_native_path(path: &OsStr) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    path.encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>()
+}
+
+#[cfg(unix)]
+fn decode_native_path(bytes: &[u8]) -> Option<OsString> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    Some(OsString::from_vec(bytes.to_vec()))
+}
+
+#[cfg(windows)]
+fn decode_native_path(bytes: &[u8]) -> Option<OsString> {
+    use std::os::windows::ffi::OsStringExt as _;
+
+    let chunks = bytes.chunks_exact(2);
+    if !chunks.remainder().is_empty() {
+        return None;
+    }
+    Some(OsString::from_wide(
+        &chunks
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>(),
+    ))
+}
+
+fn row_path(row: &Row<'_>, column: usize) -> rusqlite::Result<PathBuf> {
+    match row.get_ref(column)? {
+        ValueRef::Text(bytes) => std::str::from_utf8(bytes)
+            .map(PathBuf::from)
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
+            }),
+        ValueRef::Blob(bytes) => decode_native_path(bytes).map(PathBuf::from).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                column,
+                Type::Blob,
+                "invalid native path encoding".into(),
+            )
+        }),
+        value => Err(rusqlite::Error::InvalidColumnType(
+            column,
+            "path".to_owned(),
+            value.data_type(),
+        )),
     }
 }
 
@@ -244,15 +321,17 @@ mod tests {
     #[test]
     fn upsert_and_read_rating() {
         let db = Db::open_in_memory().unwrap();
-        db.upsert_rating("/p/a.arw", 10, 1, Some(4), 99).unwrap();
-        let row = db.get_image("/p/a.arw").unwrap();
+        let path = Path::new("/p/a.arw");
+        db.upsert_rating(path, 10, 1, Some(4), 99).unwrap();
+        let row = db.get_image(path).unwrap();
+        assert_eq!(row.size, 10);
+        assert_eq!(row.mtime_ns, 1);
         assert_eq!(row.rating, Some(4));
         assert_eq!(row.sidecar_mtime_ns, 99);
         assert!(!row.sidecar_dirty);
 
-        db.record_rating_pending_sidecar("/p/a.arw", 10, 1, 5)
-            .unwrap();
-        let row = db.get_image("/p/a.arw").unwrap();
+        db.record_rating_pending_sidecar(path, 10, 1, 5).unwrap();
+        let row = db.get_image(path).unwrap();
         assert_eq!(row.rating, Some(5));
         assert_eq!(row.sidecar_mtime_ns, 99);
         assert!(row.sidecar_dirty);
@@ -266,13 +345,13 @@ mod tests {
             }]
         );
 
-        db.upsert_rating("/p/a.arw", 10, 1, Some(2), 100).unwrap();
-        let row = db.get_image("/p/a.arw").unwrap();
+        db.upsert_rating(path, 10, 1, Some(2), 100).unwrap();
+        let row = db.get_image(path).unwrap();
         assert_eq!(row.rating, Some(2));
         assert_eq!(row.sidecar_mtime_ns, 100);
         assert!(!row.sidecar_dirty);
         assert!(db.pending_sidecars().unwrap().is_empty());
-        assert!(db.get_image("/p/other.arw").is_none());
+        assert!(db.get_image(Path::new("/p/other.arw")).is_none());
     }
 
     #[test]
@@ -282,22 +361,24 @@ mod tests {
 
         {
             let db = Db::open(&path).unwrap();
-            db.upsert_rating("/p/persistent.arw", 42, 7, Some(5), 123)
+            db.upsert_rating(Path::new("/p/persistent.arw"), 42, 7, Some(5), 123)
                 .unwrap();
         }
 
         {
             let db = Db::open(&path).unwrap();
-            let row = db.get_image("/p/persistent.arw").unwrap();
+            let row = db.get_image(Path::new("/p/persistent.arw")).unwrap();
             assert_eq!(row.rating, Some(5));
             assert_eq!(row.sidecar_mtime_ns, 123);
             assert!(!row.sidecar_dirty);
-            db.upsert_rating("/p/persistent.arw", 84, 8, None, 456)
+            db.upsert_rating(Path::new("/p/persistent.arw"), 84, 8, None, 456)
                 .unwrap();
         }
 
         let db = Db::open(&path).unwrap();
-        let row = db.get_image("/p/persistent.arw").unwrap();
+        let row = db.get_image(Path::new("/p/persistent.arw")).unwrap();
+        assert_eq!(row.size, 84);
+        assert_eq!(row.mtime_ns, 8);
         assert_eq!(row.rating, None);
         assert_eq!(row.sidecar_mtime_ns, 456);
         assert!(!row.sidecar_dirty);
@@ -327,18 +408,54 @@ mod tests {
 
         {
             let db = Db::open(&path).unwrap();
-            let row = db.get_image("/p/legacy.arw").unwrap();
+            let row = db.get_image(Path::new("/p/legacy.arw")).unwrap();
             assert_eq!(row.rating, Some(3));
             assert_eq!(row.sidecar_mtime_ns, 123);
             assert!(!row.sidecar_dirty);
-            db.record_rating_pending_sidecar("/p/legacy.arw", 42, 7, 4)
+            db.record_rating_pending_sidecar(Path::new("/p/legacy.arw"), 42, 7, 4)
                 .unwrap();
         }
 
         let db = Db::open(&path).unwrap();
-        let row = db.get_image("/p/legacy.arw").unwrap();
+        let row = db.get_image(Path::new("/p/legacy.arw")).unwrap();
         assert_eq!(row.rating, Some(4));
         assert_eq!(row.sidecar_mtime_ns, 123);
         assert!(row.sidecar_dirty);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_paths_round_trip_without_lossy_collisions() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let db = Db::open_in_memory().unwrap();
+        let first = PathBuf::from(OsString::from_vec(b"/p/photo-\x80.arw".to_vec()));
+        let second = PathBuf::from(OsString::from_vec(b"/p/photo-\x81.arw".to_vec()));
+        assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+
+        db.record_rating_pending_sidecar(&first, 10, 1, 3).unwrap();
+        db.record_rating_pending_sidecar(&second, 20, 2, 5).unwrap();
+
+        assert_eq!(db.get_image(&first).unwrap().rating, Some(3));
+        assert_eq!(db.get_image(&second).unwrap().rating, Some(5));
+        let mut pending = db.pending_sidecars().unwrap();
+        pending.sort_by(|a, b| a.size.cmp(&b.size));
+        assert_eq!(
+            pending,
+            vec![
+                PendingSidecar {
+                    path: first,
+                    size: 10,
+                    mtime_ns: 1,
+                    rating: 3,
+                },
+                PendingSidecar {
+                    path: second,
+                    size: 20,
+                    mtime_ns: 2,
+                    rating: 5,
+                },
+            ]
+        );
     }
 }

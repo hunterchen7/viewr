@@ -67,7 +67,9 @@ pub fn load_ratings(entries: &[FolderEntry], db: Option<&Db>) -> HashMap<usize, 
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_nanos() as i64);
-        let row = db.and_then(|db| db.get_image(&entry.path.to_string_lossy()));
+        let row = db
+            .and_then(|db| db.get_image(&entry.path))
+            .filter(|row| row.size == entry.size && row.mtime_ns == entry.mtime_ns);
 
         // A dirty row is a database rating that has not reached its sidecar.
         // It must win even when the old sidecar has an equal or newer mtime.
@@ -215,16 +217,14 @@ fn persist_thread(rx: &Receiver<Cmd>, db: Option<&Db>, debounce: Duration) {
                 // Commit the rating and dirty marker together before the
                 // debounced sidecar write. A restart can then recover both the
                 // rating precedence and the unfinished sidecar operation.
-                if let Some(db) = &db {
-                    let key = path.to_string_lossy().into_owned();
-                    if let Err(error) =
-                        db.record_rating_pending_sidecar(&key, size, mtime_ns, rating)
-                    {
-                        eprintln!(
-                            "rating database write failed for {}: {error}",
-                            path.display()
-                        );
-                    }
+                if let Some(db) = &db
+                    && let Err(error) =
+                        db.record_rating_pending_sidecar(&path, size, mtime_ns, rating)
+                {
+                    eprintln!(
+                        "rating database write failed for {}: {error}",
+                        path.display()
+                    );
                 }
                 pending.insert(
                     path,
@@ -281,13 +281,7 @@ fn flush_due(pending: &mut HashMap<PathBuf, Pending>, db: Option<&Db>, all: bool
             continue;
         };
         if let Some(db) = db
-            && let Err(error) = db.upsert_rating(
-                &path.to_string_lossy(),
-                p.size,
-                p.mtime_ns,
-                Some(p.rating),
-                mtime,
-            )
+            && let Err(error) = db.upsert_rating(&path, p.size, p.mtime_ns, Some(p.rating), mtime)
         {
             eprintln!(
                 "rating database sync failed for {}: {error}",
@@ -338,7 +332,7 @@ mod tests {
 
     fn put_db_rating(db: &Db, entry: &FolderEntry, rating: Option<u8>, sidecar_mtime_ns: i64) {
         db.upsert_rating(
-            &entry.path.to_string_lossy(),
+            &entry.path,
             entry.size,
             entry.mtime_ns,
             rating,
@@ -382,6 +376,32 @@ mod tests {
     }
 
     #[test]
+    fn load_ratings_ignores_database_rows_for_a_replaced_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = entry(dir.path().join("replaced.ARW"));
+        let db = Db::open_in_memory().unwrap();
+
+        xmp::write_rating(&entry.sidecar_path(), 2).unwrap();
+        db.record_rating_pending_sidecar(
+            &entry.path,
+            entry.size.saturating_add(1),
+            entry.mtime_ns,
+            5,
+        )
+        .unwrap();
+
+        // A dirty rating for an older file at the same path must neither
+        // suppress nor replace the current file's sidecar rating.
+        assert_eq!(
+            load_ratings(std::slice::from_ref(&entry), Some(&db)),
+            HashMap::from([(0, 2)])
+        );
+
+        std::fs::remove_file(entry.sidecar_path()).unwrap();
+        assert!(load_ratings(&[entry], Some(&db)).is_empty());
+    }
+
+    #[test]
     fn flush_waits_for_coalesced_sidecar_and_database_writes() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("viewr.db");
@@ -397,7 +417,7 @@ mod tests {
         assert!(!entry.sidecar_path().with_extension("xmp.tmp").exists());
         let db = Db::open(&db_path).unwrap();
         let row = db
-            .get_image(&entry.path.to_string_lossy())
+            .get_image(&entry.path)
             .expect("flush must make the DB row visible");
         assert_eq!(row.rating, Some(2));
         assert!(row.sidecar_mtime_ns > 0);
@@ -427,15 +447,8 @@ mod tests {
 
         assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(4));
         let db = Db::open(&db_path).unwrap();
-        assert_eq!(
-            db.get_image(&entry.path.to_string_lossy()).unwrap().rating,
-            Some(4)
-        );
-        assert!(
-            !db.get_image(&entry.path.to_string_lossy())
-                .unwrap()
-                .sidecar_dirty
-        );
+        assert_eq!(db.get_image(&entry.path).unwrap().rating, Some(4));
+        assert!(!db.get_image(&entry.path).unwrap().sidecar_dirty);
     }
 
     #[test]
@@ -449,17 +462,12 @@ mod tests {
         {
             let db = Db::open(&db_path).unwrap();
             put_db_rating(&db, &entry, Some(2), original_sidecar_mtime);
-            db.record_rating_pending_sidecar(
-                &entry.path.to_string_lossy(),
-                entry.size,
-                entry.mtime_ns,
-                5,
-            )
-            .unwrap();
+            db.record_rating_pending_sidecar(&entry.path, entry.size, entry.mtime_ns, 5)
+                .unwrap();
         }
 
         let db = Db::open(&db_path).unwrap();
-        let row = db.get_image(&entry.path.to_string_lossy()).unwrap();
+        let row = db.get_image(&entry.path).unwrap();
         assert_eq!(row.rating, Some(5));
         assert_eq!(row.sidecar_mtime_ns, original_sidecar_mtime);
         assert!(row.sidecar_dirty);
@@ -476,13 +484,8 @@ mod tests {
         {
             let db = Db::open(&db_path).unwrap();
             put_db_rating(&db, &entry, Some(1), sidecar_mtime(&entry));
-            db.record_rating_pending_sidecar(
-                &entry.path.to_string_lossy(),
-                entry.size,
-                entry.mtime_ns,
-                4,
-            )
-            .unwrap();
+            db.record_rating_pending_sidecar(&entry.path, entry.size, entry.mtime_ns, 4)
+                .unwrap();
         }
 
         {
@@ -492,7 +495,7 @@ mod tests {
 
         assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(4));
         let db = Db::open(&db_path).unwrap();
-        let row = db.get_image(&entry.path.to_string_lossy()).unwrap();
+        let row = db.get_image(&entry.path).unwrap();
         assert_eq!(row.rating, Some(4));
         assert!(!row.sidecar_dirty);
         assert!(db.pending_sidecars().unwrap().is_empty());
@@ -517,7 +520,7 @@ mod tests {
         assert!(library.dirty.load(Ordering::Acquire));
         assert!(!entry.sidecar_path().exists());
         let db = Db::open(&db_path).unwrap();
-        let row = db.get_image(&entry.path.to_string_lossy()).unwrap();
+        let row = db.get_image(&entry.path).unwrap();
         assert_eq!(row.rating, Some(3));
         assert!(row.sidecar_dirty);
         drop(db);
@@ -528,10 +531,6 @@ mod tests {
         assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(3));
         assert!(!library.dirty.load(Ordering::Acquire));
         let db = Db::open(&db_path).unwrap();
-        assert!(
-            !db.get_image(&entry.path.to_string_lossy())
-                .unwrap()
-                .sidecar_dirty
-        );
+        assert!(!db.get_image(&entry.path).unwrap().sidecar_dirty);
     }
 }
