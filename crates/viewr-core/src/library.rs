@@ -429,10 +429,11 @@ fn flush_due(
         let Some(mut p) = pending.remove(&queued_key) else {
             continue;
         };
-        let path = p.path.clone();
+        let mut path = p.path.clone();
         let mut owner = queued_key;
         if !p.owner_resolved {
-            match sidecar_owner_key(&path) {
+            let resolved_path = normalize_physical_path(&path);
+            match sidecar_owner_key(&resolved_path) {
                 Ok(resolved_owner) => {
                     if latest_sequence_by_owner
                         .get(&resolved_owner)
@@ -456,6 +457,8 @@ fn flush_due(
                     }
                     latest_sequence_by_owner.insert(resolved_owner.clone(), p.sequence);
                     owner = resolved_owner;
+                    path = resolved_path;
+                    p.path = path.clone();
                     p.owner_resolved = true;
                 }
                 Err(error) => {
@@ -1193,6 +1196,40 @@ mod tests {
         older.flush();
 
         assert_eq!(xmp::read_rating(&direct.sidecar_path()), Some(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unresolved_owner_survives_an_unrelated_database_rating() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let physical_dir = dir.path().join("physical");
+        let unresolved_alias = dir.path().join("alias");
+        std::fs::create_dir(&physical_dir).unwrap();
+        let eventual = entry(physical_dir.join("eventual.ARW"));
+        let unrelated = entry(physical_dir.join("unrelated.ARW"));
+        let unresolved_entry = FolderEntry {
+            path: unresolved_alias.join("eventual.ARW"),
+            file_name: eventual.file_name.clone(),
+            size: eventual.size,
+            mtime_ns: eventual.mtime_ns,
+        };
+        let db_path = dir.path().join("viewr.db");
+        let library = Library::start_with(Some(db_path), Duration::from_secs(60));
+        worker_barrier(&library);
+
+        library.set_rating(&unresolved_entry, 1);
+        worker_barrier(&library);
+        library.set_rating(&unrelated, 5);
+        library.flush();
+        assert_eq!(xmp::read_rating(&unrelated.sidecar_path()), Some(5));
+
+        symlink(&physical_dir, &unresolved_alias).unwrap();
+        library.flush();
+
+        assert_eq!(xmp::read_rating(&eventual.sidecar_path()), Some(1));
+        assert_eq!(xmp::read_rating(&unrelated.sidecar_path()), Some(5));
     }
 
     #[cfg(unix)]

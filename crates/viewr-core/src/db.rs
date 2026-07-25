@@ -5,6 +5,7 @@
 //! container reads. Each [`Db`] owns one connection; startup reads and the
 //! persistence worker may use separate instances.
 
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
@@ -13,7 +14,8 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, Transaction, Trans
 
 use crate::folder::{normalize_physical_path, sidecar_owner_key};
 
-const RATING_GENERATION_MIGRATION: &str = "rating-generation-and-owner-v6";
+const RATING_GENERATION_MIGRATION: &str = "rating-generation-and-owner-v7";
+const RATING_READ_COMPATIBILITY_MIGRATION: &str = "rating-generation-and-owner-v6";
 const DATABASE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const DATABASE_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
 
@@ -137,7 +139,7 @@ impl Db {
         Self::open_with_timeout(path, DATABASE_LOCK_TIMEOUT)
     }
 
-    /// Opens an already-current schema read-only without waiting or migrating.
+    /// Opens a read-compatible schema without waiting or migrating.
     ///
     /// This is intended for best-effort reads on a latency-sensitive caller.
     /// Persistence workers should use [`Db::open`] so they can queue behind a
@@ -151,7 +153,9 @@ impl Db {
     pub fn try_open_for_read(path: &Path) -> Result<Self, DbError> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.busy_timeout(std::time::Duration::ZERO)?;
-        if !migration_is_complete(&conn, RATING_GENERATION_MIGRATION)? {
+        if !migration_is_complete(&conn, RATING_GENERATION_MIGRATION)?
+            && !migration_is_complete(&conn, RATING_READ_COMPATIBILITY_MIGRATION)?
+        {
             return Err(DbError::SchemaNotReady);
         }
         Ok(Self { conn })
@@ -428,7 +432,7 @@ impl Db {
         let path = normalize_physical_path(path);
         let owner = sidecar_owner_key(&path)?;
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        if rating_global_snapshot_on(&transaction)? != predecessor {
+        if sidecar_owner_last_global_revision_on(&transaction, &owner)? > predecessor.0 {
             transaction.rollback()?;
             return Ok(false);
         }
@@ -669,18 +673,21 @@ fn advance_sidecar_owner_revision(
     conn: &Connection,
     sidecar_owner: &Path,
 ) -> Result<(), rusqlite::Error> {
-    conn.execute(
-        "INSERT INTO sidecar_owner_revisions (owner, revision)
-         VALUES (?1, 1)
-         ON CONFLICT(owner) DO UPDATE SET
-            revision = sidecar_owner_revisions.revision + 1",
-        [path_value(sidecar_owner)],
-    )?;
-    conn.execute(
+    let global_revision = conn.query_row(
         "UPDATE rating_global_revision
             SET revision = revision + 1
-          WHERE singleton = 1",
+          WHERE singleton = 1
+        RETURNING revision",
         [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    conn.execute(
+        "INSERT INTO sidecar_owner_revisions (owner, revision, global_revision)
+         VALUES (?1, 1, ?2)
+         ON CONFLICT(owner) DO UPDATE SET
+            revision = sidecar_owner_revisions.revision + 1,
+            global_revision = excluded.global_revision",
+        rusqlite::params![path_value(sidecar_owner), global_revision],
     )?;
     Ok(())
 }
@@ -710,6 +717,22 @@ fn sidecar_owner_revision_on(conn: &Connection, owner: &Path) -> Result<i64, rus
     conn.query_row(
         "SELECT COALESCE(
              (SELECT revision
+                FROM sidecar_owner_revisions
+               WHERE owner = ?1),
+             0
+         )",
+        [path_value(owner)],
+        |row| row.get(0),
+    )
+}
+
+fn sidecar_owner_last_global_revision_on(
+    conn: &Connection,
+    owner: &Path,
+) -> Result<i64, rusqlite::Error> {
+    conn.query_row(
+        "SELECT COALESCE(
+             (SELECT global_revision
                 FROM sidecar_owner_revisions
                WHERE owner = ?1),
              0
@@ -908,6 +931,132 @@ fn row_path(row: &Row<'_>, column: usize) -> rusqlite::Result<PathBuf> {
     }
 }
 
+fn migrate_legacy_dirty_ratings(conn: &Connection) -> Result<(usize, usize), rusqlite::Error> {
+    #[derive(Debug)]
+    struct LegacyDirty {
+        path: PathBuf,
+        size: u64,
+        mtime_ns: i64,
+        dirty: bool,
+        has_rating: bool,
+    }
+
+    let existing_owner_paths = {
+        let mut statement = conn.prepare(
+            "SELECT sidecar_owner, path
+               FROM images
+              WHERE sidecar_owner IS NOT NULL",
+        )?;
+        statement
+            .query_map([], |row| Ok((row_path(row, 0)?, row_path(row, 1)?)))?
+            .collect::<Result<HashMap<_, _>, _>>()?
+    };
+    let rows = {
+        let mut statement = conn.prepare(
+            "SELECT path, size, mtime_ns, sidecar_dirty, rating IS NOT NULL
+               FROM images
+              WHERE sidecar_owner IS NULL",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok(LegacyDirty {
+                    path: row_path(row, 0)?,
+                    size: row.get(1)?,
+                    mtime_ns: row.get(2)?,
+                    dirty: row.get(3)?,
+                    has_rating: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    let mut by_owner: HashMap<PathBuf, Vec<LegacyDirty>> = HashMap::new();
+    let mut quarantine = Vec::new();
+    for row in rows {
+        let owner = match sidecar_owner_key(&row.path) {
+            Ok(owner) => owner,
+            Err(_) => {
+                if row.dirty {
+                    quarantine.push(row.path);
+                }
+                continue;
+            }
+        };
+        by_owner.entry(owner).or_default().push(row);
+    }
+
+    let mut recovered = 0;
+    for (owner, mut rows) in by_owner {
+        // A clean alias proves that this owner had another publication
+        // history, while multiple dirty aliases have no cross-path order.
+        // Only a group containing one legacy row total is unambiguous.
+        if rows.len() != 1 {
+            quarantine.extend(rows.into_iter().filter(|row| row.dirty).map(|row| row.path));
+            continue;
+        }
+        let row = rows.pop().expect("single legacy owner row");
+        if !row.dirty {
+            continue;
+        }
+        let identity_matches = std::fs::metadata(&row.path).ok().is_some_and(|metadata| {
+            let mtime_ns = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos() as i64)
+                .unwrap_or(0);
+            metadata.len() == row.size && mtime_ns == row.mtime_ns
+        });
+        if !row.has_rating || !identity_matches {
+            quarantine.push(row.path);
+            continue;
+        }
+        let owner_conflicts = existing_owner_paths
+            .get(&owner)
+            .is_some_and(|path| path != &row.path);
+        if owner_conflicts {
+            quarantine.push(row.path);
+            continue;
+        }
+        let changed = conn.execute(
+            "UPDATE images
+                SET sidecar_owner = ?2
+              WHERE path = ?1
+                AND sidecar_dirty = 1
+                AND sidecar_owner IS NULL",
+            rusqlite::params![path_value(&row.path), path_value(&owner)],
+        )?;
+        if changed == 1 {
+            advance_sidecar_owner_revision(conn, &owner)?;
+            recovered += 1;
+        }
+    }
+
+    let mut quarantined = 0;
+    for path in quarantine {
+        conn.execute(
+            "INSERT OR REPLACE INTO quarantined_legacy_ratings
+                (path, size, mtime_ns, rating, sidecar_mtime_ns, revision,
+                 last_seen, quarantined_at)
+             SELECT path, size, mtime_ns, rating, sidecar_mtime_ns, revision,
+                    last_seen, unixepoch()
+               FROM images
+              WHERE path = ?1
+                AND sidecar_dirty = 1
+                AND sidecar_owner IS NULL",
+            [path_value(&path)],
+        )?;
+        quarantined += conn.execute(
+            "DELETE FROM images
+              WHERE path = ?1
+                AND sidecar_dirty = 1
+                AND sidecar_owner IS NULL",
+            [path_value(&path)],
+        )?;
+    }
+    Ok((recovered, quarantined))
+}
+
 fn initialize_schema(conn: &Connection) -> Result<(), DbError> {
     if migration_is_complete(conn, RATING_GENERATION_MIGRATION)? {
         return Ok(());
@@ -960,11 +1109,10 @@ fn initialize_schema(conn: &Connection) -> Result<(), DbError> {
     if !has_column(&transaction, "images", "sidecar_owner")? {
         transaction.execute("ALTER TABLE images ADD COLUMN sidecar_owner", [])?;
     }
-    // Pre-owner versions accepted path aliases and did not carry a global
-    // order across them. No legacy dirty row can therefore be recovered
-    // without risking a stale sidecar overwrite. Move those rows out of the
-    // live table so even an already-running older process observes that it no
-    // longer owns publication.
+    // Conflicting or unverifiable pre-owner journals cannot be replayed
+    // safely because those versions did not carry a total order across path
+    // aliases. The migration below promotes only identity-valid,
+    // single-owner rows and archives the rest for an explicit re-rating.
     transaction.execute_batch(
         "CREATE TABLE IF NOT EXISTS quarantined_legacy_ratings (
             path PRIMARY KEY,
@@ -977,23 +1125,6 @@ fn initialize_schema(conn: &Connection) -> Result<(), DbError> {
             quarantined_at INTEGER NOT NULL
         ) WITHOUT ROWID;",
     )?;
-    let quarantined = transaction.execute(
-        "INSERT OR REPLACE INTO quarantined_legacy_ratings
-            (path, size, mtime_ns, rating, sidecar_mtime_ns, revision,
-             last_seen, quarantined_at)
-         SELECT path, size, mtime_ns, rating, sidecar_mtime_ns, revision,
-                last_seen, unixepoch()
-           FROM images
-          WHERE sidecar_dirty = 1",
-        [],
-    )?;
-    transaction.execute("DELETE FROM images WHERE sidecar_dirty = 1", [])?;
-    if quarantined > 0 {
-        eprintln!(
-            "quarantined {quarantined} unfinished legacy rating(s); rate those photos again to \
-             publish a sidecar safely"
-        );
-    }
 
     // `images.revision` is the logical rating generation used by delayed
     // compare-and-swap retries. Sidecar completion bookkeeping deliberately
@@ -1008,7 +1139,8 @@ fn initialize_schema(conn: &Connection) -> Result<(), DbError> {
 
         CREATE TABLE IF NOT EXISTS sidecar_owner_revisions (
             owner PRIMARY KEY,
-            revision INTEGER NOT NULL
+            revision INTEGER NOT NULL,
+            global_revision INTEGER NOT NULL DEFAULT 0
         ) WITHOUT ROWID;
 
         CREATE TABLE IF NOT EXISTS rating_global_revision (
@@ -1024,10 +1156,6 @@ fn initialize_schema(conn: &Connection) -> Result<(), DbError> {
          WHERE sidecar_dirty = 1
            AND sidecar_quarantined = 0
            AND rating IS NOT NULL;
-
-        CREATE UNIQUE INDEX IF NOT EXISTS images_sidecar_owners
-            ON images(sidecar_owner)
-         WHERE sidecar_owner IS NOT NULL;
 
         CREATE TRIGGER IF NOT EXISTS images_reject_unowned_dirty_insert
         BEFORE INSERT ON images
@@ -1112,6 +1240,74 @@ fn initialize_schema(conn: &Connection) -> Result<(), DbError> {
 
         DROP TRIGGER IF EXISTS images_revision_after_update;",
     )?;
+    if !has_column(&transaction, "sidecar_owner_revisions", "global_revision")? {
+        transaction.execute(
+            "ALTER TABLE sidecar_owner_revisions
+             ADD COLUMN global_revision INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    // An owner row created before v7 has no per-owner position in the global
+    // order. Treat migration as its latest possible position. This is
+    // conservative for retries captured before the migration and exact for
+    // every snapshot captured afterward.
+    transaction.execute(
+        "UPDATE sidecar_owner_revisions
+            SET global_revision = (
+                    SELECT revision
+                      FROM rating_global_revision
+                     WHERE singleton = 1
+                )
+          WHERE global_revision = 0",
+        [],
+    )?;
+    // v6 updates the owner ledger before the global ledger and does not know
+    // about `global_revision`. These triggers make that still-live SQL shape
+    // visible to v7's per-owner guard. A v7 write supplies a changed nonzero
+    // value after advancing the global row, so it does not take either path.
+    transaction.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS sidecar_owner_v6_insert_order
+         AFTER INSERT ON sidecar_owner_revisions
+         WHEN NEW.global_revision = 0
+         BEGIN
+             UPDATE sidecar_owner_revisions
+                SET global_revision = (
+                        SELECT revision + 1
+                          FROM rating_global_revision
+                         WHERE singleton = 1
+                    )
+              WHERE owner = NEW.owner;
+         END;
+
+         CREATE TRIGGER IF NOT EXISTS sidecar_owner_v6_update_order
+         AFTER UPDATE OF revision ON sidecar_owner_revisions
+         WHEN NEW.global_revision = OLD.global_revision
+         BEGIN
+             UPDATE sidecar_owner_revisions
+                SET global_revision = (
+                        SELECT revision + 1
+                          FROM rating_global_revision
+                         WHERE singleton = 1
+                    )
+              WHERE owner = NEW.owner;
+         END;",
+    )?;
+
+    let (recovered, quarantined) = migrate_legacy_dirty_ratings(&transaction)?;
+    transaction.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS images_sidecar_owners
+            ON images(sidecar_owner)
+         WHERE sidecar_owner IS NOT NULL;",
+    )?;
+    if recovered > 0 {
+        eprintln!("recovered {recovered} unambiguous unfinished legacy rating(s)");
+    }
+    if quarantined > 0 {
+        eprintln!(
+            "quarantined {quarantined} conflicting or unverifiable unfinished legacy rating(s); \
+             rate those photos again to publish a sidecar safely"
+        );
+    }
 
     transaction.execute_batch(
         "CREATE TABLE IF NOT EXISTS viewr_schema_migrations (
@@ -1710,7 +1906,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_durably_quarantines_legacy_dirty_rows() {
+    fn migration_durably_quarantines_unverifiable_legacy_dirty_rows() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy-dirty.db");
         {
@@ -1773,13 +1969,320 @@ mod tests {
                     [],
                 )
                 .is_err(),
-            "an overlapping pre-owner writer must not recreate a live dirty row"
+            "pre-owner SQL must not recreate a live unowned dirty row"
         );
         drop(db);
 
         let reopened = Db::open(&path).unwrap();
         assert!(reopened.get_image("/p/dirty-legacy.arw").is_none());
         assert!(reopened.pending_sidecars().unwrap().is_empty());
+    }
+
+    #[test]
+    fn migration_recovers_an_unambiguous_identity_valid_legacy_rating() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("recoverable-legacy.db");
+        let raw = directory.path().join("recoverable.ARW");
+        std::fs::write(&raw, b"raw").unwrap();
+        let metadata = std::fs::metadata(&raw).unwrap();
+        let mtime_ns = metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE images (
+                    path PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO images
+                    (path, size, mtime_ns, rating, sidecar_mtime_ns,
+                     sidecar_dirty, last_seen)
+                 VALUES (?1, ?2, ?3, 5, 7, 1, 0)",
+                rusqlite::params![path_value(&raw), metadata.len(), mtime_ns],
+            )
+            .unwrap();
+        drop(connection);
+
+        let db = Db::open(&database_path).unwrap();
+
+        assert_eq!(
+            db.pending_sidecars().unwrap(),
+            vec![PendingSidecar {
+                path: raw.clone(),
+                size: metadata.len(),
+                mtime_ns,
+                rating: 5,
+            }]
+        );
+        assert_eq!(
+            db.dirty_rating_for_owner(&sidecar_owner_key(&raw).unwrap())
+                .unwrap()
+                .unwrap()
+                .rating,
+            5
+        );
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM quarantined_legacy_ratings",
+                    [],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn migration_quarantines_a_dirty_owner_with_a_clean_legacy_alias() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("conflicting-legacy.db");
+        let dirty_raw = directory.path().join("photo.ARW");
+        let clean_raw = directory.path().join("photo.DNG");
+        std::fs::write(&dirty_raw, b"raw").unwrap();
+        std::fs::write(&clean_raw, b"dng").unwrap();
+        let identity = |path: &Path| {
+            let metadata = std::fs::metadata(path).unwrap();
+            let mtime_ns = metadata
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as i64;
+            (metadata.len(), mtime_ns)
+        };
+        let dirty_identity = identity(&dirty_raw);
+        let clean_identity = identity(&clean_raw);
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE images (
+                    path PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO images
+                    (path, size, mtime_ns, rating, sidecar_mtime_ns,
+                     sidecar_dirty, last_seen)
+                 VALUES
+                    (?1, ?2, ?3, 1, 0, 1, 1),
+                    (?4, ?5, ?6, 5, 10, 0, 2)",
+                rusqlite::params![
+                    path_value(&dirty_raw),
+                    dirty_identity.0,
+                    dirty_identity.1,
+                    path_value(&clean_raw),
+                    clean_identity.0,
+                    clean_identity.1,
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let db = Db::open(&database_path).unwrap();
+
+        assert!(db.pending_sidecars().unwrap().is_empty());
+        assert!(db.get_image_path(&dirty_raw).is_none());
+        assert_eq!(db.get_image_path(&clean_raw).unwrap().rating, Some(5));
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT rating
+                       FROM quarantined_legacy_ratings
+                      WHERE path = ?1",
+                    [path_value(&dirty_raw)],
+                    |row| row.get::<_, u8>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn owner_ledger_migration_preserves_owned_pending_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("owner-ledger-v6.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE images (
+                    path PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+                    sidecar_quarantined INTEGER NOT NULL DEFAULT 0,
+                    sidecar_owner,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE sidecar_owner_revisions (
+                    owner PRIMARY KEY,
+                    revision INTEGER NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE rating_global_revision (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    revision INTEGER NOT NULL
+                ) WITHOUT ROWID;
+                INSERT INTO rating_global_revision VALUES (1, 7);
+                CREATE TABLE viewr_schema_migrations (
+                    name TEXT PRIMARY KEY
+                ) WITHOUT ROWID;
+                INSERT INTO viewr_schema_migrations
+                VALUES ('rating-generation-and-owner-v6');
+                INSERT INTO images
+                    (path, size, mtime_ns, rating, sidecar_dirty,
+                     sidecar_owner)
+                VALUES
+                    ('/p/owned.arw', 10, 1, 5, 1, '/p/owned.xmp'),
+                    ('/p/legacy.arw', 20, 2, 2, 1, NULL);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let compatible = Db::try_open_for_read(&path).unwrap();
+        assert_eq!(
+            compatible.pending_sidecars().unwrap(),
+            vec![PendingSidecar {
+                path: PathBuf::from("/p/owned.arw"),
+                size: 10,
+                mtime_ns: 1,
+                rating: 5,
+            }]
+        );
+        assert!(
+            !has_column(
+                &compatible.conn,
+                "sidecar_owner_revisions",
+                "global_revision"
+            )
+            .unwrap(),
+            "the latency-sensitive read must not migrate v6"
+        );
+        drop(compatible);
+
+        let db = Db::open(&path).unwrap();
+
+        assert_eq!(
+            db.pending_sidecars().unwrap(),
+            vec![PendingSidecar {
+                path: PathBuf::from("/p/owned.arw"),
+                size: 10,
+                mtime_ns: 1,
+                rating: 5,
+            }]
+        );
+        assert!(db.get_image_path(Path::new("/p/legacy.arw")).is_none());
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT rating
+                       FROM quarantined_legacy_ratings
+                      WHERE path = '/p/legacy.arw'",
+                    [],
+                    |row| row.get::<_, u8>(0),
+                )
+                .unwrap(),
+            2
+        );
+        assert!(has_column(&db.conn, "sidecar_owner_revisions", "global_revision").unwrap());
+    }
+
+    #[test]
+    fn v6_owner_updates_advance_the_v7_global_owner_position() {
+        fn advance_like_v6(conn: &Connection, owner: &Path) {
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            conn.execute(
+                "INSERT INTO sidecar_owner_revisions (owner, revision)
+                 VALUES (?1, 1)
+                 ON CONFLICT(owner) DO UPDATE SET
+                    revision = sidecar_owner_revisions.revision + 1",
+                [path_value(owner)],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE rating_global_revision
+                    SET revision = revision + 1
+                  WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch("COMMIT").unwrap();
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("insert.ARW");
+        let second = directory.path().join("update.ARW");
+        std::fs::write(&first, b"raw").unwrap();
+        std::fs::write(&second, b"raw").unwrap();
+        let db = Db::open_in_memory().unwrap();
+
+        let first_predecessor = db.rating_global_snapshot().unwrap();
+        let first_owner = sidecar_owner_key(&first).unwrap();
+        advance_like_v6(&db.conn, &first_owner);
+        assert!(
+            !db.record_rating_pending_sidecar_if_global_unchanged(
+                &first,
+                3,
+                1,
+                1,
+                first_predecessor,
+            )
+            .unwrap()
+        );
+
+        db.record_rating_pending_sidecar_canonical(&second, 3, 1, 2)
+            .unwrap();
+        let second_predecessor = db.rating_global_snapshot().unwrap();
+        let second_owner = sidecar_owner_key(&second).unwrap();
+        advance_like_v6(&db.conn, &second_owner);
+        assert!(
+            !db.record_rating_pending_sidecar_if_global_unchanged(
+                &second,
+                3,
+                1,
+                3,
+                second_predecessor,
+            )
+            .unwrap()
+        );
+
+        let (global, last_owner) = db
+            .conn
+            .query_row(
+                "SELECT rating_global_revision.revision,
+                        sidecar_owner_revisions.global_revision
+                   FROM rating_global_revision
+                   JOIN sidecar_owner_revisions
+                     ON sidecar_owner_revisions.owner = ?1
+                  WHERE rating_global_revision.singleton = 1",
+                [path_value(&second_owner)],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(last_owner, global);
     }
 
     #[test]
