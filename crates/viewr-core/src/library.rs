@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
@@ -29,7 +30,7 @@ enum Cmd {
         rating: u8,
     },
     Flush {
-        done: Sender<bool>,
+        done: Option<Sender<bool>>,
     },
     Shutdown,
 }
@@ -48,7 +49,7 @@ pub struct Library {
     worker: Option<JoinHandle<()>>,
     /// Avoid a channel allocation and worker round-trip on ordinary
     /// navigation when no rating has changed since the last flush.
-    dirty: AtomicBool,
+    dirty: Arc<AtomicBool>,
 }
 
 /// Initial persisted per-index ratings resolved across the journal, sidecars,
@@ -106,14 +107,16 @@ impl Library {
 
     fn start_with(db_path: Option<PathBuf>, debounce: Duration) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
+        let dirty = Arc::new(AtomicBool::new(false));
+        let worker_dirty = dirty.clone();
         let worker = std::thread::spawn(move || {
             let db = db_path.and_then(|path| Db::open(&path).ok());
-            persist_thread(&rx, db.as_ref(), debounce);
+            persist_thread(&rx, db.as_ref(), debounce, &worker_dirty);
         });
         Self {
             tx,
             worker: Some(worker),
-            dirty: AtomicBool::new(false),
+            dirty,
         }
     }
 
@@ -151,11 +154,26 @@ impl Library {
             return;
         }
         let (done, wait) = std::sync::mpsc::channel();
-        let clean =
-            self.tx.send(Cmd::Flush { done }).is_ok() && wait.recv().is_ok_and(|clean| clean);
+        let clean = self.tx.send(Cmd::Flush { done: Some(done) }).is_ok()
+            && wait.recv().is_ok_and(|clean| clean);
         if !clean {
             // Keep the fast-path state dirty so a later flush retries any
             // sidecar that failed. The DB remains the crash-safe authority.
+            self.dirty.store(true, Ordering::Release);
+        }
+    }
+
+    /// Requests one immediate persistence attempt without blocking the caller.
+    ///
+    /// Commands use one FIFO channel, so a preceding [`set_rating`](Self::set_rating)
+    /// is journaled before this flush is handled. Failures restore the dirty
+    /// marker on the worker thread for a later retry. Dropping the library
+    /// remains the blocking durability boundary.
+    pub fn request_flush(&self) {
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        if self.tx.send(Cmd::Flush { done: None }).is_err() {
             self.dirty.store(true, Ordering::Release);
         }
     }
@@ -177,7 +195,7 @@ struct Pending {
     due: Instant,
 }
 
-fn persist_thread(rx: &Receiver<Cmd>, db: Option<&Db>, debounce: Duration) {
+fn persist_thread(rx: &Receiver<Cmd>, db: Option<&Db>, debounce: Duration, dirty: &AtomicBool) {
     let mut pending: HashMap<PathBuf, Pending> = db
         .map(|db| match db.pending_sidecars() {
             Ok(rows) => rows
@@ -238,7 +256,12 @@ fn persist_thread(rx: &Receiver<Cmd>, db: Option<&Db>, debounce: Duration) {
             }
             Ok(Cmd::Flush { done }) => {
                 let clean = flush_due(&mut pending, db, true);
-                let _ = done.send(clean);
+                if !clean {
+                    dirty.store(true, Ordering::Release);
+                }
+                if let Some(done) = done {
+                    let _ = done.send(clean);
+                }
             }
             Ok(Cmd::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
                 flush_due(&mut pending, db, true);
@@ -473,6 +496,37 @@ mod tests {
         assert!(!library.dirty.load(Ordering::Acquire));
         library.flush();
         assert!(!library.dirty.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn requested_flush_preserves_fifo_order_without_a_caller_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("viewr.db");
+        let entry = entry(dir.path().join("photo.ARW"));
+        let library = Library::start_with(Some(db_path.clone()), Duration::from_secs(60));
+
+        library.set_rating(&entry, 4);
+        library.request_flush();
+        assert!(!library.dirty.load(Ordering::Acquire));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while xmp::read_rating(&entry.sidecar_path()) != Some(4) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(4));
+        let db = Db::open(&db_path).unwrap();
+        let db_deadline = Instant::now() + Duration::from_secs(2);
+        while db
+            .get_image(&entry.path)
+            .is_none_or(|row| row.sidecar_dirty)
+            && Instant::now() < db_deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let row = db.get_image(&entry.path).unwrap();
+        assert_eq!(row.rating, Some(4));
+        assert!(!row.sidecar_dirty);
     }
 
     #[test]

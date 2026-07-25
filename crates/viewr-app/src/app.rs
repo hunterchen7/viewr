@@ -364,7 +364,7 @@ impl App {
         self.scroll_to_current = true;
         self.nav_started = Some(Instant::now());
         if let Some(s) = &self.session {
-            s.library.flush();
+            s.library.request_flush();
         }
         self.replan();
     }
