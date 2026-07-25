@@ -368,6 +368,33 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn key_distinguishes_non_unicode_windows_paths_with_the_same_lossy_text() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt as _;
+
+        let make_entry = |surrogate| {
+            let mut path = "C:\\photos\\photo-".encode_utf16().collect::<Vec<_>>();
+            path.push(surrogate);
+            path.extend(".arw".encode_utf16());
+            FolderEntry {
+                path: PathBuf::from(OsString::from_wide(&path)),
+                file_name: "non-unicode.arw".into(),
+                size: 10,
+                mtime_ns: 1,
+            }
+        };
+        let first = make_entry(0xd800);
+        let second = make_entry(0xd801);
+        assert_eq!(first.path.to_string_lossy(), second.path.to_string_lossy());
+
+        assert_ne!(
+            DiskCache::key(&first, Tier::Browse),
+            DiskCache::key(&second, Tier::Browse)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn valid_utf8_path_preserves_the_existing_cache_key() {

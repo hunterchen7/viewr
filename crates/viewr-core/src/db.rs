@@ -466,23 +466,36 @@ mod tests {
     }
 
     #[test]
-    fn stale_completion_and_discard_cannot_replace_a_newer_dirty_rating() {
+    fn sidecar_compare_and_swap_requires_every_identity_field() {
         let db = Db::open_in_memory().unwrap();
         let path = Path::new("/p/concurrent.arw");
-        db.record_rating_pending_sidecar(path, 10, 1, 2).unwrap();
         db.record_rating_pending_sidecar(path, 10, 1, 5).unwrap();
 
-        assert!(!db.complete_pending_sidecar(path, 10, 1, 2, 99).unwrap());
-        assert!(!db.discard_pending_sidecar(path, 10, 1, 2).unwrap());
-        let row = db.get_image(path).unwrap();
-        assert_eq!(row.rating, Some(5));
-        assert!(row.sidecar_dirty);
+        for (size, mtime_ns, rating) in [(11, 1, 5), (10, 2, 5), (10, 1, 4)] {
+            assert!(
+                !db.complete_pending_sidecar(path, size, mtime_ns, rating, 99)
+                    .unwrap()
+            );
+            assert!(
+                !db.discard_pending_sidecar(path, size, mtime_ns, rating)
+                    .unwrap()
+            );
+            let row = db.get_image(path).unwrap();
+            assert_eq!(row.rating, Some(5));
+            assert!(row.sidecar_dirty);
+        }
 
         assert!(db.complete_pending_sidecar(path, 10, 1, 5, 100).unwrap());
         let row = db.get_image(path).unwrap();
         assert_eq!(row.rating, Some(5));
         assert_eq!(row.sidecar_mtime_ns, 100);
         assert!(!row.sidecar_dirty);
+
+        assert!(!db.complete_pending_sidecar(path, 10, 1, 5, 101).unwrap());
+        assert!(!db.discard_pending_sidecar(path, 10, 1, 5).unwrap());
+        let missing = Path::new("/p/missing.arw");
+        assert!(!db.complete_pending_sidecar(missing, 10, 1, 5, 101).unwrap());
+        assert!(!db.discard_pending_sidecar(missing, 10, 1, 5).unwrap());
     }
 
     #[test]
@@ -558,5 +571,44 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_unicode_windows_paths_round_trip_without_lossy_collisions() {
+        use std::os::windows::ffi::OsStringExt as _;
+
+        let make_path = |surrogate| {
+            let mut units = "C:\\photos\\photo-".encode_utf16().collect::<Vec<_>>();
+            units.push(surrogate);
+            units.extend(".arw".encode_utf16());
+            PathBuf::from(OsString::from_wide(&units))
+        };
+        let first = make_path(0xd800);
+        let second = make_path(0xd801);
+        assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+
+        let db = Db::open_in_memory().unwrap();
+        db.record_rating_pending_sidecar(&first, 10, 1, 3).unwrap();
+        db.record_rating_pending_sidecar(&second, 20, 2, 5).unwrap();
+
+        assert_eq!(db.get_image(&first).unwrap().rating, Some(3));
+        assert_eq!(db.get_image(&second).unwrap().rating, Some(5));
+        let mut pending = db.pending_sidecars().unwrap();
+        pending.sort_by_key(|item| item.size);
+        assert_eq!(pending[0].path, first);
+        assert_eq!(pending[1].path, second);
+
+        let malformed = Db::open_in_memory().unwrap();
+        malformed
+            .conn
+            .execute(
+                "INSERT INTO images
+                    (path, size, mtime_ns, rating, sidecar_dirty)
+                 VALUES (?1, 1, 1, 1, 1)",
+                rusqlite::params![vec![0xff_u8]],
+            )
+            .unwrap();
+        assert!(malformed.pending_sidecars().is_err());
     }
 }
