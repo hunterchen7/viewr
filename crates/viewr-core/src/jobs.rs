@@ -724,8 +724,12 @@ impl JobQueue {
         self.finish_with(id, token, JobCompletion::Complete);
     }
 
-    fn finish_with(&self, id: JobId, token: &Arc<CancelToken>, completion: JobCompletion) {
+    fn finish_with(&self, id: JobId, token: &Arc<CancelToken>, completion: JobCompletion) -> bool {
         let mut state = self.state.lock().unwrap();
+        let publishable = state
+            .in_flight
+            .get(&id)
+            .is_some_and(|current| Arc::ptr_eq(&current.token, token) && !token.cancelled());
         let retry_action = state.background_in_flight.get(&id).and_then(|background| {
             Arc::ptr_eq(&background.token, token).then_some(background.action)
         });
@@ -754,6 +758,7 @@ impl JobQueue {
         }
         drop(state);
         self.cond.notify_one();
+        publishable
     }
 
     /// Make one backpressured warm job runnable after persistence capacity or
@@ -1224,9 +1229,12 @@ fn execute_claimed_job(
         JobCompletion::DeferBackground { required_bytes } => Some(required_bytes),
         JobCompletion::Complete | JobCompletion::RetryBackground => None,
     };
-    queue.finish_with(id, token, completion);
-    if let Some(payload) = panic_payload {
-        emit(worker_panic_event(id, action, payload.as_ref()));
+    let publishable = queue.finish_with(id, token, completion);
+    if publishable
+        && let Some(payload) = panic_payload
+        && let Some(event) = worker_panic_event(id, action, payload.as_ref())
+    {
+        emit(event);
     }
     deferred_bytes
 }
@@ -1235,7 +1243,7 @@ fn worker_panic_event(
     (index, tier): JobId,
     action: Action,
     payload: &(dyn std::any::Any + Send),
-) -> Event {
+) -> Option<Event> {
     let detail = if let Some(message) = payload.downcast_ref::<&str>() {
         *message
     } else if let Some(message) = payload.downcast_ref::<String>() {
@@ -1245,10 +1253,13 @@ fn worker_panic_event(
     };
     let error = format!("worker panicked: {detail}");
     match action {
-        Action::Metadata => Event::MetadataFailed { index, error },
-        Action::Thumb | Action::Develop(_) | Action::WarmDevelop(_) | Action::Rehydrate => {
-            Event::ImageFailed { index, tier, error }
+        Action::Metadata => Some(Event::MetadataFailed { index, error }),
+        Action::Thumb | Action::Develop(_) | Action::Rehydrate => {
+            Some(Event::ImageFailed { index, tier, error })
         }
+        // Folder-wide warming is intentionally invisible to the event/UI
+        // channel. The panic hook still records the contained panic.
+        Action::WarmDevelop(_) => None,
     }
 }
 
@@ -1764,7 +1775,8 @@ mod tests {
             (8, Tier::Full),
             Action::Rehydrate,
             &payload as &(dyn std::any::Any + Send),
-        );
+        )
+        .unwrap();
 
         assert!(matches!(
             event,
@@ -1774,6 +1786,40 @@ mod tests {
                 error,
             } if error == "worker panicked: rehydrate invariant failed"
         ));
+    }
+
+    #[test]
+    fn cancelled_worker_panic_does_not_publish_a_stale_failure() {
+        let queue = JobQueue::new();
+        queue.extend([((3, Tier::Thumb), 0, 0, Action::Metadata)]);
+        let (id, action, token) = queue.pop().unwrap();
+        token.cancel();
+        let mut events = Vec::new();
+
+        execute_claimed_job(
+            &queue,
+            id,
+            action,
+            &token,
+            || panic!("stale decoder panic"),
+            |event| events.push(event),
+        );
+
+        assert!(events.is_empty());
+        assert!(queue.state.lock().unwrap().in_flight.is_empty());
+    }
+
+    #[test]
+    fn background_warm_panic_has_no_user_visible_event() {
+        let payload = "warm decoder panic";
+        assert!(
+            worker_panic_event(
+                (8, Tier::Browse),
+                Action::WarmDevelop(Quality::Browse),
+                &payload as &(dyn std::any::Any + Send),
+            )
+            .is_none()
+        );
     }
 
     fn patterned_buf(width: u32, height: u32) -> PixelBuf {
