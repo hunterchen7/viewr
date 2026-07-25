@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use rusqlite::types::{Type, Value, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 
+const RATING_GENERATION_MIGRATION: &str = "rating-generation-v2";
+
 #[derive(Debug, thiserror::Error)]
 /// Failure while opening, migrating, or updating the metadata database.
 pub enum DbError {
@@ -553,7 +555,21 @@ fn row_path(row: &Row<'_>, column: usize) -> rusqlite::Result<PathBuf> {
 }
 
 fn initialize_schema(conn: &Connection) -> Result<(), DbError> {
-    conn.execute_batch(
+    if migration_is_complete(conn, RATING_GENERATION_MIGRATION)? {
+        return Ok(());
+    }
+
+    // The fast marker check above keeps ordinary opens read-only. An
+    // immediate transaction serializes first-time migration, and the second
+    // check prevents a waiter from repeating the row backfill after the
+    // process that held the lock commits.
+    let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    if migration_is_complete(&transaction, RATING_GENERATION_MIGRATION)? {
+        transaction.rollback()?;
+        return Ok(());
+    }
+
+    transaction.execute_batch(
         "CREATE TABLE IF NOT EXISTS images (
             path TEXT PRIMARY KEY,
             size INTEGER NOT NULL,
@@ -566,29 +582,17 @@ fn initialize_schema(conn: &Connection) -> Result<(), DbError> {
         );",
     )?;
 
-    if !has_column(conn, "images", "sidecar_dirty")?
-        && let Err(error) = conn.execute(
+    if !has_column(&transaction, "images", "sidecar_dirty")? {
+        transaction.execute(
             "ALTER TABLE images ADD COLUMN sidecar_dirty INTEGER NOT NULL DEFAULT 0",
             [],
-        )
-    {
-        // Another process can complete the migration after our check but
-        // before ALTER obtains SQLite's schema lock.
-        if !has_column(conn, "images", "sidecar_dirty")? {
-            return Err(error.into());
-        }
+        )?;
     }
-    if !has_column(conn, "images", "revision")?
-        && let Err(error) = conn.execute(
+    if !has_column(&transaction, "images", "revision")? {
+        transaction.execute(
             "ALTER TABLE images ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
             [],
-        )
-    {
-        // Another process can complete the migration after our check but
-        // before ALTER obtains SQLite's schema lock.
-        if !has_column(conn, "images", "revision")? {
-            return Err(error.into());
-        }
+        )?;
     }
 
     // `images.revision` is the logical rating generation used by delayed
@@ -596,7 +600,7 @@ fn initialize_schema(conn: &Connection) -> Result<(), DbError> {
     // does not advance it: completing the predecessor is not a newer rating.
     // The companion ledger retains the generation after a row is deleted, so
     // a missing -> present -> missing ABA cycle cannot revive a stale retry.
-    conn.execute_batch(
+    transaction.execute_batch(
         "CREATE TABLE IF NOT EXISTS image_revisions (
             path TEXT PRIMARY KEY,
             revision INTEGER NOT NULL
@@ -671,7 +675,43 @@ fn initialize_schema(conn: &Connection) -> Result<(), DbError> {
 
         DROP TRIGGER IF EXISTS images_revision_after_update;",
     )?;
+
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS viewr_schema_migrations (
+            name TEXT PRIMARY KEY
+        ) WITHOUT ROWID;",
+    )?;
+    transaction.execute(
+        "INSERT INTO viewr_schema_migrations (name) VALUES (?1)",
+        [RATING_GENERATION_MIGRATION],
+    )?;
+    transaction.commit()?;
     Ok(())
+}
+
+fn migration_is_complete(conn: &Connection, migration: &str) -> Result<bool, rusqlite::Error> {
+    let table_exists = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM sqlite_schema
+              WHERE type = 'table'
+                AND name = 'viewr_schema_migrations'
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !table_exists {
+        return Ok(false);
+    }
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM viewr_schema_migrations
+              WHERE name = ?1
+         )",
+        [migration],
+        |row| row.get(0),
+    )
 }
 
 fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, rusqlite::Error> {
@@ -1058,6 +1098,85 @@ mod tests {
             db.rating_revision_snapshot(Path::new("/p/legacy.arw"))
                 .unwrap(),
             ImageRevisionSnapshot::Present { revision: 1 }
+        );
+    }
+
+    #[test]
+    fn warm_schema_reinitialization_performs_no_row_dml() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_rating_pending_sidecar("/p/warm-open.arw", 42, 7, 4)
+            .unwrap();
+        let changes_before = db.conn.total_changes();
+
+        initialize_schema(&db.conn).unwrap();
+
+        assert_eq!(db.conn.total_changes(), changes_before);
+        assert!(
+            migration_is_complete(&db.conn, RATING_GENERATION_MIGRATION).unwrap(),
+            "the durable marker must make later initialization read-only"
+        );
+    }
+
+    #[test]
+    fn concurrent_legacy_opens_apply_the_migration_once() {
+        const OPENERS: usize = 8;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent-legacy.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            conn.execute_batch(
+                "CREATE TABLE images (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO images
+                    (path, size, mtime_ns, rating, sidecar_mtime_ns, last_seen)
+                VALUES ('/p/concurrent-legacy.arw', 42, 7, 3, 123, 0);",
+            )
+            .unwrap();
+        }
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(OPENERS));
+        let openers = (0..OPENERS)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let db = Db::open(&path).unwrap();
+                    assert_eq!(
+                        db.get_image("/p/concurrent-legacy.arw").unwrap().rating,
+                        Some(3)
+                    );
+                })
+            })
+            .collect::<Vec<_>>();
+        for opener in openers {
+            opener.join().unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        let migration_rows = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*)
+                   FROM viewr_schema_migrations
+                  WHERE name = ?1",
+                [RATING_GENERATION_MIGRATION],
+                |row| row.get::<_, usize>(0),
+            )
+            .unwrap();
+        assert_eq!(migration_rows, 1);
+        assert_eq!(
+            db.rating_revision_snapshot(Path::new("/p/concurrent-legacy.arw"))
+                .unwrap(),
+            ImageRevisionSnapshot::Present { revision: 0 }
         );
     }
 

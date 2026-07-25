@@ -214,6 +214,54 @@ fn bench_rating_db_lookup(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_rating_db_reopen(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rating_db_reopen");
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+
+    for len in [1_000_usize, 10_000, 50_000] {
+        let directory = tempfile::tempdir().expect("benchmark database directory");
+        let database_path = directory.path().join("viewr.db");
+        let db = Db::open(&database_path).expect("benchmark database opens");
+        for index in 0..len {
+            db.upsert_rating(
+                &format!("/benchmark/photo-{index:08}.arw"),
+                index as u64,
+                index as i64,
+                Some(4),
+                1,
+            )
+            .expect("benchmark row inserts");
+        }
+        drop(db);
+
+        let probe = Db::open(&database_path).expect("populated benchmark database reopens");
+        assert!(
+            probe
+                .get_image(&format!("/benchmark/photo-{:08}.arw", len - 1))
+                .is_some(),
+            "reopen benchmark must retain its populated database"
+        );
+        drop(probe);
+
+        group.bench_with_input(
+            BenchmarkId::new("warm", len),
+            &database_path,
+            |b, database_path| {
+                b.iter(|| {
+                    black_box(
+                        Db::open(black_box(database_path.as_path()))
+                            .expect("benchmark database reopens"),
+                    )
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_resize(c: &mut Criterion) {
     let photo = synthetic_photo(PHOTO_WIDTH, PHOTO_HEIGHT);
     let source_pixels = u64::from(photo.width) * u64::from(photo.height);
@@ -641,6 +689,7 @@ criterion_group! {
         bench_navigation_plan,
         bench_metadata_queue_setup,
         bench_rating_db_lookup,
+        bench_rating_db_reopen,
         bench_resize,
         bench_orientation,
         bench_jpeg,
