@@ -6,10 +6,10 @@ use std::time::Duration;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use viewr_core::cache_disk::DiskCache;
 use viewr_core::cache_ram::RamCache;
-use viewr_core::db::{Db, benchmark_rating_lookup};
+use viewr_core::db::{Db, benchmark_insert_rating, benchmark_rating_lookup};
 use viewr_core::decode;
 use viewr_core::develop::{self, Quality};
-use viewr_core::folder::{FolderEntry, outward_order};
+use viewr_core::folder::{FolderEntry, benchmark_sidecar_owner_keys, outward_order};
 use viewr_core::jobs::{
     BenchmarkNavigationQueue, benchmark_jpeg_quality, benchmark_metadata_queue_setup, decode_jpeg,
     encode_jpeg,
@@ -190,14 +190,8 @@ fn bench_rating_db_lookup(c: &mut Criterion) {
             .map(|index| PathBuf::from(format!("/benchmark/photo-{index:08}.arw")))
             .collect::<Vec<_>>();
         for (index, path) in paths.iter().enumerate() {
-            db.upsert_rating(
-                path.to_str().expect("synthetic benchmark paths are UTF-8"),
-                index as u64,
-                index as i64,
-                Some(4),
-                1,
-            )
-            .expect("benchmark row inserts");
+            benchmark_insert_rating(&db, path, index as u64, index as i64, 4)
+                .expect("benchmark row inserts");
         }
 
         group.throughput(Throughput::Elements(len as u64));
@@ -225,12 +219,12 @@ fn bench_rating_db_reopen(c: &mut Criterion) {
         let database_path = directory.path().join("viewr.db");
         let db = Db::open(&database_path).expect("benchmark database opens");
         for index in 0..len {
-            db.upsert_rating(
-                &format!("/benchmark/photo-{index:08}.arw"),
+            benchmark_insert_rating(
+                &db,
+                &PathBuf::from(format!("/benchmark/photo-{index:08}.arw")),
                 index as u64,
                 index as i64,
-                Some(4),
-                1,
+                4,
             )
             .expect("benchmark row inserts");
         }
@@ -257,6 +251,98 @@ fn bench_rating_db_reopen(c: &mut Criterion) {
                 });
             },
         );
+        group.bench_with_input(
+            BenchmarkId::new("read_only_current", len),
+            &database_path,
+            |b, database_path| {
+                b.iter(|| {
+                    black_box(
+                        Db::try_open_for_read(black_box(database_path.as_path()))
+                            .expect("current benchmark database opens read-only"),
+                    )
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_rating_db_journal(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rating_db_journal");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+
+    for len in [1_000_usize, 10_000, 50_000] {
+        let directory = tempfile::tempdir().expect("benchmark RAW directory");
+        let raw = directory.path().join("target.ARW");
+        std::fs::write(&raw, b"raw").expect("benchmark RAW placeholder");
+        let metadata = std::fs::metadata(&raw).expect("benchmark RAW metadata");
+        let mtime_ns = metadata
+            .modified()
+            .expect("benchmark RAW mtime")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("benchmark RAW mtime after epoch")
+            .as_nanos() as i64;
+        let db = Db::open_in_memory().expect("benchmark database opens");
+        for index in 0..len {
+            benchmark_insert_rating(
+                &db,
+                &PathBuf::from(format!("/benchmark/photo-{index:08}.arw")),
+                index as u64,
+                index as i64,
+                4,
+            )
+            .expect("benchmark row inserts");
+        }
+
+        group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, _| {
+            b.iter(|| {
+                db.record_rating_pending_sidecar(
+                    black_box(raw.to_str().expect("benchmark path is UTF-8")),
+                    black_box(metadata.len()),
+                    black_box(mtime_ns),
+                    black_box(4),
+                )
+                .expect("canonical journal update");
+            });
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_sidecar_owner_batch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sidecar_owner_batch");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+
+    for len in [1_000_usize, 10_000, 50_000] {
+        let directory = tempfile::tempdir().expect("benchmark RAW directory");
+        let canonical =
+            std::fs::canonicalize(directory.path()).expect("benchmark directory canonicalizes");
+        std::fs::write(canonical.join("photo-00000000.ARW"), b"raw")
+            .expect("owner probe RAW placeholder");
+        let entries = (0..len)
+            .map(|index| FolderEntry {
+                path: canonical.join(format!("photo-{index:08}.ARW")),
+                file_name: format!("photo-{index:08}.ARW"),
+                size: 3,
+                mtime_ns: 0,
+            })
+            .collect::<Vec<_>>();
+
+        group.throughput(Throughput::Elements(len as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, _| {
+            b.iter(|| {
+                assert_eq!(
+                    benchmark_sidecar_owner_keys(black_box(&entries)),
+                    black_box(len)
+                );
+            });
+        });
     }
 
     group.finish();
@@ -690,6 +776,8 @@ criterion_group! {
         bench_metadata_queue_setup,
         bench_rating_db_lookup,
         bench_rating_db_reopen,
+        bench_rating_db_journal,
+        bench_sidecar_owner_batch,
         bench_resize,
         bench_orientation,
         bench_jpeg,

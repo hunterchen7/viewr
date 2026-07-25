@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::hint::black_box;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
@@ -7,6 +9,9 @@ use eframe::egui;
 #[allow(dead_code, unused_imports)]
 #[path = "../src/filmstrip.rs"]
 mod filmstrip;
+#[allow(dead_code, unused_imports)]
+#[path = "../src/rating_groups.rs"]
+mod rating_groups;
 #[allow(dead_code, unused_imports)]
 #[path = "../src/texture_lru.rs"]
 mod texture_lru;
@@ -19,6 +24,44 @@ fn input() -> egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN)),
         ..Default::default()
     }
+}
+
+fn bench_rating_propagation(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rating_propagation");
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+
+    for len in [1_000_usize, 10_000, 100_000] {
+        let owners = (0..len)
+            .map(|index| Some(PathBuf::from(format!("/photos/{:08}.xmp", index / 2))))
+            .collect::<Vec<_>>();
+        let members = rating_groups::build_owner_members(&owners);
+        let target = len / 2;
+        let target_members = members[target]
+            .as_deref()
+            .expect("paired benchmark owners share a group");
+        assert!(target_members.len() <= 2);
+        let mut ratings = HashMap::new();
+
+        group.bench_with_input(BenchmarkId::new("build_groups", len), &len, |b, _| {
+            b.iter(|| {
+                black_box(rating_groups::build_owner_members(black_box(&owners)));
+            });
+        });
+        group.bench_with_input(BenchmarkId::new("install_rating", len), &len, |b, _| {
+            b.iter(|| {
+                black_box(rating_groups::install_rating_for_members(
+                    black_box(&mut ratings),
+                    black_box(target_members),
+                    black_box(5),
+                    |_, _| false,
+                ));
+            });
+        });
+    }
+
+    group.finish();
 }
 
 /// Headless version of the pre-virtualization placeholder path. This is kept
@@ -127,5 +170,10 @@ fn bench_thumbnail_lru(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_filmstrip_scaling, bench_thumbnail_lru);
+criterion_group!(
+    benches,
+    bench_filmstrip_scaling,
+    bench_thumbnail_lru,
+    bench_rating_propagation
+);
 criterion_main!(benches);
