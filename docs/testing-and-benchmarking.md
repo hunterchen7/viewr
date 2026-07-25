@@ -165,13 +165,13 @@ cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked 
 
 The RAW suite measures metadata-only extraction, thumbnail extraction, the
 complete `decode::load` path, and both develop qualities. The decode benchmark
-includes source construction, metadata extraction, and CFA mosaic decode; it
-does not isolate entropy decoding.
+includes source construction, metadata extraction, and CFA mosaic decode.
+It does not isolate entropy decoding.
 The develop benchmark excludes decode setup.
 The initial probe and Criterion warm-up normally make these warm operating-
 system page-cache measurements. They are not Viewr RAM- or disk-cache hits.
-When `VIEWR_BENCH_RAW` is unset, the harness prints an explicit skip message;
-synthetic success must not be interpreted as real-camera fixture coverage.
+When `VIEWR_BENCH_RAW` is unset, the harness prints an explicit skip message.
+Synthetic success must not be interpreted as real-camera fixture coverage.
 
 Use `viewr dev` in a new process for a cold-path inspection:
 
