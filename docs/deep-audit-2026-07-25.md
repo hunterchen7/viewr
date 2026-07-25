@@ -48,14 +48,18 @@ All promoted performance decisions use later isolated target runs.
 | P1 | A rating row did not verify the RAW size and modification time during folder load. | Fixed. A row applies only to the matching RAW identity. |
 | P1 | Startup recovery could write an old rating beside a replaced RAW file. | Fixed. Recovery checks the current RAW identity before each write. A conditional delete cannot remove a newer journal row. |
 | P1 | An old sidecar completion could clear a newer dirty rating. | Fixed. Completion uses a conditional compare operation on path, identity, and rating. |
+| P1 | An older Viewr process could replace XMP after a newer process completed its rating. | Fixed. An immediate SQLite ownership transaction now covers the exact-row check, durable XMP replacement, and database completion. |
+| P1 | A transient initial journal failure could leave an older dirty rating authoritative. | Fixed. Unjournaled work remains pending and must establish database ownership before it can publish XMP. |
 | P1 | A panic in one decode job left its ID in flight and removed one worker. | Fixed. Each claimed job now has a panic boundary. Cleanup occurs before failure publication, and the worker continues. |
 | P1 | `ByteLru::remove` performed a required map removal inside `debug_assert_eq!`. | Fixed. Release builds now perform the removal before the assertion. The new release test gate found this defect. |
+| P2 | A canceled decode generation could publish a stale panic failure. | Fixed. Only the current uncanceled generation can publish a panic event, and background warming remains invisible to the UI event channel. |
 | P2 | Atomic sidecar replacement lost the prior file permissions and destroyed a symbolic link. | Fixed. Replacement keeps file permissions and rejects symbolic-link targets. |
 | P2 | Non-finite configuration values could enter layout and budget calculations. | Fixed. Non-finite values now use documented defaults. |
 | P2 | Invalid metadata could create zero-denominator exposure text or non-finite color math. | Fixed. Invalid rationals, matrices, and white-balance values now fail closed. |
 
 The rating journal now uses stronger local and database checks.
-One cross-process sidecar race remains and is in the deferred section.
+Cooperating Viewr processes that use the same database serialize sidecar
+ownership before touching XMP.
 
 ## Performance changes and measured decisions
 
@@ -161,20 +165,23 @@ The manual benchmark workflow now stores `benchmark-metadata.json`.
 The file records the commit, lockfile hash, toolchain, OS, CPU, memory, Rayon setting, and cache condition.
 Criterion results and metadata remain available for 90 days.
 
-CI now runs the core library tests with the release profile.
+The optimized CI job now runs the complete workspace test suite with the release profile.
 This gate executes optimized-only parallel code and detects release-only assertion mistakes.
 CI also reports that private RAW fixtures are absent instead of silently implying camera coverage.
+The same job smoke-runs both Criterion harnesses instead of only compiling them.
+Benchmark preflight assertions verify that queue and XMP workloads cannot
+silently become no-ops.
+The review rejected a hard source-coverage percentage gate until the project
+has an advisory baseline and a policy for UI-heavy and private-RAW paths.
 
 ## Deferred work
 
-### Cross-process sidecar serialization
+### External sidecar writers
 
-The database compare operation prevents an old completion from clearing a newer rating.
-It does not fully serialize XMP replacement across two Viewr processes.
-
-A complete fix needs one ownership transaction or one operating-system file lock.
-The lock must cover the ownership check, XMP replacement, and database completion.
-This change needs a two-process fault-injection test before promotion.
+The ownership transaction serializes Viewr processes that share the same
+SQLite database.
+Other applications do not participate in that transaction.
+Their later sidecar modification time still wins during the next folder load.
 
 ### RAW pipeline concurrency
 
@@ -252,8 +259,10 @@ The final verification set is:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --locked
-cargo test -p viewr-core --release --lib --locked
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+cargo test --workspace --release --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
+cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- --test
+cargo bench -p viewr --features benchmarks --bench filmstrip_scaling --locked -- --test
 cargo +nightly-2026-07-21 miri test -p viewr-core --lib resize::tests::rotate_ --locked
 cargo +nightly-2026-07-21 miri test -p viewr-core --lib \
   develop::tests::superpixel_output_initialization_is_valid_under_miri --locked
@@ -263,10 +272,12 @@ The ordinary and release test output reports the three absent private-RAW fixtur
 
 Final verification passed:
 
-- The workspace reported 177 passed tests and three ignored private-RAW tests.
-- The release core suite reported 143 passed tests and three ignored private-RAW tests.
+- The debug and release workspace suites each reported 185 passed tests and
+  three ignored private-RAW tests.
+- The core library reported 151 passed tests and three ignored private-RAW tests.
 - The Rustdoc suite reported one passed documentation test.
 - Clippy reported no warnings across all targets and features.
+- Both optimized Criterion harnesses completed their runtime smoke checks.
 - Miri reported four passed unsafe-path tests.
 - The base-to-branch whitespace check passed.
 - The rendering, layout, settings, color, and texture-LRU files had no source changes.

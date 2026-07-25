@@ -11,7 +11,7 @@ Run these commands before each commit:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --locked
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
 ```
 
 The test suite covers these areas:
@@ -20,7 +20,8 @@ The test suite covers these areas:
 - Folder scans, navigation waves, queue generations, and cancellation.
 - JPEG cache round-trips, resize geometry, rotation, and tone-curve invariants.
 - RAW crop layout, Bayer superpixels, transfer-table error, and persistence bounds.
-- XMP preservation, rating precedence, SQLite reopen behavior, and durable flushes.
+- XMP preservation, rating precedence, cross-process ownership, native paths,
+  SQLite reopen behavior, and durable flushes.
 - Configuration parsing and loupe layout mathematics.
 
 CI runs the full test suite on macOS, Windows, and Linux. Platform-independent
@@ -30,9 +31,11 @@ test, optimized-build, and Miri jobs run in parallel.
 
 The optimized-build job builds the application and both benchmark harnesses
 with one release-profile Cargo invocation using
-`--bins --benches --all-features`. It then runs the core library tests in
-release mode. The release test is intentional: optimized-only parallel paths
-and code hidden behind `debug_assert!` must execute in CI, not merely compile.
+`--bins --benches --all-features`. It then runs the complete workspace test
+suite in release mode and executes both Criterion harnesses in smoke-test mode.
+These checks are intentional: optimized-only parallel paths, code hidden behind
+`debug_assert!`, and benchmark runtime setup must execute in CI, not merely
+compile.
 
 CI caches downloaded Cargo registry and Git sources plus compiled dependency
 artifacts. Quality, test, optimized-build, benchmark, and Miri jobs use separate
