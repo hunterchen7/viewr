@@ -272,9 +272,9 @@ The ordinary and release test output reports the three absent private-RAW fixtur
 
 Final verification passed:
 
-- The debug and release workspace suites each reported 185 passed tests and
+- The debug and release workspace suites each reported 186 passed tests and
   three ignored private-RAW tests.
-- The core library reported 151 passed tests and three ignored private-RAW tests.
+- The core library reported 152 passed tests and three ignored private-RAW tests.
 - The Rustdoc suite reported one passed documentation test.
 - Clippy reported no warnings across all targets and features.
 - Both optimized Criterion harnesses completed their runtime smoke checks.

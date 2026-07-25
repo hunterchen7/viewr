@@ -658,6 +658,33 @@ mod tests {
     }
 
     #[test]
+    fn failed_sidecar_publication_rolls_back_ownership_for_a_retry() {
+        let db = Db::open_in_memory().unwrap();
+        let path = Path::new("/p/retry.arw");
+        db.record_rating_pending_sidecar(path, 10, 1, 4).unwrap();
+
+        let result = db
+            .synchronize_pending_sidecar(path, 10, 1, 4, || {
+                Err::<i64, _>("injected sidecar failure")
+            })
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            PendingSidecarSync::WriteFailed("injected sidecar failure")
+        ));
+        assert!(db.get_image(path).unwrap().sidecar_dirty);
+        assert!(matches!(
+            db.synchronize_pending_sidecar(path, 10, 1, 4, || Ok::<_, ()>(101))
+                .unwrap(),
+            PendingSidecarSync::Written
+        ));
+        let row = db.get_image(path).unwrap();
+        assert_eq!(row.sidecar_mtime_ns, 101);
+        assert!(!row.sidecar_dirty);
+    }
+
+    #[test]
     fn opening_a_legacy_database_adds_the_dirty_column_without_changing_rows() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.db");
