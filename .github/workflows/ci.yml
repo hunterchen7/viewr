@@ -62,6 +62,9 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test workspace
         run: cargo test --workspace --locked
+      - name: Check benchmark targets
+        if: runner.os != 'Linux'
+        run: cargo check --workspace --benches --all-features --locked
       - name: Report optional real-RAW fixture coverage
         if: ${{ always() && runner.os == 'Linux' }}
         shell: bash
