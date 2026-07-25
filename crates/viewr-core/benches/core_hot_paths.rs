@@ -6,6 +6,7 @@ use std::time::Duration;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use viewr_core::cache_disk::DiskCache;
 use viewr_core::cache_ram::RamCache;
+use viewr_core::db::{Db, benchmark_rating_lookup};
 use viewr_core::decode;
 use viewr_core::develop::{self, Quality};
 use viewr_core::folder::{FolderEntry, outward_order};
@@ -164,6 +165,36 @@ fn bench_metadata_queue_setup(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, &len| {
             b.iter(|| {
                 black_box(benchmark_metadata_queue_setup(black_box(len)));
+            });
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_rating_db_lookup(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rating_db_lookup");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_secs(2));
+
+    for len in [1_000_usize, 10_000, 50_000] {
+        let db = Db::open_in_memory().expect("benchmark database opens");
+        let paths = (0..len)
+            .map(|index| PathBuf::from(format!("/benchmark/photo-{index:08}.arw")))
+            .collect::<Vec<_>>();
+        for (index, path) in paths.iter().enumerate() {
+            db.upsert_rating(path, index as u64, index as i64, Some(4), 1)
+                .expect("benchmark row inserts");
+        }
+
+        group.throughput(Throughput::Elements(len as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, _| {
+            b.iter(|| {
+                assert_eq!(
+                    black_box(benchmark_rating_lookup(black_box(&db), black_box(&paths))),
+                    len
+                );
             });
         });
     }
@@ -550,6 +581,7 @@ criterion_group! {
         bench_outward_order,
         bench_navigation_plan,
         bench_metadata_queue_setup,
+        bench_rating_db_lookup,
         bench_resize,
         bench_orientation,
         bench_jpeg,

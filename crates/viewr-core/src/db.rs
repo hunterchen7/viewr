@@ -81,8 +81,9 @@ impl Db {
         Ok(Self { conn })
     }
 
-    #[cfg(test)]
-    /// Creates an in-memory database with the production schema for tests.
+    #[cfg(any(test, feature = "benchmarks"))]
+    /// Creates an in-memory database with the production schema for tests and
+    /// the benchmark harness.
     pub fn open_in_memory() -> Result<Self, DbError> {
         let conn = Connection::open_in_memory()?;
         initialize_schema(&conn)?;
@@ -275,6 +276,17 @@ impl Db {
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+}
+
+/// Looks up ratings through the same per-path database path used during
+/// folder startup and returns the number of hits.
+#[cfg(feature = "benchmarks")]
+#[doc(hidden)]
+pub fn benchmark_rating_lookup(db: &Db, paths: &[PathBuf]) -> usize {
+    paths
+        .iter()
+        .filter(|path| db.get_image(path).is_some())
+        .count()
 }
 
 fn path_value(path: &Path) -> Value {
