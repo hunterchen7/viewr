@@ -831,15 +831,15 @@ struct Shared {
 /// indices stable across events and cache keys. Interactive navigation plans
 /// replace one another, viewport thumbnail demand is replaceable, and
 /// folder-wide Browse warming occupies a persistent lowest-priority lane.
-/// Dropping the engine cancels queued work and joins decode, persistence, and
-/// disk-GC threads; no worker may outlive the engine. Drop can block until an
+/// Dropping the engine cancels queued work and joins decode and persistence
+/// threads; no image worker may outlive the engine. Drop can block until an
 /// active non-interruptible `rawler` decode or demosaic finishes and until
-/// accepted persistence and GC work has joined.
+/// accepted persistence work has joined. Disk-cache maintenance is detached,
+/// single-flight best-effort work and does not delay engine teardown.
 pub struct Engine {
     shared: Arc<Shared>,
     workers: Vec<std::thread::JoinHandle<()>>,
     persistence_worker: Option<std::thread::JoinHandle<()>>,
-    gc_worker: Option<std::thread::JoinHandle<()>>,
 }
 
 fn navigation_pins(
@@ -946,15 +946,19 @@ impl Engine {
             );
         }
 
-        // Background disk-cache GC sweep on open.
-        let gc_worker = shared.disk.clone().map(|disk| {
-            std::thread::Builder::new()
+        // Background disk-cache GC sweep on open. A session does not own this
+        // best-effort maintenance task: a new sweep skips if the same cache
+        // root is already being scanned, and engine teardown never waits for
+        // it.
+        if let Some(disk) = shared.disk.clone()
+            && let Err(error) = std::thread::Builder::new()
                 .name("viewr-cache-gc".into())
                 .spawn(move || {
-                    disk.gc_to_budget();
+                    let _ = disk.try_gc_to_budget();
                 })
-                .expect("failed to spawn disk cache GC worker")
-        });
+        {
+            eprintln!("failed to spawn disk cache GC worker: {error}");
+        }
 
         // Discover embedded ratings and EXIF in the background without
         // decoding every preview JPEG. Thumbnail pixels are requested only by
@@ -972,7 +976,6 @@ impl Engine {
                 shared,
                 workers,
                 persistence_worker: Some(persistence_worker),
-                gc_worker,
             },
             rx,
         )
@@ -1098,9 +1101,6 @@ impl Drop for Engine {
         }
         self.shared.persistence.close();
         if let Some(worker) = self.persistence_worker.take() {
-            let _ = worker.join();
-        }
-        if let Some(worker) = self.gc_worker.take() {
             let _ = worker.join();
         }
     }
@@ -2832,7 +2832,6 @@ mod tests {
             shared: shared.clone(),
             workers: Vec::new(),
             persistence_worker: Some(worker),
-            gc_worker: None,
         };
         drop(engine);
         assert_eq!(

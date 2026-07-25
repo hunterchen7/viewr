@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError, Weak};
 use std::time::Duration;
 
 use crate::atomic_write;
@@ -204,6 +204,21 @@ impl DiskCache {
         self.gc(self.budget_bytes)
     }
 
+    /// Attempts one budget sweep without waiting for another sweep on this
+    /// cache root.
+    ///
+    /// Returns `None` when a sweep is already active. This is intended for
+    /// best-effort background maintenance where folder/session teardown must
+    /// not queue behind a full directory scan.
+    pub fn try_gc_to_budget(&self) -> Option<u64> {
+        let _gc_guard = match self.gc_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return None,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        Some(self.gc_without_lock(self.budget_bytes))
+    }
+
     /// Enforce the byte budget by deleting the oldest-written objects first.
     /// Cache reads do not refresh file modification times, so this is not LRU.
     /// Stale-keyed objects age out naturally.
@@ -220,6 +235,10 @@ impl DiskCache {
             .gc_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.gc_without_lock(budget_bytes)
+    }
+
+    fn gc_without_lock(&self, budget_bytes: u64) -> u64 {
         let mut objects: Vec<(std::path::PathBuf, std::time::SystemTime, u64)> = Vec::new();
         let mut total: u64 = 0;
         let Ok(shards) = std::fs::read_dir(&self.root) else {
@@ -565,6 +584,11 @@ mod tests {
         let first = DiskCache::open_at(dir.path().to_owned());
         let second = DiskCache::open_at(dir.path().to_owned());
         assert!(Arc::ptr_eq(&first.gc_lock, &second.gc_lock));
+
+        let guard = first.gc_lock.lock().unwrap();
+        assert_eq!(second.try_gc_to_budget(), None);
+        drop(guard);
+        assert_eq!(second.try_gc_to_budget(), Some(0));
     }
 
     #[test]
