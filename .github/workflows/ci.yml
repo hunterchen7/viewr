@@ -36,7 +36,7 @@ jobs:
       - name: Lint all targets and features
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Check documentation
-        run: cargo doc --workspace --no-deps --locked
+        run: cargo doc --workspace --no-deps --all-features --locked
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -96,8 +96,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build release and benchmark targets
         run: cargo build --workspace --release --bins --benches --all-features --locked
-      - name: Test viewr-core release library
-        run: cargo test -p viewr-core --release --lib --locked
+      - name: Test workspace release behavior
+        run: cargo test --workspace --release --locked
+      - name: Smoke-test optimized benchmark harnesses
+        run: |
+          cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- --test
+          cargo bench -p viewr --features benchmarks --bench filmstrip_scaling --locked -- --test
 
   miri:
     name: Miri unsafe-path checks
