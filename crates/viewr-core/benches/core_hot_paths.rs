@@ -14,7 +14,7 @@ use viewr_core::decode;
 use viewr_core::develop::{self, Quality};
 use viewr_core::folder::{FolderEntry, benchmark_sidecar_owner_keys, outward_order};
 use viewr_core::jobs::{
-    BenchmarkNavigationQueue, benchmark_jpeg_quality, benchmark_metadata_queue_setup, decode_jpeg,
+    BenchmarkMetadataQueue, BenchmarkNavigationQueue, benchmark_jpeg_quality, decode_jpeg,
     encode_jpeg,
 };
 use viewr_core::library::{benchmark_load_ratings_legacy_full_scan, try_load_ratings_with_owners};
@@ -167,15 +167,13 @@ fn bench_metadata_queue_setup(c: &mut Criterion) {
 
     for len in [1_000_usize, 10_000, 100_000] {
         assert_eq!(
-            benchmark_metadata_queue_setup(len),
+            BenchmarkMetadataQueue::new(len).resident_jobs(),
             len,
             "metadata benchmark must retain every production queue item"
         );
         group.throughput(Throughput::Elements(len as u64));
         group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, &len| {
-            b.iter(|| {
-                black_box(benchmark_metadata_queue_setup(black_box(len)));
-            });
+            b.iter_with_large_drop(|| BenchmarkMetadataQueue::new(black_box(len)));
         });
     }
 
@@ -725,19 +723,42 @@ struct V01MigrationExpectations {
     quarantined_ratings: usize,
 }
 
-fn create_v01_migration_template(path: &std::path::Path, rows: usize) -> V01MigrationExpectations {
+#[derive(Clone, Copy)]
+enum V01Release {
+    V010,
+    V011,
+}
+
+impl V01Release {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::V010 => "v0.1.0",
+            Self::V011 => "v0.1.1",
+        }
+    }
+
+    const fn has_dirty_column(self) -> bool {
+        matches!(self, Self::V011)
+    }
+}
+
+fn create_v01_migration_template(
+    path: &std::path::Path,
+    rows: usize,
+    release: V01Release,
+) -> V01MigrationExpectations {
     const EXISTING_STRIDE: usize = 250;
     const DIRTY_STRIDE: usize = 997;
 
     let fixture_root = path.parent().expect("v0.1 migration template has a parent");
-    let existing_root = fixture_root.join(format!("existing-v01-{rows}"));
+    let existing_root = fixture_root.join(format!("existing-{}-{rows}", release.label()));
     std::fs::create_dir(&existing_root).expect("v0.1 existing RAW directory initializes");
     let existing_root =
         std::fs::canonicalize(existing_root).expect("v0.1 existing RAW directory canonicalizes");
     let missing_root = existing_root
         .parent()
         .expect("v0.1 existing RAW directory has a parent")
-        .join(format!("missing-v01-{rows}"));
+        .join(format!("missing-{}-{rows}", release.label()));
     assert!(
         !missing_root.exists(),
         "v0.1 missing RAW directory must stay unresolved"
@@ -746,35 +767,54 @@ fn create_v01_migration_template(path: &std::path::Path, rows: usize) -> V01Migr
     let mut connection =
         rusqlite::Connection::open(path).expect("v0.1 migration template database opens");
     connection
-        .execute_batch(
-            "CREATE TABLE images (
-                path TEXT PRIMARY KEY,
-                size INTEGER NOT NULL,
-                mtime_ns INTEGER NOT NULL,
-                rating INTEGER,
-                sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
-                sidecar_dirty INTEGER NOT NULL DEFAULT 0,
-                last_seen INTEGER NOT NULL DEFAULT 0
-            );",
-        )
+        .execute_batch(match release {
+            V01Release::V010 => {
+                "CREATE TABLE images (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );"
+            }
+            V01Release::V011 => {
+                "CREATE TABLE images (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );"
+            }
+        })
         .expect("released v0.1 rating schema initializes");
 
     let transaction = connection
         .transaction()
         .expect("v0.1 migration template transaction begins");
     let mut insert = transaction
-        .prepare(
-            "INSERT INTO images
-                (path, size, mtime_ns, rating, sidecar_mtime_ns,
-                 sidecar_dirty, last_seen)
-             VALUES (?1, ?2, ?3, 4, 1, ?4, 0)",
-        )
+        .prepare(match release {
+            V01Release::V010 => {
+                "INSERT INTO images
+                    (path, size, mtime_ns, rating, sidecar_mtime_ns, last_seen)
+                 VALUES (?1, ?2, ?3, 4, 1, 0)"
+            }
+            V01Release::V011 => {
+                "INSERT INTO images
+                    (path, size, mtime_ns, rating, sidecar_mtime_ns,
+                     sidecar_dirty, last_seen)
+                 VALUES (?1, ?2, ?3, 4, 1, ?4, 0)"
+            }
+        })
         .expect("v0.1 migration template insert prepares");
     let mut existing_dirty = 0_usize;
     let mut missing_dirty = 0_usize;
     for index in 0..rows {
         let exists = index % EXISTING_STRIDE == 0;
-        let dirty = index % DIRTY_STRIDE == 0;
+        let dirty = release.has_dirty_column() && index % DIRTY_STRIDE == 0;
         let raw = if exists {
             let raw = existing_root.join(format!("photo-{index:08}.ARW"));
             std::fs::write(&raw, b"raw").expect("v0.1 existing RAW placeholder writes");
@@ -794,14 +834,12 @@ fn create_v01_migration_template(path: &std::path::Path, rows: usize) -> V01Migr
         } else {
             (index as u64 + 1, index as i64 + 1)
         };
-        insert
-            .execute(rusqlite::params![
-                raw.to_str().expect("v0.1 benchmark path is UTF-8"),
-                size,
-                mtime_ns,
-                dirty,
-            ])
-            .expect("v0.1 migration template row inserts");
+        let raw = raw.to_str().expect("v0.1 benchmark path is UTF-8");
+        match release {
+            V01Release::V010 => insert.execute(rusqlite::params![raw, size, mtime_ns]),
+            V01Release::V011 => insert.execute(rusqlite::params![raw, size, mtime_ns, dirty]),
+        }
+        .expect("v0.1 migration template row inserts");
         if dirty {
             if exists {
                 existing_dirty += 1;
@@ -816,78 +854,94 @@ fn create_v01_migration_template(path: &std::path::Path, rows: usize) -> V01Migr
         .expect("v0.1 migration template transaction commits");
     drop(connection);
 
-    assert!(
-        existing_dirty > 0 && missing_dirty > 0,
-        "v0.1 migration corpus must include recoverable and quarantined dirty rows"
-    );
-    V01MigrationExpectations {
-        surviving_images: rows - missing_dirty,
-        owner_ledgers: existing_dirty,
-        pending_sidecars: existing_dirty,
-        quarantined_ratings: missing_dirty,
+    match release {
+        V01Release::V010 => V01MigrationExpectations {
+            surviving_images: rows,
+            owner_ledgers: 0,
+            pending_sidecars: 0,
+            quarantined_ratings: 0,
+        },
+        V01Release::V011 => {
+            assert!(
+                existing_dirty > 0 && missing_dirty > 0,
+                "v0.1.1 corpus must include recoverable and quarantined dirty rows"
+            );
+            V01MigrationExpectations {
+                surviving_images: rows - missing_dirty,
+                owner_ledgers: existing_dirty,
+                pending_sidecars: existing_dirty,
+                quarantined_ratings: missing_dirty,
+            }
+        }
     }
 }
 
-fn bench_rating_db_cold_v01_migration(c: &mut Criterion) {
-    let mut group = c.benchmark_group("rating_db_cold_v01_migration");
+fn bench_rating_db_cold_released_migrations(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rating_db_cold_released_migrations");
     group.sample_size(10);
     group.warm_up_time(Duration::from_millis(300));
     group.measurement_time(Duration::from_millis(1_500));
 
-    for rows in [1_000_usize, 10_000] {
-        let template_directory = tempfile::tempdir().expect("v0.1 template directory");
-        let template_path = template_directory.path().join("viewr-v01.db");
-        let expected = create_v01_migration_template(&template_path, rows);
+    for release in [V01Release::V010, V01Release::V011] {
+        for rows in [1_000_usize, 10_000] {
+            let template_directory = tempfile::tempdir().expect("v0.1 template directory");
+            let template_path = template_directory
+                .path()
+                .join(format!("viewr-{}.db", release.label()));
+            let expected = create_v01_migration_template(&template_path, rows, release);
 
-        let preflight_directory = tempfile::tempdir().expect("v0.1 preflight directory");
-        let preflight_path = preflight_directory.path().join("viewr.db");
-        std::fs::copy(&template_path, &preflight_path)
-            .expect("v0.1 migration preflight template copies");
-        let preflight = Db::open(&preflight_path).expect("v0.1 migration preflight succeeds");
-        assert_eq!(
-            benchmark_rating_cardinalities(&preflight).expect("v0.1 migration cardinalities read"),
-            (expected.surviving_images, expected.owner_ledgers),
-            "v0.1 migration must retain clean history and recover only identity-valid dirty rows"
-        );
-        assert_eq!(
-            preflight
-                .pending_sidecars()
-                .expect("v0.1 migrated pending sidecars read")
-                .len(),
-            expected.pending_sidecars,
-            "v0.1 migration must retain only recoverable unfinished work"
-        );
-        drop(preflight);
-        let quarantine = rusqlite::Connection::open(&preflight_path)
-            .expect("v0.1 migrated preflight database reopens")
-            .query_row(
-                "SELECT COUNT(*) FROM quarantined_legacy_ratings",
-                [],
-                |row| row.get::<_, usize>(0),
-            )
-            .expect("v0.1 migration quarantine cardinality reads");
-        assert_eq!(
-            quarantine, expected.quarantined_ratings,
-            "v0.1 migration must archive every unresolved dirty row"
-        );
-
-        group.bench_with_input(BenchmarkId::from_parameter(rows), &rows, |b, _| {
-            b.iter_batched(
-                || {
-                    let directory =
-                        tempfile::tempdir().expect("v0.1 migration iteration directory");
-                    let database_path = directory.path().join("viewr.db");
-                    std::fs::copy(&template_path, &database_path)
-                        .expect("v0.1 migration iteration template copies");
-                    (directory, database_path)
-                },
-                |(directory, database_path)| {
-                    let db = Db::open(black_box(&database_path)).expect("v0.1 migration succeeds");
-                    black_box((db, directory))
-                },
-                BatchSize::SmallInput,
+            let preflight_directory = tempfile::tempdir().expect("v0.1 preflight directory");
+            let preflight_path = preflight_directory.path().join("viewr.db");
+            std::fs::copy(&template_path, &preflight_path)
+                .expect("v0.1 migration preflight template copies");
+            let preflight = Db::open(&preflight_path).expect("v0.1 migration preflight succeeds");
+            assert_eq!(
+                benchmark_rating_cardinalities(&preflight)
+                    .expect("v0.1 migration cardinalities read"),
+                (expected.surviving_images, expected.owner_ledgers),
+                "released migration must retain the expected history and unfinished work"
             );
-        });
+            assert_eq!(
+                preflight
+                    .pending_sidecars()
+                    .expect("v0.1 migrated pending sidecars read")
+                    .len(),
+                expected.pending_sidecars,
+                "released migration must retain only recoverable unfinished work"
+            );
+            drop(preflight);
+            let quarantine = rusqlite::Connection::open(&preflight_path)
+                .expect("v0.1 migrated preflight database reopens")
+                .query_row(
+                    "SELECT COUNT(*) FROM quarantined_legacy_ratings",
+                    [],
+                    |row| row.get::<_, usize>(0),
+                )
+                .expect("v0.1 migration quarantine cardinality reads");
+            assert_eq!(
+                quarantine, expected.quarantined_ratings,
+                "released migration must archive every unresolved unfinished row"
+            );
+
+            group.bench_with_input(BenchmarkId::new(release.label(), rows), &rows, |b, _| {
+                b.iter_batched(
+                    || {
+                        let directory =
+                            tempfile::tempdir().expect("v0.1 migration iteration directory");
+                        let database_path = directory.path().join("viewr.db");
+                        std::fs::copy(&template_path, &database_path)
+                            .expect("v0.1 migration iteration template copies");
+                        (directory, database_path)
+                    },
+                    |(directory, database_path)| {
+                        let db =
+                            Db::open(black_box(&database_path)).expect("v0.1 migration succeeds");
+                        black_box((db, directory))
+                    },
+                    BatchSize::SmallInput,
+                );
+            });
+        }
     }
 
     group.finish();
@@ -1018,6 +1072,18 @@ fn bench_rating_db_journal(c: &mut Criterion) {
             benchmark_rating_cardinalities(&db).expect("benchmark cardinalities"),
             (len, len),
             "journal corpus must scale both image and owner ledgers"
+        );
+        db.record_rating_pending_sidecar(
+            raw.to_str().expect("benchmark path is UTF-8"),
+            metadata.len(),
+            mtime_ns,
+            3,
+        )
+        .expect("journal target prefills");
+        assert_eq!(
+            benchmark_rating_cardinalities(&db).expect("prefilled benchmark cardinalities"),
+            (len + 1, len + 1),
+            "timed journal operation must update an existing image and owner ledger"
         );
 
         group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, _| {
@@ -1282,7 +1348,7 @@ fn bench_jpeg(c: &mut Criterion) {
     for (name, photo, quality) in &cases {
         // Encoding is deliberately outside the decode timing.
         let encoded = encode_jpeg(photo, *quality).expect("synthetic photo must encode");
-        decode_group.throughput(Throughput::Bytes(photo.byte_len() as u64));
+        decode_group.throughput(Throughput::Bytes(encoded.len() as u64));
         decode_group.bench_function(format!("{name}_q{quality}"), |b| {
             b.iter(|| black_box(decode_jpeg(black_box(encoded.as_slice())).unwrap()));
         });
@@ -1333,7 +1399,10 @@ fn bench_ram_cache(c: &mut Criterion) {
     // Reuse the payload so this isolates LRU/hash-map churn rather than buffer
     // allocation. Every insert has a fresh key and evicts one resident entry.
     let churn = RamCache::new(0, rgba_bytes * 8, 0);
-    let mut next_key = 0_usize;
+    for index in 0..8 {
+        churn.insert_rgba((index, Tier::Browse), Arc::clone(&rgba));
+    }
+    let mut next_key = 8_usize;
     group.throughput(Throughput::Elements(1));
     group.bench_function("rgba_insert_with_eviction", |b| {
         b.iter(|| {
@@ -1602,7 +1671,7 @@ criterion_group! {
         bench_legacy_rating_folder_load,
         bench_legacy_rating_stress,
         bench_rating_db_reopen,
-        bench_rating_db_cold_v01_migration,
+        bench_rating_db_cold_released_migrations,
         bench_rating_db_cold_v7_migration,
         bench_rating_db_journal,
         bench_rating_db_pending_scan,

@@ -1176,24 +1176,33 @@ impl Drop for Engine {
     }
 }
 
-/// Builds the production metadata queue and returns its resident job count.
-///
-/// This is exposed only to the Criterion harness so folder-open queue
-/// construction can be measured without starting decoder threads or touching
-/// the filesystem.
+/// Production metadata queue fixture exposed only to the Criterion harness.
 #[cfg(feature = "benchmarks")]
 #[doc(hidden)]
-pub fn benchmark_metadata_queue_setup(len: usize) -> usize {
-    let queue = JobQueue::new();
-    queue.extend((0..len).map(|index| {
-        (
-            (index, Tier::Thumb),
-            5,
-            index.min(u32::MAX as usize) as u32,
-            Action::Metadata,
-        )
-    }));
-    queue.state.lock().unwrap().heap.len()
+pub struct BenchmarkMetadataQueue {
+    queue: JobQueue,
+}
+
+#[cfg(feature = "benchmarks")]
+impl BenchmarkMetadataQueue {
+    /// Builds the production metadata queue without starting decoder threads.
+    pub fn new(len: usize) -> Self {
+        let queue = JobQueue::new();
+        queue.extend((0..len).map(|index| {
+            (
+                (index, Tier::Thumb),
+                5,
+                index.min(u32::MAX as usize) as u32,
+                Action::Metadata,
+            )
+        }));
+        Self { queue }
+    }
+
+    /// Returns the number of jobs retained by the production queue.
+    pub fn resident_jobs(&self) -> usize {
+        self.queue.state.lock().unwrap().heap.len()
+    }
 }
 
 /// Production priority-queue synchronization isolated from decoder threads.
