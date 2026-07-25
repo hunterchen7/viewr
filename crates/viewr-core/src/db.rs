@@ -2584,7 +2584,11 @@ fn migrate_sidecar_owner_keys(
         };
         let planned = plan_owner_key_rows(&stored);
         let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        if current_owner_schema_is_ready(&transaction)? && !force_repair {
+        // Another opener may have completed the forced repair after this
+        // connection observed the sentinel. Its current capability snapshot
+        // is sufficient; repeating the repair would only advance every retry
+        // barrier again and amplify startup contention.
+        if current_owner_schema_is_ready(&transaction)? {
             transaction.rollback()?;
             return Ok(());
         }
@@ -6868,6 +6872,71 @@ mod tests {
 
         let db = Db::open(&path).unwrap();
         assert_eq!(db.get_image(raw.to_str().unwrap()).unwrap().rating, Some(3));
+    }
+
+    #[test]
+    fn stale_forced_repair_returns_when_another_opener_made_schema_current() {
+        let db = Db::open_in_memory().unwrap();
+        let before = rating_global_revisions_on(&db.conn).unwrap();
+
+        migrate_sidecar_owner_keys(&db.conn, true).unwrap();
+
+        assert_eq!(
+            rating_global_revisions_on(&db.conn).unwrap(),
+            before,
+            "a stale repair decision must not advance current retry barriers"
+        );
+    }
+
+    #[test]
+    fn concurrent_damaged_schema_opens_share_one_forced_repair() {
+        const OPENERS: usize = 8;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("concurrent-damaged.db");
+        let raw = normalize_physical_path(&directory.path().join("photo.ARW"));
+        std::fs::write(&raw, b"raw").unwrap();
+        let (size, mtime_ns) = file_identity(&raw);
+        let before = {
+            let db = Db::open(&path).unwrap();
+            db.record_rating_pending_sidecar(raw.to_str().unwrap(), size, mtime_ns, 4)
+                .unwrap();
+            let before = rating_global_revisions_on(&db.conn).unwrap();
+            db.conn
+                .execute_batch(
+                    "DROP TRIGGER images_generation_after_update_v2;
+                     CREATE TRIGGER images_generation_after_update_v2
+                     AFTER UPDATE OF size, mtime_ns, rating ON images
+                     BEGIN SELECT 1; END;",
+                )
+                .unwrap();
+            before
+        };
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(OPENERS));
+        let openers = (0..OPENERS)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let db = Db::open(&path).unwrap();
+                    assert!(current_owner_schema_is_ready(&db.conn).unwrap());
+                    assert_eq!(db.pending_sidecars().unwrap().len(), 1);
+                })
+            })
+            .collect::<Vec<_>>();
+        for opener in openers {
+            opener.join().unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        let after = rating_global_revisions_on(&db.conn).unwrap();
+        assert_eq!(
+            after,
+            (before.0 + 2, before.1 + 2),
+            "generation and owner repair must each install one retry barrier"
+        );
     }
 
     #[test]
