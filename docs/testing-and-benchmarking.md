@@ -98,7 +98,8 @@ The suite measures these workloads:
 - Cold migration of copied 1,000- and 10,000-row templates from both released
   ownerless schemas: v0.1.0 without the journal column and v0.1.1 with sparse
   recoverable and quarantined dirty rows. Both corpora combine existing and
-  missing RAW paths.
+  missing RAW paths and begin in the persistent WAL mode used by those
+  releases.
 - Cold v7-to-v8 migration of copied 1,000- and 10,000-row database templates.
   Template creation and copy setup are outside the timed routine.
 - Rating journal updates against owner ledgers of up to 50,000 rows, plus

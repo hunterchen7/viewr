@@ -53,7 +53,7 @@ All promoted performance decisions use later isolated target runs.
 | P1 | Parent symlinks, filesystem-verified case and Unicode aliases, and ARW/DNG siblings could name one XMP target through different database paths. | Fixed for the supported identity probes. Current writes use a filesystem-derived physical owner. Legacy histories are read conservatively, ambiguous dirty work is quarantined, and a retargeted parent symlink cannot redirect recovery. Linux bind mounts and distinct case-folded mount spellings remain an operational limit. |
 | P1 | A configured database directory or open failure could silently downgrade rating writes to database-free XMP publication. | Fixed. The configured database remains authoritative; work stays queued until it can journal safely. |
 | P1 | A damaged or interrupted schema repair could reuse an optimistic retry token or expose stale ownership through the read-only startup path. | Fixed. Repair intent is durable, every retry domain crosses a barrier, malformed counters fail closed before arithmetic, and read-only startup rejects incomplete repair state. |
-| P1 | Simultaneous first opens could combine schema observations from different migration states and reject an otherwise valid database. | Fixed. Readiness decisions use one SQLite snapshot, repair selection is serialized, and final verification tolerates a cooperating opener's temporary repair sentinel. The process test now runs four independent eight-writer start bursts. |
+| P1 | Simultaneous first opens could combine schema observations from different migration states and reject an otherwise valid database. | Fixed. Readiness decisions use one SQLite snapshot, repair selection is serialized, stale forced-repair decisions accept a capability state completed by another opener, and final verification tolerates a cooperating opener's temporary repair sentinel. The process test runs four independent eight-writer start bursts, and damaged-schema openers have a separate concurrency test. |
 | P1 | A removed clean legacy alias did not invalidate unordered dirty same-name history, and a partially migrated database handled ownerless/owned ambiguity asymmetrically. | Fixed. Clean unresolved paths poison only dirty recovery candidates, mixed migration carries ambiguity in both directions, and focused read/migration tests cover distinct legacy owner spellings. |
 | P1 | SQLite can store same-name indexes and triggers, allowing a valid object to mask a hostile opposite-type object. | Fixed. Readiness checks both namespaces and repair removes both before installing canonical objects. |
 | P1 | A panic in one decode job left its ID in flight and removed one worker. | Fixed. Each claimed job now has a panic boundary. Cleanup occurs before failure publication, and the worker continues. |
@@ -234,8 +234,8 @@ The benchmark suite now includes these production-adjacent costs:
   including dense-dirty and repeated-stem adversarial histories.
 - Cold migration from both released ownerless schemas: v0.1.0 without the
   journal column and v0.1.1 with sparse unfinished work. Both use existing and
-  missing RAWs, correctness preflights, and a fresh database copy for every
-  timed iteration.
+  missing RAWs, persistent WAL mode, correctness preflights, and a fresh
+  database copy for every timed iteration.
 - Cold v7-to-v8 migration from a fresh database copy on every measured
   iteration.
 - Indexed pending-journal scans with zero and one dirty row, plus journal
@@ -437,10 +437,10 @@ The ordinary and release test output reports the three absent private-RAW fixtur
 
 Final verification passed:
 
-- The debug and release workspace suites each reported 302 passed unit tests
+- The debug and release workspace suites each reported 304 passed unit tests
   and three ignored private-RAW tests.
 - The app reported 39 passed unit tests.
-- The core library reported 263 passed unit tests and three ignored private-RAW tests.
+- The core library reported 265 passed unit tests and three ignored private-RAW tests.
 - The Rustdoc suite reported one passed documentation test.
 - Clippy reported no warnings across all targets and features.
 - The all-feature release bins and benchmark targets built successfully.
@@ -448,5 +448,7 @@ Final verification passed:
 - Miri reported four passed unsafe-path tests.
 - Seventy repeated cross-process parent tests completed 2,240 synchronized
   child opens and writes without a failure.
+- Fifty repeated eight-thread damaged-schema tests each converged on one
+  generation barrier and one owner-repair barrier.
 - The base-to-branch whitespace check passed.
 - The rendering, layout, settings, color, and texture-LRU files had no source changes.
