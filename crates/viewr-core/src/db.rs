@@ -528,7 +528,7 @@ mod tests {
         assert_eq!(db.get_image(&first).unwrap().rating, Some(3));
         assert_eq!(db.get_image(&second).unwrap().rating, Some(5));
         let mut pending = db.pending_sidecars().unwrap();
-        pending.sort_by(|a, b| a.size.cmp(&b.size));
+        pending.sort_by_key(|item| item.size);
         assert_eq!(
             pending,
             vec![
