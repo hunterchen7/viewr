@@ -15,12 +15,14 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::db::{Db, PendingSidecarSync, default_db_path};
+use crate::db::{Db, ImageRevisionSnapshot, PendingSidecarSync, default_db_path};
 use crate::folder::FolderEntry;
 use crate::xmp;
 
 const SIDECAR_DEBOUNCE: Duration = Duration::from_millis(400);
 const SIDECAR_RETRY: Duration = Duration::from_secs(5);
+const SHUTDOWN_FLUSH_ATTEMPTS: usize = 3;
+const SHUTDOWN_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 enum Cmd {
     SetRating {
@@ -32,6 +34,10 @@ enum Cmd {
     Flush {
         done: Option<Sender<bool>>,
     },
+    #[cfg(test)]
+    Barrier {
+        done: Sender<()>,
+    },
     Shutdown,
 }
 
@@ -41,9 +47,9 @@ enum Cmd {
 /// which attempts to journal it and coalesces repeated changes to the same RAW
 /// before writing its XMP sidecar. The optional SQLite database is an
 /// accelerator and crash-recovery journal; sidecars remain the interoperable
-/// source of truth. Dropping the service makes one best-effort flush attempt
-/// and joins its worker. A failed sidecar remains recoverable on restart only
-/// if its dirty database journal write succeeded.
+/// source of truth. Dropping the service makes a bounded sequence of
+/// best-effort flush attempts and joins its worker. A failed sidecar remains
+/// recoverable on restart only if its dirty database journal write succeeded.
 pub struct Library {
     tx: Sender<Cmd>,
     worker: Option<JoinHandle<()>>,
@@ -167,7 +173,7 @@ impl Library {
     /// Commands use one FIFO channel, so a preceding [`set_rating`](Self::set_rating)
     /// is journaled before this flush is handled. Failures restore the dirty
     /// marker on the worker thread for a later retry. Dropping the library
-    /// remains the blocking durability boundary.
+    /// blocks for a bounded sequence of best-effort persistence attempts.
     pub fn request_flush(&self) {
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return;
@@ -192,6 +198,7 @@ struct Pending {
     mtime_ns: i64,
     rating: u8,
     journaled: bool,
+    journal_predecessor: Option<ImageRevisionSnapshot>,
     due: Instant,
 }
 
@@ -208,6 +215,7 @@ fn persist_thread(rx: &Receiver<Cmd>, db: Option<&Db>, debounce: Duration, dirty
                             mtime_ns: row.mtime_ns,
                             rating: row.rating,
                             journaled: true,
+                            journal_predecessor: None,
                             due: Instant::now(),
                         },
                     )
@@ -236,8 +244,19 @@ fn persist_thread(rx: &Receiver<Cmd>, db: Option<&Db>, debounce: Duration, dirty
                 // Commit the rating and dirty marker together before the
                 // debounced sidecar write. A restart can then recover both the
                 // rating precedence and the unfinished sidecar operation.
+                let journal_predecessor =
+                    db.and_then(|db| match db.rating_revision_snapshot(&path) {
+                        Ok(predecessor) => Some(predecessor),
+                        Err(error) => {
+                            eprintln!(
+                                "rating database ownership read failed for {}: {error}",
+                                path.display()
+                            );
+                            None
+                        }
+                    });
                 let journaled = db.as_ref().is_some_and(|db| {
-                    match db.record_rating_pending_sidecar(&path, size, mtime_ns, rating) {
+                    match db.record_rating_pending_sidecar_path(&path, size, mtime_ns, rating) {
                         Ok(()) => true,
                         Err(error) => {
                             eprintln!(
@@ -255,6 +274,7 @@ fn persist_thread(rx: &Receiver<Cmd>, db: Option<&Db>, debounce: Duration, dirty
                         mtime_ns,
                         rating,
                         journaled,
+                        journal_predecessor: (!journaled).then_some(journal_predecessor).flatten(),
                         due: Instant::now() + debounce,
                     },
                 );
@@ -268,8 +288,22 @@ fn persist_thread(rx: &Receiver<Cmd>, db: Option<&Db>, debounce: Duration, dirty
                     let _ = done.send(clean);
                 }
             }
+            #[cfg(test)]
+            Ok(Cmd::Barrier { done }) => {
+                let _ = done.send(());
+            }
             Ok(Cmd::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
-                flush_due(&mut pending, db, true);
+                let clean = retry_shutdown_flush(
+                    || flush_due(&mut pending, db, true),
+                    || std::thread::sleep(SHUTDOWN_RETRY_DELAY),
+                );
+                if !clean {
+                    eprintln!(
+                        "rating shutdown left {} update(s) unpersisted after \
+                         {SHUTDOWN_FLUSH_ATTEMPTS} attempts",
+                        pending.len()
+                    );
+                }
                 return;
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -290,49 +324,65 @@ fn flush_due(pending: &mut HashMap<PathBuf, Pending>, db: Option<&Db>, all: bool
         let Some(mut p) = pending.remove(&path) else {
             continue;
         };
-        match current_raw_identity(&path) {
-            Ok(identity) if identity == (p.size, p.mtime_ns) => {}
-            Ok(_) => {
-                if let Some(db) = db
-                    && let Err(error) =
-                        db.discard_pending_sidecar(&path, p.size, p.mtime_ns, p.rating)
-                {
+        if let Some(db) = db
+            && !p.journaled
+        {
+            let Some(predecessor) = p.journal_predecessor else {
+                eprintln!(
+                    "retaining unjournaled rating for {} because safe retry ownership \
+                     could not be established",
+                    path.display()
+                );
+                retry_later(pending, path, p);
+                continue;
+            };
+            match db.record_rating_pending_sidecar_if_unchanged(
+                &path,
+                p.size,
+                p.mtime_ns,
+                p.rating,
+                predecessor,
+            ) {
+                Ok(true) => {
+                    p.journaled = true;
+                    p.journal_predecessor = None;
+                }
+                Ok(false) => {
                     eprintln!(
-                        "stale rating database cleanup failed for {}: {error}",
+                        "discarding superseded unjournaled rating for {}",
+                        path.display()
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "rating database retry failed for {}: {error}",
                         path.display()
                     );
                     retry_later(pending, path, p);
                     continue;
                 }
-                eprintln!("discarding rating for replaced RAW file {}", path.display());
-                continue;
             }
-            Err(error) => {
-                eprintln!("RAW identity read failed for {}: {error}", path.display());
-                retry_later(pending, path, p);
-                continue;
-            }
-        }
-        if let Some(db) = db
-            && !p.journaled
-        {
-            if let Err(error) =
-                db.record_rating_pending_sidecar(&path, p.size, p.mtime_ns, p.rating)
-            {
-                eprintln!(
-                    "rating database retry failed for {}: {error}",
-                    path.display()
-                );
-                retry_later(pending, path, p);
-                continue;
-            }
-            p.journaled = true;
         }
         if let Some(db) = db {
             match db.synchronize_pending_sidecar(&path, p.size, p.mtime_ns, p.rating, || {
-                write_sidecar(&path, p.rating)
+                write_sidecar_for_identity(&path, p.size, p.mtime_ns, p.rating)
             }) {
                 Ok(PendingSidecarSync::Written | PendingSidecarSync::Superseded) => {}
+                Ok(PendingSidecarSync::WriteFailed(SidecarWriteError::RawReplaced { .. })) => {
+                    match db.discard_pending_sidecar(&path, p.size, p.mtime_ns, p.rating) {
+                        Ok(_) => {
+                            eprintln!("discarding rating for replaced RAW file {}", path.display());
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "stale rating database cleanup failed for {}: {error}",
+                                path.display()
+                            );
+                            retry_later(pending, path, p);
+                        }
+                    }
+                }
                 Ok(PendingSidecarSync::WriteFailed(error)) => {
                     eprintln!("{error}");
                     retry_later(pending, path, p);
@@ -345,24 +395,75 @@ fn flush_due(pending: &mut HashMap<PathBuf, Pending>, db: Option<&Db>, all: bool
                     retry_later(pending, path, p);
                 }
             }
-        } else if let Err(error) = write_sidecar(&path, p.rating) {
-            eprintln!("{error}");
-            retry_later(pending, path, p);
+        } else {
+            match write_sidecar_for_identity(&path, p.size, p.mtime_ns, p.rating) {
+                Ok(_) => {}
+                Err(SidecarWriteError::RawReplaced { .. }) => {
+                    eprintln!("discarding rating for replaced RAW file {}", path.display());
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    retry_later(pending, path, p);
+                }
+            }
         }
     }
     pending.is_empty()
 }
 
-fn write_sidecar(path: &std::path::Path, rating: u8) -> Result<i64, String> {
+#[derive(Debug, thiserror::Error)]
+enum SidecarWriteError {
+    #[error("RAW identity read failed for {}: {source}", path.display())]
+    RawIdentity {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("RAW file was replaced: {}", path.display())]
+    RawReplaced { path: PathBuf },
+    #[error("{0}")]
+    Sidecar(String),
+}
+
+fn write_sidecar_for_identity(
+    path: &std::path::Path,
+    size: u64,
+    mtime_ns: i64,
+    rating: u8,
+) -> Result<i64, SidecarWriteError> {
+    match current_raw_identity(path) {
+        Ok(identity) if identity == (size, mtime_ns) => {}
+        Ok(_) => {
+            return Err(SidecarWriteError::RawReplaced {
+                path: path.to_path_buf(),
+            });
+        }
+        Err(source) => {
+            return Err(SidecarWriteError::RawIdentity {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    }
+
     let sidecar = path.with_extension("xmp");
-    xmp::write_rating(&sidecar, rating)
-        .map_err(|error| format!("sidecar write failed for {}: {error}", sidecar.display()))?;
+    xmp::write_rating(&sidecar, rating).map_err(|error| {
+        SidecarWriteError::Sidecar(format!(
+            "sidecar write failed for {}: {error}",
+            sidecar.display()
+        ))
+    })?;
     std::fs::metadata(&sidecar)
         .ok()
         .and_then(|metadata| metadata.modified().ok())
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos() as i64)
-        .ok_or_else(|| format!("sidecar metadata read failed for {}", sidecar.display()))
+        .ok_or_else(|| {
+            SidecarWriteError::Sidecar(format!(
+                "sidecar metadata read failed for {}",
+                sidecar.display()
+            ))
+        })
 }
 
 fn current_raw_identity(path: &std::path::Path) -> std::io::Result<(u64, i64)> {
@@ -379,6 +480,18 @@ fn current_raw_identity(path: &std::path::Path) -> std::io::Result<(u64, i64)> {
 fn retry_later(pending: &mut HashMap<PathBuf, Pending>, path: PathBuf, mut item: Pending) {
     item.due = Instant::now() + SIDECAR_RETRY;
     pending.insert(path, item);
+}
+
+fn retry_shutdown_flush(mut flush: impl FnMut() -> bool, mut pause: impl FnMut()) -> bool {
+    for attempt in 0..SHUTDOWN_FLUSH_ATTEMPTS {
+        if flush() {
+            return true;
+        }
+        if attempt + 1 < SHUTDOWN_FLUSH_ATTEMPTS {
+            pause();
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -414,7 +527,7 @@ mod tests {
     }
 
     fn put_db_rating(db: &Db, entry: &FolderEntry, rating: Option<u8>, sidecar_mtime_ns: i64) {
-        db.upsert_rating(
+        db.upsert_rating_path(
             &entry.path,
             entry.size,
             entry.mtime_ns,
@@ -424,11 +537,11 @@ mod tests {
         .unwrap();
     }
 
-    fn flush_barrier(library: &Library) -> bool {
+    fn worker_barrier(library: &Library) {
         let (done, wait) = std::sync::mpsc::channel();
-        library.tx.send(Cmd::Flush { done: Some(done) }).unwrap();
+        library.tx.send(Cmd::Barrier { done }).unwrap();
         wait.recv_timeout(Duration::from_secs(2))
-            .expect("persistence worker must answer a FIFO flush barrier")
+            .expect("persistence worker must answer a FIFO barrier");
     }
 
     #[test]
@@ -472,7 +585,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
 
         xmp::write_rating(&entry.sidecar_path(), 2).unwrap();
-        db.record_rating_pending_sidecar(
+        db.record_rating_pending_sidecar_path(
             &entry.path,
             entry.size.saturating_add(1),
             entry.mtime_ns,
@@ -507,7 +620,7 @@ mod tests {
         assert!(!entry.sidecar_path().with_extension("xmp.tmp").exists());
         let db = Db::open(&db_path).unwrap();
         let row = db
-            .get_image(&entry.path)
+            .get_image_path(&entry.path)
             .expect("flush must make the DB row visible");
         assert_eq!(row.rating, Some(2));
         assert!(row.sidecar_mtime_ns > 0);
@@ -525,6 +638,25 @@ mod tests {
     }
 
     #[test]
+    fn worker_barrier_observes_fifo_progress_without_flushing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("viewr.db");
+        let entry = entry(dir.path().join("photo.ARW"));
+        let library = Library::start_with(Some(db_path.clone()), Duration::from_secs(60));
+
+        library.set_rating(&entry, 4);
+        worker_barrier(&library);
+
+        assert!(!entry.sidecar_path().exists());
+        let row = Db::open(&db_path)
+            .unwrap()
+            .get_image_path(&entry.path)
+            .unwrap();
+        assert_eq!(row.rating, Some(4));
+        assert!(row.sidecar_dirty);
+    }
+
+    #[test]
     fn requested_flush_preserves_fifo_order_without_a_caller_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("viewr.db");
@@ -534,11 +666,11 @@ mod tests {
         library.set_rating(&entry, 4);
         library.request_flush();
         assert!(!library.dirty.load(Ordering::Acquire));
-        assert!(flush_barrier(&library));
+        worker_barrier(&library);
 
         assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(4));
         let db = Db::open(&db_path).unwrap();
-        let row = db.get_image(&entry.path).unwrap();
+        let row = db.get_image_path(&entry.path).unwrap();
         assert_eq!(row.rating, Some(4));
         assert!(!row.sidecar_dirty);
     }
@@ -562,10 +694,10 @@ mod tests {
 
         library.set_rating(&entry, 3);
         library.request_flush();
-        assert!(!flush_barrier(&library));
+        worker_barrier(&library);
         assert!(library.dirty.load(Ordering::Acquire));
         let db = Db::open(&db_path).unwrap();
-        assert!(db.get_image(&entry.path).unwrap().sidecar_dirty);
+        assert!(db.get_image_path(&entry.path).unwrap().sidecar_dirty);
         drop(db);
 
         std::fs::create_dir_all(entry.path.parent().unwrap()).unwrap();
@@ -590,11 +722,11 @@ mod tests {
         let entry = entry(dir.path().join("photo.ARW"));
         xmp::write_rating(&entry.sidecar_path(), 1).unwrap();
         let library = Library::start_with(Some(db_path.clone()), Duration::from_secs(60));
-        assert!(flush_barrier(&library));
+        worker_barrier(&library);
 
         let setup = Db::open(&db_path).unwrap();
         setup
-            .record_rating_pending_sidecar(&entry.path, entry.size, entry.mtime_ns, 1)
+            .record_rating_pending_sidecar_path(&entry.path, entry.size, entry.mtime_ns, 1)
             .unwrap();
         drop(setup);
         let connection = rusqlite::Connection::open(&db_path).unwrap();
@@ -605,6 +737,12 @@ mod tests {
                  WHEN NEW.sidecar_dirty = 1
                  BEGIN
                    SELECT RAISE(FAIL, 'injected journal failure');
+                 END;
+                 CREATE TRIGGER reject_dirty_rating_update
+                 BEFORE UPDATE ON images
+                 WHEN NEW.sidecar_dirty = 1 AND NEW.rating = 5
+                 BEGIN
+                   SELECT RAISE(FAIL, 'injected journal retry failure');
                  END;",
             )
             .unwrap();
@@ -614,18 +752,82 @@ mod tests {
 
         assert!(library.dirty.load(Ordering::Acquire));
         assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(1));
-        let row = Db::open(&db_path).unwrap().get_image(&entry.path).unwrap();
+        let row = Db::open(&db_path)
+            .unwrap()
+            .get_image_path(&entry.path)
+            .unwrap();
         assert_eq!(row.rating, Some(1));
         assert!(row.sidecar_dirty);
 
         connection
-            .execute_batch("DROP TRIGGER reject_dirty_rating;")
+            .execute_batch(
+                "DROP TRIGGER reject_dirty_rating;
+                 DROP TRIGGER reject_dirty_rating_update;",
+            )
             .unwrap();
         library.flush();
 
         assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(5));
         assert!(!library.dirty.load(Ordering::Acquire));
-        let row = Db::open(&db_path).unwrap().get_image(&entry.path).unwrap();
+        let row = Db::open(&db_path)
+            .unwrap()
+            .get_image_path(&entry.path)
+            .unwrap();
+        assert_eq!(row.rating, Some(5));
+        assert!(!row.sidecar_dirty);
+    }
+
+    #[test]
+    fn failed_initial_journal_retry_cannot_overwrite_a_newer_completed_rating() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("viewr.db");
+        let entry = entry(dir.path().join("photo.ARW"));
+        xmp::write_rating(&entry.sidecar_path(), 1).unwrap();
+        let initial_sidecar_mtime = sidecar_mtime(&entry);
+        {
+            let db = Db::open(&db_path).unwrap();
+            put_db_rating(&db, &entry, Some(1), initial_sidecar_mtime);
+        }
+
+        let library = Library::start_with(Some(db_path.clone()), Duration::from_secs(60));
+        worker_barrier(&library);
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_initial_dirty_rating
+                 BEFORE INSERT ON images
+                 WHEN NEW.sidecar_dirty = 1
+                 BEGIN
+                   SELECT RAISE(FAIL, 'injected initial journal failure');
+                 END;",
+            )
+            .unwrap();
+
+        library.set_rating(&entry, 2);
+        worker_barrier(&library);
+        assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(1));
+        connection
+            .execute_batch("DROP TRIGGER reject_initial_dirty_rating;")
+            .unwrap();
+
+        let newer = Db::open(&db_path).unwrap();
+        newer
+            .record_rating_pending_sidecar_path(&entry.path, entry.size, entry.mtime_ns, 5)
+            .unwrap();
+        assert!(matches!(
+            newer
+                .synchronize_pending_sidecar(&entry.path, entry.size, entry.mtime_ns, 5, || {
+                    write_sidecar_for_identity(&entry.path, entry.size, entry.mtime_ns, 5)
+                },)
+                .unwrap(),
+            PendingSidecarSync::Written
+        ));
+
+        library.flush();
+
+        assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(5));
+        assert!(!library.dirty.load(Ordering::Acquire));
+        let row = newer.get_image_path(&entry.path).unwrap();
         assert_eq!(row.rating, Some(5));
         assert!(!row.sidecar_dirty);
     }
@@ -639,10 +841,10 @@ mod tests {
         let newer = Db::open(&db_path).unwrap();
 
         older
-            .record_rating_pending_sidecar(&entry.path, entry.size, entry.mtime_ns, 1)
+            .record_rating_pending_sidecar_path(&entry.path, entry.size, entry.mtime_ns, 1)
             .unwrap();
         newer
-            .record_rating_pending_sidecar(&entry.path, entry.size, entry.mtime_ns, 5)
+            .record_rating_pending_sidecar_path(&entry.path, entry.size, entry.mtime_ns, 5)
             .unwrap();
         xmp::write_rating(&entry.sidecar_path(), 5).unwrap();
         assert!(
@@ -664,13 +866,14 @@ mod tests {
                 mtime_ns: entry.mtime_ns,
                 rating: 1,
                 journaled: true,
+                journal_predecessor: None,
                 due: Instant::now(),
             },
         )]);
         assert!(flush_due(&mut pending, Some(&older), true));
 
         assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(5));
-        let row = newer.get_image(&entry.path).unwrap();
+        let row = newer.get_image_path(&entry.path).unwrap();
         assert_eq!(row.rating, Some(5));
         assert!(!row.sidecar_dirty);
     }
@@ -688,8 +891,8 @@ mod tests {
 
         assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(4));
         let db = Db::open(&db_path).unwrap();
-        assert_eq!(db.get_image(&entry.path).unwrap().rating, Some(4));
-        assert!(!db.get_image(&entry.path).unwrap().sidecar_dirty);
+        assert_eq!(db.get_image_path(&entry.path).unwrap().rating, Some(4));
+        assert!(!db.get_image_path(&entry.path).unwrap().sidecar_dirty);
     }
 
     #[test]
@@ -703,12 +906,12 @@ mod tests {
         {
             let db = Db::open(&db_path).unwrap();
             put_db_rating(&db, &entry, Some(2), original_sidecar_mtime);
-            db.record_rating_pending_sidecar(&entry.path, entry.size, entry.mtime_ns, 5)
+            db.record_rating_pending_sidecar_path(&entry.path, entry.size, entry.mtime_ns, 5)
                 .unwrap();
         }
 
         let db = Db::open(&db_path).unwrap();
-        let row = db.get_image(&entry.path).unwrap();
+        let row = db.get_image_path(&entry.path).unwrap();
         assert_eq!(row.rating, Some(5));
         assert_eq!(row.sidecar_mtime_ns, original_sidecar_mtime);
         assert!(row.sidecar_dirty);
@@ -725,7 +928,7 @@ mod tests {
         {
             let db = Db::open(&db_path).unwrap();
             put_db_rating(&db, &entry, Some(1), sidecar_mtime(&entry));
-            db.record_rating_pending_sidecar(&entry.path, entry.size, entry.mtime_ns, 4)
+            db.record_rating_pending_sidecar_path(&entry.path, entry.size, entry.mtime_ns, 4)
                 .unwrap();
         }
 
@@ -736,7 +939,7 @@ mod tests {
 
         assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(4));
         let db = Db::open(&db_path).unwrap();
-        let row = db.get_image(&entry.path).unwrap();
+        let row = db.get_image_path(&entry.path).unwrap();
         assert_eq!(row.rating, Some(4));
         assert!(!row.sidecar_dirty);
         assert!(db.pending_sidecars().unwrap().is_empty());
@@ -750,7 +953,7 @@ mod tests {
         xmp::write_rating(&entry.sidecar_path(), 1).unwrap();
         {
             let db = Db::open(&db_path).unwrap();
-            db.record_rating_pending_sidecar(&entry.path, entry.size, entry.mtime_ns, 5)
+            db.record_rating_pending_sidecar_path(&entry.path, entry.size, entry.mtime_ns, 5)
                 .unwrap();
         }
         std::fs::write(&entry.path, b"a different raw payload").unwrap();
@@ -762,8 +965,31 @@ mod tests {
 
         assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(1));
         let db = Db::open(&db_path).unwrap();
-        assert!(db.get_image(&entry.path).is_none());
+        assert!(db.get_image_path(&entry.path).is_none());
         assert!(db.pending_sidecars().unwrap().is_empty());
+    }
+
+    #[test]
+    fn raw_identity_is_revalidated_after_database_ownership_is_acquired() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = entry(dir.path().join("photo.ARW"));
+        let db = Db::open_in_memory().unwrap();
+        db.record_rating_pending_sidecar_path(&entry.path, entry.size, entry.mtime_ns, 5)
+            .unwrap();
+
+        let result = db
+            .synchronize_pending_sidecar(&entry.path, entry.size, entry.mtime_ns, 5, || {
+                std::fs::write(&entry.path, b"a replacement RAW payload").unwrap();
+                write_sidecar_for_identity(&entry.path, entry.size, entry.mtime_ns, 5)
+            })
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            PendingSidecarSync::WriteFailed(SidecarWriteError::RawReplaced { .. })
+        ));
+        assert!(!entry.sidecar_path().exists());
+        assert!(db.get_image_path(&entry.path).unwrap().sidecar_dirty);
     }
 
     #[test]
@@ -789,7 +1015,7 @@ mod tests {
         assert!(library.dirty.load(Ordering::Acquire));
         assert!(!entry.sidecar_path().exists());
         let db = Db::open(&db_path).unwrap();
-        let row = db.get_image(&entry.path).unwrap();
+        let row = db.get_image_path(&entry.path).unwrap();
         assert_eq!(row.rating, Some(3));
         assert!(row.sidecar_dirty);
         drop(db);
@@ -811,6 +1037,33 @@ mod tests {
         assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(3));
         assert!(!library.dirty.load(Ordering::Acquire));
         let db = Db::open(&db_path).unwrap();
-        assert!(!db.get_image(&entry.path).unwrap().sidecar_dirty);
+        assert!(!db.get_image_path(&entry.path).unwrap().sidecar_dirty);
+    }
+
+    #[test]
+    fn shutdown_flush_retry_is_bounded_and_stops_after_success() {
+        let attempts = std::cell::Cell::new(0);
+        let pauses = std::cell::Cell::new(0);
+        assert!(retry_shutdown_flush(
+            || {
+                attempts.set(attempts.get() + 1);
+                attempts.get() == SHUTDOWN_FLUSH_ATTEMPTS
+            },
+            || pauses.set(pauses.get() + 1),
+        ));
+        assert_eq!(attempts.get(), SHUTDOWN_FLUSH_ATTEMPTS);
+        assert_eq!(pauses.get(), SHUTDOWN_FLUSH_ATTEMPTS - 1);
+
+        attempts.set(0);
+        pauses.set(0);
+        assert!(!retry_shutdown_flush(
+            || {
+                attempts.set(attempts.get() + 1);
+                false
+            },
+            || pauses.set(pauses.get() + 1),
+        ));
+        assert_eq!(attempts.get(), SHUTDOWN_FLUSH_ATTEMPTS);
+        assert_eq!(pauses.get(), SHUTDOWN_FLUSH_ATTEMPTS - 1);
     }
 }
