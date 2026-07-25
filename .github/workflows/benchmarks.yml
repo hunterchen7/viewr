@@ -24,11 +24,44 @@ jobs:
         with:
           shared-key: benchmarks
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Record environment
+      - name: Record benchmark environment
+        shell: bash
         run: |
           rustc -Vv
           uname -a
           lscpu
+          mkdir -p target
+          bench_commit="$(git rev-parse HEAD)"
+          bench_rust="$(rustc -Vv)"
+          bench_os="$(uname -a)"
+          bench_cpu="$(lscpu | awk -F: '/Model name/ {sub(/^[ \t]+/, "", $2); print $2; exit}')"
+          bench_cores="$(nproc)"
+          bench_memory="$(awk '/MemTotal/ {print $2 * 1024; exit}' /proc/meminfo)"
+          bench_lock_hash="$(sha256sum Cargo.lock | awk '{print $1}')"
+          jq -n \
+            --arg commit "$bench_commit" \
+            --arg cargo_lock_sha256 "$bench_lock_hash" \
+            --arg rustc "$bench_rust" \
+            --arg os "$bench_os" \
+            --arg cpu "$bench_cpu" \
+            --argjson logical_cores "$bench_cores" \
+            --argjson memory_bytes "$bench_memory" \
+            --arg rayon_threads "${RAYON_NUM_THREADS:-default}" \
+            '{
+              schema_version: 1,
+              commit: $commit,
+              cargo_lock_sha256: $cargo_lock_sha256,
+              rustc: $rustc,
+              os: $os,
+              cpu: $cpu,
+              logical_cores: $logical_cores,
+              memory_bytes: $memory_bytes,
+              rayon_threads: $rayon_threads,
+              raw_fixture: null,
+              cache_condition: "Criterion warm-up; operating-system cache not reset",
+              power_mode: "GitHub-hosted runner (not controlled)"
+            }' > target/benchmark-metadata.json
+          cat target/benchmark-metadata.json
       - name: Run core synthetic benchmarks
         run: cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- --noplot
       - name: Run filmstrip scaling benchmarks
@@ -37,7 +70,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: criterion-${{ github.run_id }}
-          path: target/criterion
+          name: criterion-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            target/criterion
+            target/benchmark-metadata.json
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 90

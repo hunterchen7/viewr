@@ -28,10 +28,11 @@ formatting, Clippy, Rustdoc, benchmark compilation, and release compilation run
 once on Linux. Miri uses one pinned Linux nightly job. The independent quality,
 test, optimized-build, and Miri jobs run in parallel.
 
-The optimized-build job uses one release-profile Cargo invocation with
-`--bins --benches --all-features`. This builds the application and both
-benchmark harnesses with one unified dependency graph. It does not duplicate
-the three test jobs by linking unit-test harnesses again in release mode.
+The optimized-build job builds the application and both benchmark harnesses
+with one release-profile Cargo invocation using
+`--bins --benches --all-features`. It then runs the core library tests in
+release mode. The release test is intentional: optimized-only parallel paths
+and code hidden behind `debug_assert!` must execute in CI, not merely compile.
 
 CI caches downloaded Cargo registry and Git sources plus compiled dependency
 artifacts. Quality, test, optimized-build, benchmark, and Miri jobs use separate
@@ -74,16 +75,19 @@ cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked 
 
 The suite measures these workloads:
 
-- Navigation planning for 100, 1,000, and 10,000 images.
-- A pure bounded-planner proxy for navigation after persistent disk warming is
-  configured, plus the former folder-wide planner as an explicitly labeled
-  reference. These measurements exclude Engine locks, cache probes, queue
-  synchronization, and the one-time warm-order installation.
+- Navigation planning and production priority-queue synchronization for 100,
+  1,000, and 10,000 images, plus the former folder-wide planner as an
+  explicitly labeled reference. The queue benchmark excludes decoder threads
+  and filesystem cache probes.
+- Folder-open metadata queue construction and SQLite rating lookup for up to
+  100,000 and 50,000 entries, respectively.
 - Outward-order construction for up to 1,000,000 images.
 - Resize of a deterministic 12.2-megapixel image, plus rotation at 12.2 and
   32.7 megapixels.
-- JPEG encoding, JPEG decoding, RAM-cache hits, and eviction scaling.
-- XMP parsing, XMP updates, and disk-cache key generation.
+- JPEG encoding and decoding at the production Browse and Full dimensions and
+  qualities, plus RAM-cache hits and eviction scaling.
+- XMP parsing, XMP updates, disk-cache key generation, and cache-GC scans up
+  to 10,000 objects.
 - Loupe filmstrip widget scaling at 10,000 and 50,000 images.
 - Thumbnail texture-LRU maintenance for 200 touches among 773 residents.
 
@@ -134,7 +138,10 @@ Use these initial review limits:
 - Do not reject a change from one hosted-runner result.
 
 The manual `Benchmarks` workflow is advisory.
-Download its Criterion artifact to inspect the complete report.
+Download its Criterion artifact to inspect the complete report. The artifact
+also contains `benchmark-metadata.json` with the commit, Cargo.lock hash, Rust
+version, OS, CPU, logical-core count, memory, Rayon setting, cache condition,
+and fixture state. Benchmark artifacts are retained for 90 days.
 
 ## Real RAW benchmarks
 
@@ -163,6 +170,8 @@ does not isolate entropy decoding.
 The develop benchmark excludes decode setup.
 The initial probe and Criterion warm-up normally make these warm operating-
 system page-cache measurements. They are not Viewr RAM- or disk-cache hits.
+When `VIEWR_BENCH_RAW` is unset, the harness prints an explicit skip message;
+synthetic success must not be interpreted as real-camera fixture coverage.
 
 Use `viewr dev` in a new process for a cold-path inspection:
 
