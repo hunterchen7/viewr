@@ -191,6 +191,7 @@ struct Pending {
     size: u64,
     mtime_ns: i64,
     rating: u8,
+    journaled: bool,
     due: Instant,
 }
 
@@ -206,6 +207,7 @@ fn persist_thread(rx: &Receiver<Cmd>, db: Option<&Db>, debounce: Duration, dirty
                             size: row.size,
                             mtime_ns: row.mtime_ns,
                             rating: row.rating,
+                            journaled: true,
                             due: Instant::now(),
                         },
                     )
@@ -234,21 +236,25 @@ fn persist_thread(rx: &Receiver<Cmd>, db: Option<&Db>, debounce: Duration, dirty
                 // Commit the rating and dirty marker together before the
                 // debounced sidecar write. A restart can then recover both the
                 // rating precedence and the unfinished sidecar operation.
-                if let Some(db) = &db
-                    && let Err(error) =
-                        db.record_rating_pending_sidecar(&path, size, mtime_ns, rating)
-                {
-                    eprintln!(
-                        "rating database write failed for {}: {error}",
-                        path.display()
-                    );
-                }
+                let journaled = db.as_ref().is_some_and(|db| {
+                    match db.record_rating_pending_sidecar(&path, size, mtime_ns, rating) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            eprintln!(
+                                "rating database write failed for {}: {error}",
+                                path.display()
+                            );
+                            false
+                        }
+                    }
+                });
                 pending.insert(
                     path,
                     Pending {
                         size,
                         mtime_ns,
                         rating,
+                        journaled,
                         due: Instant::now() + debounce,
                     },
                 );
@@ -281,7 +287,7 @@ fn flush_due(pending: &mut HashMap<PathBuf, Pending>, db: Option<&Db>, all: bool
         .map(|(k, _)| k.clone())
         .collect();
     for path in due {
-        let Some(p) = pending.remove(&path) else {
+        let Some(mut p) = pending.remove(&path) else {
             continue;
         };
         match current_raw_identity(&path) {
@@ -306,6 +312,21 @@ fn flush_due(pending: &mut HashMap<PathBuf, Pending>, db: Option<&Db>, all: bool
                 retry_later(pending, path, p);
                 continue;
             }
+        }
+        if let Some(db) = db
+            && !p.journaled
+        {
+            if let Err(error) =
+                db.record_rating_pending_sidecar(&path, p.size, p.mtime_ns, p.rating)
+            {
+                eprintln!(
+                    "rating database retry failed for {}: {error}",
+                    path.display()
+                );
+                retry_later(pending, path, p);
+                continue;
+            }
+            p.journaled = true;
         }
         let sidecar = path.with_extension("xmp");
         if let Err(e) = xmp::write_rating(&sidecar, p.rating) {
@@ -561,6 +582,53 @@ mod tests {
 
         assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(3));
         assert!(!library.dirty.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn failed_initial_journal_write_cannot_leave_an_older_dirty_rating_authoritative() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("viewr.db");
+        let entry = entry(dir.path().join("photo.ARW"));
+        xmp::write_rating(&entry.sidecar_path(), 1).unwrap();
+        let library = Library::start_with(Some(db_path.clone()), Duration::from_secs(60));
+        assert!(flush_barrier(&library));
+
+        let setup = Db::open(&db_path).unwrap();
+        setup
+            .record_rating_pending_sidecar(&entry.path, entry.size, entry.mtime_ns, 1)
+            .unwrap();
+        drop(setup);
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_dirty_rating
+                 BEFORE INSERT ON images
+                 WHEN NEW.sidecar_dirty = 1
+                 BEGIN
+                   SELECT RAISE(FAIL, 'injected journal failure');
+                 END;",
+            )
+            .unwrap();
+
+        library.set_rating(&entry, 5);
+        library.flush();
+
+        assert!(library.dirty.load(Ordering::Acquire));
+        assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(1));
+        let row = Db::open(&db_path).unwrap().get_image(&entry.path).unwrap();
+        assert_eq!(row.rating, Some(1));
+        assert!(row.sidecar_dirty);
+
+        connection
+            .execute_batch("DROP TRIGGER reject_dirty_rating;")
+            .unwrap();
+        library.flush();
+
+        assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(5));
+        assert!(!library.dirty.load(Ordering::Acquire));
+        let row = Db::open(&db_path).unwrap().get_image(&entry.path).unwrap();
+        assert_eq!(row.rating, Some(5));
+        assert!(!row.sidecar_dirty);
     }
 
     #[test]
