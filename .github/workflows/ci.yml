@@ -62,6 +62,22 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test workspace
         run: cargo test --workspace --locked
+      - name: Report optional real-RAW fixture coverage
+        if: ${{ always() && runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          fixture_dir="testdata/real-raw-corpus"
+          if [[ -f "$fixture_dir/HCA04875.ARW" && -f "$fixture_dir/HCA05417.ARW" ]]; then
+            fixture_status="Available but not run: real-RAW tests are opt-in because they are marked ignored."
+          else
+            fixture_status="Not run: optional local RAW fixtures are absent, so the ignored real-RAW tests have no fixture coverage in this CI run."
+          fi
+          echo "::notice title=Optional real-RAW fixture tests::$fixture_status"
+          {
+            echo "### Optional real-RAW fixture coverage"
+            echo
+            echo "$fixture_status"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build:
     name: Release and benchmark builds
@@ -80,6 +96,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build release and benchmark targets
         run: cargo build --workspace --release --bins --benches --all-features --locked
+      - name: Test viewr-core release library
+        run: cargo test -p viewr-core --release --lib --locked
 
   miri:
     name: Miri unsafe-path checks
