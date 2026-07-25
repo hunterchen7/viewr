@@ -15,7 +15,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::db::{Db, default_db_path};
+use crate::db::{Db, PendingSidecarSync, default_db_path};
 use crate::folder::FolderEntry;
 use crate::xmp;
 
@@ -328,30 +328,14 @@ fn flush_due(pending: &mut HashMap<PathBuf, Pending>, db: Option<&Db>, all: bool
             }
             p.journaled = true;
         }
-        let sidecar = path.with_extension("xmp");
-        if let Err(e) = xmp::write_rating(&sidecar, p.rating) {
-            eprintln!("sidecar write failed for {}: {e}", sidecar.display());
-            retry_later(pending, path, p);
-            continue;
-        }
-        // Record the sidecar mtime we just produced so external edits
-        // (which will be newer) win on next load.
-        let mtime = std::fs::metadata(&sidecar)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos() as i64);
-        let Some(mtime) = mtime else {
-            eprintln!("sidecar metadata read failed for {}", sidecar.display());
-            retry_later(pending, path, p);
-            continue;
-        };
         if let Some(db) = db {
-            match db.complete_pending_sidecar(&path, p.size, p.mtime_ns, p.rating, mtime) {
-                Ok(true) => {}
-                Ok(false) => {
-                    // A newer journal write won the path. It remains dirty and
-                    // must not be cleared by this older completion.
+            match db.synchronize_pending_sidecar(&path, p.size, p.mtime_ns, p.rating, || {
+                write_sidecar(&path, p.rating)
+            }) {
+                Ok(PendingSidecarSync::Written | PendingSidecarSync::Superseded) => {}
+                Ok(PendingSidecarSync::WriteFailed(error)) => {
+                    eprintln!("{error}");
+                    retry_later(pending, path, p);
                 }
                 Err(error) => {
                     eprintln!(
@@ -361,9 +345,24 @@ fn flush_due(pending: &mut HashMap<PathBuf, Pending>, db: Option<&Db>, all: bool
                     retry_later(pending, path, p);
                 }
             }
+        } else if let Err(error) = write_sidecar(&path, p.rating) {
+            eprintln!("{error}");
+            retry_later(pending, path, p);
         }
     }
     pending.is_empty()
+}
+
+fn write_sidecar(path: &std::path::Path, rating: u8) -> Result<i64, String> {
+    let sidecar = path.with_extension("xmp");
+    xmp::write_rating(&sidecar, rating)
+        .map_err(|error| format!("sidecar write failed for {}: {error}", sidecar.display()))?;
+    std::fs::metadata(&sidecar)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos() as i64)
+        .ok_or_else(|| format!("sidecar metadata read failed for {}", sidecar.display()))
 }
 
 fn current_raw_identity(path: &std::path::Path) -> std::io::Result<(u64, i64)> {
@@ -627,6 +626,51 @@ mod tests {
         assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(5));
         assert!(!library.dirty.load(Ordering::Acquire));
         let row = Db::open(&db_path).unwrap().get_image(&entry.path).unwrap();
+        assert_eq!(row.rating, Some(5));
+        assert!(!row.sidecar_dirty);
+    }
+
+    #[test]
+    fn superseded_recovery_cannot_publish_after_a_newer_rating_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("viewr.db");
+        let entry = entry(dir.path().join("photo.ARW"));
+        let older = Db::open(&db_path).unwrap();
+        let newer = Db::open(&db_path).unwrap();
+
+        older
+            .record_rating_pending_sidecar(&entry.path, entry.size, entry.mtime_ns, 1)
+            .unwrap();
+        newer
+            .record_rating_pending_sidecar(&entry.path, entry.size, entry.mtime_ns, 5)
+            .unwrap();
+        xmp::write_rating(&entry.sidecar_path(), 5).unwrap();
+        assert!(
+            newer
+                .complete_pending_sidecar(
+                    &entry.path,
+                    entry.size,
+                    entry.mtime_ns,
+                    5,
+                    sidecar_mtime(&entry),
+                )
+                .unwrap()
+        );
+
+        let mut pending = HashMap::from([(
+            entry.path.clone(),
+            Pending {
+                size: entry.size,
+                mtime_ns: entry.mtime_ns,
+                rating: 1,
+                journaled: true,
+                due: Instant::now(),
+            },
+        )]);
+        assert!(flush_due(&mut pending, Some(&older), true));
+
+        assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(5));
+        let row = newer.get_image(&entry.path).unwrap();
         assert_eq!(row.rating, Some(5));
         assert!(!row.sidecar_dirty);
     }

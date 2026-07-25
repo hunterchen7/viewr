@@ -9,7 +9,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use rusqlite::types::{Type, Value, ValueRef};
-use rusqlite::{Connection, Row};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 
 #[derive(Debug, thiserror::Error)]
 /// Failure while opening, migrating, or updating the metadata database.
@@ -51,6 +51,20 @@ pub struct PendingSidecar {
     pub mtime_ns: i64,
     /// Rating to persist, normally in `0..=5`.
     pub rating: u8,
+}
+
+pub(crate) enum PendingSidecarSync<E> {
+    Written,
+    Superseded,
+    WriteFailed(E),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PendingSidecarSyncError {
+    #[error("sqlite: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("sidecar ownership changed inside an immediate transaction")]
+    OwnershipLost,
 }
 
 /// Returns the platform-default database path, creating its parent directory.
@@ -244,6 +258,64 @@ impl Db {
                 sidecar_mtime_ns
             ])?;
         Ok(changed == 1)
+    }
+
+    pub(crate) fn synchronize_pending_sidecar<E>(
+        &self,
+        path: &Path,
+        size: u64,
+        mtime_ns: i64,
+        rating: u8,
+        write: impl FnOnce() -> Result<i64, E>,
+    ) -> Result<PendingSidecarSync<E>, PendingSidecarSyncError> {
+        // The immediate transaction serializes cooperating Viewr processes
+        // before any sidecar bytes are replaced. Without this ownership
+        // boundary, an older writer can publish stale XMP and only discover
+        // that it lost the database compare-and-swap afterward.
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let is_current = transaction
+            .query_row(
+                "SELECT 1
+                   FROM images
+                  WHERE path = ?1
+                    AND size = ?2
+                    AND mtime_ns = ?3
+                    AND rating = ?4
+                    AND sidecar_dirty = 1",
+                rusqlite::params![path_value(path), size, mtime_ns, rating],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !is_current {
+            transaction.rollback()?;
+            return Ok(PendingSidecarSync::Superseded);
+        }
+
+        let sidecar_mtime_ns = match write() {
+            Ok(mtime) => mtime,
+            Err(error) => return Ok(PendingSidecarSync::WriteFailed(error)),
+        };
+        let changed = transaction.execute(
+            "UPDATE images
+                SET sidecar_mtime_ns = ?5,
+                    sidecar_dirty = 0,
+                    last_seen = unixepoch()
+              WHERE path = ?1
+                AND size = ?2
+                AND mtime_ns = ?3
+                AND rating = ?4
+                AND sidecar_dirty = 1",
+            rusqlite::params![path_value(path), size, mtime_ns, rating, sidecar_mtime_ns],
+        )?;
+        if changed != 1 {
+            // No other SQLite writer can change the row while this immediate
+            // transaction is active. Treat trigger/corruption interference as
+            // a database failure and leave the journal dirty for a retry.
+            return Err(PendingSidecarSyncError::OwnershipLost);
+        }
+        transaction.commit()?;
+        Ok(PendingSidecarSync::Written)
     }
 
     /// Remove one exact dirty row after its RAW identity has gone stale.
@@ -519,6 +591,70 @@ mod tests {
         let missing = Path::new("/p/missing.arw");
         assert!(!db.complete_pending_sidecar(missing, 10, 1, 5, 101).unwrap());
         assert!(!db.discard_pending_sidecar(missing, 10, 1, 5).unwrap());
+    }
+
+    #[test]
+    fn sidecar_sync_holds_sqlite_write_ownership_across_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("viewr.db");
+        let path = PathBuf::from("/p/concurrent.arw");
+        let owner = Db::open(&database_path).unwrap();
+        let contender = Db::open(&database_path).unwrap();
+        owner
+            .record_rating_pending_sidecar(&path, 10, 1, 2)
+            .unwrap();
+
+        let (entered, entered_wait) = std::sync::mpsc::channel();
+        let (release, release_wait) = std::sync::mpsc::channel();
+        let owner_path = path.clone();
+        let owner_thread = std::thread::spawn(move || {
+            owner
+                .synchronize_pending_sidecar(&owner_path, 10, 1, 2, || {
+                    entered.send(()).unwrap();
+                    release_wait.recv().unwrap();
+                    Ok::<_, ()>(99)
+                })
+                .unwrap()
+        });
+        entered_wait
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+
+        contender
+            .conn
+            .busy_timeout(std::time::Duration::ZERO)
+            .unwrap();
+        let error = contender
+            .record_rating_pending_sidecar(&path, 10, 1, 5)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DbError::Sqlite(rusqlite::Error::SqliteFailure(ref failure, _))
+                if matches!(
+                    failure.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        ));
+
+        release.send(()).unwrap();
+        assert!(matches!(
+            owner_thread.join().unwrap(),
+            PendingSidecarSync::Written
+        ));
+
+        contender
+            .record_rating_pending_sidecar(&path, 10, 1, 5)
+            .unwrap();
+        assert!(matches!(
+            contender
+                .synchronize_pending_sidecar(&path, 10, 1, 5, || Ok::<_, ()>(100))
+                .unwrap(),
+            PendingSidecarSync::Written
+        ));
+        let row = contender.get_image(&path).unwrap();
+        assert_eq!(row.rating, Some(5));
+        assert_eq!(row.sidecar_mtime_ns, 100);
+        assert!(!row.sidecar_dirty);
     }
 
     #[test]
