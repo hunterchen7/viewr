@@ -68,3 +68,41 @@ impl FileMeta {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::FileMeta;
+    use rawler::decoders::RawMetadata;
+    use rawler::formats::tiff::Rational;
+
+    #[test]
+    fn malformed_zero_denominator_rationals_are_omitted() {
+        let mut metadata = RawMetadata::default();
+        metadata.exif.exposure_time = Some(Rational { n: 1, d: 0 });
+        metadata.exif.fnumber = Some(Rational { n: 28, d: 0 });
+        metadata.exif.focal_length = Some(Rational { n: 50, d: 0 });
+
+        let file = FileMeta::from_metadata(&metadata);
+
+        assert_eq!(file.shutter, None);
+        assert_eq!(file.aperture, None);
+        assert_eq!(file.focal_mm, None);
+    }
+
+    #[test]
+    fn shutter_rationals_use_the_expected_display_forms() {
+        for (rational, expected) in [
+            (Rational { n: 1, d: 1_600 }, "1/1600"),
+            (Rational { n: 2, d: 1 }, "2s"),
+            (Rational { n: 3, d: 2 }, "1.5s"),
+        ] {
+            let mut metadata = RawMetadata::default();
+            metadata.exif.exposure_time = Some(rational);
+
+            assert_eq!(
+                FileMeta::from_metadata(&metadata).shutter.as_deref(),
+                Some(expected)
+            );
+        }
+    }
+}

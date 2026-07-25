@@ -405,6 +405,13 @@ mod tests {
         .unwrap();
     }
 
+    fn flush_barrier(library: &Library) -> bool {
+        let (done, wait) = std::sync::mpsc::channel();
+        library.tx.send(Cmd::Flush { done: Some(done) }).unwrap();
+        wait.recv_timeout(Duration::from_secs(2))
+            .expect("persistence worker must answer a FIFO flush barrier")
+    }
+
     #[test]
     fn load_ratings_resolves_sidecar_database_and_missing_precedence() {
         let dir = tempfile::tempdir().unwrap();
@@ -508,25 +515,53 @@ mod tests {
         library.set_rating(&entry, 4);
         library.request_flush();
         assert!(!library.dirty.load(Ordering::Acquire));
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while xmp::read_rating(&entry.sidecar_path()) != Some(4) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        assert!(flush_barrier(&library));
 
         assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(4));
         let db = Db::open(&db_path).unwrap();
-        let db_deadline = Instant::now() + Duration::from_secs(2);
-        while db
-            .get_image(&entry.path)
-            .is_none_or(|row| row.sidecar_dirty)
-            && Instant::now() < db_deadline
-        {
-            std::thread::sleep(Duration::from_millis(5));
-        }
         let row = db.get_image(&entry.path).unwrap();
         assert_eq!(row.rating, Some(4));
         assert!(!row.sidecar_dirty);
+    }
+
+    #[test]
+    fn requested_flush_failure_restores_dirty_state_for_a_later_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("viewr.db");
+        let raw_path = dir.path().join("missing-parent/photo.ARW");
+        let raw_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let entry = FolderEntry {
+            file_name: "photo.ARW".into(),
+            path: raw_path,
+            size: 3,
+            mtime_ns: raw_mtime
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as i64,
+        };
+        let library = Library::start_with(Some(db_path.clone()), Duration::from_secs(60));
+
+        library.set_rating(&entry, 3);
+        library.request_flush();
+        assert!(!flush_barrier(&library));
+        assert!(library.dirty.load(Ordering::Acquire));
+        let db = Db::open(&db_path).unwrap();
+        assert!(db.get_image(&entry.path).unwrap().sidecar_dirty);
+        drop(db);
+
+        std::fs::create_dir_all(entry.path.parent().unwrap()).unwrap();
+        std::fs::write(&entry.path, b"raw").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&entry.path)
+            .unwrap()
+            .set_modified(raw_mtime)
+            .unwrap();
+
+        library.flush();
+
+        assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(3));
+        assert!(!library.dirty.load(Ordering::Acquire));
     }
 
     #[test]
