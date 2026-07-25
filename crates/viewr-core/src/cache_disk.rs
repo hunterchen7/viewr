@@ -116,8 +116,8 @@ impl DiskCache {
         })
     }
 
-    #[cfg(test)]
-    /// Opens a cache at an explicit root for unit tests.
+    #[cfg(any(test, feature = "benchmarks"))]
+    /// Opens a cache at an explicit root for tests and benchmarks.
     pub fn open_at(root: PathBuf) -> Self {
         std::fs::create_dir_all(&root).unwrap();
         let gc_lock = shared_gc_lock(&root);

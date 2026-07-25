@@ -46,6 +46,20 @@ const JPEG_QUALITY_FULL: u8 = 90;
 const PERSIST_WRITE_ATTEMPTS: usize = 3;
 const PERSIST_RETRY_BASE_DELAY: Duration = Duration::from_millis(2);
 
+fn jpeg_quality(tier: Tier) -> u8 {
+    match tier {
+        Tier::Full => JPEG_QUALITY_FULL,
+        Tier::Thumb | Tier::Browse => JPEG_QUALITY_BROWSE,
+    }
+}
+
+/// Returns the production persistence quality for a benchmark tier.
+#[cfg(feature = "benchmarks")]
+#[doc(hidden)]
+pub fn benchmark_jpeg_quality(tier: Tier) -> u8 {
+    jpeg_quality(tier)
+}
+
 #[derive(Debug)]
 /// Result notification published by [`Engine`] workers.
 ///
@@ -1126,6 +1140,43 @@ pub fn benchmark_metadata_queue_setup(len: usize) -> usize {
     queue.state.lock().unwrap().heap.len()
 }
 
+/// Production priority-queue synchronization isolated from decoder threads.
+#[cfg(feature = "benchmarks")]
+#[doc(hidden)]
+pub struct BenchmarkNavigationQueue {
+    queue: JobQueue,
+    len: usize,
+}
+
+#[cfg(feature = "benchmarks")]
+impl BenchmarkNavigationQueue {
+    /// Creates an empty production queue for a synthetic folder.
+    pub fn new(len: usize) -> Self {
+        Self {
+            queue: JobQueue::new(),
+            len,
+        }
+    }
+
+    /// Replans one fit-mode navigation and returns the queued target count.
+    pub fn navigate(&self, current: usize) -> usize {
+        let plan = build_plan_targets(self.len, current, 1, false, &[], false)
+            .into_iter()
+            .filter(|target| target.kind == PlanKind::Display)
+            .map(|target| {
+                (
+                    (target.index, target.tier),
+                    target.class,
+                    target.effective_distance,
+                    Action::Develop(Quality::Browse),
+                )
+            })
+            .collect();
+        self.queue.set_plan(plan, true);
+        self.queue.state.lock().unwrap().heap.len()
+    }
+}
+
 fn worker(shared: &Shared, light: bool) {
     let queue = if light { &shared.light } else { &shared.heavy };
     while let Some((id, action, token)) = queue.pop() {
@@ -1238,10 +1289,7 @@ fn persistence_worker(shared: &Shared) {
         // This lane is intentionally single-threaded and yields before CPU
         // work so interactive develop workers retain scheduling priority.
         std::thread::yield_now();
-        let quality = match request.id.1 {
-            Tier::Full => JPEG_QUALITY_FULL,
-            _ => JPEG_QUALITY_BROWSE,
-        };
+        let quality = jpeg_quality(request.id.1);
         let encoded = encode_jpeg(&request.pixels, quality);
         let mut persistence_error = None;
         let encode_error = encoded.as_ref().err().cloned();

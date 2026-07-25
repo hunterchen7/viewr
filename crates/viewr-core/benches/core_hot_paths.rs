@@ -10,7 +10,10 @@ use viewr_core::db::{Db, benchmark_rating_lookup};
 use viewr_core::decode;
 use viewr_core::develop::{self, Quality};
 use viewr_core::folder::{FolderEntry, outward_order};
-use viewr_core::jobs::{benchmark_metadata_queue_setup, decode_jpeg, encode_jpeg};
+use viewr_core::jobs::{
+    BenchmarkNavigationQueue, benchmark_jpeg_quality, benchmark_metadata_queue_setup, decode_jpeg,
+    encode_jpeg,
+};
 use viewr_core::planning::build_plan_targets;
 use viewr_core::resize::{apply_orient, downscale_to_fit, resize_exact};
 use viewr_core::types::{Orient, PixelBuf, Tier};
@@ -78,7 +81,6 @@ fn bench_navigation_plan(c: &mut Criterion) {
     group.measurement_time(Duration::from_millis(1_500));
 
     for len in [100_usize, 1_000, 10_000] {
-        group.throughput(Throughput::Elements(len as u64));
         group.bench_with_input(BenchmarkId::new("identity", len), &len, |b, &len| {
             b.iter(|| {
                 black_box(build_plan_targets(
@@ -91,27 +93,22 @@ fn bench_navigation_plan(c: &mut Criterion) {
                 ))
             });
         });
-        // With a disk cache configured, repeated navigation still uses this
-        // bounded pure planner after the one-shot warm queue is initialized.
-        // This intentionally excludes Engine locks, cache probes, queue sync,
-        // and the first O(N) initialization; it is an asymptotic planner
-        // comparison, not an end-to-end navigation benchmark.
+
+        // This includes the production heap/index synchronization but keeps
+        // decoder threads and filesystem cache probes out of the measurement.
+        let queue = BenchmarkNavigationQueue::new(len);
+        let mut queue_current = len / 2;
         group.bench_with_input(
-            BenchmarkId::new("bounded_planner_with_disk_config", len),
+            BenchmarkId::new("production_queue_sync", len),
             &len,
             |b, &len| {
                 b.iter(|| {
-                    black_box(build_plan_targets(
-                        black_box(len),
-                        black_box(len / 2),
-                        black_box(1),
-                        black_box(false),
-                        black_box(&[]),
-                        black_box(false),
-                    ))
+                    queue_current = (queue_current + 1) % len;
+                    black_box(queue.navigate(black_box(queue_current)))
                 });
             },
         );
+
         // Retain the former O(N) planner as a reference measurement. The
         // engine no longer calls this path during navigation.
         group.bench_with_input(
@@ -281,35 +278,43 @@ fn bench_orientation(c: &mut Criterion) {
 }
 
 fn bench_jpeg(c: &mut Criterion) {
-    let photo = synthetic_photo(PHOTO_WIDTH, PHOTO_HEIGHT);
-    let decoded_bytes = photo.byte_len() as u64;
+    let cases = [
+        (
+            "browse_8mp",
+            synthetic_photo(3_504, 2_336),
+            benchmark_jpeg_quality(Tier::Browse),
+        ),
+        (
+            "full_33mp",
+            synthetic_photo(7_008, 4_672),
+            benchmark_jpeg_quality(Tier::Full),
+        ),
+    ];
 
     let mut encode_group = c.benchmark_group("jpeg_encode");
     encode_group.sample_size(10);
     encode_group.warm_up_time(Duration::from_millis(300));
     encode_group.measurement_time(Duration::from_secs(2));
-    encode_group.throughput(Throughput::Bytes(decoded_bytes));
-    for quality in [80_u8, 92] {
-        encode_group.bench_with_input(
-            BenchmarkId::from_parameter(quality),
-            &quality,
-            |b, &quality| {
-                b.iter(|| black_box(encode_jpeg(black_box(&photo), quality).unwrap()));
-            },
-        );
+    for (name, photo, quality) in &cases {
+        encode_group.throughput(Throughput::Bytes(photo.byte_len() as u64));
+        encode_group.bench_function(format!("{name}_q{quality}"), |b| {
+            b.iter(|| black_box(encode_jpeg(black_box(photo), *quality).unwrap()));
+        });
     }
     encode_group.finish();
 
-    // Encoding is deliberately outside the decode timing.
-    let encoded = encode_jpeg(&photo, 88).expect("synthetic photo must encode");
     let mut decode_group = c.benchmark_group("jpeg_decode");
     decode_group.sample_size(10);
     decode_group.warm_up_time(Duration::from_millis(300));
     decode_group.measurement_time(Duration::from_secs(2));
-    decode_group.throughput(Throughput::Bytes(decoded_bytes));
-    decode_group.bench_function("quality_88", |b| {
-        b.iter(|| black_box(decode_jpeg(black_box(encoded.as_slice())).unwrap()));
-    });
+    for (name, photo, quality) in &cases {
+        // Encoding is deliberately outside the decode timing.
+        let encoded = encode_jpeg(photo, *quality).expect("synthetic photo must encode");
+        decode_group.throughput(Throughput::Bytes(photo.byte_len() as u64));
+        decode_group.bench_function(format!("{name}_q{quality}"), |b| {
+            b.iter(|| black_box(decode_jpeg(black_box(encoded.as_slice())).unwrap()));
+        });
+    }
     decode_group.finish();
 }
 
@@ -503,11 +508,44 @@ fn bench_disk_cache_key(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_disk_cache_gc_scan(c: &mut Criterion) {
+    let mut group = c.benchmark_group("disk_cache_gc_scan");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_secs(2));
+
+    for len in [1_000_usize, 10_000] {
+        let directory = tempfile::tempdir().expect("benchmark cache directory");
+        let cache = DiskCache::open_at(directory.path().to_owned());
+        for index in 0..len {
+            let entry = FolderEntry {
+                path: PathBuf::from(format!("/benchmark/photo-{index:08}.arw")),
+                file_name: format!("photo-{index:08}.arw"),
+                size: index as u64,
+                mtime_ns: index as i64,
+            };
+            cache
+                .put(&DiskCache::key(&entry, Tier::Browse), b"x")
+                .expect("benchmark cache object writes");
+        }
+
+        group.throughput(Throughput::Elements(len as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, _| {
+            b.iter(|| assert_eq!(black_box(cache.gc(black_box(u64::MAX))), 0));
+        });
+    }
+
+    group.finish();
+}
+
 /// Set VIEWR_BENCH_RAW to an ARW or DNG path to include disk decode and both
 /// development qualities. Decode happens in iter_batched's setup closure for
 /// the develop cases, so only the consuming development pipeline is timed.
 fn bench_opt_in_raw(c: &mut Criterion) {
     let Some(raw_path) = std::env::var_os("VIEWR_BENCH_RAW").map(PathBuf::from) else {
+        eprintln!(
+            "raw_opt_in skipped: set VIEWR_BENCH_RAW to an untracked ARW or DNG fixture to run it"
+        );
         return;
     };
 
@@ -589,6 +627,7 @@ criterion_group! {
         bench_ram_cache_eviction_scaling,
         bench_xmp,
         bench_disk_cache_key,
+        bench_disk_cache_gc_scan,
         bench_opt_in_raw
 }
 criterion_main!(core_hot_paths);
