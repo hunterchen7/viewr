@@ -6,7 +6,9 @@ use std::time::Duration;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use viewr_core::cache_disk::DiskCache;
 use viewr_core::cache_ram::RamCache;
-use viewr_core::db::{Db, benchmark_insert_rating, benchmark_rating_lookup};
+use viewr_core::db::{
+    Db, benchmark_insert_rating, benchmark_rating_cardinalities, benchmark_rating_lookup,
+};
 use viewr_core::decode;
 use viewr_core::develop::{self, Quality};
 use viewr_core::folder::{FolderEntry, benchmark_sidecar_owner_keys, outward_order};
@@ -14,6 +16,7 @@ use viewr_core::jobs::{
     BenchmarkNavigationQueue, benchmark_jpeg_quality, benchmark_metadata_queue_setup, decode_jpeg,
     encode_jpeg,
 };
+use viewr_core::library::load_ratings_with_owners;
 use viewr_core::planning::build_plan_targets;
 use viewr_core::resize::{apply_orient, downscale_to_fit, resize_exact};
 use viewr_core::types::{Orient, PixelBuf, Tier};
@@ -193,6 +196,11 @@ fn bench_rating_db_lookup(c: &mut Criterion) {
             benchmark_insert_rating(&db, path, index as u64, index as i64, 4)
                 .expect("benchmark row inserts");
         }
+        assert_eq!(
+            benchmark_rating_cardinalities(&db).expect("benchmark cardinalities"),
+            (len, len),
+            "lookup corpus must scale both image and owner ledgers"
+        );
 
         group.throughput(Throughput::Elements(len as u64));
         group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, _| {
@@ -200,6 +208,54 @@ fn bench_rating_db_lookup(c: &mut Criterion) {
                 assert_eq!(
                     black_box(benchmark_rating_lookup(black_box(&db), black_box(&paths))),
                     len
+                );
+            });
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_rating_folder_load(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rating_folder_load");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+
+    for len in [1_000_usize, 10_000, 50_000] {
+        let directory = tempfile::tempdir().expect("benchmark RAW directory");
+        let canonical =
+            std::fs::canonicalize(directory.path()).expect("benchmark directory canonicalizes");
+        let first = canonical.join("photo-00000000.ARW");
+        std::fs::write(&first, b"raw").expect("owner probe RAW placeholder");
+        let entries = (0..len)
+            .map(|index| FolderEntry {
+                path: canonical.join(format!("photo-{index:08}.ARW")),
+                file_name: format!("photo-{index:08}.ARW"),
+                size: 3,
+                mtime_ns: index as i64,
+            })
+            .collect::<Vec<_>>();
+        let db = Db::open_in_memory().expect("benchmark database opens");
+        for entry in &entries {
+            benchmark_insert_rating(&db, &entry.path, entry.size, entry.mtime_ns, 4)
+                .expect("benchmark row inserts");
+        }
+        assert_eq!(
+            benchmark_rating_cardinalities(&db).expect("benchmark cardinalities"),
+            (len, len),
+            "folder-load corpus must scale both image and owner ledgers"
+        );
+
+        group.throughput(Throughput::Elements(len as u64));
+        group.bench_with_input(BenchmarkId::new("clean_database", len), &len, |b, _| {
+            b.iter(|| {
+                let (ratings, owners) =
+                    load_ratings_with_owners(black_box(&entries), black_box(Some(&db)));
+                assert_eq!(ratings.len(), black_box(len));
+                assert_eq!(
+                    owners.iter().filter(|owner| owner.is_some()).count(),
+                    black_box(len)
                 );
             });
         });
@@ -228,6 +284,11 @@ fn bench_rating_db_reopen(c: &mut Criterion) {
             )
             .expect("benchmark row inserts");
         }
+        assert_eq!(
+            benchmark_rating_cardinalities(&db).expect("benchmark cardinalities"),
+            (len, len),
+            "reopen corpus must scale both image and owner ledgers"
+        );
         drop(db);
 
         let probe = Db::open(&database_path).expect("populated benchmark database reopens");
@@ -296,6 +357,11 @@ fn bench_rating_db_journal(c: &mut Criterion) {
             )
             .expect("benchmark row inserts");
         }
+        assert_eq!(
+            benchmark_rating_cardinalities(&db).expect("benchmark cardinalities"),
+            (len, len),
+            "journal corpus must scale both image and owner ledgers"
+        );
 
         group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, _| {
             b.iter(|| {
@@ -333,6 +399,43 @@ fn bench_sidecar_owner_batch(c: &mut Criterion) {
                 mtime_ns: 0,
             })
             .collect::<Vec<_>>();
+
+        group.throughput(Throughput::Elements(len as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, _| {
+            b.iter(|| {
+                assert_eq!(
+                    benchmark_sidecar_owner_keys(black_box(&entries)),
+                    black_box(len)
+                );
+            });
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_unicode_sidecar_owner_batch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sidecar_owner_unicode_batch");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+
+    for len in [1_000_usize, 10_000] {
+        let directory = tempfile::tempdir().expect("benchmark RAW directory");
+        let canonical =
+            std::fs::canonicalize(directory.path()).expect("benchmark directory canonicalizes");
+        let mut entries = Vec::with_capacity(len);
+        for index in 0..len {
+            let file_name = format!("caf\u{e9}-{index:08}.ARW");
+            let path = canonical.join(&file_name);
+            std::fs::write(&path, b"raw").expect("Unicode owner probe RAW placeholder");
+            entries.push(FolderEntry {
+                path,
+                file_name,
+                size: 3,
+                mtime_ns: 0,
+            });
+        }
 
         group.throughput(Throughput::Elements(len as u64));
         group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, _| {
@@ -775,9 +878,11 @@ criterion_group! {
         bench_navigation_plan,
         bench_metadata_queue_setup,
         bench_rating_db_lookup,
+        bench_rating_folder_load,
         bench_rating_db_reopen,
         bench_rating_db_journal,
         bench_sidecar_owner_batch,
+        bench_unicode_sidecar_owner_batch,
         bench_resize,
         bench_orientation,
         bench_jpeg,

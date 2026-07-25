@@ -84,55 +84,133 @@ pub fn load_ratings_with_owners(
 ) -> (HashMap<usize, u8>, Vec<Option<PathBuf>>) {
     let mut out = HashMap::new();
     let owners = sidecar_owner_keys(entries);
-    let mut dirty_by_owner: HashMap<PathBuf, Option<u8>> = HashMap::new();
-    for (i, (entry, owner)) in entries.iter().zip(&owners).enumerate() {
-        // One XMP target can be shared by multiple RAW containers (for
-        // example, `photo.ARW` and `photo.DNG`). A crash-recovery journal is
-        // authoritative for that owner, not just for the exact RAW path that
-        // most recently set it.
-        let dirty_rating = db.and_then(|db| {
-            let owner = owner.as_ref()?;
-            *dirty_by_owner.entry(owner.clone()).or_insert_with(|| {
-                db.dirty_rating_for_owner(owner)
-                    .ok()
-                    .flatten()
-                    .filter(|row| {
-                        current_raw_identity(&row.path).ok() == Some((row.size, row.mtime_ns))
-                    })
-                    .map(|row| row.rating)
-            })
+    let snapshot = db
+        .and_then(|db| {
+            db.rating_snapshot(entries.iter().map(|entry| entry.path.as_path()), &owners)
+                .ok()
+        })
+        .unwrap_or_default();
+    let mut members_by_owner: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+    let mut unresolved = Vec::new();
+    for (index, owner) in owners.iter().enumerate() {
+        match owner {
+            Some(owner) => members_by_owner
+                .entry(owner.clone())
+                .or_default()
+                .push(index),
+            None => unresolved.push(index),
+        }
+    }
+
+    for (owner, members) in members_by_owner {
+        let owned = snapshot.by_owner.get(&owner).filter(|row| {
+            members
+                .iter()
+                .map(|index| &entries[*index])
+                .find(|entry| entry.path == row.path)
+                .map_or_else(
+                    || current_raw_identity(&row.path).ok() == Some((row.size, row.mtime_ns)),
+                    |entry| entry.size == row.size && entry.mtime_ns == row.mtime_ns,
+                )
         });
-        if let Some(rating) = dirty_rating {
-            out.insert(i, rating);
+        let legacy = members
+            .iter()
+            .filter_map(|index| {
+                let entry = &entries[*index];
+                snapshot.by_path.get(&entry.path).filter(|row| {
+                    row.sidecar_owner.is_none()
+                        && row.size == entry.size
+                        && row.mtime_ns == entry.mtime_ns
+                })
+            })
+            .collect::<Vec<_>>();
+
+        // One XMP target can be shared by multiple RAW containers. A current
+        // dirty owner row is authoritative for every member, not just for the
+        // exact RAW path that accepted the rating.
+        let dirty_count = usize::from(owned.is_some_and(|row| row.sidecar_dirty))
+            + legacy.iter().filter(|row| row.sidecar_dirty).count();
+        if dirty_count > 0 {
+            let rating = if legacy.is_empty() {
+                owned
+                    .filter(|row| row.sidecar_dirty)
+                    .and_then(|row| row.rating)
+            } else if owned.is_none() && legacy.len() == 1 && legacy[0].sidecar_dirty {
+                legacy[0].rating
+            } else {
+                None
+            };
+            if let Some(rating) = rating {
+                install_group_rating(&mut out, &members, rating);
+            }
             continue;
         }
 
-        let sidecar = entry.sidecar_path();
-        let sidecar_mtime = std::fs::metadata(&sidecar)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos() as i64);
-        let row =
-            db.and_then(|db| db.get_image_for_identity(&entry.path, entry.size, entry.mtime_ns));
+        let clean_rows = owned
+            .into_iter()
+            .chain(legacy.iter().copied())
+            .filter(|row| !row.sidecar_dirty)
+            .collect::<Vec<_>>();
+        let newest_db_sidecar = clean_rows
+            .iter()
+            .map(|row| row.sidecar_mtime_ns)
+            .max()
+            .unwrap_or(0);
+        let sidecar = entries[members[0]].sidecar_path();
+        let sidecar_rating = sidecar_mtime_ns(&sidecar)
+            .filter(|mtime| *mtime >= newest_db_sidecar)
+            .and_then(|_| xmp::read_rating(&sidecar));
+        if let Some(rating) = sidecar_rating {
+            install_group_rating(&mut out, &members, rating);
+            continue;
+        }
 
-        // A dirty row is a database rating that has not reached its sidecar.
-        // It must win even when the old sidecar has an equal or newer mtime.
-        let from_sidecar = sidecar_mtime.and_then(|mt| {
-            let db_row = row.as_ref();
-            let db_mt = db_row.map_or(0, |r| r.sidecar_mtime_ns);
-            if !db_row.is_some_and(|r| r.sidecar_dirty) && mt >= db_mt {
-                xmp::read_rating(&sidecar)
-            } else {
-                None
-            }
-        });
-        let rating = from_sidecar.or(row.and_then(|r| r.rating));
-        if let Some(r) = rating {
-            out.insert(i, r);
+        let mut clean_ratings = clean_rows.iter().map(|row| row.rating);
+        let clean_rating = clean_ratings
+            .next()
+            .flatten()
+            .filter(|rating| clean_ratings.all(|candidate| candidate == Some(*rating)));
+        if let Some(rating) = clean_rating {
+            install_group_rating(&mut out, &members, rating);
+        }
+    }
+
+    for index in unresolved {
+        let entry = &entries[index];
+        let row = snapshot
+            .by_path
+            .get(&entry.path)
+            .filter(|row| row.size == entry.size && row.mtime_ns == entry.mtime_ns);
+        if let Some(rating) = row
+            .filter(|row| row.sidecar_dirty)
+            .and_then(|row| row.rating)
+        {
+            out.insert(index, rating);
+            continue;
+        }
+        let sidecar = entry.sidecar_path();
+        let sidecar_rating = sidecar_mtime_ns(&sidecar)
+            .filter(|mtime| *mtime >= row.map_or(0, |row| row.sidecar_mtime_ns))
+            .and_then(|_| xmp::read_rating(&sidecar));
+        if let Some(rating) = sidecar_rating.or_else(|| row.and_then(|row| row.rating)) {
+            out.insert(index, rating);
         }
     }
     (out, owners)
+}
+
+fn install_group_rating(ratings: &mut HashMap<usize, u8>, members: &[usize], rating: u8) {
+    ratings.extend(members.iter().map(|index| (*index, rating)));
+}
+
+fn sidecar_mtime_ns(path: &std::path::Path) -> Option<i64> {
+    std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_nanos() as i64)
 }
 
 impl Library {
@@ -756,6 +834,53 @@ mod tests {
 
         std::fs::remove_file(entry.sidecar_path()).unwrap();
         assert!(load_ratings(&[entry], Some(&db)).is_empty());
+    }
+
+    #[test]
+    fn clean_owned_database_rating_applies_to_every_raw_sharing_the_sidecar() {
+        let directory = tempfile::tempdir().unwrap();
+        let arw = entry(directory.path().join("photo.ARW"));
+        let dng = entry(directory.path().join("photo.DNG"));
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_rating(
+            arw.path.to_str().unwrap(),
+            arw.size,
+            arw.mtime_ns,
+            Some(4),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_ratings(&[arw, dng], Some(&db)),
+            HashMap::from([(0, 4), (1, 4)])
+        );
+    }
+
+    #[test]
+    fn singleton_legacy_clean_rating_applies_to_its_sidecar_owner_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let arw = entry(directory.path().join("photo.ARW"));
+        let dng = entry(directory.path().join("photo.DNG"));
+        let db = Db::open_in_memory().unwrap();
+        put_db_rating(&db, &arw, Some(3), 0);
+
+        assert_eq!(
+            load_ratings(&[arw, dng], Some(&db)),
+            HashMap::from([(0, 3), (1, 3)])
+        );
+    }
+
+    #[test]
+    fn conflicting_legacy_clean_aliases_fail_closed_without_a_sidecar() {
+        let directory = tempfile::tempdir().unwrap();
+        let arw = entry(directory.path().join("photo.ARW"));
+        let dng = entry(directory.path().join("photo.DNG"));
+        let db = Db::open_in_memory().unwrap();
+        put_db_rating(&db, &arw, Some(2), 0);
+        put_db_rating(&db, &dng, Some(5), 0);
+
+        assert!(load_ratings(&[arw, dng], Some(&db)).is_empty());
     }
 
     #[test]

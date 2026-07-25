@@ -5,7 +5,7 @@
 //! container reads. Each [`Db`] owns one connection; startup reads and the
 //! persistence worker may use separate instances.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
@@ -89,12 +89,30 @@ pub(crate) struct OwnedPendingSidecar {
     pub pending: PendingSidecar,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DirtyOwnerRating {
     pub path: PathBuf,
     pub size: u64,
     pub mtime_ns: i64,
     pub rating: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoredRatingRow {
+    pub path: PathBuf,
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub rating: Option<u8>,
+    pub sidecar_mtime_ns: i64,
+    pub sidecar_dirty: bool,
+    pub sidecar_owner: Option<PathBuf>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RatingSnapshot {
+    pub by_path: HashMap<PathBuf, StoredRatingRow>,
+    pub by_owner: HashMap<PathBuf, StoredRatingRow>,
 }
 
 pub(crate) enum PendingSidecarSync<E> {
@@ -216,6 +234,7 @@ impl Db {
             .ok()
     }
 
+    #[cfg(test)]
     pub(crate) fn get_image_for_identity(
         &self,
         path: &Path,
@@ -441,6 +460,7 @@ impl Db {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(crate) fn dirty_rating_for_owner(
         &self,
         owner: &Path,
@@ -465,6 +485,38 @@ impl Db {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub(crate) fn rating_snapshot<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a Path>,
+        owners: &[Option<PathBuf>],
+    ) -> Result<RatingSnapshot, DbError> {
+        const QUERY_KEYS_PER_CHUNK: usize = 900;
+
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let path_keys = deduplicated_paths(paths);
+        let owner_keys = deduplicated_paths(owners.iter().filter_map(Option::as_deref));
+        let mut rows = HashMap::with_capacity(path_keys.len().saturating_add(owner_keys.len()));
+        for chunk in path_keys.chunks(QUERY_KEYS_PER_CHUNK) {
+            query_rating_rows(&transaction, "path", chunk, &mut rows)?;
+        }
+        for chunk in owner_keys.chunks(QUERY_KEYS_PER_CHUNK) {
+            query_rating_rows(&transaction, "sidecar_owner", chunk, &mut rows)?;
+        }
+        transaction.commit()?;
+
+        let mut snapshot = RatingSnapshot {
+            by_path: HashMap::with_capacity(rows.len()),
+            by_owner: HashMap::with_capacity(owner_keys.len()),
+        };
+        for row in rows.into_values() {
+            snapshot.by_path.insert(row.path.clone(), row.clone());
+            if let Some(owner) = &row.sidecar_owner {
+                snapshot.by_owner.insert(owner.clone(), row);
+            }
+        }
+        Ok(snapshot)
     }
 
     /// Mark one exact dirty rating as synchronized with its sidecar.
@@ -775,6 +827,60 @@ fn pending_sidecars_on(conn: &Connection) -> Result<Vec<OwnedPendingSidecar>, ru
     rows.collect()
 }
 
+fn deduplicated_paths<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    paths
+        .into_iter()
+        .filter(|path| seen.insert((*path).to_path_buf()))
+        .map(Path::to_path_buf)
+        .collect()
+}
+
+fn query_rating_rows(
+    conn: &Connection,
+    indexed_column: &str,
+    keys: &[PathBuf],
+    rows: &mut HashMap<PathBuf, StoredRatingRow>,
+) -> Result<(), rusqlite::Error> {
+    debug_assert!(matches!(indexed_column, "path" | "sidecar_owner"));
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let placeholders = std::iter::repeat_n("?", keys.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT path, size, mtime_ns, rating, sidecar_mtime_ns,
+                sidecar_dirty, sidecar_owner
+           FROM images
+          WHERE sidecar_quarantined = 0
+            AND {indexed_column} IN ({placeholders})"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let mapped = statement.query_map(
+        rusqlite::params_from_iter(keys.iter().map(|path| path_value(path))),
+        |row| {
+            Ok(StoredRatingRow {
+                path: row_path(row, 0)?,
+                size: row.get(1)?,
+                mtime_ns: row.get(2)?,
+                rating: row.get(3)?,
+                sidecar_mtime_ns: row.get(4)?,
+                sidecar_dirty: row.get(5)?,
+                sidecar_owner: match row.get_ref(6)? {
+                    ValueRef::Null => None,
+                    _ => Some(row_path(row, 6)?),
+                },
+            })
+        },
+    )?;
+    for row in mapped {
+        let row = row?;
+        rows.insert(row.path.clone(), row);
+    }
+    Ok(())
+}
+
 fn delete_sidecar_owner_rows(
     conn: &Connection,
     canonical: &Path,
@@ -845,7 +951,8 @@ pub fn benchmark_insert_rating(
     rating: u8,
 ) -> Result<(), DbError> {
     let owner = path.with_extension("xmp");
-    db.conn.execute(
+    let transaction = Transaction::new_unchecked(&db.conn, TransactionBehavior::Immediate)?;
+    transaction.execute(
         "INSERT INTO images
            (path, size, mtime_ns, rating, sidecar_mtime_ns, sidecar_dirty,
             sidecar_quarantined, sidecar_owner, last_seen)
@@ -861,7 +968,22 @@ pub fn benchmark_insert_rating(
            last_seen = excluded.last_seen",
         rusqlite::params![path_value(path), size, mtime_ns, rating, path_value(&owner)],
     )?;
+    advance_sidecar_owner_revision(&transaction, &owner)?;
+    transaction.commit()?;
     Ok(())
+}
+
+#[cfg(feature = "benchmarks")]
+#[doc(hidden)]
+pub fn benchmark_rating_cardinalities(db: &Db) -> Result<(usize, usize), DbError> {
+    Ok((
+        db.conn
+            .query_row("SELECT COUNT(*) FROM images", [], |row| row.get(0))?,
+        db.conn
+            .query_row("SELECT COUNT(*) FROM sidecar_owner_revisions", [], |row| {
+                row.get(0)
+            })?,
+    ))
 }
 
 fn path_value(path: &Path) -> Value {
@@ -1634,6 +1756,26 @@ mod tests {
         assert!(!row.sidecar_dirty);
         assert!(db.pending_sidecars().unwrap().is_empty());
         assert!(db.get_image_path(Path::new("/p/other.arw")).is_none());
+    }
+
+    #[test]
+    fn rating_snapshot_chunks_large_path_sets_without_losing_rows() {
+        let db = Db::open_in_memory().unwrap();
+        let paths = (0..1_901)
+            .map(|index| PathBuf::from(format!("/p/{index}.arw")))
+            .collect::<Vec<_>>();
+        for (index, path) in paths.iter().enumerate() {
+            db.upsert_rating_path(path, 10, index as i64, Some((index % 6) as u8), 1)
+                .unwrap();
+        }
+
+        let snapshot = db
+            .rating_snapshot(paths.iter().map(PathBuf::as_path), &vec![None; paths.len()])
+            .unwrap();
+
+        assert_eq!(snapshot.by_path.len(), paths.len());
+        assert!(snapshot.by_owner.is_empty());
+        assert_eq!(snapshot.by_path.get(&paths[1_900]).unwrap().rating, Some(4));
     }
 
     #[test]
