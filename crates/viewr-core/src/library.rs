@@ -262,6 +262,29 @@ fn flush_due(pending: &mut HashMap<PathBuf, Pending>, db: Option<&Db>, all: bool
         let Some(p) = pending.remove(&path) else {
             continue;
         };
+        match current_raw_identity(&path) {
+            Ok(identity) if identity == (p.size, p.mtime_ns) => {}
+            Ok(_) => {
+                if let Some(db) = db
+                    && let Err(error) =
+                        db.discard_pending_sidecar(&path, p.size, p.mtime_ns, p.rating)
+                {
+                    eprintln!(
+                        "stale rating database cleanup failed for {}: {error}",
+                        path.display()
+                    );
+                    retry_later(pending, path, p);
+                    continue;
+                }
+                eprintln!("discarding rating for replaced RAW file {}", path.display());
+                continue;
+            }
+            Err(error) => {
+                eprintln!("RAW identity read failed for {}: {error}", path.display());
+                retry_later(pending, path, p);
+                continue;
+            }
+        }
         let sidecar = path.with_extension("xmp");
         if let Err(e) = xmp::write_rating(&sidecar, p.rating) {
             eprintln!("sidecar write failed for {}: {e}", sidecar.display());
@@ -280,17 +303,35 @@ fn flush_due(pending: &mut HashMap<PathBuf, Pending>, db: Option<&Db>, all: bool
             retry_later(pending, path, p);
             continue;
         };
-        if let Some(db) = db
-            && let Err(error) = db.upsert_rating(&path, p.size, p.mtime_ns, Some(p.rating), mtime)
-        {
-            eprintln!(
-                "rating database sync failed for {}: {error}",
-                path.display()
-            );
-            retry_later(pending, path, p);
+        if let Some(db) = db {
+            match db.complete_pending_sidecar(&path, p.size, p.mtime_ns, p.rating, mtime) {
+                Ok(true) => {}
+                Ok(false) => {
+                    // A newer journal write won the path. It remains dirty and
+                    // must not be cleared by this older completion.
+                }
+                Err(error) => {
+                    eprintln!(
+                        "rating database sync failed for {}: {error}",
+                        path.display()
+                    );
+                    retry_later(pending, path, p);
+                }
+            }
         }
     }
     pending.is_empty()
+}
+
+fn current_raw_identity(path: &std::path::Path) -> std::io::Result<(u64, i64)> {
+    let metadata = std::fs::metadata(path)?;
+    let mtime_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos() as i64)
+        .unwrap_or(0);
+    Ok((metadata.len(), mtime_ns))
 }
 
 fn retry_later(pending: &mut HashMap<PathBuf, Pending>, path: PathBuf, mut item: Pending) {
@@ -502,15 +543,43 @@ mod tests {
     }
 
     #[test]
+    fn startup_discards_a_pending_rating_when_the_raw_was_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("viewr.db");
+        let entry = entry(dir.path().join("photo.ARW"));
+        xmp::write_rating(&entry.sidecar_path(), 1).unwrap();
+        {
+            let db = Db::open(&db_path).unwrap();
+            db.record_rating_pending_sidecar(&entry.path, entry.size, entry.mtime_ns, 5)
+                .unwrap();
+        }
+        std::fs::write(&entry.path, b"a different raw payload").unwrap();
+
+        {
+            let library = Library::start_with(Some(db_path.clone()), Duration::from_secs(60));
+            drop(library);
+        }
+
+        assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(1));
+        let db = Db::open(&db_path).unwrap();
+        assert!(db.get_image(&entry.path).is_none());
+        assert!(db.pending_sidecars().unwrap().is_empty());
+    }
+
+    #[test]
     fn failed_flush_remains_dirty_and_retries_after_the_path_recovers() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("viewr.db");
         let raw_path = dir.path().join("missing-parent/photo.ARW");
+        let raw_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let entry = FolderEntry {
             file_name: "photo.ARW".into(),
             path: raw_path,
             size: 3,
-            mtime_ns: 7,
+            mtime_ns: raw_mtime
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as i64,
         };
         let library = Library::start_with(Some(db_path.clone()), Duration::from_secs(60));
 
@@ -526,6 +595,17 @@ mod tests {
         drop(db);
 
         std::fs::create_dir_all(entry.path.parent().unwrap()).unwrap();
+        std::fs::write(&entry.path, b"raw").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&entry.path)
+            .unwrap()
+            .set_modified(raw_mtime)
+            .unwrap();
+        assert_eq!(
+            current_raw_identity(&entry.path).unwrap(),
+            (entry.size, entry.mtime_ns)
+        );
         library.flush();
 
         assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(3));

@@ -184,6 +184,75 @@ impl Db {
         Ok(())
     }
 
+    /// Mark one exact dirty rating as synchronized with its sidecar.
+    ///
+    /// Returns `false` if another writer has replaced the row since this
+    /// operation was journaled. In that case the newer dirty rating remains
+    /// authoritative.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::Sqlite`] if preparing or executing the update fails.
+    pub fn complete_pending_sidecar(
+        &self,
+        path: &Path,
+        size: u64,
+        mtime_ns: i64,
+        rating: u8,
+        sidecar_mtime_ns: i64,
+    ) -> Result<bool, DbError> {
+        let changed = self
+            .conn
+            .prepare_cached(
+                "UPDATE images
+                    SET sidecar_mtime_ns = ?5,
+                        sidecar_dirty = 0,
+                        last_seen = unixepoch()
+                  WHERE path = ?1
+                    AND size = ?2
+                    AND mtime_ns = ?3
+                    AND rating = ?4
+                    AND sidecar_dirty = 1",
+            )?
+            .execute(rusqlite::params![
+                path_value(path),
+                size,
+                mtime_ns,
+                rating,
+                sidecar_mtime_ns
+            ])?;
+        Ok(changed == 1)
+    }
+
+    /// Remove one exact dirty row after its RAW identity has gone stale.
+    ///
+    /// A conditional delete prevents an older recovery attempt from removing
+    /// a newer rating for the same path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::Sqlite`] if preparing or executing the delete fails.
+    pub fn discard_pending_sidecar(
+        &self,
+        path: &Path,
+        size: u64,
+        mtime_ns: i64,
+        rating: u8,
+    ) -> Result<bool, DbError> {
+        let changed = self
+            .conn
+            .prepare_cached(
+                "DELETE FROM images
+                  WHERE path = ?1
+                    AND size = ?2
+                    AND mtime_ns = ?3
+                    AND rating = ?4
+                    AND sidecar_dirty = 1",
+            )?
+            .execute(rusqlite::params![path_value(path), size, mtime_ns, rating])?;
+        Ok(changed == 1)
+    }
+
     /// Return dirty ratings so a new persistence worker can resume sidecar
     /// writes that a prior process did not finish.
     ///
@@ -381,6 +450,26 @@ mod tests {
         assert_eq!(row.mtime_ns, 8);
         assert_eq!(row.rating, None);
         assert_eq!(row.sidecar_mtime_ns, 456);
+        assert!(!row.sidecar_dirty);
+    }
+
+    #[test]
+    fn stale_completion_and_discard_cannot_replace_a_newer_dirty_rating() {
+        let db = Db::open_in_memory().unwrap();
+        let path = Path::new("/p/concurrent.arw");
+        db.record_rating_pending_sidecar(path, 10, 1, 2).unwrap();
+        db.record_rating_pending_sidecar(path, 10, 1, 5).unwrap();
+
+        assert!(!db.complete_pending_sidecar(path, 10, 1, 2, 99).unwrap());
+        assert!(!db.discard_pending_sidecar(path, 10, 1, 2).unwrap());
+        let row = db.get_image(path).unwrap();
+        assert_eq!(row.rating, Some(5));
+        assert!(row.sidecar_dirty);
+
+        assert!(db.complete_pending_sidecar(path, 10, 1, 5, 100).unwrap());
+        let row = db.get_image(path).unwrap();
+        assert_eq!(row.rating, Some(5));
+        assert_eq!(row.sidecar_mtime_ns, 100);
         assert!(!row.sidecar_dirty);
     }
 
