@@ -173,7 +173,11 @@ fn bench_metadata_queue_setup(c: &mut Criterion) {
         );
         group.throughput(Throughput::Elements(len as u64));
         group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, &len| {
-            b.iter_with_large_drop(|| BenchmarkMetadataQueue::new(black_box(len)));
+            b.iter_batched(
+                || (),
+                |()| BenchmarkMetadataQueue::new(black_box(len)),
+                BatchSize::LargeInput,
+            );
         });
     }
 
@@ -766,6 +770,16 @@ fn create_v01_migration_template(
 
     let mut connection =
         rusqlite::Connection::open(path).expect("v0.1 migration template database opens");
+    connection
+        .pragma_update(None, "journal_mode", "WAL")
+        .expect("released v0.1 template enables WAL");
+    let journal_mode = connection
+        .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+        .expect("released v0.1 template journal mode reads");
+    assert!(
+        journal_mode.eq_ignore_ascii_case("wal"),
+        "released v0.1 template must begin in persistent WAL mode"
+    );
     connection
         .execute_batch(match release {
             V01Release::V010 => {
