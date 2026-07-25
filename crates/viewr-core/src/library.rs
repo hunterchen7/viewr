@@ -68,9 +68,8 @@ pub fn load_ratings(entries: &[FolderEntry], db: Option<&Db>) -> HashMap<usize, 
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_nanos() as i64);
-        let row = db
-            .and_then(|db| db.get_image(&entry.path))
-            .filter(|row| row.size == entry.size && row.mtime_ns == entry.mtime_ns);
+        let row =
+            db.and_then(|db| db.get_image_for_identity(&entry.path, entry.size, entry.mtime_ns));
 
         // A dirty row is a database rating that has not reached its sidecar.
         // It must win even when the old sidecar has an equal or newer mtime.

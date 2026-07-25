@@ -31,10 +31,6 @@ pub struct Db {
 #[derive(Debug, Clone, Default)]
 /// Rating state mirrored for one RAW path.
 pub struct ImageRow {
-    /// RAW size captured when this row was last updated.
-    pub size: u64,
-    /// RAW modification time captured when this row was last updated.
-    pub mtime_ns: i64,
     /// Last recorded rating, normally in `0..=5`.
     pub rating: Option<u8>,
     /// Modification time of the sidecar represented by this row, or zero when
@@ -82,6 +78,7 @@ impl Db {
     }
 
     #[cfg(any(test, feature = "benchmarks"))]
+    #[doc(hidden)]
     /// Creates an in-memory database with the production schema for tests and
     /// the benchmark harness.
     pub fn open_in_memory() -> Result<Self, DbError> {
@@ -95,21 +92,43 @@ impl Db {
     /// Missing rows and SQLite prepare/query failures both return `None`. This
     /// makes the database a best-effort metadata accelerator rather than a
     /// requirement for opening a photo folder.
-    pub fn get_image(&self, path: &Path) -> Option<ImageRow> {
+    pub fn get_image(&self, path: impl AsRef<Path>) -> Option<ImageRow> {
+        let path = path.as_ref();
         self.conn
             .prepare_cached(
-                "SELECT size, mtime_ns, rating, sidecar_mtime_ns, sidecar_dirty
+                "SELECT rating, sidecar_mtime_ns, sidecar_dirty
                    FROM images
                   WHERE path = ?1",
             )
             .ok()?
             .query_row([path_value(path)], |row| {
                 Ok(ImageRow {
-                    size: row.get(0)?,
-                    mtime_ns: row.get(1)?,
-                    rating: row.get::<_, Option<u8>>(2)?,
-                    sidecar_mtime_ns: row.get(3)?,
-                    sidecar_dirty: row.get(4)?,
+                    rating: row.get::<_, Option<u8>>(0)?,
+                    sidecar_mtime_ns: row.get(1)?,
+                    sidecar_dirty: row.get(2)?,
+                })
+            })
+            .ok()
+    }
+
+    pub(crate) fn get_image_for_identity(
+        &self,
+        path: &Path,
+        size: u64,
+        mtime_ns: i64,
+    ) -> Option<ImageRow> {
+        self.conn
+            .prepare_cached(
+                "SELECT rating, sidecar_mtime_ns, sidecar_dirty
+                   FROM images
+                  WHERE path = ?1 AND size = ?2 AND mtime_ns = ?3",
+            )
+            .ok()?
+            .query_row(rusqlite::params![path_value(path), size, mtime_ns], |row| {
+                Ok(ImageRow {
+                    rating: row.get::<_, Option<u8>>(0)?,
+                    sidecar_mtime_ns: row.get(1)?,
+                    sidecar_dirty: row.get(2)?,
                 })
             })
             .ok()
@@ -125,12 +144,13 @@ impl Db {
     /// Returns [`DbError::Sqlite`] when the insert or update fails.
     pub fn upsert_rating(
         &self,
-        path: &Path,
+        path: impl AsRef<Path>,
         size: u64,
         mtime_ns: i64,
         rating: Option<u8>,
         sidecar_mtime_ns: i64,
     ) -> Result<(), DbError> {
+        let path = path.as_ref();
         self.conn
             .prepare_cached(
                 "INSERT INTO images
@@ -164,11 +184,12 @@ impl Db {
     /// update fails.
     pub fn record_rating_pending_sidecar(
         &self,
-        path: &Path,
+        path: impl AsRef<Path>,
         size: u64,
         mtime_ns: i64,
         rating: u8,
     ) -> Result<(), DbError> {
+        let path = path.as_ref();
         self.conn
             .prepare_cached(
                 "INSERT INTO images
@@ -405,8 +426,8 @@ mod tests {
         let path = Path::new("/p/a.arw");
         db.upsert_rating(path, 10, 1, Some(4), 99).unwrap();
         let row = db.get_image(path).unwrap();
-        assert_eq!(row.size, 10);
-        assert_eq!(row.mtime_ns, 1);
+        assert!(db.get_image_for_identity(path, 10, 1).is_some());
+        assert!(db.get_image_for_identity(path, 11, 1).is_none());
         assert_eq!(row.rating, Some(4));
         assert_eq!(row.sidecar_mtime_ns, 99);
         assert!(!row.sidecar_dirty);
@@ -458,8 +479,10 @@ mod tests {
 
         let db = Db::open(&path).unwrap();
         let row = db.get_image(Path::new("/p/persistent.arw")).unwrap();
-        assert_eq!(row.size, 84);
-        assert_eq!(row.mtime_ns, 8);
+        assert!(
+            db.get_image_for_identity(Path::new("/p/persistent.arw"), 84, 8)
+                .is_some()
+        );
         assert_eq!(row.rating, None);
         assert_eq!(row.sidecar_mtime_ns, 456);
         assert!(!row.sidecar_dirty);

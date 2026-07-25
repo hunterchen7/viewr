@@ -117,6 +117,7 @@ impl DiskCache {
     }
 
     #[cfg(any(test, feature = "benchmarks"))]
+    #[doc(hidden)]
     /// Opens a cache at an explicit root for tests and benchmarks.
     pub fn open_at(root: PathBuf) -> Self {
         std::fs::create_dir_all(&root).unwrap();
