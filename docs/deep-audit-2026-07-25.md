@@ -53,6 +53,8 @@ All promoted performance decisions use later isolated target runs.
 | P1 | Parent symlinks, filesystem-verified case and Unicode aliases, and ARW/DNG siblings could name one XMP target through different database paths. | Fixed for the supported identity probes. Current writes use a filesystem-derived physical owner. Legacy histories are read conservatively, ambiguous dirty work is quarantined, and a retargeted parent symlink cannot redirect recovery. Linux bind mounts and distinct case-folded mount spellings remain an operational limit. |
 | P1 | A configured database directory or open failure could silently downgrade rating writes to database-free XMP publication. | Fixed. The configured database remains authoritative; work stays queued until it can journal safely. |
 | P1 | A damaged or interrupted schema repair could reuse an optimistic retry token or expose stale ownership through the read-only startup path. | Fixed. Repair intent is durable, every retry domain crosses a barrier, malformed counters fail closed before arithmetic, and read-only startup rejects incomplete repair state. |
+| P1 | Simultaneous first opens could combine schema observations from different migration states and reject an otherwise valid database. | Fixed. Readiness decisions use one SQLite snapshot, repair selection is serialized, and final verification tolerates a cooperating opener's temporary repair sentinel. The process test now runs four independent eight-writer start bursts. |
+| P1 | A removed clean legacy alias did not invalidate unordered dirty same-name history, and a partially migrated database handled ownerless/owned ambiguity asymmetrically. | Fixed. Clean unresolved paths poison only dirty recovery candidates, mixed migration carries ambiguity in both directions, and focused read/migration tests cover distinct legacy owner spellings. |
 | P1 | SQLite can store same-name indexes and triggers, allowing a valid object to mask a hostile opposite-type object. | Fixed. Readiness checks both namespaces and repair removes both before installing canonical objects. |
 | P1 | A panic in one decode job left its ID in flight and removed one worker. | Fixed. Each claimed job now has a panic boundary. Cleanup occurs before failure publication, and the worker continues. |
 | P1 | `ByteLru::remove` performed a required map removal inside `debug_assert_eq!`. | Fixed. Release builds now perform the removal before the assertion. The new release test gate found this defect. |
@@ -191,7 +193,7 @@ stress, pending scans, and cold migration:
 | Current read-only reopen, through 50,000 rows | 0.32–0.38 ms |
 | Selective legacy load with 50,000 history rows | 13.9–22.1 ms |
 | Full-scan legacy reference with 50,000 history rows | 94–115 ms |
-| Cold released-v0.1-to-v8 migration, 1,000/10,000 rows | Covered; stable baseline not yet recorded |
+| Cold released-v0.1.0/v0.1.1-to-v8 migration, 1,000/10,000 rows | Covered; stable baseline not yet recorded |
 | Cold v7-to-v8 migration, 1,000 rows | 17.9–19.1 ms |
 | Cold v7-to-v8 migration, 10,000 rows | 182.7–204.9 ms |
 
@@ -230,9 +232,10 @@ The benchmark suite now includes these production-adjacent costs:
   rows.
 - Selective legacy startup paired with a full-scan correctness reference,
   including dense-dirty and repeated-stem adversarial histories.
-- Cold migration from the released v0.1 ownerless schema with existing and
-  missing RAWs, sparse unfinished work, correctness preflights, and a fresh
-  database copy for every timed iteration.
+- Cold migration from both released ownerless schemas: v0.1.0 without the
+  journal column and v0.1.1 with sparse unfinished work. Both use existing and
+  missing RAWs, correctness preflights, and a fresh database copy for every
+  timed iteration.
 - Cold v7-to-v8 migration from a fresh database copy on every measured
   iteration.
 - Indexed pending-journal scans with zero and one dirty row, plus journal
@@ -240,8 +243,10 @@ The benchmark suite now includes these production-adjacent costs:
 - Production priority-queue synchronization.
 - Warm, under-budget disk-cache GC scans for up to 10,000 objects.
 - Browse and Full JPEG work at production dimensions and quality values.
-- Shared-owner rating propagation against prefilled maps through 100,000
-  entries, so the advertised sizes represent the timed map residency.
+- Shared-owner group construction and rating installation against prefilled
+  maps through 100,000 entries. The install case executes a threshold-filter
+  transition predicate; it isolates this primitive and is not end-to-end UI
+  latency.
 
 The suite removed a duplicate planner benchmark.
 Navigation benchmarks now report latency instead of misleading folder-element throughput.
@@ -258,7 +263,10 @@ The same job smoke-runs both Criterion harnesses instead of only compiling them.
 The macOS and Windows test jobs compile every all-feature benchmark target;
 Linux remains the single optimized runtime-smoke host.
 Benchmark preflight assertions verify that queue and XMP workloads cannot
-silently become no-ops.
+silently become no-ops. The one-iteration CI smoke also starts the rating
+journal target in update state, the RAM cache at its eviction limit, the
+texture LRU with asserted resident hits, and the filmstrip with a nonempty
+bounded viewport.
 The review rejected a hard source-coverage percentage gate until the project
 has an advisory baseline and a policy for UI-heavy and private-RAW paths.
 
@@ -399,7 +407,7 @@ The application changes are limited to these nonvisual operations:
 - Keep rating state consistent for ARW/DNG or filesystem aliases that share one
   physical XMP owner.
 
-No rendering function, widget tree, layout value, style value, control, or visible label changed.
+No widget construction, paint path, layout behavior, style value, control, or visible label changed.
 The loupe, filmstrip, settings, color, and texture-LRU source files are unchanged.
 The shared-owner correction can update multiple existing star displays and
 their filter membership after one rating because those entries persist to the
@@ -417,6 +425,7 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --locked
 cargo test --workspace --release --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
+cargo build --workspace --release --locked --bins --benches --all-features
 cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- --test
 cargo bench -p viewr --features benchmarks --bench filmstrip_scaling --locked -- --test
 cargo +nightly-2026-07-21 miri test -p viewr-core --lib resize::tests::rotate_ --locked
@@ -428,13 +437,16 @@ The ordinary and release test output reports the three absent private-RAW fixtur
 
 Final verification passed:
 
-- The debug and release workspace suites each reported 298 passed unit tests
+- The debug and release workspace suites each reported 302 passed unit tests
   and three ignored private-RAW tests.
 - The app reported 39 passed unit tests.
-- The core library reported 259 passed unit tests and three ignored private-RAW tests.
+- The core library reported 263 passed unit tests and three ignored private-RAW tests.
 - The Rustdoc suite reported one passed documentation test.
 - Clippy reported no warnings across all targets and features.
+- The all-feature release bins and benchmark targets built successfully.
 - Both optimized Criterion harnesses completed their runtime smoke checks.
 - Miri reported four passed unsafe-path tests.
+- Seventy repeated cross-process parent tests completed 2,240 synchronized
+  child opens and writes without a failure.
 - The base-to-branch whitespace check passed.
 - The rendering, layout, settings, color, and texture-LRU files had no source changes.

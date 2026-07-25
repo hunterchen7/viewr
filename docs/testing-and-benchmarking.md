@@ -83,7 +83,8 @@ The suite measures these workloads:
   1,000, and 10,000 images, plus the former folder-wide planner as an
   explicitly labeled reference. The queue benchmark excludes decoder threads
   and filesystem cache probes.
-- Folder-open metadata queue construction for up to 100,000 entries.
+- Folder-open metadata queue construction for up to 100,000 entries. Queue
+  destruction is excluded from the timed interval.
 - Warm, in-memory, all-hit SQLite point lookup and complete folder-startup
   rating hydration for up to 50,000 entries.
 - Read-write and read-only reopen of current rating databases with 1,000,
@@ -94,9 +95,10 @@ The suite measures these workloads:
   history rows, paired with a full-scan reference implementation. A separate
   stress group covers zero dirty rows, dense dirty rows, and repeated clean
   filename stems for both supported legacy schemas.
-- Cold migration of copied 1,000- and 10,000-row templates from the released
-  v0.1 ownerless schema. The corpus combines existing and missing RAW paths
-  with sparse recoverable and quarantined dirty rows.
+- Cold migration of copied 1,000- and 10,000-row templates from both released
+  ownerless schemas: v0.1.0 without the journal column and v0.1.1 with sparse
+  recoverable and quarantined dirty rows. Both corpora combine existing and
+  missing RAW paths.
 - Cold v7-to-v8 migration of copied 1,000- and 10,000-row database templates.
   Template creation and copy setup are outside the timed routine.
 - Rating journal updates against owner ledgers of up to 50,000 rows, plus
@@ -107,14 +109,17 @@ The suite measures these workloads:
 - Resize of a deterministic 12.2-megapixel image, plus rotation at 12.2 and
   32.7 megapixels.
 - JPEG encoding and decoding at the production Browse and Full dimensions and
-  qualities, plus RAM-cache hits and eviction scaling.
+  qualities, plus RAM-cache hits and eviction scaling. Decode throughput uses
+  compressed input bytes; latency remains the primary comparison.
 - XMP parsing, XMP updates, and disk-cache key generation.
 - Warm, under-budget cache-GC scans for up to 10,000 objects.
   This case does not sort or delete cache objects.
 - Loupe filmstrip widget scaling at 10,000 and 50,000 images.
 - Thumbnail texture-LRU maintenance for 200 touches among 773 residents.
-- Shared-owner rating propagation through a prefilled rating map at 1,000,
-  10,000, and 100,000 entries.
+- Shared-owner group construction and rating installation through a prefilled
+  rating map at 1,000, 10,000, and 100,000 entries. The installation primitive
+  runs a threshold-filter transition predicate; it does not include event,
+  persistence, repaint, or full-session costs.
 
 Criterion stores reports in `target/criterion`.
 Git ignores this directory.
@@ -171,13 +176,14 @@ CI smoke-runs every benchmark case but does not compare Criterion estimates
 with a stored numeric baseline, so performance regressions still require a
 reviewer to run and interpret a controlled before/after comparison.
 
-The released-v0.1 migration corpus samples existing RAW files at a fixed
-stride and leaves the rest unresolved. It exercises both filesystem validation
-and quarantine without making every benchmark row a filesystem object. The
-cold v7 corpus intentionally uses only unresolved paths and therefore measures
-validation, removal, and ledger repair without depending on a particular host
-filesystem. Neither corpus represents a fully resident photo library that
-requires per-file case and Unicode probing.
+The released-v0.1 migration corpora sample existing RAW files at a fixed
+stride and leave the rest unresolved. The v0.1.0 corpus covers the original
+clean mirror, while v0.1.1 also exercises recovery and quarantine. This avoids
+making every benchmark row a filesystem object. The cold v7 corpus
+intentionally uses only unresolved paths and therefore measures validation,
+removal, and ledger repair without depending on a particular host filesystem.
+None of these corpora represents a fully resident photo library that requires
+per-file case and Unicode probing.
 
 The suite also does not yet benchmark contended sidecar publication: a durable
 XMP write holds SQLite's immediate transaction, so a slow external volume can
