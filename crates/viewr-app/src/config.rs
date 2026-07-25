@@ -228,6 +228,8 @@ impl Config {
     }
 
     fn from_raw(raw: RawConfig) -> Self {
+        let default_ui = RawUi::default();
+        let default_cache = RawCache::default();
         let mut binds = HashMap::new();
         for &(name, _, action) in ACTIONS {
             let specs: Vec<String> = raw.binds.get(name).cloned().unwrap_or_else(|| {
@@ -251,10 +253,15 @@ impl Config {
         Self {
             scroll: raw.input.scroll,
             tier_border: raw.ui.tier_border,
-            filmstrip_height: raw.ui.filmstrip_height.clamp(70.0, 320.0),
-            grid_cell: raw.ui.grid_cell.clamp(120.0, 400.0),
-            ram_gb: raw.cache.ram_gb.clamp(1.0, 20.0),
-            disk_gb: raw.cache.disk_gb.clamp(1.0, 500.0),
+            filmstrip_height: finite_clamp(
+                raw.ui.filmstrip_height,
+                default_ui.filmstrip_height,
+                70.0,
+                320.0,
+            ),
+            grid_cell: finite_clamp(raw.ui.grid_cell, default_ui.grid_cell, 120.0, 400.0),
+            ram_gb: finite_clamp(raw.cache.ram_gb, default_cache.ram_gb, 1.0, 20.0),
+            disk_gb: finite_clamp(raw.cache.disk_gb, default_cache.disk_gb, 1.0, 500.0),
             binds,
         }
     }
@@ -321,6 +328,14 @@ impl Config {
     }
 }
 
+fn finite_clamp(value: f32, fallback: f32, minimum: f32, maximum: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(minimum, maximum)
+    } else {
+        fallback
+    }
+}
+
 fn config_path() -> Option<PathBuf> {
     let dir = dirs::config_dir()?.join("viewr");
     std::fs::create_dir_all(&dir).ok()?;
@@ -342,7 +357,7 @@ scroll = "pan"
 tier_border = true
 
 [cache]
-# RAM cache budget in GB (decoded pixels 2/3, developed-JPEG ring 1/3).
+# Total RAM cache budget in GB, including thumbnails.
 ram_gb = 4.5
 # Disk cache budget in GB (~/Library/Caches/viewr).
 disk_gb = 20.0
@@ -460,6 +475,22 @@ mod tests {
         assert_eq!(cfg.grid_cell, 400.0);
         assert_eq!(cfg.ram_gb, 20.0);
         assert_eq!(cfg.disk_gb, 500.0);
+    }
+
+    #[test]
+    fn non_finite_numeric_values_restore_safe_defaults() {
+        let mut raw = RawConfig::default();
+        raw.ui.filmstrip_height = f32::NAN;
+        raw.ui.grid_cell = f32::INFINITY;
+        raw.cache.ram_gb = f32::NEG_INFINITY;
+        raw.cache.disk_gb = f32::NAN;
+
+        let cfg = Config::from_raw(raw);
+
+        assert_eq!(cfg.filmstrip_height, RawUi::default().filmstrip_height);
+        assert_eq!(cfg.grid_cell, RawUi::default().grid_cell);
+        assert_eq!(cfg.ram_gb, RawCache::default().ram_gb);
+        assert_eq!(cfg.disk_gb, RawCache::default().disk_gb);
     }
 
     #[test]
