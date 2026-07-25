@@ -9,9 +9,13 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use rusqlite::types::{Type, Value, ValueRef};
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior};
 
-const RATING_GENERATION_MIGRATION: &str = "rating-generation-v2";
+use crate::folder::{normalize_physical_path, sidecar_owner_key};
+
+const RATING_GENERATION_MIGRATION: &str = "rating-generation-and-owner-v6";
+const DATABASE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const DATABASE_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
 
 #[derive(Debug, thiserror::Error)]
 /// Failure while opening, migrating, or updating the metadata database.
@@ -19,6 +23,13 @@ pub enum DbError {
     /// SQLite returned an error.
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// A stable filesystem owner for the sidecar could not be established.
+    #[error("sidecar owner: {0}")]
+    SidecarOwner(#[from] std::io::Error),
+    /// The latency-sensitive read path found a database that still needs a
+    /// migration by the background persistence worker.
+    #[error("database schema is not ready for latency-sensitive reads")]
+    SchemaNotReady,
 }
 
 /// SQLite-backed rating and sidecar recovery journal.
@@ -48,6 +59,15 @@ pub(crate) enum ImageRevisionSnapshot {
     Present { revision: i64 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RatingOwnerSnapshot {
+    image: ImageRevisionSnapshot,
+    owner_revision: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RatingGlobalSnapshot(i64);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A journaled rating whose XMP sidecar write must be resumed.
 pub struct PendingSidecar {
@@ -61,10 +81,31 @@ pub struct PendingSidecar {
     pub rating: u8,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OwnedPendingSidecar {
+    pub owner: PathBuf,
+    pub pending: PendingSidecar,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DirtyOwnerRating {
+    pub path: PathBuf,
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub rating: u8,
+}
+
 pub(crate) enum PendingSidecarSync<E> {
     Written,
+    Discarded,
     Superseded,
     WriteFailed(E),
+}
+
+pub(crate) enum PendingSidecarWrite<E> {
+    Written(i64),
+    Discard,
+    Failed(E),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -93,8 +134,36 @@ impl Db {
     ///
     /// Returns [`DbError::Sqlite`] for open, pragma, or migration failures.
     pub fn open(path: &Path) -> Result<Self, DbError> {
+        Self::open_with_timeout(path, DATABASE_LOCK_TIMEOUT)
+    }
+
+    /// Opens an already-current schema read-only without waiting or migrating.
+    ///
+    /// This is intended for best-effort reads on a latency-sensitive caller.
+    /// Persistence workers should use [`Db::open`] so they can queue behind a
+    /// cooperating writer instead of dropping durable recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::Sqlite`] for open or immediate lock-contention
+    /// failures, and [`DbError::SchemaNotReady`] when a background open must
+    /// migrate the database first.
+    pub fn try_open_for_read(path: &Path) -> Result<Self, DbError> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(std::time::Duration::ZERO)?;
+        if !migration_is_complete(&conn, RATING_GENERATION_MIGRATION)? {
+            return Err(DbError::SchemaNotReady);
+        }
+        Ok(Self { conn })
+    }
+
+    fn open_with_timeout(path: &Path, lock_timeout: std::time::Duration) -> Result<Self, DbError> {
         let conn = Connection::open(path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Schema initialization and sidecar publication use write
+        // transactions. Let cooperating processes queue briefly instead of
+        // spuriously degrading to database-free persistence on lock overlap.
+        conn.busy_timeout(lock_timeout)?;
+        enable_wal(&conn, lock_timeout)?;
         initialize_schema(&conn)?;
         Ok(Self { conn })
     }
@@ -115,7 +184,13 @@ impl Db {
     /// makes the database a best-effort metadata accelerator rather than a
     /// requirement for opening a photo folder.
     pub fn get_image(&self, path: &str) -> Option<ImageRow> {
-        self.get_image_path(Path::new(path))
+        let original = Path::new(path);
+        let normalized = normalize_physical_path(original);
+        self.get_image_path(&normalized).or_else(|| {
+            (normalized != original)
+                .then(|| self.get_image_path(original))
+                .flatten()
+        })
     }
 
     pub(crate) fn get_image_path(&self, path: &Path) -> Option<ImageRow> {
@@ -123,7 +198,8 @@ impl Db {
             .prepare_cached(
                 "SELECT rating, sidecar_mtime_ns, sidecar_dirty
                    FROM images
-                  WHERE path = ?1",
+                  WHERE path = ?1
+                    AND sidecar_quarantined = 0",
             )
             .ok()?
             .query_row([path_value(path)], |row| {
@@ -146,7 +222,10 @@ impl Db {
             .prepare_cached(
                 "SELECT rating, sidecar_mtime_ns, sidecar_dirty
                    FROM images
-                  WHERE path = ?1 AND size = ?2 AND mtime_ns = ?3",
+                  WHERE path = ?1
+                    AND size = ?2
+                    AND mtime_ns = ?3
+                    AND sidecar_quarantined = 0",
             )
             .ok()?
             .query_row(rusqlite::params![path_value(path), size, mtime_ns], |row| {
@@ -175,9 +254,41 @@ impl Db {
         rating: Option<u8>,
         sidecar_mtime_ns: i64,
     ) -> Result<(), DbError> {
-        self.upsert_rating_path(Path::new(path), size, mtime_ns, rating, sidecar_mtime_ns)
+        let source = Path::new(path);
+        let path = normalize_physical_path(source);
+        let owner = sidecar_owner_key(&path)?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        migrate_legacy_source_alias(&transaction, source, &path)?;
+        delete_sidecar_owner_rows(&transaction, &path, &owner)?;
+        transaction.execute(
+            "INSERT INTO images
+               (path, size, mtime_ns, rating, sidecar_mtime_ns, sidecar_dirty,
+                sidecar_quarantined, sidecar_owner, last_seen)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, ?6, unixepoch())
+             ON CONFLICT(path) DO UPDATE SET
+               size = excluded.size,
+               mtime_ns = excluded.mtime_ns,
+               rating = excluded.rating,
+               sidecar_mtime_ns = excluded.sidecar_mtime_ns,
+               sidecar_dirty = 0,
+               sidecar_quarantined = 0,
+               sidecar_owner = excluded.sidecar_owner,
+               last_seen = excluded.last_seen",
+            rusqlite::params![
+                path_value(&path),
+                size,
+                mtime_ns,
+                rating,
+                sidecar_mtime_ns,
+                path_value(&owner)
+            ],
+        )?;
+        advance_sidecar_owner_revision(&transaction, &owner)?;
+        transaction.commit()?;
+        Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn upsert_rating_path(
         &self,
         path: &Path,
@@ -197,6 +308,7 @@ impl Db {
                rating = excluded.rating,
                sidecar_mtime_ns = excluded.sidecar_mtime_ns,
                sidecar_dirty = 0,
+               sidecar_quarantined = 0,
                last_seen = excluded.last_seen",
             )?
             .execute(rusqlite::params![
@@ -224,9 +336,10 @@ impl Db {
         mtime_ns: i64,
         rating: u8,
     ) -> Result<(), DbError> {
-        self.record_rating_pending_sidecar_path(Path::new(path), size, mtime_ns, rating)
+        self.record_rating_pending_sidecar_canonical(Path::new(path), size, mtime_ns, rating)
     }
 
+    #[cfg(test)]
     pub(crate) fn record_rating_pending_sidecar_path(
         &self,
         path: &Path,
@@ -234,41 +347,50 @@ impl Db {
         mtime_ns: i64,
         rating: u8,
     ) -> Result<(), DbError> {
-        self.conn
-            .prepare_cached(
-                "INSERT INTO images
-                   (path, size, mtime_ns, rating, sidecar_mtime_ns, sidecar_dirty, last_seen)
-             VALUES (?1, ?2, ?3, ?4, 0, 1, unixepoch())
-             ON CONFLICT(path) DO UPDATE SET
-               size = excluded.size,
-               mtime_ns = excluded.mtime_ns,
-               rating = excluded.rating,
-               sidecar_dirty = 1,
-               last_seen = excluded.last_seen",
-            )?
-            .execute(rusqlite::params![path_value(path), size, mtime_ns, rating])?;
+        // Exact-path tests may intentionally use synthetic or non-UTF-8
+        // paths. Give those rows a stable test-only owner so recovery queries
+        // still exercise the production schema.
+        let owner = sidecar_owner_key(path).unwrap_or_else(|_| path.with_extension("xmp"));
+        upsert_pending_sidecar(&self.conn, path, size, mtime_ns, rating, Some(&owner))?;
         Ok(())
     }
 
-    pub(crate) fn rating_revision_snapshot(
+    pub(crate) fn record_rating_pending_sidecar_canonical(
         &self,
         path: &Path,
-    ) -> Result<ImageRevisionSnapshot, DbError> {
-        let (revision, present) = self.conn.query_row(
-            "SELECT
-                 COALESCE(
-                     (SELECT revision FROM image_revisions WHERE path = ?1),
-                     0
-                 ),
-                 EXISTS(SELECT 1 FROM images WHERE path = ?1)",
-            [path_value(path)],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
-        )?;
-        Ok(if present {
-            ImageRevisionSnapshot::Present { revision }
-        } else {
-            ImageRevisionSnapshot::Missing { revision }
+        size: u64,
+        mtime_ns: i64,
+        rating: u8,
+    ) -> Result<(), DbError> {
+        let source = path;
+        let path = normalize_physical_path(source);
+        let owner = sidecar_owner_key(&path)?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        migrate_legacy_source_alias(&transaction, source, &path)?;
+        journal_canonical_rating(&transaction, &path, &owner, size, mtime_ns, rating)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn rating_owner_snapshot(
+        &self,
+        path: &Path,
+    ) -> Result<RatingOwnerSnapshot, DbError> {
+        let path = normalize_physical_path(path);
+        let owner = sidecar_owner_key(&path)?;
+        Ok(RatingOwnerSnapshot {
+            image: rating_revision_snapshot_on(&self.conn, &path)?,
+            owner_revision: sidecar_owner_revision_on(&self.conn, &owner)?,
         })
+    }
+
+    pub(crate) fn rating_global_snapshot(&self) -> Result<RatingGlobalSnapshot, DbError> {
+        rating_global_snapshot_on(&self.conn).map_err(Into::into)
+    }
+
+    #[cfg(test)]
+    fn rating_revision_snapshot(&self, path: &Path) -> Result<ImageRevisionSnapshot, DbError> {
+        rating_revision_snapshot_on(&self.conn, path).map_err(Into::into)
     }
 
     pub(crate) fn record_rating_pending_sidecar_if_unchanged(
@@ -277,52 +399,68 @@ impl Db {
         size: u64,
         mtime_ns: i64,
         rating: u8,
-        predecessor: ImageRevisionSnapshot,
+        predecessor: RatingOwnerSnapshot,
     ) -> Result<bool, DbError> {
-        let changed = match predecessor {
-            ImageRevisionSnapshot::Present { revision } => self
-                .conn
-                .prepare_cached(
-                    "UPDATE images
-                        SET size = ?2,
-                            mtime_ns = ?3,
-                            rating = ?4,
-                            sidecar_dirty = 1,
-                            last_seen = unixepoch()
-                      WHERE path = ?1
-                        AND revision = ?5",
-                )?
-                .execute(rusqlite::params![
-                    path_value(path),
-                    size,
-                    mtime_ns,
-                    rating,
-                    revision
-                ])?,
-            ImageRevisionSnapshot::Missing { revision } => self
-                .conn
-                .prepare_cached(
-                    "INSERT INTO images
-                       (path, size, mtime_ns, rating, sidecar_mtime_ns, sidecar_dirty, last_seen)
-                     SELECT ?1, ?2, ?3, ?4, 0, 1, unixepoch()
-                      WHERE NOT EXISTS(SELECT 1 FROM images WHERE path = ?1)
-                        AND COALESCE(
-                                (SELECT revision
-                                   FROM image_revisions
-                                  WHERE path = ?1),
-                                0
-                            ) = ?5
-                     ON CONFLICT(path) DO NOTHING",
-                )?
-                .execute(rusqlite::params![
-                    path_value(path),
-                    size,
-                    mtime_ns,
-                    rating,
-                    revision
-                ])?,
+        let path = normalize_physical_path(path);
+        let owner = sidecar_owner_key(&path)?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let current = RatingOwnerSnapshot {
+            image: rating_revision_snapshot_on(&transaction, &path)?,
+            owner_revision: sidecar_owner_revision_on(&transaction, &owner)?,
         };
-        Ok(changed == 1)
+        if current != predecessor {
+            transaction.rollback()?;
+            return Ok(false);
+        }
+        journal_canonical_rating(&transaction, &path, &owner, size, mtime_ns, rating)?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn record_rating_pending_sidecar_if_global_unchanged(
+        &self,
+        path: &Path,
+        size: u64,
+        mtime_ns: i64,
+        rating: u8,
+        predecessor: RatingGlobalSnapshot,
+    ) -> Result<bool, DbError> {
+        let path = normalize_physical_path(path);
+        let owner = sidecar_owner_key(&path)?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if rating_global_snapshot_on(&transaction)? != predecessor {
+            transaction.rollback()?;
+            return Ok(false);
+        }
+        journal_canonical_rating(&transaction, &path, &owner, size, mtime_ns, rating)?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn dirty_rating_for_owner(
+        &self,
+        owner: &Path,
+    ) -> Result<Option<DirtyOwnerRating>, DbError> {
+        self.conn
+            .query_row(
+                "SELECT path, size, mtime_ns, rating
+                   FROM images
+                  WHERE sidecar_owner = ?1
+                    AND sidecar_dirty = 1
+                    AND sidecar_quarantined = 0
+                    AND rating IS NOT NULL",
+                [path_value(owner)],
+                |row| {
+                    Ok(DirtyOwnerRating {
+                        path: row_path(row, 0)?,
+                        size: row.get(1)?,
+                        mtime_ns: row.get(2)?,
+                        rating: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     /// Mark one exact dirty rating as synchronized with its sidecar.
@@ -334,7 +472,8 @@ impl Db {
     /// # Errors
     ///
     /// Returns [`DbError::Sqlite`] if preparing or executing the update fails.
-    pub fn complete_pending_sidecar(
+    #[cfg(test)]
+    pub(crate) fn complete_pending_sidecar(
         &self,
         path: &Path,
         size: u64,
@@ -342,6 +481,7 @@ impl Db {
         rating: u8,
         sidecar_mtime_ns: i64,
     ) -> Result<bool, DbError> {
+        let path = normalize_physical_path(path);
         let changed = self
             .conn
             .prepare_cached(
@@ -353,10 +493,11 @@ impl Db {
                     AND size = ?2
                     AND mtime_ns = ?3
                     AND rating = ?4
-                    AND sidecar_dirty = 1",
+                    AND sidecar_dirty = 1
+                    AND sidecar_quarantined = 0",
             )?
             .execute(rusqlite::params![
-                path_value(path),
+                path_value(&path),
                 size,
                 mtime_ns,
                 rating,
@@ -371,35 +512,57 @@ impl Db {
         size: u64,
         mtime_ns: i64,
         rating: u8,
-        write: impl FnOnce() -> Result<i64, E>,
+        write: impl FnOnce() -> PendingSidecarWrite<E>,
     ) -> Result<PendingSidecarSync<E>, PendingSidecarSyncError> {
         // The immediate transaction serializes cooperating Viewr processes
         // before any sidecar bytes are replaced. Without this ownership
         // boundary, an older writer can publish stale XMP and only discover
         // that it lost the database compare-and-swap afterward.
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let is_current = transaction
+        let current_owner = transaction
             .query_row(
-                "SELECT 1
+                "SELECT sidecar_owner
                    FROM images
                   WHERE path = ?1
                     AND size = ?2
                     AND mtime_ns = ?3
                     AND rating = ?4
-                    AND sidecar_dirty = 1",
+                    AND sidecar_dirty = 1
+                    AND sidecar_quarantined = 0
+                    AND sidecar_owner IS NOT NULL",
                 rusqlite::params![path_value(path), size, mtime_ns, rating],
-                |_| Ok(()),
+                |row| row_path(row, 0),
             )
-            .optional()?
-            .is_some();
-        if !is_current {
+            .optional()?;
+        let Some(current_owner) = current_owner else {
             transaction.rollback()?;
             return Ok(PendingSidecarSync::Superseded);
-        }
+        };
 
         let sidecar_mtime_ns = match write() {
-            Ok(mtime) => mtime,
-            Err(error) => return Ok(PendingSidecarSync::WriteFailed(error)),
+            PendingSidecarWrite::Written(mtime) => mtime,
+            PendingSidecarWrite::Discard => {
+                let changed = transaction.execute(
+                    "DELETE FROM images
+                      WHERE path = ?1
+                        AND size = ?2
+                        AND mtime_ns = ?3
+                        AND rating = ?4
+                        AND sidecar_dirty = 1
+                        AND sidecar_quarantined = 0",
+                    rusqlite::params![path_value(path), size, mtime_ns, rating],
+                )?;
+                if changed != 1 {
+                    return Err(PendingSidecarSyncError::OwnershipLost);
+                }
+                advance_sidecar_owner_revision(&transaction, &current_owner)?;
+                transaction.commit()?;
+                return Ok(PendingSidecarSync::Discarded);
+            }
+            PendingSidecarWrite::Failed(error) => {
+                transaction.rollback()?;
+                return Ok(PendingSidecarSync::WriteFailed(error));
+            }
         };
         let changed = transaction.execute(
             "UPDATE images
@@ -410,7 +573,8 @@ impl Db {
                 AND size = ?2
                 AND mtime_ns = ?3
                 AND rating = ?4
-                AND sidecar_dirty = 1",
+                AND sidecar_dirty = 1
+                AND sidecar_quarantined = 0",
             rusqlite::params![path_value(path), size, mtime_ns, rating, sidecar_mtime_ns],
         )?;
         if changed != 1 {
@@ -423,15 +587,8 @@ impl Db {
         Ok(PendingSidecarSync::Written)
     }
 
-    /// Remove one exact dirty row after its RAW identity has gone stale.
-    ///
-    /// A conditional delete prevents an older recovery attempt from removing
-    /// a newer rating for the same path.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DbError::Sqlite`] if preparing or executing the delete fails.
-    pub fn discard_pending_sidecar(
+    #[cfg(test)]
+    fn discard_pending_sidecar(
         &self,
         path: &Path,
         size: u64,
@@ -446,7 +603,8 @@ impl Db {
                     AND size = ?2
                     AND mtime_ns = ?3
                     AND rating = ?4
-                    AND sidecar_dirty = 1",
+                    AND sidecar_dirty = 1
+                    AND sidecar_quarantined = 0",
             )?
             .execute(rusqlite::params![path_value(path), size, mtime_ns, rating])?;
         Ok(changed == 1)
@@ -459,21 +617,183 @@ impl Db {
     ///
     /// Returns [`DbError::Sqlite`] if preparing or reading the query fails.
     pub fn pending_sidecars(&self) -> Result<Vec<PendingSidecar>, DbError> {
-        let mut statement = self.conn.prepare_cached(
-            "SELECT path, size, mtime_ns, rating
-               FROM images
-              WHERE sidecar_dirty = 1 AND rating IS NOT NULL",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok(PendingSidecar {
+        self.pending_sidecars_with_owners()
+            .map(|rows| rows.into_iter().map(|row| row.pending).collect::<Vec<_>>())
+    }
+
+    pub(crate) fn pending_sidecars_with_owners(&self) -> Result<Vec<OwnedPendingSidecar>, DbError> {
+        pending_sidecars_on(&self.conn).map_err(Into::into)
+    }
+}
+
+fn upsert_pending_sidecar(
+    conn: &Connection,
+    path: &Path,
+    size: u64,
+    mtime_ns: i64,
+    rating: u8,
+    sidecar_owner: Option<&Path>,
+) -> Result<usize, rusqlite::Error> {
+    let sidecar_owner = sidecar_owner.map(path_value);
+    conn.execute(
+        "INSERT INTO images
+           (path, size, mtime_ns, rating, sidecar_mtime_ns, sidecar_dirty,
+            sidecar_owner, last_seen)
+         VALUES (?1, ?2, ?3, ?4, 0, 1, ?5, unixepoch())
+         ON CONFLICT(path) DO UPDATE SET
+           size = excluded.size,
+           mtime_ns = excluded.mtime_ns,
+           rating = excluded.rating,
+           sidecar_dirty = 1,
+           sidecar_quarantined = 0,
+           sidecar_owner = COALESCE(excluded.sidecar_owner, images.sidecar_owner),
+           last_seen = excluded.last_seen",
+        rusqlite::params![path_value(path), size, mtime_ns, rating, sidecar_owner],
+    )
+}
+
+fn journal_canonical_rating(
+    conn: &Connection,
+    path: &Path,
+    sidecar_owner: &Path,
+    size: u64,
+    mtime_ns: i64,
+    rating: u8,
+) -> Result<(), rusqlite::Error> {
+    delete_sidecar_owner_rows(conn, path, sidecar_owner)?;
+    upsert_pending_sidecar(conn, path, size, mtime_ns, rating, Some(sidecar_owner))?;
+    advance_sidecar_owner_revision(conn, sidecar_owner)
+}
+
+fn advance_sidecar_owner_revision(
+    conn: &Connection,
+    sidecar_owner: &Path,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO sidecar_owner_revisions (owner, revision)
+         VALUES (?1, 1)
+         ON CONFLICT(owner) DO UPDATE SET
+            revision = sidecar_owner_revisions.revision + 1",
+        [path_value(sidecar_owner)],
+    )?;
+    conn.execute(
+        "UPDATE rating_global_revision
+            SET revision = revision + 1
+          WHERE singleton = 1",
+        [],
+    )?;
+    Ok(())
+}
+
+fn rating_revision_snapshot_on(
+    conn: &Connection,
+    path: &Path,
+) -> Result<ImageRevisionSnapshot, rusqlite::Error> {
+    let (revision, present) = conn.query_row(
+        "SELECT
+             COALESCE(
+                 (SELECT revision FROM image_revisions WHERE path = ?1),
+                 0
+             ),
+             EXISTS(SELECT 1 FROM images WHERE path = ?1)",
+        [path_value(path)],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+    )?;
+    Ok(if present {
+        ImageRevisionSnapshot::Present { revision }
+    } else {
+        ImageRevisionSnapshot::Missing { revision }
+    })
+}
+
+fn sidecar_owner_revision_on(conn: &Connection, owner: &Path) -> Result<i64, rusqlite::Error> {
+    conn.query_row(
+        "SELECT COALESCE(
+             (SELECT revision
+                FROM sidecar_owner_revisions
+               WHERE owner = ?1),
+             0
+         )",
+        [path_value(owner)],
+        |row| row.get(0),
+    )
+}
+
+fn rating_global_snapshot_on(conn: &Connection) -> Result<RatingGlobalSnapshot, rusqlite::Error> {
+    conn.query_row(
+        "SELECT revision
+           FROM rating_global_revision
+          WHERE singleton = 1",
+        [],
+        |row| row.get(0).map(RatingGlobalSnapshot),
+    )
+}
+
+fn pending_sidecars_on(conn: &Connection) -> Result<Vec<OwnedPendingSidecar>, rusqlite::Error> {
+    let mut statement = conn.prepare(
+        "SELECT path, size, mtime_ns, rating, sidecar_owner
+           FROM images
+          WHERE sidecar_dirty = 1
+            AND sidecar_quarantined = 0
+            AND sidecar_owner IS NOT NULL
+            AND rating IS NOT NULL",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(OwnedPendingSidecar {
+            owner: row_path(row, 4)?,
+            pending: PendingSidecar {
                 path: row_path(row, 0)?,
                 size: row.get(1)?,
                 mtime_ns: row.get(2)?,
                 rating: row.get(3)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+            },
+        })
+    })?;
+    rows.collect()
+}
+
+fn delete_sidecar_owner_rows(
+    conn: &Connection,
+    canonical: &Path,
+    sidecar_owner: &Path,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "DELETE FROM images
+          WHERE path <> ?1
+            AND sidecar_owner = ?2",
+        rusqlite::params![path_value(canonical), path_value(sidecar_owner)],
+    )?;
+    Ok(())
+}
+
+fn migrate_legacy_source_alias(
+    conn: &Connection,
+    source: &Path,
+    canonical: &Path,
+) -> Result<(), rusqlite::Error> {
+    if source == canonical {
+        return Ok(());
     }
+    conn.execute(
+        "UPDATE images
+            SET path = ?2
+          WHERE path = ?1
+            AND sidecar_owner IS NULL
+            AND sidecar_quarantined = 0
+            AND NOT EXISTS(
+                    SELECT 1
+                      FROM images
+                     WHERE path = ?2
+                )",
+        rusqlite::params![path_value(source), path_value(canonical)],
+    )?;
+    conn.execute(
+        "DELETE FROM images
+          WHERE path = ?1
+            AND sidecar_owner IS NULL",
+        [path_value(source)],
+    )?;
+    Ok(())
 }
 
 /// Looks up ratings through the same per-path database path used during
@@ -485,6 +805,40 @@ pub fn benchmark_rating_lookup(db: &Db, paths: &[PathBuf]) -> usize {
         .iter()
         .filter(|path| db.get_image_path(path).is_some())
         .count()
+}
+
+/// Populates one clean synthetic row without filesystem owner discovery.
+///
+/// This is available only to the benchmark harness so lookup, reopen, and
+/// indexed-journal scaling can use large databases without creating tens of
+/// thousands of placeholder RAW files.
+#[cfg(feature = "benchmarks")]
+#[doc(hidden)]
+pub fn benchmark_insert_rating(
+    db: &Db,
+    path: &Path,
+    size: u64,
+    mtime_ns: i64,
+    rating: u8,
+) -> Result<(), DbError> {
+    let owner = path.with_extension("xmp");
+    db.conn.execute(
+        "INSERT INTO images
+           (path, size, mtime_ns, rating, sidecar_mtime_ns, sidecar_dirty,
+            sidecar_quarantined, sidecar_owner, last_seen)
+         VALUES (?1, ?2, ?3, ?4, 1, 0, 0, ?5, unixepoch())
+         ON CONFLICT(path) DO UPDATE SET
+           size = excluded.size,
+           mtime_ns = excluded.mtime_ns,
+           rating = excluded.rating,
+           sidecar_mtime_ns = excluded.sidecar_mtime_ns,
+           sidecar_dirty = 0,
+           sidecar_quarantined = 0,
+           sidecar_owner = excluded.sidecar_owner,
+           last_seen = excluded.last_seen",
+        rusqlite::params![path_value(path), size, mtime_ns, rating, path_value(&owner)],
+    )?;
+    Ok(())
 }
 
 fn path_value(path: &Path) -> Value {
@@ -577,6 +931,8 @@ fn initialize_schema(conn: &Connection) -> Result<(), DbError> {
             rating INTEGER,
             sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
             sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+            sidecar_quarantined INTEGER NOT NULL DEFAULT 0,
+            sidecar_owner,
             revision INTEGER NOT NULL DEFAULT 0,
             last_seen INTEGER NOT NULL DEFAULT 0
         );",
@@ -594,6 +950,50 @@ fn initialize_schema(conn: &Connection) -> Result<(), DbError> {
             [],
         )?;
     }
+    if !has_column(&transaction, "images", "sidecar_quarantined")? {
+        transaction.execute(
+            "ALTER TABLE images
+             ADD COLUMN sidecar_quarantined INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !has_column(&transaction, "images", "sidecar_owner")? {
+        transaction.execute("ALTER TABLE images ADD COLUMN sidecar_owner", [])?;
+    }
+    // Pre-owner versions accepted path aliases and did not carry a global
+    // order across them. No legacy dirty row can therefore be recovered
+    // without risking a stale sidecar overwrite. Move those rows out of the
+    // live table so even an already-running older process observes that it no
+    // longer owns publication.
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS quarantined_legacy_ratings (
+            path PRIMARY KEY,
+            size INTEGER NOT NULL,
+            mtime_ns INTEGER NOT NULL,
+            rating INTEGER,
+            sidecar_mtime_ns INTEGER NOT NULL,
+            revision INTEGER NOT NULL,
+            last_seen INTEGER NOT NULL,
+            quarantined_at INTEGER NOT NULL
+        ) WITHOUT ROWID;",
+    )?;
+    let quarantined = transaction.execute(
+        "INSERT OR REPLACE INTO quarantined_legacy_ratings
+            (path, size, mtime_ns, rating, sidecar_mtime_ns, revision,
+             last_seen, quarantined_at)
+         SELECT path, size, mtime_ns, rating, sidecar_mtime_ns, revision,
+                last_seen, unixepoch()
+           FROM images
+          WHERE sidecar_dirty = 1",
+        [],
+    )?;
+    transaction.execute("DELETE FROM images WHERE sidecar_dirty = 1", [])?;
+    if quarantined > 0 {
+        eprintln!(
+            "quarantined {quarantined} unfinished legacy rating(s); rate those photos again to \
+             publish a sidecar safely"
+        );
+    }
 
     // `images.revision` is the logical rating generation used by delayed
     // compare-and-swap retries. Sidecar completion bookkeeping deliberately
@@ -605,6 +1005,43 @@ fn initialize_schema(conn: &Connection) -> Result<(), DbError> {
             path TEXT PRIMARY KEY,
             revision INTEGER NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS sidecar_owner_revisions (
+            owner PRIMARY KEY,
+            revision INTEGER NOT NULL
+        ) WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS rating_global_revision (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            revision INTEGER NOT NULL
+        ) WITHOUT ROWID;
+
+        INSERT OR IGNORE INTO rating_global_revision (singleton, revision)
+        VALUES (1, 0);
+
+        CREATE INDEX IF NOT EXISTS images_pending_sidecars
+            ON images(path)
+         WHERE sidecar_dirty = 1
+           AND sidecar_quarantined = 0
+           AND rating IS NOT NULL;
+
+        CREATE UNIQUE INDEX IF NOT EXISTS images_sidecar_owners
+            ON images(sidecar_owner)
+         WHERE sidecar_owner IS NOT NULL;
+
+        CREATE TRIGGER IF NOT EXISTS images_reject_unowned_dirty_insert
+        BEFORE INSERT ON images
+        WHEN NEW.sidecar_dirty = 1 AND NEW.sidecar_owner IS NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'dirty rating requires a sidecar owner');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS images_reject_unowned_dirty_update
+        BEFORE UPDATE OF sidecar_dirty, sidecar_owner ON images
+        WHEN NEW.sidecar_dirty = 1 AND NEW.sidecar_owner IS NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'dirty rating requires a sidecar owner');
+        END;
 
         INSERT OR IGNORE INTO image_revisions (path, revision)
         SELECT path, revision FROM images;
@@ -689,6 +1126,33 @@ fn initialize_schema(conn: &Connection) -> Result<(), DbError> {
     Ok(())
 }
 
+fn enable_wal(conn: &Connection, lock_timeout: std::time::Duration) -> Result<(), rusqlite::Error> {
+    let deadline = std::time::Instant::now() + lock_timeout;
+    loop {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => return Ok(()),
+            Err(error) if database_is_locked(&error) && std::time::Instant::now() < deadline => {
+                // SQLITE_LOCKED does not invoke SQLite's busy handler. A
+                // short bounded retry covers simultaneous first opens while
+                // retaining the connection-level handler for SQLITE_BUSY.
+                std::thread::sleep(DATABASE_LOCK_RETRY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn database_is_locked(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
 fn migration_is_complete(conn: &Connection, migration: &str) -> Result<bool, rusqlite::Error> {
     let table_exists = conn.query_row(
         "SELECT EXISTS(
@@ -738,50 +1202,128 @@ mod tests {
             Db::record_rating_pending_sidecar;
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn public_path_methods_round_trip_through_a_parent_alias() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let physical = directory.path().join("physical");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&physical).unwrap();
+        symlink(&physical, &alias).unwrap();
+        let raw = physical.join("photo.ARW");
+        std::fs::write(&raw, b"raw").unwrap();
+        let aliased = alias.join("photo.ARW");
+        let db = Db::open_in_memory().unwrap();
+
+        db.record_rating_pending_sidecar(aliased.to_str().unwrap(), 3, 1, 4)
+            .unwrap();
+
+        assert_eq!(
+            db.get_image(aliased.to_str().unwrap()).unwrap().rating,
+            Some(4)
+        );
+        assert_eq!(db.get_image(raw.to_str().unwrap()).unwrap().rating, Some(4));
+        assert!(db.complete_pending_sidecar(&aliased, 3, 1, 4, 99).unwrap());
+        assert!(!db.get_image(raw.to_str().unwrap()).unwrap().sidecar_dirty);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_getter_falls_back_to_a_legacy_symlink_spelling() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let physical = directory.path().join("physical");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&physical).unwrap();
+        symlink(&physical, &alias).unwrap();
+        let raw = physical.join("photo.ARW");
+        let legacy_raw = alias.join("photo.ARW");
+        std::fs::write(&raw, b"raw").unwrap();
+        let database_path = directory.path().join("legacy-alias.db");
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE images (
+                    path PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO images
+                    (path, size, mtime_ns, rating, sidecar_mtime_ns, last_seen)
+                 VALUES (?1, 3, 1, 4, 99, 0)",
+                [path_value(&legacy_raw)],
+            )
+            .unwrap();
+        drop(connection);
+
+        let db = Db::open(&database_path).unwrap();
+
+        assert_eq!(
+            db.get_image(legacy_raw.to_str().unwrap()).unwrap().rating,
+            Some(4)
+        );
+        assert!(db.get_image(raw.to_str().unwrap()).is_none());
+    }
+
     #[test]
     fn revision_cas_rejects_present_and_missing_aba() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = normalize_physical_path(&directory.path().join("aba.arw"));
+        std::fs::write(&path, b"raw").unwrap();
         let db = Db::open_in_memory().unwrap();
-        let path = Path::new("/p/aba.arw");
-        let initially_missing = db.rating_revision_snapshot(path).unwrap();
+        let initially_missing = db.rating_owner_snapshot(&path).unwrap();
         assert_eq!(
-            initially_missing,
+            initially_missing.image,
             ImageRevisionSnapshot::Missing { revision: 0 }
         );
 
         assert!(
-            db.record_rating_pending_sidecar_if_unchanged(path, 10, 1, 2, initially_missing)
+            db.record_rating_pending_sidecar_if_unchanged(&path, 10, 1, 2, initially_missing)
                 .unwrap()
         );
-        let rating_two = db.rating_revision_snapshot(path).unwrap();
-        assert_eq!(rating_two, ImageRevisionSnapshot::Present { revision: 1 });
+        let rating_two = db.rating_owner_snapshot(&path).unwrap();
+        assert_eq!(
+            rating_two.image,
+            ImageRevisionSnapshot::Present { revision: 1 }
+        );
 
-        db.record_rating_pending_sidecar_path(path, 10, 1, 5)
+        db.record_rating_pending_sidecar_path(&path, 10, 1, 5)
             .unwrap();
-        db.record_rating_pending_sidecar_path(path, 10, 1, 2)
+        db.record_rating_pending_sidecar_path(&path, 10, 1, 2)
             .unwrap();
         assert!(
-            !db.record_rating_pending_sidecar_if_unchanged(path, 10, 1, 4, rating_two)
+            !db.record_rating_pending_sidecar_if_unchanged(&path, 10, 1, 4, rating_two)
                 .unwrap()
         );
-        assert_eq!(db.get_image_path(path).unwrap().rating, Some(2));
+        assert_eq!(db.get_image_path(&path).unwrap().rating, Some(2));
 
-        assert!(db.discard_pending_sidecar(path, 10, 1, 2).unwrap());
+        assert!(db.discard_pending_sidecar(&path, 10, 1, 2).unwrap());
         assert_eq!(
-            db.rating_revision_snapshot(path).unwrap(),
+            db.rating_revision_snapshot(&path).unwrap(),
             ImageRevisionSnapshot::Missing { revision: 4 }
         );
         assert!(
-            !db.record_rating_pending_sidecar_if_unchanged(path, 10, 1, 3, initially_missing)
+            !db.record_rating_pending_sidecar_if_unchanged(&path, 10, 1, 3, initially_missing)
                 .unwrap()
         );
 
-        let currently_missing = db.rating_revision_snapshot(path).unwrap();
+        let currently_missing = db.rating_owner_snapshot(&path).unwrap();
         assert!(
-            db.record_rating_pending_sidecar_if_unchanged(path, 10, 1, 3, currently_missing)
+            db.record_rating_pending_sidecar_if_unchanged(&path, 10, 1, 3, currently_missing)
                 .unwrap()
         );
         assert_eq!(
-            db.rating_revision_snapshot(path).unwrap(),
+            db.rating_revision_snapshot(&path).unwrap(),
             ImageRevisionSnapshot::Present { revision: 5 }
         );
     }
@@ -815,8 +1357,10 @@ mod tests {
         db.record_rating_pending_sidecar_path(path, 10, 1, 4)
             .unwrap();
         assert!(matches!(
-            db.synchronize_pending_sidecar(path, 10, 1, 4, || Ok::<_, ()>(13))
-                .unwrap(),
+            db.synchronize_pending_sidecar(path, 10, 1, 4, || {
+                PendingSidecarWrite::<()>::Written(13)
+            })
+            .unwrap(),
             PendingSidecarSync::Written
         ));
         assert_eq!(
@@ -834,25 +1378,27 @@ mod tests {
 
     #[test]
     fn completing_the_predecessor_does_not_supersede_a_delayed_rating() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = normalize_physical_path(&directory.path().join("completed-predecessor.arw"));
+        std::fs::write(&path, b"raw").unwrap();
         let db = Db::open_in_memory().unwrap();
-        let path = Path::new("/p/completed-predecessor.arw");
-        db.record_rating_pending_sidecar_path(path, 10, 1, 2)
+        db.record_rating_pending_sidecar_path(&path, 10, 1, 2)
             .unwrap();
-        let predecessor = db.rating_revision_snapshot(path).unwrap();
+        let predecessor = db.rating_owner_snapshot(&path).unwrap();
 
-        assert!(db.complete_pending_sidecar(path, 10, 1, 2, 99).unwrap());
-        assert_eq!(db.rating_revision_snapshot(path).unwrap(), predecessor);
+        assert!(db.complete_pending_sidecar(&path, 10, 1, 2, 99).unwrap());
+        assert_eq!(db.rating_owner_snapshot(&path).unwrap(), predecessor);
         assert!(
-            db.record_rating_pending_sidecar_if_unchanged(path, 10, 1, 5, predecessor)
+            db.record_rating_pending_sidecar_if_unchanged(&path, 10, 1, 5, predecessor)
                 .unwrap()
         );
 
-        let row = db.get_image_path(path).unwrap();
+        let row = db.get_image_path(&path).unwrap();
         assert_eq!(row.rating, Some(5));
         assert_eq!(row.sidecar_mtime_ns, 99);
         assert!(row.sidecar_dirty);
         assert_eq!(
-            db.rating_revision_snapshot(path).unwrap(),
+            db.rating_revision_snapshot(&path).unwrap(),
             ImageRevisionSnapshot::Present { revision: 2 }
         );
     }
@@ -979,7 +1525,7 @@ mod tests {
                 .synchronize_pending_sidecar(&owner_path, 10, 1, 2, || {
                     entered.send(()).unwrap();
                     release_wait.recv().unwrap();
-                    Ok::<_, ()>(99)
+                    PendingSidecarWrite::<()>::Written(99)
                 })
                 .unwrap()
         });
@@ -1014,7 +1560,9 @@ mod tests {
             .unwrap();
         assert!(matches!(
             contender
-                .synchronize_pending_sidecar(&path, 10, 1, 5, || Ok::<_, ()>(100))
+                .synchronize_pending_sidecar(&path, 10, 1, 5, || {
+                    PendingSidecarWrite::<()>::Written(100)
+                })
                 .unwrap(),
             PendingSidecarSync::Written
         ));
@@ -1022,6 +1570,59 @@ mod tests {
         assert_eq!(row.rating, Some(5));
         assert_eq!(row.sidecar_mtime_ns, 100);
         assert!(!row.sidecar_dirty);
+    }
+
+    #[test]
+    fn sidecar_discard_holds_ownership_until_the_delete_commits() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("viewr.db");
+        let path = PathBuf::from("/p/discard-race.arw");
+        let owner = Db::open(&database_path).unwrap();
+        let contender = Db::open(&database_path).unwrap();
+        owner
+            .record_rating_pending_sidecar_path(&path, 10, 1, 4)
+            .unwrap();
+
+        let (entered, entered_wait) = std::sync::mpsc::channel();
+        let (release, release_wait) = std::sync::mpsc::channel();
+        let owner_path = path.clone();
+        let owner_thread = std::thread::spawn(move || {
+            owner
+                .synchronize_pending_sidecar(&owner_path, 10, 1, 4, || {
+                    entered.send(()).unwrap();
+                    release_wait.recv().unwrap();
+                    PendingSidecarWrite::<()>::Discard
+                })
+                .unwrap()
+        });
+        entered_wait
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+
+        contender
+            .conn
+            .busy_timeout(std::time::Duration::ZERO)
+            .unwrap();
+        let error = contender
+            .record_rating_pending_sidecar_path(&path, 10, 1, 4)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DbError::Sqlite(ref error) if database_is_locked(error)
+        ));
+
+        release.send(()).unwrap();
+        assert!(matches!(
+            owner_thread.join().unwrap(),
+            PendingSidecarSync::Discarded
+        ));
+
+        contender
+            .record_rating_pending_sidecar_path(&path, 10, 1, 4)
+            .unwrap();
+        let row = contender.get_image_path(&path).unwrap();
+        assert_eq!(row.rating, Some(4));
+        assert!(row.sidecar_dirty);
     }
 
     #[test]
@@ -1033,7 +1634,7 @@ mod tests {
 
         let result = db
             .synchronize_pending_sidecar(path, 10, 1, 4, || {
-                Err::<i64, _>("injected sidecar failure")
+                PendingSidecarWrite::Failed("injected sidecar failure")
             })
             .unwrap();
 
@@ -1043,8 +1644,10 @@ mod tests {
         ));
         assert!(db.get_image_path(path).unwrap().sidecar_dirty);
         assert!(matches!(
-            db.synchronize_pending_sidecar(path, 10, 1, 4, || Ok::<_, ()>(101))
-                .unwrap(),
+            db.synchronize_pending_sidecar(path, 10, 1, 4, || {
+                PendingSidecarWrite::<()>::Written(101)
+            })
+            .unwrap(),
             PendingSidecarSync::Written
         ));
         let row = db.get_image_path(path).unwrap();
@@ -1056,9 +1659,169 @@ mod tests {
     fn opening_a_legacy_database_adds_journal_columns_without_changing_rows() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.db");
+        let raw = dir.path().join("legacy.arw");
+        std::fs::write(&raw, b"raw").unwrap();
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(
+                "CREATE TABLE images (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO images
+                    (path, size, mtime_ns, rating, sidecar_mtime_ns, last_seen)
+                 VALUES (?1, 42, 7, 3, 123, 0)",
+                [path_value(&raw)],
+            )
+            .unwrap();
+        }
+
+        {
+            let db = Db::open(&path).unwrap();
+            let row = db.get_image(raw.to_str().unwrap()).unwrap();
+            assert_eq!(row.rating, Some(3));
+            assert_eq!(row.sidecar_mtime_ns, 123);
+            assert!(!row.sidecar_dirty);
+            assert_eq!(
+                db.rating_revision_snapshot(&raw).unwrap(),
+                ImageRevisionSnapshot::Present { revision: 0 }
+            );
+            db.record_rating_pending_sidecar(raw.to_str().unwrap(), 42, 7, 4)
+                .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        let row = db.get_image(raw.to_str().unwrap()).unwrap();
+        assert_eq!(row.rating, Some(4));
+        assert_eq!(row.sidecar_mtime_ns, 123);
+        assert!(row.sidecar_dirty);
+        assert_eq!(
+            db.rating_revision_snapshot(&normalize_physical_path(&raw))
+                .unwrap(),
+            ImageRevisionSnapshot::Present { revision: 1 }
+        );
+    }
+
+    #[test]
+    fn migration_durably_quarantines_legacy_dirty_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-dirty.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE images (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO images
+                    (path, size, mtime_ns, rating, sidecar_mtime_ns,
+                     sidecar_dirty, last_seen)
+                VALUES
+                    ('/p/dirty-legacy.arw', 42, 7, 4, 123, 1, 0),
+                    ('/p/clean-legacy.arw', 42, 7, 3, 123, 0, 0);",
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+
+        assert!(db.get_image("/p/dirty-legacy.arw").is_none());
+        assert_eq!(db.get_image("/p/clean-legacy.arw").unwrap().rating, Some(3));
+        assert!(db.pending_sidecars().unwrap().is_empty());
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT rating
+                       FROM quarantined_legacy_ratings
+                      WHERE path = '/p/dirty-legacy.arw'",
+                    [],
+                    |row| row.get::<_, u8>(0),
+                )
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*)
+                       FROM images
+                      WHERE path = '/p/dirty-legacy.arw'",
+                    [],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert!(
+            db.conn
+                .execute(
+                    "INSERT INTO images
+                        (path, size, mtime_ns, rating, sidecar_dirty)
+                     VALUES ('/p/old-writer.arw', 42, 7, 5, 1)",
+                    [],
+                )
+                .is_err(),
+            "an overlapping pre-owner writer must not recreate a live dirty row"
+        );
+        drop(db);
+
+        let reopened = Db::open(&path).unwrap();
+        assert!(reopened.get_image("/p/dirty-legacy.arw").is_none());
+        assert!(reopened.pending_sidecars().unwrap().is_empty());
+    }
+
+    #[test]
+    fn warm_schema_reinitialization_performs_no_row_dml() {
+        let directory = tempfile::tempdir().unwrap();
+        let raw = directory.path().join("warm-open.arw");
+        std::fs::write(&raw, b"raw").unwrap();
+        let db = Db::open_in_memory().unwrap();
+        db.record_rating_pending_sidecar(raw.to_str().unwrap(), 42, 7, 4)
+            .unwrap();
+        let changes_before = db.conn.total_changes();
+
+        initialize_schema(&db.conn).unwrap();
+
+        assert_eq!(db.conn.total_changes(), changes_before);
+        assert!(
+            migration_is_complete(&db.conn, RATING_GENERATION_MIGRATION).unwrap(),
+            "the durable marker must make later initialization read-only"
+        );
+        assert!(
+            db.conn
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1
+                           FROM sqlite_schema
+                          WHERE type = 'index'
+                            AND name = 'images_pending_sidecars'
+                     )",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn latency_sensitive_read_open_never_migrates_a_legacy_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy-read.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
                 "CREATE TABLE images (
                     path TEXT PRIMARY KEY,
                     size INTEGER NOT NULL,
@@ -1072,49 +1835,38 @@ mod tests {
                 VALUES ('/p/legacy.arw', 42, 7, 3, 123, 0);",
             )
             .unwrap();
-        }
+        drop(connection);
 
-        {
-            let db = Db::open(&path).unwrap();
-            let row = db.get_image("/p/legacy.arw").unwrap();
-            assert_eq!(row.rating, Some(3));
-            assert_eq!(row.sidecar_mtime_ns, 123);
-            assert!(!row.sidecar_dirty);
-            assert_eq!(
-                db.rating_revision_snapshot(Path::new("/p/legacy.arw"))
-                    .unwrap(),
-                ImageRevisionSnapshot::Present { revision: 0 }
-            );
-            db.record_rating_pending_sidecar("/p/legacy.arw", 42, 7, 4)
-                .unwrap();
-        }
-
-        let db = Db::open(&path).unwrap();
-        let row = db.get_image("/p/legacy.arw").unwrap();
-        assert_eq!(row.rating, Some(4));
-        assert_eq!(row.sidecar_mtime_ns, 123);
-        assert!(row.sidecar_dirty);
-        assert_eq!(
-            db.rating_revision_snapshot(Path::new("/p/legacy.arw"))
-                .unwrap(),
-            ImageRevisionSnapshot::Present { revision: 1 }
+        assert!(matches!(
+            Db::try_open_for_read(&path),
+            Err(DbError::SchemaNotReady)
+        ));
+        let connection = Connection::open(&path).unwrap();
+        assert!(!has_column(&connection, "images", "sidecar_owner").unwrap());
+        assert!(
+            !migration_is_complete(&connection, RATING_GENERATION_MIGRATION).unwrap(),
+            "the UI read path must leave migration to the persistence worker"
         );
     }
 
     #[test]
-    fn warm_schema_reinitialization_performs_no_row_dml() {
-        let db = Db::open_in_memory().unwrap();
-        db.record_rating_pending_sidecar("/p/warm-open.arw", 42, 7, 4)
-            .unwrap();
-        let changes_before = db.conn.total_changes();
+    fn latency_sensitive_read_open_does_not_wait_for_a_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("contended-read.db");
+        drop(Db::open(&path).unwrap());
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
 
-        initialize_schema(&db.conn).unwrap();
+        let started = std::time::Instant::now();
+        let opened = Db::try_open_for_read(&path);
+        let elapsed = started.elapsed();
 
-        assert_eq!(db.conn.total_changes(), changes_before);
+        assert!(opened.is_ok(), "WAL readers should coexist with a writer");
         assert!(
-            migration_is_complete(&db.conn, RATING_GENERATION_MIGRATION).unwrap(),
-            "the durable marker must make later initialization read-only"
+            elapsed < std::time::Duration::from_secs(1),
+            "latency-sensitive read open waited {elapsed:?}"
         );
+        writer.execute_batch("ROLLBACK").unwrap();
     }
 
     #[test]
@@ -1178,6 +1930,128 @@ mod tests {
                 .unwrap(),
             ImageRevisionSnapshot::Present { revision: 0 }
         );
+    }
+
+    #[test]
+    fn concurrent_fresh_opens_all_initialize_successfully() {
+        const OPENERS: usize = 8;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent-fresh.db");
+        let raw = dir.path().join("concurrent-fresh.arw");
+        std::fs::write(&raw, b"raw").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(OPENERS));
+        let openers = (0..OPENERS)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let path = path.clone();
+                let raw = raw.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let db = Db::open(&path).unwrap();
+                    db.record_rating_pending_sidecar(raw.to_str().unwrap(), 42, 7, 3)
+                        .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for opener in openers {
+            opener.join().unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.get_image(raw.to_str().unwrap()).unwrap().rating, Some(3));
+    }
+
+    #[test]
+    fn multi_process_owner_writer_helper() {
+        let Some(database_path) = std::env::var_os("VIEWR_TEST_WRITER_DATABASE") else {
+            return;
+        };
+        let raw_path: PathBuf = std::env::var_os("VIEWR_TEST_WRITER_RAW")
+            .expect("child RAW path")
+            .into();
+        let gate_path: PathBuf = std::env::var_os("VIEWR_TEST_WRITER_GATE")
+            .expect("child gate path")
+            .into();
+        let rating = std::env::var("VIEWR_TEST_WRITER_RATING")
+            .expect("child rating")
+            .parse::<u8>()
+            .expect("numeric child rating");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !gate_path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "parent did not release the process gate"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let metadata = std::fs::metadata(&raw_path).unwrap();
+        let mtime_ns = metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let db = Db::open(Path::new(&database_path)).unwrap();
+        db.record_rating_pending_sidecar(
+            raw_path.to_str().unwrap(),
+            metadata.len(),
+            mtime_ns,
+            rating,
+        )
+        .unwrap();
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn independent_processes_share_one_sidecar_owner() {
+        const WRITERS: usize = 8;
+
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("multi-process.db");
+        let arw = directory.path().join("photo.ARW");
+        let dng = directory.path().join("photo.DNG");
+        let gate_path = directory.path().join("start-writers");
+        std::fs::write(&arw, b"raw").unwrap();
+        std::fs::write(&dng, b"raw").unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut children = (0..WRITERS)
+            .map(|index| {
+                std::process::Command::new(&executable)
+                    .args([
+                        "--exact",
+                        "db::tests::multi_process_owner_writer_helper",
+                        "--nocapture",
+                    ])
+                    .env("VIEWR_TEST_WRITER_DATABASE", &database_path)
+                    .env(
+                        "VIEWR_TEST_WRITER_RAW",
+                        if index % 2 == 0 { &arw } else { &dng },
+                    )
+                    .env("VIEWR_TEST_WRITER_GATE", &gate_path)
+                    .env("VIEWR_TEST_WRITER_RATING", ((index % 5) + 1).to_string())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        std::fs::write(&gate_path, b"go").unwrap();
+        for child in &mut children {
+            assert!(child.wait().unwrap().success());
+        }
+
+        let db = Db::open(&database_path).unwrap();
+        let active_rows = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*)
+                   FROM images
+                  WHERE sidecar_quarantined = 0",
+                [],
+                |row| row.get::<_, usize>(0),
+            )
+            .unwrap();
+        assert_eq!(active_rows, 1);
+        assert_eq!(db.pending_sidecars().unwrap().len(), 1);
     }
 
     #[cfg(unix)]
@@ -1251,8 +2125,8 @@ mod tests {
             .conn
             .execute(
                 "INSERT INTO images
-                    (path, size, mtime_ns, rating, sidecar_dirty)
-                 VALUES (?1, 1, 1, 1, 1)",
+                    (path, size, mtime_ns, rating, sidecar_dirty, sidecar_owner)
+                 VALUES (?1, 1, 1, 1, 1, '/p/owner.xmp')",
                 rusqlite::params![vec![0xff_u8]],
             )
             .unwrap();

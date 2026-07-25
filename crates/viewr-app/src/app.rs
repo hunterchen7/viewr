@@ -17,15 +17,16 @@ use eframe::egui::{self, vec2};
 use viewr_core::cache_disk::DiskCache;
 use viewr_core::cache_ram::RamCache;
 use viewr_core::db::{Db, default_db_path};
-use viewr_core::folder::{FolderEntry, scan};
+use viewr_core::folder::{FolderEntry, normalize_physical_path, scan};
 use viewr_core::jobs::{Engine, Event, NavState};
-use viewr_core::library::{Library, load_ratings};
+use viewr_core::library::{Library, load_ratings_with_owners};
 use viewr_core::meta::FileMeta;
 use viewr_core::types::{PixelBuf, Tier};
 
 use crate::config::{Action, Config, ScrollMode};
 use crate::filmstrip;
 use crate::loupe::{self, Zoom};
+use crate::rating_groups::{build_owner_members, install_rating_for_members};
 use crate::settings::SettingsState;
 use crate::texture_lru::ByteLru;
 
@@ -166,6 +167,7 @@ fn install_metadata(
 /// Store every explicit user choice, including zero. Absence means that no
 /// higher-precedence rating source has been observed yet, so removing a zero
 /// would let a delayed embedded-metadata event resurrect the camera rating.
+#[cfg(test)]
 fn install_user_rating(ratings: &mut HashMap<usize, u8>, index: usize, rating: u8) -> u8 {
     let old_rating = ratings.get(&index).copied().unwrap_or(0);
     ratings.insert(index, rating);
@@ -181,6 +183,7 @@ struct Session {
     cache: Arc<RamCache>,
     library: Library,
     ratings: HashMap<usize, u8>,
+    rating_members: Vec<Option<Arc<[usize]>>>,
     metas: HashMap<usize, FileMeta>,
     thumbs: ByteLru<egui::TextureHandle>,
     /// Demand requests are bounded to the current viewport and time out so a
@@ -243,8 +246,10 @@ impl App {
         if entries.is_empty() {
             return Err(anyhow!("no raw files found in {}", dir.display()));
         }
-        let start = select
-            .and_then(|f| entries.iter().position(|e| e.path == f))
+        let selected = select.map(normalize_physical_path);
+        let start = selected
+            .as_deref()
+            .and_then(|file| entries.iter().position(|entry| entry.path == file))
             .unwrap_or(0);
         let entries = Arc::new(entries);
         let ram_bytes = (self.config.ram_gb as f64 * 1e9) as u64;
@@ -253,8 +258,9 @@ impl App {
         let disk = DiskCache::open_default((self.config.disk_gb as f64 * 1e9) as u64);
         // Resolve persisted ratings before decode workers can publish embedded
         // metadata, so startup precedence does not depend on worker timing.
-        let db = default_db_path().and_then(|p| Db::open(&p).ok());
-        let ratings = load_ratings(&entries, db.as_ref());
+        let db = default_db_path().and_then(|p| Db::try_open_for_read(&p).ok());
+        let (ratings, rating_owners) = load_ratings_with_owners(&entries, db.as_ref());
+        let rating_members = build_owner_members(&rating_owners);
         let library = Library::start();
 
         let ctx = self.ctx.clone();
@@ -269,6 +275,7 @@ impl App {
             cache,
             library,
             ratings,
+            rating_members,
             metas: HashMap::new(),
             thumbs: ByteLru::new(THUMB_TEXTURE_BUDGET_BYTES),
             thumb_requests: HashMap::new(),
@@ -379,9 +386,20 @@ impl App {
         let Some(session) = &mut self.session else {
             return;
         };
-        let old_rating = install_user_rating(&mut session.ratings, index, rating);
+        let singleton = [index];
+        let members = session.rating_members[index]
+            .as_deref()
+            .unwrap_or(&singleton);
+        let filter_changed = install_rating_for_members(
+            &mut session.ratings,
+            members,
+            rating,
+            |old_rating, new_rating| {
+                self.filter.passes(old_rating) != self.filter.passes(new_rating)
+            },
+        );
         session.library.set_rating(&session.entries[index], rating);
-        if self.filter.passes(old_rating) != self.filter.passes(rating) {
+        if filter_changed {
             self.filter_dirty = true;
         }
     }
@@ -1324,6 +1342,39 @@ mod tests {
             [0],
             "explicit zero still passes the unrated filter"
         );
+    }
+
+    #[test]
+    fn user_rating_updates_every_entry_with_the_same_sidecar_owner() {
+        let owner = PathBuf::from("/photos/photo.xmp");
+        let owners = vec![
+            Some(owner.clone()),
+            Some(owner),
+            Some(PathBuf::from("/photos/other.xmp")),
+            None,
+        ];
+        let mut ratings = HashMap::from([(0, 1), (1, 2), (2, 3), (3, 4)]);
+        let filter = Filter {
+            min_rating: 5,
+            unrated_only: false,
+        };
+        let members = build_owner_members(&owners);
+
+        assert!(install_rating_for_members(
+            &mut ratings,
+            members[0].as_deref().unwrap(),
+            5,
+            |old, new| filter.passes(old) != filter.passes(new)
+        ));
+        assert_eq!(ratings, HashMap::from([(0, 5), (1, 5), (2, 3), (3, 4)]));
+
+        assert!(!install_rating_for_members(
+            &mut ratings,
+            &[3],
+            4,
+            |old, new| filter.passes(old) != filter.passes(new)
+        ));
+        assert_eq!(ratings.get(&3), Some(&4));
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! Folder scanning: find the raws, ordered by filename (Sony DSC/HCA
 //! numbering ≡ capture order for bursts).
 
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -11,7 +13,9 @@ use std::path::{Path, PathBuf};
 /// equality. A file replaced while preserving both values can retain a stale
 /// render-cache key.
 pub struct FolderEntry {
-    /// Native filesystem path to the RAW file.
+    /// Native filesystem path to the RAW file. [`scan`] returns a stable
+    /// absolute physical spelling; manually constructed entries should do the
+    /// same when multiple processes share rating state.
     pub path: PathBuf,
     /// Lossy display name used for deterministic lexical sorting.
     pub file_name: String,
@@ -34,30 +38,266 @@ impl FolderEntry {
 /// rawler path so it comes for free.
 const RAW_EXTENSIONS: &[&str] = &["arw", "dng"];
 
+/// Resolves an absolute RAW path to a stable physical spelling.
+///
+/// A missing RAW is accepted only when its immediate parent still resolves.
+/// Relative paths and paths with an unresolved parent are ambiguous.
+fn resolve_physical_path(path: &Path) -> io::Result<PathBuf> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sidecar owner path must be absolute",
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "RAW path has no parent"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "RAW path has no file name"))?;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Ok(std::fs::canonicalize(parent)?.join(name))
+        }
+        Ok(_) => std::fs::canonicalize(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok(std::fs::canonicalize(parent)?.join(name))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Returns a stable absolute spelling for a physical path when possible.
+///
+/// Existing paths are canonicalized directly. For a temporarily missing leaf,
+/// the deepest existing ancestor is canonicalized and the unresolved suffix is
+/// appended. This lets background persistence normalize aliased parents
+/// without turning a transiently missing RAW into a blocking caller error.
+pub fn normalize_physical_path(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(current) => current.join(path),
+            Err(_) => return path.to_path_buf(),
+        }
+    };
+    if let Ok(path) = resolve_physical_path(&absolute) {
+        return path;
+    }
+
+    let mut unresolved = Vec::new();
+    let mut ancestor = absolute.as_path();
+    while let Some(name) = ancestor.file_name() {
+        unresolved.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            break;
+        };
+        ancestor = parent;
+        if let Ok(mut canonical) = std::fs::canonicalize(ancestor) {
+            for component in unresolved.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+    }
+    absolute
+}
+
+/// Returns the database/in-memory ownership key for a RAW's XMP target.
+///
+/// The containing directory is probed rather than inferred from the operating
+/// system, because case-sensitive and case-insensitive volumes can coexist.
+/// An unresolved probe returns an error instead of activating a guessed owner.
+pub(crate) fn sidecar_owner_key(path: &Path) -> io::Result<PathBuf> {
+    let raw = resolve_physical_path(path)?;
+    let case_insensitive = directory_is_case_insensitive(&raw)?;
+    Ok(owner_from_raw(&raw, case_insensitive))
+}
+
+/// Resolves sidecar owners for a scanned folder with one physical-directory
+/// and case-semantics probe per distinct parent spelling.
+pub(crate) fn sidecar_owner_keys(entries: &[FolderEntry]) -> Vec<Option<PathBuf>> {
+    let mut parents: HashMap<PathBuf, (PathBuf, bool)> = HashMap::new();
+    entries
+        .iter()
+        .map(|entry| {
+            let parent = entry.path.parent()?.to_path_buf();
+            let name = entry.path.file_name()?;
+            if !parents.contains_key(&parent) {
+                let physical_parent = std::fs::canonicalize(&parent).ok()?;
+                let raw = physical_parent.join(name);
+                let case_insensitive = directory_is_case_insensitive(&raw).ok()?;
+                parents.insert(parent.clone(), (physical_parent, case_insensitive));
+            }
+            let (physical_parent, case_insensitive) = parents.get(&parent)?;
+            Some(owner_from_raw(
+                &physical_parent.join(name),
+                *case_insensitive,
+            ))
+        })
+        .collect()
+}
+
+/// Resolves the production batch of sidecar owners and returns its hit count.
+#[cfg(feature = "benchmarks")]
+#[doc(hidden)]
+pub fn benchmark_sidecar_owner_keys(entries: &[FolderEntry]) -> usize {
+    sidecar_owner_keys(entries).into_iter().flatten().count()
+}
+
+fn owner_from_raw(raw: &Path, case_insensitive: bool) -> PathBuf {
+    let sidecar = raw.with_extension("xmp");
+    if case_insensitive && let (Some(parent), Some(name)) = (sidecar.parent(), sidecar.file_name())
+    {
+        return parent.join(fold_owner_name(name));
+    }
+    sidecar
+}
+
+fn directory_is_case_insensitive(path: &Path) -> io::Result<bool> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "RAW path has no parent"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "RAW path has no file name"))?;
+    // Requiring the RAW to resolve is intentional. If it vanished before a
+    // queued rating reached the worker, guessing its case semantics could
+    // merge distinct XMP targets on a case-sensitive volume.
+    let canonical = std::fs::canonicalize(path)?;
+    let alternate = toggled_ascii_case(name).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cannot case-probe RAW filename",
+        )
+    })?;
+    let alternate = parent.join(alternate);
+    match std::fs::symlink_metadata(&alternate) {
+        // A separately named symlink on a case-sensitive filesystem can
+        // resolve to the original RAW without making the directory itself
+        // case-insensitive.
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let original_name = path.file_name().expect("validated RAW name");
+            let alternate_name = alternate.file_name().expect("constructed alternate name");
+            let mut has_original = false;
+            let mut has_alternate = false;
+            for entry in std::fs::read_dir(parent)?.filter_map(Result::ok) {
+                has_original |= entry.file_name() == original_name;
+                has_alternate |= entry.file_name() == alternate_name;
+            }
+            Ok(!(has_original && has_alternate) && std::fs::canonicalize(alternate)? == canonical)
+        }
+        Ok(_) => std::fs::canonicalize(alternate).map(|alternate| alternate == canonical),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn toggled_ascii_case(name: &OsStr) -> Option<OsString> {
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+    let mut bytes = name.as_bytes().to_vec();
+    let byte = bytes.iter_mut().find(|byte| byte.is_ascii_alphabetic())?;
+    *byte = if byte.is_ascii_lowercase() {
+        byte.to_ascii_uppercase()
+    } else {
+        byte.to_ascii_lowercase()
+    };
+    Some(OsString::from_vec(bytes))
+}
+
+#[cfg(windows)]
+fn toggled_ascii_case(name: &OsStr) -> Option<OsString> {
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+
+    let mut units = name.encode_wide().collect::<Vec<_>>();
+    let unit = units
+        .iter_mut()
+        .find(|unit| (**unit as u8).is_ascii_alphabetic() && **unit <= u16::from(u8::MAX))?;
+    *unit = if (*unit as u8).is_ascii_lowercase() {
+        u16::from((*unit as u8).to_ascii_uppercase())
+    } else {
+        u16::from((*unit as u8).to_ascii_lowercase())
+    };
+    Some(OsString::from_wide(&units))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn toggled_ascii_case(name: &OsStr) -> Option<OsString> {
+    let mut name = name.to_str()?.to_owned();
+    let index = name.find(|character: char| character.is_ascii_alphabetic())?;
+    let replacement = if name.as_bytes()[index].is_ascii_lowercase() {
+        name.as_bytes()[index].to_ascii_uppercase()
+    } else {
+        name.as_bytes()[index].to_ascii_lowercase()
+    };
+    name.replace_range(index..=index, std::str::from_utf8(&[replacement]).ok()?);
+    Some(name.into())
+}
+
+fn fold_owner_name(name: &OsStr) -> OsString {
+    if let Some(name) = name.to_str() {
+        return name.to_lowercase().into();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+        OsString::from_vec(name.as_bytes().iter().map(u8::to_ascii_lowercase).collect())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+
+        OsString::from_wide(
+            &name
+                .encode_wide()
+                .map(|unit| {
+                    if unit <= u16::from(u8::MAX) {
+                        u16::from((unit as u8).to_ascii_lowercase())
+                    } else {
+                        unit
+                    }
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    name.to_string_lossy().to_lowercase().into()
+}
+
 /// Scans one directory for regular ARW and DNG files in filename order.
 ///
 /// Extension matching is ASCII case-insensitive. Hidden entries, AppleDouble
-/// files, non-files, unsupported extensions, and entries whose metadata cannot
-/// be read are skipped. The function does not recurse.
+/// files, symlinks, non-files, unsupported extensions, and entries whose
+/// metadata cannot be read are skipped. Returned paths use a canonical
+/// directory spelling. The function does not recurse.
 ///
 /// # Errors
 ///
-/// Returns the error from opening the directory itself. Per-entry iterator and
-/// metadata errors are treated as skipped entries.
+/// Returns an error when the directory cannot be resolved or opened. Per-entry
+/// iterator and metadata errors are treated as skipped entries.
 pub fn scan(dir: &Path) -> io::Result<Vec<FolderEntry>> {
+    // Canonicalizing once makes every ordinary entry path independent of the
+    // caller's parent-directory casing or symlink spelling.
+    let dir = std::fs::canonicalize(dir)?;
     let mut entries: Vec<FolderEntry> = std::fs::read_dir(dir)?
         .filter_map(Result::ok)
         .filter_map(|e| {
-            let path = e.path();
+            let entry_path = e.path();
             let name = e.file_name().to_string_lossy().into_owned();
             // Skip dotfiles and AppleDouble ("._foo.ARW") droppings on SD cards.
             if name.starts_with('.') {
                 return None;
             }
-            let ext = path.extension()?.to_string_lossy().to_lowercase();
+            let ext = entry_path.extension()?.to_string_lossy().to_lowercase();
             if !RAW_EXTENSIONS.contains(&ext.as_str()) {
                 return None;
             }
+            // `DirEntry::metadata` preserves the established behavior of
+            // excluding RAW-file symlinks from the visible folder contents.
             let md = e.metadata().ok()?;
             if !md.is_file() {
                 return None;
@@ -69,7 +309,7 @@ pub fn scan(dir: &Path) -> io::Result<Vec<FolderEntry>> {
                 .map(|d| d.as_nanos() as i64)
                 .unwrap_or(0);
             Some(FolderEntry {
-                path,
+                path: entry_path,
                 file_name: name,
                 size: md.len(),
                 mtime_ns,
@@ -112,7 +352,7 @@ pub fn outward_order(len: usize, start: usize) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{outward_order, scan};
+    use super::{normalize_physical_path, outward_order, scan};
 
     #[test]
     fn scan_finds_supported_files_with_sorted_metadata() {
@@ -141,8 +381,9 @@ mod tests {
             [1, 2, 3]
         );
         assert!(entries.iter().all(|entry| entry.mtime_ns > 0));
-        assert_eq!(entries[0].path, dir.path().join("A001.DNG"));
-        assert_eq!(entries[0].sidecar_path(), dir.path().join("A001.xmp"));
+        let canonical_dir = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(entries[0].path, canonical_dir.join("A001.DNG"));
+        assert_eq!(entries[0].sidecar_path(), canonical_dir.join("A001.xmp"));
     }
 
     #[test]
@@ -150,6 +391,97 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let error = scan(&dir.path().join("missing")).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_and_missing_descendants_normalize_a_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let physical = dir.path().join("physical");
+        let alias = dir.path().join("alias");
+        std::fs::create_dir(&physical).unwrap();
+        std::fs::write(physical.join("photo.ARW"), b"raw").unwrap();
+        symlink(&physical, &alias).unwrap();
+
+        let physical_entries = scan(&physical).unwrap();
+        let alias_entries = scan(&alias).unwrap();
+        assert_eq!(alias_entries[0].path, physical_entries[0].path);
+        assert_eq!(
+            normalize_physical_path(&alias.join("missing/photo.ARW")),
+            std::fs::canonicalize(&physical)
+                .unwrap()
+                .join("missing/photo.ARW")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_file_symlinks_remain_excluded_from_folder_contents() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = dir.path().join("target");
+        let scan_dir = dir.path().join("scan");
+        std::fs::create_dir(&target_dir).unwrap();
+        std::fs::create_dir(&scan_dir).unwrap();
+        let target = target_dir.join("physical.ARW");
+        std::fs::write(&target, b"raw").unwrap();
+        symlink(&target, scan_dir.join("display-name.ARW")).unwrap();
+
+        let entries = scan(&scan_dir).unwrap();
+
+        assert!(entries.is_empty());
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn scan_normalizes_case_aliases_on_case_insensitive_filesystems() {
+        let dir = tempfile::tempdir().unwrap();
+        let physical = dir.path().join("CaseAlias");
+        let alias = dir.path().join("casealias");
+        std::fs::create_dir(&physical).unwrap();
+        std::fs::write(physical.join("Photo.ARW"), b"raw").unwrap();
+        let Ok(alias_root) = std::fs::canonicalize(&alias) else {
+            // Some supported installations deliberately use a case-sensitive
+            // volume, where this spelling is not an alias.
+            return;
+        };
+        assert_eq!(alias_root, std::fs::canonicalize(&physical).unwrap());
+
+        assert_eq!(
+            scan(&alias).unwrap()[0].path,
+            scan(&physical).unwrap()[0].path
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_owner_folding_preserves_unpaired_utf16_units() {
+        use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+
+        let first = std::ffi::OsString::from_wide(&[
+            u16::from(b'P'),
+            u16::from(b'h'),
+            u16::from(b'o'),
+            u16::from(b't'),
+            u16::from(b'o'),
+            0xd800,
+        ]);
+        let second = std::ffi::OsString::from_wide(&[
+            u16::from(b'P'),
+            u16::from(b'h'),
+            u16::from(b'o'),
+            u16::from(b't'),
+            u16::from(b'o'),
+            0xd801,
+        ]);
+
+        let first = super::fold_owner_name(&first);
+        let second = super::fold_owner_name(&second);
+        assert_ne!(first, second);
+        assert_eq!(first.encode_wide().next(), Some(u16::from(b'p')));
     }
 
     #[test]
