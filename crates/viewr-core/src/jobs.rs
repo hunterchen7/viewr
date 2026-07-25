@@ -1129,12 +1129,14 @@ pub fn benchmark_metadata_queue_setup(len: usize) -> usize {
 fn worker(shared: &Shared, light: bool) {
     let queue = if light { &shared.light } else { &shared.heavy };
     while let Some((id, action, token)) = queue.pop() {
-        let completion = run_job(shared, id, action, &token);
-        let deferred_bytes = match completion {
-            JobCompletion::DeferBackground { required_bytes } => Some(required_bytes),
-            JobCompletion::Complete | JobCompletion::RetryBackground => None,
-        };
-        queue.finish_with(id, &token, completion);
+        let deferred_bytes = execute_claimed_job(
+            queue,
+            id,
+            action,
+            &token,
+            || run_job(shared, id, action, &token),
+            |event| publish(shared, event),
+        );
         // Close the race where persistence frees capacity immediately before
         // this worker parks its rejected warm item. A later completion also
         // runs the same one-at-a-time admission check.
@@ -1143,6 +1145,58 @@ fn worker(shared: &Shared, light: bool) {
             if required_bytes <= available_bytes {
                 queue.release_one_deferred(available_bytes);
             }
+        }
+    }
+}
+
+/// Run one claimed job without allowing a decoder panic to strand its queue
+/// identity or permanently remove a worker from the pool.
+///
+/// A panicking background job is completed rather than retried: repeating an
+/// identical panic would otherwise create an unbounded retry loop. Queue
+/// cleanup happens before failure publication so even an unexpected reporting
+/// failure cannot leave the job in `in_flight`.
+fn execute_claimed_job(
+    queue: &JobQueue,
+    id: JobId,
+    action: Action,
+    token: &Arc<CancelToken>,
+    run: impl FnOnce() -> JobCompletion,
+    emit: impl FnOnce(Event),
+) -> Option<usize> {
+    let (completion, panic_payload) =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+            Ok(completion) => (completion, None),
+            Err(payload) => (JobCompletion::Complete, Some(payload)),
+        };
+    let deferred_bytes = match completion {
+        JobCompletion::DeferBackground { required_bytes } => Some(required_bytes),
+        JobCompletion::Complete | JobCompletion::RetryBackground => None,
+    };
+    queue.finish_with(id, token, completion);
+    if let Some(payload) = panic_payload {
+        emit(worker_panic_event(id, action, payload.as_ref()));
+    }
+    deferred_bytes
+}
+
+fn worker_panic_event(
+    (index, tier): JobId,
+    action: Action,
+    payload: &(dyn std::any::Any + Send),
+) -> Event {
+    let detail = if let Some(message) = payload.downcast_ref::<&str>() {
+        *message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "non-string panic payload"
+    };
+    let error = format!("worker panicked: {detail}");
+    match action {
+        Action::Metadata => Event::MetadataFailed { index, error },
+        Action::Thumb | Action::Develop(_) | Action::WarmDevelop(_) | Action::Rehydrate => {
+            Event::ImageFailed { index, tier, error }
         }
     }
 }
@@ -1596,6 +1650,82 @@ mod tests {
         notify_safely(&notify);
 
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn claimed_job_panic_clears_in_flight_and_the_next_job_runs() {
+        let queue = JobQueue::new();
+        queue.extend([
+            ((3, Tier::Thumb), 0, 0, Action::Metadata),
+            ((4, Tier::Thumb), 1, 0, Action::Thumb),
+        ]);
+
+        let (failed_id, failed_action, failed_token) = queue.pop().unwrap();
+        assert_eq!(
+            (failed_id, failed_action),
+            ((3, Tier::Thumb), Action::Metadata)
+        );
+        let mut events = Vec::new();
+        let deferred = execute_claimed_job(
+            &queue,
+            failed_id,
+            failed_action,
+            &failed_token,
+            || panic!("deterministic decoder panic"),
+            |event| events.push(event),
+        );
+
+        assert_eq!(deferred, None);
+        assert!(
+            !queue
+                .state
+                .lock()
+                .unwrap()
+                .in_flight
+                .contains_key(&failed_id)
+        );
+        assert!(matches!(
+            &events[..],
+            [Event::MetadataFailed { index: 3, error }]
+                if error == "worker panicked: deterministic decoder panic"
+        ));
+
+        let (next_id, next_action, next_token) = queue.pop().unwrap();
+        assert_eq!((next_id, next_action), ((4, Tier::Thumb), Action::Thumb));
+        let mut next_ran = false;
+        let deferred = execute_claimed_job(
+            &queue,
+            next_id,
+            next_action,
+            &next_token,
+            || {
+                next_ran = true;
+                JobCompletion::Complete
+            },
+            |_| panic!("a successful job must not emit a panic event"),
+        );
+        assert!(next_ran);
+        assert_eq!(deferred, None);
+        assert!(queue.state.lock().unwrap().in_flight.is_empty());
+    }
+
+    #[test]
+    fn non_metadata_worker_panic_is_an_image_failure_for_the_claimed_tier() {
+        let payload = String::from("rehydrate invariant failed");
+        let event = worker_panic_event(
+            (8, Tier::Full),
+            Action::Rehydrate,
+            &payload as &(dyn std::any::Any + Send),
+        );
+
+        assert!(matches!(
+            event,
+            Event::ImageFailed {
+                index: 8,
+                tier: Tier::Full,
+                error,
+            } if error == "worker panicked: rehydrate invariant failed"
+        ));
     }
 
     fn patterned_buf(width: u32, height: u32) -> PixelBuf {
