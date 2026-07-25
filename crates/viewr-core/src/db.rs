@@ -591,11 +591,11 @@ fn initialize_schema(conn: &Connection) -> Result<(), DbError> {
         }
     }
 
-    // `images.revision` makes ordinary compare-and-swap retries cheap. The
-    // companion ledger retains the last revision after a row is deleted, so a
-    // missing -> present -> missing ABA cycle cannot revive a stale retry.
-    // Triggers keep both values atomic with every successful row mutation,
-    // including direct SQL used by migrations or diagnostic tooling.
+    // `images.revision` is the logical rating generation used by delayed
+    // compare-and-swap retries. Sidecar completion bookkeeping deliberately
+    // does not advance it: completing the predecessor is not a newer rating.
+    // The companion ledger retains the generation after a row is deleted, so
+    // a missing -> present -> missing ABA cycle cannot revive a stale retry.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS image_revisions (
             path TEXT PRIMARY KEY,
@@ -644,15 +644,8 @@ fn initialize_schema(conn: &Connection) -> Result<(), DbError> {
              WHERE path = NEW.path;
         END;
 
-        CREATE TRIGGER IF NOT EXISTS images_revision_after_update
-        AFTER UPDATE OF
-            size,
-            mtime_ns,
-            rating,
-            sidecar_mtime_ns,
-            sidecar_dirty,
-            last_seen
-        ON images
+        CREATE TRIGGER IF NOT EXISTS images_generation_after_update_v2
+        AFTER UPDATE OF size, mtime_ns, rating ON images
         BEGIN
             INSERT INTO image_revisions (path, revision)
             VALUES (NEW.path, MAX(OLD.revision, 0) + 1)
@@ -674,7 +667,9 @@ fn initialize_schema(conn: &Connection) -> Result<(), DbError> {
             VALUES (OLD.path, MAX(OLD.revision, 0) + 1)
             ON CONFLICT(path) DO UPDATE SET
                 revision = MAX(image_revisions.revision, OLD.revision) + 1;
-        END;",
+        END;
+
+        DROP TRIGGER IF EXISTS images_revision_after_update;",
     )?;
     Ok(())
 }
@@ -752,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn revision_advances_for_each_supported_row_mutation() {
+    fn rating_generation_advances_only_for_rating_ownership_changes() {
         let db = Db::open_in_memory().unwrap();
         let path = Path::new("/p/revisions.arw");
 
@@ -775,7 +770,7 @@ mod tests {
         assert!(db.complete_pending_sidecar(path, 10, 1, 3, 12).unwrap());
         assert_eq!(
             db.rating_revision_snapshot(path).unwrap(),
-            ImageRevisionSnapshot::Present { revision: 4 }
+            ImageRevisionSnapshot::Present { revision: 3 }
         );
         db.record_rating_pending_sidecar_path(path, 10, 1, 4)
             .unwrap();
@@ -786,14 +781,39 @@ mod tests {
         ));
         assert_eq!(
             db.rating_revision_snapshot(path).unwrap(),
-            ImageRevisionSnapshot::Present { revision: 6 }
+            ImageRevisionSnapshot::Present { revision: 4 }
         );
         db.record_rating_pending_sidecar_path(path, 10, 1, 5)
             .unwrap();
         assert!(db.discard_pending_sidecar(path, 10, 1, 5).unwrap());
         assert_eq!(
             db.rating_revision_snapshot(path).unwrap(),
-            ImageRevisionSnapshot::Missing { revision: 8 }
+            ImageRevisionSnapshot::Missing { revision: 6 }
+        );
+    }
+
+    #[test]
+    fn completing_the_predecessor_does_not_supersede_a_delayed_rating() {
+        let db = Db::open_in_memory().unwrap();
+        let path = Path::new("/p/completed-predecessor.arw");
+        db.record_rating_pending_sidecar_path(path, 10, 1, 2)
+            .unwrap();
+        let predecessor = db.rating_revision_snapshot(path).unwrap();
+
+        assert!(db.complete_pending_sidecar(path, 10, 1, 2, 99).unwrap());
+        assert_eq!(db.rating_revision_snapshot(path).unwrap(), predecessor);
+        assert!(
+            db.record_rating_pending_sidecar_if_unchanged(path, 10, 1, 5, predecessor)
+                .unwrap()
+        );
+
+        let row = db.get_image_path(path).unwrap();
+        assert_eq!(row.rating, Some(5));
+        assert_eq!(row.sidecar_mtime_ns, 99);
+        assert!(row.sidecar_dirty);
+        assert_eq!(
+            db.rating_revision_snapshot(path).unwrap(),
+            ImageRevisionSnapshot::Present { revision: 2 }
         );
     }
 

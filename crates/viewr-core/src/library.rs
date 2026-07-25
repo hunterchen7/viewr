@@ -833,6 +833,57 @@ mod tests {
     }
 
     #[test]
+    fn completed_predecessor_does_not_discard_a_delayed_newer_rating() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("viewr.db");
+        let entry = entry(dir.path().join("photo.ARW"));
+        xmp::write_rating(&entry.sidecar_path(), 1).unwrap();
+        let library = Library::start_with(Some(db_path.clone()), Duration::from_secs(60));
+        worker_barrier(&library);
+
+        let predecessor = Db::open(&db_path).unwrap();
+        predecessor
+            .record_rating_pending_sidecar_path(&entry.path, entry.size, entry.mtime_ns, 1)
+            .unwrap();
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_new_rating_once
+                 BEFORE INSERT ON images
+                 WHEN NEW.sidecar_dirty = 1
+                 BEGIN
+                   SELECT RAISE(FAIL, 'injected initial journal failure');
+                 END;",
+            )
+            .unwrap();
+
+        library.set_rating(&entry, 5);
+        worker_barrier(&library);
+        connection
+            .execute_batch("DROP TRIGGER reject_new_rating_once;")
+            .unwrap();
+        assert!(
+            predecessor
+                .complete_pending_sidecar(
+                    &entry.path,
+                    entry.size,
+                    entry.mtime_ns,
+                    1,
+                    sidecar_mtime(&entry),
+                )
+                .unwrap()
+        );
+
+        library.flush();
+
+        assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(5));
+        assert!(!library.dirty.load(Ordering::Acquire));
+        let row = predecessor.get_image_path(&entry.path).unwrap();
+        assert_eq!(row.rating, Some(5));
+        assert!(!row.sidecar_dirty);
+    }
+
+    #[test]
     fn superseded_recovery_cannot_publish_after_a_newer_rating_completed() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("viewr.db");
