@@ -80,8 +80,9 @@ pub struct Config {
     pub filmstrip_height: f32,
     /// Grid cell width in px.
     pub grid_cell: f32,
-    /// Total RAM cache budget in GB (rgba ⅔, jpeg ⅓). Applies on the
-    /// next folder open.
+    /// Total RAM cache budget in GB, including thumbnails. The remainder
+    /// after the thumbnail allowance is split between RGBA and JPEG rings.
+    /// Applies on the next folder open.
     pub ram_gb: f32,
     /// Disk cache budget in GB. Applies on the next folder open.
     pub disk_gb: f32,

@@ -38,6 +38,14 @@ const THUMB_REQUEST_POLL_AFTER: Duration = Duration::from_millis(16);
 const THUMB_REQUEST_STALE_AFTER: Duration = Duration::from_millis(500);
 const THUMB_FAILURE_RETRY_AFTER: Duration = Duration::from_secs(2);
 
+fn ram_cache_budgets(total: u64) -> (u64, u64, u64) {
+    let thumbs = THUMB_BUDGET.min(total / 2);
+    let developed = total - thumbs;
+    let rgba = developed / 3 * 2 + (developed % 3) * 2 / 3;
+    let jpeg = developed - rgba;
+    (thumbs, rgba, jpeg)
+}
+
 pub fn run(dir: &Path, select: Option<&Path>) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1500.0, 950.0]),
@@ -240,11 +248,8 @@ impl App {
             .unwrap_or(0);
         let entries = Arc::new(entries);
         let ram_bytes = (self.config.ram_gb as f64 * 1e9) as u64;
-        let cache = Arc::new(RamCache::new(
-            THUMB_BUDGET,
-            ram_bytes * 2 / 3,
-            ram_bytes / 3,
-        ));
+        let (thumb_bytes, rgba_bytes, jpeg_bytes) = ram_cache_budgets(ram_bytes);
+        let cache = Arc::new(RamCache::new(thumb_bytes, rgba_bytes, jpeg_bytes));
         let disk = DiskCache::open_default((self.config.disk_gb as f64 * 1e9) as u64);
         // Resolve persisted ratings before decode workers can publish embedded
         // metadata, so startup precedence does not depend on worker timing.
@@ -1369,6 +1374,21 @@ mod tests {
             &near,
             Zoom::Fit
         ));
+    }
+
+    #[test]
+    fn configured_ram_budget_includes_all_three_cache_rings() {
+        for total in [0, 1, 3, 1_000_000_000, 64_000_000_000, u64::MAX] {
+            let (thumbs, rgba, jpeg) = ram_cache_budgets(total);
+            assert_eq!(thumbs + rgba + jpeg, total);
+            assert!(thumbs <= THUMB_BUDGET);
+            assert!(thumbs <= total / 2);
+            assert!(rgba >= jpeg || total <= 1);
+        }
+
+        let (thumbs, rgba, jpeg) = ram_cache_budgets(1_000_000_000);
+        assert_eq!(thumbs, THUMB_BUDGET);
+        assert_eq!(rgba + jpeg, 1_000_000_000 - THUMB_BUDGET);
     }
 
     #[test]
