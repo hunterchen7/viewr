@@ -7,7 +7,7 @@
 //! entries still missing a rating. The persistence thread attempts to journal
 //! updates before debouncing XMP sidecar writes (~400 ms per image).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +26,9 @@ const SIDECAR_DEBOUNCE: Duration = Duration::from_millis(400);
 const SIDECAR_RETRY: Duration = Duration::from_secs(5);
 const SHUTDOWN_FLUSH_ATTEMPTS: usize = 3;
 const SHUTDOWN_RETRY_DELAY: Duration = Duration::from_millis(50);
+const DB_OPEN_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(50);
+const DB_OPEN_LOCK_RETRY: Duration = Duration::from_millis(50);
+const DB_OPEN_OTHER_RETRY: Duration = Duration::from_secs(1);
 
 enum Cmd {
     SetRating {
@@ -216,9 +219,11 @@ fn sidecar_mtime_ns(path: &std::path::Path) -> Option<i64> {
 impl Library {
     /// Spawns the persistence thread.
     ///
-    /// The platform-default database is best-effort: failure to locate or open
-    /// it does not prevent XMP sidecar writes. Journaled sidecar writes left by
-    /// a prior process are resumed automatically when the database opens.
+    /// When a platform database path exists, it remains the publication
+    /// authority: open failures retain updates for retry rather than silently
+    /// switching to unsynchronized XMP writes. Systems without a platform
+    /// configuration directory use the explicit database-free mode. Journaled
+    /// sidecar writes left by a prior process resume when the database opens.
     ///
     /// # Panics
     ///
@@ -232,17 +237,11 @@ impl Library {
         let dirty = Arc::new(AtomicBool::new(false));
         let worker_dirty = dirty.clone();
         let worker = std::thread::spawn(move || {
-            let db = db_path.and_then(|path| match Db::open(&path) {
-                Ok(db) => Some(db),
-                Err(error) => {
-                    eprintln!(
-                        "rating database open failed for {}: {error}",
-                        path.display()
-                    );
-                    None
-                }
-            });
-            persist_thread(&rx, db.as_ref(), debounce, &worker_dirty);
+            if let Some(path) = db_path {
+                persist_configured_thread(&rx, &path, debounce, &worker_dirty);
+            } else {
+                persist_thread(&rx, None, debounce, &worker_dirty, VecDeque::new());
+            }
         });
         Self {
             tx,
@@ -338,7 +337,90 @@ enum JournalPredecessor {
     Global(RatingGlobalSnapshot),
 }
 
-fn persist_thread(rx: &Receiver<Cmd>, db: Option<&Db>, debounce: Duration, dirty: &AtomicBool) {
+fn persist_configured_thread(
+    rx: &Receiver<Cmd>,
+    path: &std::path::Path,
+    debounce: Duration,
+    dirty: &AtomicBool,
+) {
+    let mut backlog = VecDeque::new();
+    let mut retry_at = Instant::now();
+    let mut last_error: Option<String> = None;
+    loop {
+        if Instant::now() >= retry_at {
+            match Db::open_with_timeout(path, DB_OPEN_ATTEMPT_TIMEOUT) {
+                Ok(db) => {
+                    persist_thread(rx, Some(&db), debounce, dirty, backlog);
+                    return;
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    if last_error.as_deref() != Some(message.as_str()) {
+                        eprintln!(
+                            "rating database open failed for {}; retaining updates and retrying: \
+                             {error}",
+                            path.display()
+                        );
+                        last_error = Some(message);
+                    }
+                    retry_at = Instant::now()
+                        + if Db::is_lock_contention(&error) {
+                            DB_OPEN_LOCK_RETRY
+                        } else {
+                            DB_OPEN_OTHER_RETRY
+                        };
+                }
+            }
+        }
+
+        let wait = retry_at.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(wait) {
+            Ok(Cmd::Flush { done: Some(done) }) => {
+                // A configured database is an ownership boundary, not an
+                // optional cache. Report this attempt as incomplete and keep
+                // an asynchronous marker at the same FIFO position.
+                let _ = done.send(false);
+                backlog.push_back(Cmd::Flush { done: None });
+            }
+            Ok(Cmd::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
+                match Db::open_with_timeout(path, DB_OPEN_ATTEMPT_TIMEOUT) {
+                    Ok(db) => {
+                        backlog.push_back(Cmd::Shutdown);
+                        persist_thread(rx, Some(&db), debounce, dirty, backlog);
+                    }
+                    Err(error) => {
+                        let unpersisted = backlog
+                            .iter()
+                            .filter(|command| matches!(command, Cmd::SetRating { .. }))
+                            .count();
+                        eprintln!(
+                            "rating database remained unavailable for {}; leaving {unpersisted} \
+                             queued update(s) unpublished: {error}",
+                            path.display()
+                        );
+                        #[cfg(test)]
+                        for command in backlog {
+                            if let Cmd::Barrier { done } = command {
+                                let _ = done.send(());
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            Ok(command) => backlog.push_back(command),
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+fn persist_thread(
+    rx: &Receiver<Cmd>,
+    db: Option<&Db>,
+    debounce: Duration,
+    dirty: &AtomicBool,
+    mut backlog: VecDeque<Cmd>,
+) {
     let mut pending: HashMap<PathBuf, Pending> = db
         .map(|db| match db.pending_sidecars_with_owners() {
             Ok(rows) => rows
@@ -379,7 +461,10 @@ fn persist_thread(rx: &Receiver<Cmd>, db: Option<&Db>, debounce: Duration, dirty
             .map(|p| p.due.saturating_duration_since(Instant::now()))
             .min()
             .unwrap_or(Duration::from_secs(3600));
-        match rx.recv_timeout(timeout) {
+        let command = backlog
+            .pop_front()
+            .map_or_else(|| rx.recv_timeout(timeout), Ok);
+        match command {
             Ok(Cmd::SetRating {
                 path,
                 size,
@@ -914,6 +999,81 @@ mod tests {
         assert!(!library.dirty.load(Ordering::Acquire));
         library.flush();
         assert!(!library.dirty.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn configured_database_lock_never_falls_back_to_unowned_xmp() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("viewr.db");
+        let entry = entry(directory.path().join("photo.ARW"));
+        let blocker = rusqlite::Connection::open(&database_path).unwrap();
+        blocker
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE hold_writer_lock (value INTEGER);",
+            )
+            .unwrap();
+        let library = Library::start_with(Some(database_path.clone()), Duration::from_secs(60));
+
+        library.set_rating(&entry, 5);
+        library.flush();
+
+        assert!(library.dirty.load(Ordering::Acquire));
+        assert!(
+            !entry.sidecar_path().exists(),
+            "a configured but locked database must not become database-free publication"
+        );
+
+        blocker.execute_batch("ROLLBACK").unwrap();
+        worker_barrier(&library);
+        library.flush();
+
+        assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(5));
+        let row = Db::open(&database_path)
+            .unwrap()
+            .get_image_path(&entry.path)
+            .unwrap();
+        assert_eq!(row.rating, Some(5));
+        assert!(!row.sidecar_dirty);
+    }
+
+    #[test]
+    fn configured_database_recovery_precedes_queued_local_commands() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("viewr.db");
+        let entry = entry(directory.path().join("photo.ARW"));
+        {
+            let db = Db::open(&database_path).unwrap();
+            db.record_rating_pending_sidecar(
+                entry.path.to_str().unwrap(),
+                entry.size,
+                entry.mtime_ns,
+                1,
+            )
+            .unwrap();
+        }
+        let blocker = rusqlite::Connection::open(&database_path).unwrap();
+        blocker
+            .pragma_update(None, "journal_mode", "DELETE")
+            .unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let library = Library::start_with(Some(database_path.clone()), Duration::from_secs(60));
+
+        library.set_rating(&entry, 5);
+        library.flush();
+        assert!(!entry.sidecar_path().exists());
+
+        blocker.execute_batch("ROLLBACK").unwrap();
+        worker_barrier(&library);
+        library.flush();
+
+        assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(5));
+        let row = Db::open(&database_path)
+            .unwrap()
+            .get_image_path(&entry.path)
+            .unwrap();
+        assert_eq!(row.rating, Some(5));
+        assert!(!row.sidecar_dirty);
     }
 
     #[test]

@@ -179,7 +179,10 @@ impl Db {
         Ok(Self { conn })
     }
 
-    fn open_with_timeout(path: &Path, lock_timeout: std::time::Duration) -> Result<Self, DbError> {
+    pub(crate) fn open_with_timeout(
+        path: &Path,
+        lock_timeout: std::time::Duration,
+    ) -> Result<Self, DbError> {
         let conn = Connection::open(path)?;
         // Schema initialization and sidecar publication use write
         // transactions. Let cooperating processes queue briefly instead of
@@ -188,6 +191,10 @@ impl Db {
         enable_wal(&conn, lock_timeout)?;
         initialize_schema(&conn)?;
         Ok(Self { conn })
+    }
+
+    pub(crate) fn is_lock_contention(error: &DbError) -> bool {
+        matches!(error, DbError::Sqlite(error) if database_is_locked(error))
     }
 
     #[cfg(any(test, feature = "benchmarks"))]
