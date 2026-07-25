@@ -7,7 +7,8 @@ use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, 
 use viewr_core::cache_disk::DiskCache;
 use viewr_core::cache_ram::RamCache;
 use viewr_core::db::{
-    Db, benchmark_insert_rating, benchmark_rating_cardinalities, benchmark_rating_lookup,
+    Db, benchmark_insert_rating, benchmark_pending_sidecars, benchmark_rating_cardinalities,
+    benchmark_rating_lookup,
 };
 use viewr_core::decode;
 use viewr_core::develop::{self, Quality};
@@ -16,7 +17,7 @@ use viewr_core::jobs::{
     BenchmarkNavigationQueue, benchmark_jpeg_quality, benchmark_metadata_queue_setup, decode_jpeg,
     encode_jpeg,
 };
-use viewr_core::library::load_ratings_with_owners;
+use viewr_core::library::{benchmark_load_ratings_legacy_full_scan, try_load_ratings_with_owners};
 use viewr_core::planning::build_plan_targets;
 use viewr_core::resize::{apply_orient, downscale_to_fit, resize_exact};
 use viewr_core::types::{Orient, PixelBuf, Tier};
@@ -251,7 +252,8 @@ fn bench_rating_folder_load(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("clean_database", len), &len, |b, _| {
             b.iter(|| {
                 let (ratings, owners) =
-                    load_ratings_with_owners(black_box(&entries), black_box(Some(&db)));
+                    try_load_ratings_with_owners(black_box(&entries), black_box(Some(&db)))
+                        .expect("current folder snapshot succeeds");
                 assert_eq!(ratings.len(), black_box(len));
                 assert_eq!(
                     owners.iter().filter(|owner| owner.is_some()).count(),
@@ -259,6 +261,391 @@ fn bench_rating_folder_load(c: &mut Criterion) {
                 );
             });
         });
+    }
+
+    group.finish();
+}
+
+#[derive(Clone, Copy)]
+enum LegacyRatingSchema {
+    DirtyOnly,
+    OwnerAware,
+}
+
+#[derive(Clone, Copy)]
+enum LegacyHistoryShape {
+    UniqueClean,
+    UniqueDirty,
+    RepeatedStemClean,
+}
+
+impl LegacyRatingSchema {
+    fn label(self) -> &'static str {
+        match self {
+            Self::DirtyOnly => "legacy_dirty",
+            Self::OwnerAware => "legacy_owner",
+        }
+    }
+}
+
+impl LegacyHistoryShape {
+    fn label(self) -> &'static str {
+        match self {
+            Self::UniqueClean => "zero_dirty",
+            Self::UniqueDirty => "dense_dirty",
+            Self::RepeatedStemClean => "repeated_stem_clean",
+        }
+    }
+
+    fn is_dirty(self) -> bool {
+        matches!(self, Self::UniqueDirty)
+    }
+
+    fn raw_path(self, root: &std::path::Path, index: usize) -> PathBuf {
+        match self {
+            Self::UniqueClean | Self::UniqueDirty => root.join(format!("photo-{index:08}.ARW")),
+            Self::RepeatedStemClean => root
+                .join(format!("directory-{index:08}"))
+                .join("photo-000.ARW"),
+        }
+    }
+}
+
+fn create_legacy_rating_database(
+    path: &std::path::Path,
+    rows: usize,
+    schema: LegacyRatingSchema,
+    history_shape: LegacyHistoryShape,
+    dirty: Option<(&std::path::Path, u64, i64)>,
+) {
+    let mut connection = rusqlite::Connection::open(path).expect("legacy benchmark database opens");
+    let missing_history = path
+        .parent()
+        .expect("benchmark database has a parent")
+        .join(format!(
+            "missing-history-{}-{}-{}",
+            schema.label(),
+            history_shape.label(),
+            rows
+        ));
+    assert!(
+        !missing_history.exists(),
+        "legacy history fixture must stay unresolved"
+    );
+    match schema {
+        LegacyRatingSchema::DirtyOnly => connection
+            .execute_batch(
+                "CREATE TABLE images (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .expect("legacy dirty schema initializes"),
+        LegacyRatingSchema::OwnerAware => connection
+            .execute_batch(
+                "CREATE TABLE images (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+                    sidecar_quarantined INTEGER NOT NULL DEFAULT 0,
+                    sidecar_owner,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE viewr_schema_migrations (
+                    name TEXT PRIMARY KEY
+                ) WITHOUT ROWID;
+                INSERT INTO viewr_schema_migrations (name)
+                VALUES ('rating-generation-and-owner-v6');",
+            )
+            .expect("legacy owner schema initializes"),
+    }
+
+    let transaction = connection
+        .transaction()
+        .expect("legacy benchmark transaction begins");
+    match schema {
+        LegacyRatingSchema::DirtyOnly => {
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO images
+                        (path, size, mtime_ns, rating, sidecar_mtime_ns,
+                         sidecar_dirty, last_seen)
+                     VALUES (?1, ?2, ?3, 4, 1, ?4, 0)",
+                )
+                .expect("legacy dirty insert prepares");
+            for index in 0..rows {
+                let raw = history_shape.raw_path(&missing_history, index);
+                insert
+                    .execute(rusqlite::params![
+                        raw.to_string_lossy(),
+                        index as u64,
+                        index as i64,
+                        history_shape.is_dirty(),
+                    ])
+                    .expect("legacy dirty history row inserts");
+            }
+            drop(insert);
+            if let Some((dirty_path, dirty_size, dirty_mtime_ns)) = dirty {
+                transaction
+                    .execute(
+                        "INSERT INTO images
+                            (path, size, mtime_ns, rating, sidecar_mtime_ns,
+                             sidecar_dirty, last_seen)
+                         VALUES (?1, ?2, ?3, 5, 0, 1, 0)",
+                        rusqlite::params![
+                            dirty_path.to_string_lossy(),
+                            dirty_size,
+                            dirty_mtime_ns,
+                        ],
+                    )
+                    .expect("legacy dirty pending row inserts");
+            }
+        }
+        LegacyRatingSchema::OwnerAware => {
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO images
+                        (path, size, mtime_ns, rating, sidecar_mtime_ns,
+                         sidecar_dirty, sidecar_quarantined, sidecar_owner,
+                         revision, last_seen)
+                     VALUES (?1, ?2, ?3, 4, 1, ?4, 0, ?5, 1, 0)",
+                )
+                .expect("legacy owner insert prepares");
+            for index in 0..rows {
+                let raw = history_shape.raw_path(&missing_history, index);
+                insert
+                    .execute(rusqlite::params![
+                        raw.to_string_lossy(),
+                        index as u64,
+                        index as i64,
+                        history_shape.is_dirty(),
+                        raw.with_extension("xmp").to_string_lossy(),
+                    ])
+                    .expect("legacy owner history row inserts");
+            }
+            drop(insert);
+            if let Some((dirty_path, dirty_size, dirty_mtime_ns)) = dirty {
+                transaction
+                    .execute(
+                        "INSERT INTO images
+                            (path, size, mtime_ns, rating, sidecar_mtime_ns,
+                             sidecar_dirty, sidecar_quarantined, sidecar_owner,
+                             revision, last_seen)
+                         VALUES (?1, ?2, ?3, 5, 0, 1, 0, ?4, 1, 0)",
+                        rusqlite::params![
+                            dirty_path.to_string_lossy(),
+                            dirty_size,
+                            dirty_mtime_ns,
+                            dirty_path.with_extension("xmp").to_string_lossy(),
+                        ],
+                    )
+                    .expect("legacy owner pending row inserts");
+            }
+        }
+    }
+    transaction
+        .commit()
+        .expect("legacy benchmark transaction commits");
+    if matches!(schema, LegacyRatingSchema::OwnerAware) {
+        connection
+            .execute_batch(
+                "CREATE UNIQUE INDEX images_sidecar_owners
+                    ON images(sidecar_owner)
+                 WHERE sidecar_owner IS NOT NULL;",
+            )
+            .expect("legacy owner index initializes");
+    }
+}
+
+fn bench_legacy_rating_folder_load(c: &mut Criterion) {
+    const FOLDER_LEN: usize = 100;
+    let mut group = c.benchmark_group("rating_legacy_folder_load");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+
+    for len in [1_000_usize, 10_000, 50_000] {
+        let directory = tempfile::tempdir().expect("legacy benchmark directory");
+        let physical = directory.path().join("physical");
+        std::fs::create_dir(&physical).expect("legacy benchmark RAW directory initializes");
+        let physical =
+            std::fs::canonicalize(physical).expect("legacy benchmark directory canonicalizes");
+        let mut entries = Vec::with_capacity(FOLDER_LEN);
+        for index in 0..FOLDER_LEN {
+            let file_name = format!("photo-{index:03}.ARW");
+            let path = physical.join(&file_name);
+            std::fs::write(&path, b"raw").expect("legacy benchmark RAW placeholder");
+            let metadata = std::fs::metadata(&path).expect("legacy benchmark RAW metadata");
+            let mtime_ns = metadata
+                .modified()
+                .expect("legacy benchmark RAW mtime")
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("legacy benchmark RAW mtime after epoch")
+                .as_nanos() as i64;
+            entries.push(FolderEntry {
+                path,
+                file_name,
+                size: metadata.len(),
+                mtime_ns,
+            });
+        }
+        let dirty = &entries[0];
+        let dirty_path = dirty.path.clone();
+
+        for schema in [
+            LegacyRatingSchema::DirtyOnly,
+            LegacyRatingSchema::OwnerAware,
+        ] {
+            let database_path = directory
+                .path()
+                .join(format!("{}-{len}.db", schema.label()));
+            create_legacy_rating_database(
+                &database_path,
+                len,
+                schema,
+                LegacyHistoryShape::UniqueClean,
+                Some((&dirty_path, dirty.size, dirty.mtime_ns)),
+            );
+            let probe = Db::try_open_for_read(&database_path)
+                .expect("legacy benchmark database opens read-only")
+                .expect("legacy benchmark schema is read-compatible");
+            let (ratings, _) = try_load_ratings_with_owners(&entries, Some(&probe))
+                .expect("targeted legacy preflight succeeds");
+            assert_eq!(
+                ratings.get(&0),
+                Some(&5),
+                "the matching physical dirty row must remain authoritative"
+            );
+            let (reference_ratings, reference_owners) =
+                benchmark_load_ratings_legacy_full_scan(&entries, &probe)
+                    .expect("full legacy preflight succeeds");
+            assert_eq!(
+                ratings, reference_ratings,
+                "targeted legacy reads must preserve full-scan decisions"
+            );
+            assert_eq!(reference_owners.len(), entries.len());
+            drop(probe);
+
+            group.bench_with_input(
+                BenchmarkId::new(schema.label(), len),
+                &database_path,
+                |b, database_path| {
+                    b.iter(|| {
+                        let db = Db::try_open_for_read(black_box(database_path.as_path()))
+                            .expect("legacy benchmark database opens read-only")
+                            .expect("legacy benchmark schema is read-compatible");
+                        let (ratings, owners) =
+                            try_load_ratings_with_owners(black_box(&entries), Some(&db))
+                                .expect("targeted legacy snapshot succeeds");
+                        assert_eq!(ratings.get(&0), Some(&5));
+                        assert_eq!(owners.len(), FOLDER_LEN);
+                    });
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new(format!("{}_full_scan_reference", schema.label()), len),
+                &database_path,
+                |b, database_path| {
+                    b.iter(|| {
+                        let db = Db::try_open_for_read(black_box(database_path.as_path()))
+                            .expect("legacy benchmark database opens read-only")
+                            .expect("legacy benchmark schema is read-compatible");
+                        let (ratings, owners) =
+                            benchmark_load_ratings_legacy_full_scan(black_box(&entries), &db)
+                                .expect("full legacy snapshot succeeds");
+                        assert_eq!(ratings.get(&0), Some(&5));
+                        assert_eq!(owners.len(), FOLDER_LEN);
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+fn bench_legacy_rating_stress(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rating_legacy_stress");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+
+    for len in [1_000_usize, 10_000] {
+        let directory = tempfile::tempdir().expect("legacy stress directory");
+        let physical = directory.path().join("physical");
+        std::fs::create_dir(&physical).expect("legacy stress RAW directory initializes");
+        let path = physical.join("photo-000.ARW");
+        std::fs::write(&path, b"raw").expect("legacy stress RAW placeholder");
+        let metadata = std::fs::metadata(&path).expect("legacy stress RAW metadata");
+        let mtime_ns = metadata
+            .modified()
+            .expect("legacy stress RAW mtime")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("legacy stress RAW mtime after epoch")
+            .as_nanos() as i64;
+        let entries = vec![FolderEntry {
+            file_name: "photo-000.ARW".to_owned(),
+            path,
+            size: metadata.len(),
+            mtime_ns,
+        }];
+
+        for history_shape in [
+            LegacyHistoryShape::UniqueClean,
+            LegacyHistoryShape::UniqueDirty,
+            LegacyHistoryShape::RepeatedStemClean,
+        ] {
+            for schema in [
+                LegacyRatingSchema::DirtyOnly,
+                LegacyRatingSchema::OwnerAware,
+            ] {
+                let database_path = directory.path().join(format!(
+                    "stress-{}-{}-{len}.db",
+                    schema.label(),
+                    history_shape.label(),
+                ));
+                create_legacy_rating_database(&database_path, len, schema, history_shape, None);
+                let probe = Db::try_open_for_read(&database_path)
+                    .expect("legacy stress database opens read-only")
+                    .expect("legacy stress schema is read-compatible");
+                let targeted = try_load_ratings_with_owners(&entries, Some(&probe))
+                    .expect("targeted legacy stress snapshot succeeds");
+                let reference = benchmark_load_ratings_legacy_full_scan(&entries, &probe)
+                    .expect("full legacy stress snapshot succeeds");
+                assert_eq!(
+                    targeted, reference,
+                    "stress corpus must preserve full-scan decisions"
+                );
+                assert!(targeted.0.is_empty());
+                drop(probe);
+
+                group.bench_with_input(
+                    BenchmarkId::new(format!("{}_{}", schema.label(), history_shape.label()), len),
+                    &database_path,
+                    |b, database_path| {
+                        b.iter(|| {
+                            let db = Db::try_open_for_read(black_box(database_path.as_path()))
+                                .expect("legacy stress database opens read-only")
+                                .expect("legacy stress schema is read-compatible");
+                            let (ratings, owners) =
+                                try_load_ratings_with_owners(black_box(&entries), Some(&db))
+                                    .expect("targeted legacy stress snapshot succeeds");
+                            assert!(ratings.is_empty());
+                            assert_eq!(owners.len(), entries.len());
+                        });
+                    },
+                );
+            }
+        }
     }
 
     group.finish();
@@ -319,11 +706,281 @@ fn bench_rating_db_reopen(c: &mut Criterion) {
                 b.iter(|| {
                     black_box(
                         Db::try_open_for_read(black_box(database_path.as_path()))
-                            .expect("current benchmark database opens read-only"),
+                            .expect("current benchmark database opens read-only")
+                            .expect("current benchmark schema is read-compatible"),
                     )
                 });
             },
         );
+    }
+
+    group.finish();
+}
+
+#[derive(Clone, Copy)]
+struct V01MigrationExpectations {
+    surviving_images: usize,
+    owner_ledgers: usize,
+    pending_sidecars: usize,
+    quarantined_ratings: usize,
+}
+
+fn create_v01_migration_template(path: &std::path::Path, rows: usize) -> V01MigrationExpectations {
+    const EXISTING_STRIDE: usize = 250;
+    const DIRTY_STRIDE: usize = 997;
+
+    let fixture_root = path.parent().expect("v0.1 migration template has a parent");
+    let existing_root = fixture_root.join(format!("existing-v01-{rows}"));
+    std::fs::create_dir(&existing_root).expect("v0.1 existing RAW directory initializes");
+    let existing_root =
+        std::fs::canonicalize(existing_root).expect("v0.1 existing RAW directory canonicalizes");
+    let missing_root = existing_root
+        .parent()
+        .expect("v0.1 existing RAW directory has a parent")
+        .join(format!("missing-v01-{rows}"));
+    assert!(
+        !missing_root.exists(),
+        "v0.1 missing RAW directory must stay unresolved"
+    );
+
+    let mut connection =
+        rusqlite::Connection::open(path).expect("v0.1 migration template database opens");
+    connection
+        .execute_batch(
+            "CREATE TABLE images (
+                path TEXT PRIMARY KEY,
+                size INTEGER NOT NULL,
+                mtime_ns INTEGER NOT NULL,
+                rating INTEGER,
+                sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+                last_seen INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .expect("released v0.1 rating schema initializes");
+
+    let transaction = connection
+        .transaction()
+        .expect("v0.1 migration template transaction begins");
+    let mut insert = transaction
+        .prepare(
+            "INSERT INTO images
+                (path, size, mtime_ns, rating, sidecar_mtime_ns,
+                 sidecar_dirty, last_seen)
+             VALUES (?1, ?2, ?3, 4, 1, ?4, 0)",
+        )
+        .expect("v0.1 migration template insert prepares");
+    let mut existing_dirty = 0_usize;
+    let mut missing_dirty = 0_usize;
+    for index in 0..rows {
+        let exists = index % EXISTING_STRIDE == 0;
+        let dirty = index % DIRTY_STRIDE == 0;
+        let raw = if exists {
+            let raw = existing_root.join(format!("photo-{index:08}.ARW"));
+            std::fs::write(&raw, b"raw").expect("v0.1 existing RAW placeholder writes");
+            raw
+        } else {
+            missing_root.join(format!("photo-{index:08}.ARW"))
+        };
+        let (size, mtime_ns) = if exists {
+            let metadata = std::fs::metadata(&raw).expect("v0.1 existing RAW metadata reads");
+            let mtime_ns = metadata
+                .modified()
+                .expect("v0.1 existing RAW mtime reads")
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("v0.1 existing RAW mtime follows epoch")
+                .as_nanos() as i64;
+            (metadata.len(), mtime_ns)
+        } else {
+            (index as u64 + 1, index as i64 + 1)
+        };
+        insert
+            .execute(rusqlite::params![
+                raw.to_str().expect("v0.1 benchmark path is UTF-8"),
+                size,
+                mtime_ns,
+                dirty,
+            ])
+            .expect("v0.1 migration template row inserts");
+        if dirty {
+            if exists {
+                existing_dirty += 1;
+            } else {
+                missing_dirty += 1;
+            }
+        }
+    }
+    drop(insert);
+    transaction
+        .commit()
+        .expect("v0.1 migration template transaction commits");
+    drop(connection);
+
+    assert!(
+        existing_dirty > 0 && missing_dirty > 0,
+        "v0.1 migration corpus must include recoverable and quarantined dirty rows"
+    );
+    V01MigrationExpectations {
+        surviving_images: rows - missing_dirty,
+        owner_ledgers: existing_dirty,
+        pending_sidecars: existing_dirty,
+        quarantined_ratings: missing_dirty,
+    }
+}
+
+fn bench_rating_db_cold_v01_migration(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rating_db_cold_v01_migration");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+
+    for rows in [1_000_usize, 10_000] {
+        let template_directory = tempfile::tempdir().expect("v0.1 template directory");
+        let template_path = template_directory.path().join("viewr-v01.db");
+        let expected = create_v01_migration_template(&template_path, rows);
+
+        let preflight_directory = tempfile::tempdir().expect("v0.1 preflight directory");
+        let preflight_path = preflight_directory.path().join("viewr.db");
+        std::fs::copy(&template_path, &preflight_path)
+            .expect("v0.1 migration preflight template copies");
+        let preflight = Db::open(&preflight_path).expect("v0.1 migration preflight succeeds");
+        assert_eq!(
+            benchmark_rating_cardinalities(&preflight).expect("v0.1 migration cardinalities read"),
+            (expected.surviving_images, expected.owner_ledgers),
+            "v0.1 migration must retain clean history and recover only identity-valid dirty rows"
+        );
+        assert_eq!(
+            preflight
+                .pending_sidecars()
+                .expect("v0.1 migrated pending sidecars read")
+                .len(),
+            expected.pending_sidecars,
+            "v0.1 migration must retain only recoverable unfinished work"
+        );
+        drop(preflight);
+        let quarantine = rusqlite::Connection::open(&preflight_path)
+            .expect("v0.1 migrated preflight database reopens")
+            .query_row(
+                "SELECT COUNT(*) FROM quarantined_legacy_ratings",
+                [],
+                |row| row.get::<_, usize>(0),
+            )
+            .expect("v0.1 migration quarantine cardinality reads");
+        assert_eq!(
+            quarantine, expected.quarantined_ratings,
+            "v0.1 migration must archive every unresolved dirty row"
+        );
+
+        group.bench_with_input(BenchmarkId::from_parameter(rows), &rows, |b, _| {
+            b.iter_batched(
+                || {
+                    let directory =
+                        tempfile::tempdir().expect("v0.1 migration iteration directory");
+                    let database_path = directory.path().join("viewr.db");
+                    std::fs::copy(&template_path, &database_path)
+                        .expect("v0.1 migration iteration template copies");
+                    (directory, database_path)
+                },
+                |(directory, database_path)| {
+                    let db = Db::open(black_box(&database_path)).expect("v0.1 migration succeeds");
+                    black_box((db, directory))
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
+fn create_v7_migration_template(path: &std::path::Path, rows: usize) {
+    let db = Db::open(path).expect("migration template database opens");
+    let missing_root = path
+        .parent()
+        .expect("migration template has a parent")
+        .join("unresolved-v7");
+    assert!(
+        !missing_root.exists(),
+        "migration fixture paths must remain unresolved"
+    );
+    for index in 0..rows {
+        benchmark_insert_rating(
+            &db,
+            &missing_root.join(format!("photo-{index:08}.ARW")),
+            index as u64,
+            index as i64,
+            4,
+        )
+        .expect("migration template row inserts");
+    }
+    drop(db);
+
+    let connection = rusqlite::Connection::open(path).expect("migration template database reopens");
+    connection
+        .execute_batch(
+            "DELETE FROM viewr_schema_migrations
+             WHERE name = 'sidecar-owner-filesystem-identity-v8';
+             DROP TRIGGER images_reject_legacy_owner_insert;
+             DROP TRIGGER images_reject_legacy_rating_update;
+             DROP TRIGGER images_reject_unowned_dirty_insert;
+             DROP TRIGGER images_reject_unowned_dirty_update;
+             ALTER TABLE images DROP COLUMN owner_key_version;
+             CREATE TRIGGER images_reject_unowned_dirty_insert
+             BEFORE INSERT ON images
+             WHEN NEW.sidecar_dirty = 1 AND NEW.sidecar_owner IS NULL
+             BEGIN
+                 SELECT RAISE(ABORT, 'dirty rating requires a sidecar owner');
+             END;
+             CREATE TRIGGER images_reject_unowned_dirty_update
+             BEFORE UPDATE OF sidecar_dirty, sidecar_owner ON images
+             WHEN NEW.sidecar_dirty = 1 AND NEW.sidecar_owner IS NULL
+             BEGIN
+                 SELECT RAISE(ABORT, 'dirty rating requires a sidecar owner');
+             END;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .expect("migration template is downgraded to the exact v7 column shape");
+}
+
+fn bench_rating_db_cold_v7_migration(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rating_db_cold_v7_migration");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+
+    for rows in [1_000_usize, 10_000] {
+        let template_directory = tempfile::tempdir().expect("migration template directory");
+        let template_path = template_directory.path().join("viewr-v7.db");
+        create_v7_migration_template(&template_path, rows);
+
+        let preflight_directory = tempfile::tempdir().expect("migration preflight directory");
+        let preflight_path = preflight_directory.path().join("viewr.db");
+        std::fs::copy(&template_path, &preflight_path)
+            .expect("migration preflight template copies");
+        let preflight = Db::open(&preflight_path).expect("v7 migration preflight succeeds");
+        assert_eq!(
+            benchmark_rating_cardinalities(&preflight).expect("migration cardinalities"),
+            (0, rows),
+            "missing v7 image rows are removed while ordering ledgers remain"
+        );
+        drop(preflight);
+
+        group.bench_with_input(BenchmarkId::from_parameter(rows), &rows, |b, _| {
+            b.iter_batched(
+                || {
+                    let directory = tempfile::tempdir().expect("migration iteration directory");
+                    let database_path = directory.path().join("viewr.db");
+                    std::fs::copy(&template_path, &database_path)
+                        .expect("migration iteration template copies");
+                    (directory, database_path)
+                },
+                |(directory, database_path)| {
+                    let db = Db::open(black_box(&database_path)).expect("v7 migration succeeds");
+                    black_box((db, directory))
+                },
+                BatchSize::SmallInput,
+            );
+        });
     }
 
     group.finish();
@@ -372,6 +1029,69 @@ fn bench_rating_db_journal(c: &mut Criterion) {
                     black_box(4),
                 )
                 .expect("canonical journal update");
+            });
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_rating_db_pending_scan(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rating_db_pending_scan");
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+
+    for len in [1_000_usize, 10_000, 50_000] {
+        let db = Db::open_in_memory().expect("benchmark database opens");
+        for index in 0..len {
+            benchmark_insert_rating(
+                &db,
+                &PathBuf::from(format!("/benchmark/photo-{index:08}.arw")),
+                index as u64,
+                index as i64,
+                4,
+            )
+            .expect("benchmark row inserts");
+        }
+        assert_eq!(
+            benchmark_rating_cardinalities(&db).expect("benchmark cardinalities"),
+            (len, len),
+            "pending-scan corpus must scale both image and owner ledgers"
+        );
+
+        group.bench_with_input(BenchmarkId::new("zero_dirty", len), &len, |b, _| {
+            b.iter(|| {
+                assert_eq!(
+                    black_box(benchmark_pending_sidecars(black_box(&db)).unwrap()),
+                    0
+                );
+            });
+        });
+
+        let directory = tempfile::tempdir().expect("benchmark RAW directory");
+        let raw = directory.path().join("pending.ARW");
+        std::fs::write(&raw, b"raw").expect("benchmark RAW placeholder");
+        let metadata = std::fs::metadata(&raw).expect("benchmark RAW metadata");
+        let mtime_ns = metadata
+            .modified()
+            .expect("benchmark RAW mtime")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("benchmark RAW mtime after epoch")
+            .as_nanos() as i64;
+        db.record_rating_pending_sidecar(
+            raw.to_str().expect("benchmark path is UTF-8"),
+            metadata.len(),
+            mtime_ns,
+            5,
+        )
+        .expect("benchmark pending row inserts");
+        group.bench_with_input(BenchmarkId::new("one_dirty", len), &len, |b, _| {
+            b.iter(|| {
+                assert_eq!(
+                    black_box(benchmark_pending_sidecars(black_box(&db)).unwrap()),
+                    1
+                );
             });
         });
     }
@@ -879,8 +1599,13 @@ criterion_group! {
         bench_metadata_queue_setup,
         bench_rating_db_lookup,
         bench_rating_folder_load,
+        bench_legacy_rating_folder_load,
+        bench_legacy_rating_stress,
         bench_rating_db_reopen,
+        bench_rating_db_cold_v01_migration,
+        bench_rating_db_cold_v7_migration,
         bench_rating_db_journal,
+        bench_rating_db_pending_scan,
         bench_sidecar_owner_batch,
         bench_unicode_sidecar_owner_batch,
         bench_resize,

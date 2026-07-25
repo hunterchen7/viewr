@@ -41,8 +41,11 @@ fn bench_rating_propagation(c: &mut Criterion) {
         let target_members = members[target]
             .as_deref()
             .expect("paired benchmark owners share a group");
-        assert!(target_members.len() <= 2);
-        let mut ratings = HashMap::new();
+        assert_eq!(target_members.len(), 2);
+        let mut ratings = (0..len)
+            .map(|index| (index, (index % 6) as u8))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(ratings.len(), len);
 
         group.bench_with_input(BenchmarkId::new("build_groups", len), &len, |b, _| {
             b.iter(|| {
