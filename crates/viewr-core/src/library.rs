@@ -7,7 +7,7 @@
 //! entries still missing a rating. The persistence thread attempts to journal
 //! updates before debouncing XMP sidecar writes (~400 ms per image).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,10 +16,13 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::db::{
-    Db, PendingSidecarSync, PendingSidecarWrite, RatingGlobalSnapshot, RatingOwnerSnapshot,
-    default_db_path,
+    Db, DbError, PendingSidecarSync, PendingSidecarWrite, RatingGlobalSnapshot,
+    RatingOwnerSnapshot, configured_db_path,
 };
-use crate::folder::{FolderEntry, normalize_physical_path, sidecar_owner_key, sidecar_owner_keys};
+use crate::folder::{
+    FolderEntry, normalize_physical_path, raw_path_from_sidecar_owner,
+    sidecar_owner_collision_token, sidecar_owner_key, sidecar_owner_keys,
+};
 use crate::xmp;
 
 const SIDECAR_DEBOUNCE: Duration = Duration::from_millis(400);
@@ -29,6 +32,18 @@ const SHUTDOWN_RETRY_DELAY: Duration = Duration::from_millis(50);
 const DB_OPEN_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(50);
 const DB_OPEN_LOCK_RETRY: Duration = Duration::from_millis(50);
 const DB_OPEN_OTHER_RETRY: Duration = Duration::from_secs(1);
+
+#[derive(Debug, thiserror::Error)]
+enum ConfiguredDbOpenError {
+    #[error("cannot create database directory {}: {source}", path.display())]
+    CreateDirectory {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(transparent)]
+    Database(#[from] DbError),
+}
 
 enum Cmd {
     SetRating {
@@ -62,6 +77,18 @@ pub struct Library {
     /// Avoid a channel allocation and worker round-trip on ordinary
     /// navigation when no rating has changed since the last flush.
     dirty: Arc<AtomicBool>,
+    database_configured: bool,
+    database_ready: Arc<AtomicBool>,
+}
+
+/// Resolved ratings and the physical sidecar owner for each input entry.
+#[doc(hidden)]
+pub type RatingLoad = (HashMap<usize, u8>, Vec<Option<PathBuf>>);
+
+/// Resolves only physical sidecar owners, without reading XMP or SQLite.
+#[doc(hidden)]
+pub fn rating_owner_keys(entries: &[FolderEntry]) -> Vec<Option<PathBuf>> {
+    sidecar_owner_keys(entries)
 }
 
 /// Initial persisted per-index ratings resolved across the journal, sidecars,
@@ -81,18 +108,60 @@ pub fn load_ratings(entries: &[FolderEntry], db: Option<&Db>) -> HashMap<usize, 
 /// share one XMP target consistent after a user rating without repeating
 /// filesystem probes.
 #[doc(hidden)]
-pub fn load_ratings_with_owners(
+pub fn load_ratings_with_owners(entries: &[FolderEntry], db: Option<&Db>) -> RatingLoad {
+    try_load_ratings_with_owners(entries, db).unwrap_or_else(|_| {
+        resolve_rating_snapshot(
+            entries,
+            rating_owner_keys(entries),
+            crate::db::RatingSnapshot::default(),
+        )
+    })
+}
+
+/// Resolves initial ratings without suppressing a database snapshot failure.
+///
+/// Callers that must retry an unavailable recovery journal can use this
+/// variant instead of the best-effort [`load_ratings_with_owners`].
+///
+/// # Errors
+///
+/// Returns [`DbError`] when reading a supplied database snapshot fails.
+#[doc(hidden)]
+pub fn try_load_ratings_with_owners(
     entries: &[FolderEntry],
     db: Option<&Db>,
+) -> Result<RatingLoad, DbError> {
+    let owners = rating_owner_keys(entries);
+    let snapshot = match db {
+        Some(db) => {
+            db.rating_snapshot(entries.iter().map(|entry| entry.path.as_path()), &owners)?
+        }
+        None => crate::db::RatingSnapshot::default(),
+    };
+    Ok(resolve_rating_snapshot(entries, owners, snapshot))
+}
+
+/// Runs the pre-optimization global legacy scan for comparative benchmarks.
+#[cfg(feature = "benchmarks")]
+#[doc(hidden)]
+pub fn benchmark_load_ratings_legacy_full_scan(
+    entries: &[FolderEntry],
+    db: &Db,
+) -> Result<RatingLoad, DbError> {
+    let owners = rating_owner_keys(entries);
+    let snapshot = db.benchmark_full_legacy_rating_snapshot(
+        entries.iter().map(|entry| entry.path.as_path()),
+        &owners,
+    )?;
+    Ok(resolve_rating_snapshot(entries, owners, snapshot))
+}
+
+fn resolve_rating_snapshot(
+    entries: &[FolderEntry],
+    owners: Vec<Option<PathBuf>>,
+    snapshot: crate::db::RatingSnapshot,
 ) -> (HashMap<usize, u8>, Vec<Option<PathBuf>>) {
     let mut out = HashMap::new();
-    let owners = sidecar_owner_keys(entries);
-    let snapshot = db
-        .and_then(|db| {
-            db.rating_snapshot(entries.iter().map(|entry| entry.path.as_path()), &owners)
-                .ok()
-        })
-        .unwrap_or_default();
     let mut members_by_owner: HashMap<PathBuf, Vec<usize>> = HashMap::new();
     let mut unresolved = Vec::new();
     for (index, owner) in owners.iter().enumerate() {
@@ -104,59 +173,114 @@ pub fn load_ratings_with_owners(
             None => unresolved.push(index),
         }
     }
+    let entry_by_path = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.path.as_path(), index))
+        .collect::<HashMap<_, _>>();
+    let mut fallback_by_owner = HashMap::<PathBuf, Vec<_>>::new();
+    let mut rejected_legacy_history_tokens = HashSet::new();
+    for row in snapshot.by_path.values() {
+        if snapshot.legacy_owners_require_derivation
+            && (normalize_physical_path(&row.path) != row.path
+                || (row.sidecar_dirty && sidecar_owner_key(&row.path).is_err()))
+        {
+            // Legacy schemas did not retain proof of the physical owner seen
+            // when a path-spelled rating was accepted. An alias can since
+            // have been removed or retargeted to an equal-identity RAW.
+            // Every same-name legacy row is therefore unordered with respect
+            // to this history, even when it is now a physical path.
+            if let Some(token) = sidecar_owner_collision_token(&row.path) {
+                rejected_legacy_history_tokens.insert(token);
+            }
+            continue;
+        }
+        let (derived_owner, identity_matches) =
+            if let Some(index) = entry_by_path.get(row.path.as_path()) {
+                (
+                    owners[*index].clone(),
+                    entries[*index].size == row.size && entries[*index].mtime_ns == row.mtime_ns,
+                )
+            } else if row.sidecar_dirty || snapshot.legacy_owners_require_derivation {
+                (
+                    sidecar_owner_key(&row.path).ok(),
+                    current_raw_identity(&row.path).ok() == Some((row.size, row.mtime_ns)),
+                )
+            } else {
+                (None, false)
+            };
+        if let Some(derived_owner) = derived_owner
+            && (row.sidecar_owner.is_none() || snapshot.legacy_owners_require_derivation)
+            && row.sidecar_owner.as_ref() != Some(&derived_owner)
+        {
+            fallback_by_owner
+                .entry(derived_owner)
+                .or_default()
+                .push((row, identity_matches));
+        }
+    }
 
     for (owner, members) in members_by_owner {
+        if sidecar_owner_collision_token(&owner)
+            .is_some_and(|token| rejected_legacy_history_tokens.contains(&token))
+        {
+            if let Some(rating) = sidecar_mtime_ns(&entries[members[0]].sidecar_path())
+                .and_then(|_| xmp::read_rating(&entries[members[0]].sidecar_path()))
+            {
+                install_group_rating(&mut out, &members, rating);
+            }
+            continue;
+        }
         let owned = snapshot.by_owner.get(&owner).filter(|row| {
             members
                 .iter()
                 .map(|index| &entries[*index])
                 .find(|entry| entry.path == row.path)
                 .map_or_else(
-                    || current_raw_identity(&row.path).ok() == Some((row.size, row.mtime_ns)),
+                    || stored_owner_identity_matches(&owner, row),
                     |entry| entry.size == row.size && entry.mtime_ns == row.mtime_ns,
                 )
         });
-        let legacy = members
-            .iter()
-            .filter_map(|index| {
-                let entry = &entries[*index];
-                snapshot.by_path.get(&entry.path).filter(|row| {
-                    row.sidecar_owner.is_none()
-                        && row.size == entry.size
-                        && row.mtime_ns == entry.mtime_ns
-                })
-            })
-            .collect::<Vec<_>>();
 
         // One XMP target can be shared by multiple RAW containers. A current
         // dirty owner row is authoritative for every member, not just for the
-        // exact RAW path that accepted the rating.
-        let dirty_count = usize::from(owned.is_some_and(|row| row.sidecar_dirty))
-            + legacy.iter().filter(|row| row.sidecar_dirty).count();
-        if dirty_count > 0 {
-            let rating = if legacy.is_empty() {
-                owned
-                    .filter(|row| row.sidecar_dirty)
-                    .and_then(|row| row.rating)
-            } else if owned.is_none() && legacy.len() == 1 && legacy[0].sidecar_dirty {
-                legacy[0].rating
-            } else {
-                None
-            };
+        // exact RAW path that accepted the rating. Once a valid current owner
+        // exists, leftover ownerless rows are historical mirrors and cannot
+        // suppress or replace it.
+        if let Some(owned) = owned {
+            if owned.sidecar_dirty {
+                if let Some(rating) = owned.rating {
+                    install_group_rating(&mut out, &members, rating);
+                }
+                continue;
+            }
+            let sidecar = entries[members[0]].sidecar_path();
+            let rating = sidecar_mtime_ns(&sidecar)
+                .filter(|mtime| *mtime >= owned.sidecar_mtime_ns)
+                .and_then(|_| xmp::read_rating(&sidecar))
+                .or(owned.rating);
             if let Some(rating) = rating {
                 install_group_rating(&mut out, &members, rating);
             }
             continue;
         }
 
-        let clean_rows = owned
-            .into_iter()
-            .chain(legacy.iter().copied())
-            .filter(|row| !row.sidecar_dirty)
-            .collect::<Vec<_>>();
-        let newest_db_sidecar = clean_rows
+        let fallback = fallback_by_owner.remove(&owner).unwrap_or_default();
+        if fallback.iter().any(|(row, _)| row.sidecar_dirty) {
+            if fallback.len() == 1
+                && fallback[0].0.sidecar_dirty
+                && fallback[0].1
+                && let Some(rating) = fallback[0].0.rating
+            {
+                install_group_rating(&mut out, &members, rating);
+            }
+            continue;
+        }
+
+        let newest_db_sidecar = fallback
             .iter()
-            .map(|row| row.sidecar_mtime_ns)
+            .filter(|(_, identity_matches)| *identity_matches)
+            .map(|(row, _)| row.sidecar_mtime_ns)
             .max()
             .unwrap_or(0);
         let sidecar = entries[members[0]].sidecar_path();
@@ -168,7 +292,10 @@ pub fn load_ratings_with_owners(
             continue;
         }
 
-        let mut clean_ratings = clean_rows.iter().map(|row| row.rating);
+        let mut clean_ratings = fallback
+            .iter()
+            .filter(|(_, identity_matches)| *identity_matches)
+            .map(|(row, _)| row.rating);
         let clean_rating = clean_ratings
             .next()
             .flatten()
@@ -183,7 +310,14 @@ pub fn load_ratings_with_owners(
         let row = snapshot
             .by_path
             .get(&entry.path)
-            .filter(|row| row.size == entry.size && row.mtime_ns == entry.mtime_ns);
+            .filter(|row| row.size == entry.size && row.mtime_ns == entry.mtime_ns)
+            .filter(|row| {
+                !snapshot.legacy_owners_require_derivation
+                    || (normalize_physical_path(&row.path) == row.path
+                        && sidecar_owner_key(&row.path).is_ok()
+                        && sidecar_owner_collision_token(&row.path)
+                            .is_none_or(|token| !rejected_legacy_history_tokens.contains(&token)))
+            });
         if let Some(rating) = row
             .filter(|row| row.sidecar_dirty)
             .and_then(|row| row.rating)
@@ -204,6 +338,21 @@ pub fn load_ratings_with_owners(
 
 fn install_group_rating(ratings: &mut HashMap<usize, u8>, members: &[usize], rating: u8) {
     ratings.extend(members.iter().map(|index| (*index, rating)));
+}
+
+fn stored_owner_identity_matches(
+    owner: &std::path::Path,
+    row: &crate::db::StoredRatingRow,
+) -> bool {
+    let raw = match sidecar_owner_key(&row.path) {
+        Ok(current_owner) if current_owner == owner => row.path.clone(),
+        Ok(_) => return false,
+        Err(_) => match raw_path_from_sidecar_owner(owner, &row.path) {
+            Ok(raw) => raw,
+            Err(_) => return false,
+        },
+    };
+    current_raw_identity(&raw).ok() == Some((row.size, row.mtime_ns))
 }
 
 fn sidecar_mtime_ns(path: &std::path::Path) -> Option<i64> {
@@ -229,25 +378,76 @@ impl Library {
     ///
     /// Panics if the operating system cannot spawn the persistence thread.
     pub fn start() -> Self {
-        Self::start_with(default_db_path(), SIDECAR_DEBOUNCE)
+        Self::start_with(configured_db_path(), SIDECAR_DEBOUNCE)
+    }
+
+    /// Spawns persistence and invokes `notify` once the configured database
+    /// has completed any required migration or repair.
+    ///
+    /// The callback runs on the persistence thread and must return quickly.
+    #[doc(hidden)]
+    pub fn start_with_database_ready_notify(notify: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self::start_with_notify(configured_db_path(), SIDECAR_DEBOUNCE, Some(notify))
     }
 
     fn start_with(db_path: Option<PathBuf>, debounce: Duration) -> Self {
+        Self::start_with_notify(db_path, debounce, None)
+    }
+
+    fn start_with_notify(
+        db_path: Option<PathBuf>,
+        debounce: Duration,
+        database_ready_notify: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         let dirty = Arc::new(AtomicBool::new(false));
         let worker_dirty = dirty.clone();
+        let database_configured = db_path.is_some();
+        let database_ready = Arc::new(AtomicBool::new(db_path.is_none()));
+        let worker_database_ready = database_ready.clone();
         let worker = std::thread::spawn(move || {
             if let Some(path) = db_path {
-                persist_configured_thread(&rx, &path, debounce, &worker_dirty);
+                persist_configured_thread(
+                    &rx,
+                    &path,
+                    debounce,
+                    &worker_dirty,
+                    &worker_database_ready,
+                    database_ready_notify.as_deref(),
+                );
             } else {
-                persist_thread(&rx, None, debounce, &worker_dirty, VecDeque::new());
+                persist_thread(
+                    &rx,
+                    None,
+                    debounce,
+                    &worker_dirty,
+                    VecDeque::new(),
+                    HashMap::new(),
+                );
             }
         });
         Self {
             tx,
             worker: Some(worker),
             dirty,
+            database_configured,
+            database_ready,
         }
+    }
+
+    /// Returns whether this service has a platform database path to open.
+    #[doc(hidden)]
+    pub fn database_configured(&self) -> bool {
+        self.database_configured
+    }
+
+    /// Returns true after the configured database has opened and completed
+    /// any required schema migration or repair.
+    ///
+    /// Applications can use this non-blocking signal to refresh an initial
+    /// read-only snapshot that was unavailable during folder open.
+    pub fn database_ready(&self) -> bool {
+        self.database_ready.load(Ordering::Acquire)
     }
 
     /// Queues a rating for attempted journaling and debounced sidecar writing.
@@ -331,7 +531,7 @@ struct Pending {
     due: Instant,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum JournalPredecessor {
     Owner(RatingOwnerSnapshot),
     Global(RatingGlobalSnapshot),
@@ -342,15 +542,36 @@ fn persist_configured_thread(
     path: &std::path::Path,
     debounce: Duration,
     dirty: &AtomicBool,
+    database_ready: &AtomicBool,
+    database_ready_notify: Option<&(dyn Fn() + Send + Sync)>,
 ) {
     let mut backlog = VecDeque::new();
     let mut retry_at = Instant::now();
     let mut last_error: Option<String> = None;
     loop {
         if Instant::now() >= retry_at {
-            match Db::open_with_timeout(path, DB_OPEN_ATTEMPT_TIMEOUT) {
-                Ok(db) => {
-                    persist_thread(rx, Some(&db), debounce, dirty, backlog);
+            match open_configured_db(path) {
+                Ok((db, mut pending)) => {
+                    // The ready signal is also the application's permission
+                    // to take a durable rating snapshot. Resolve every
+                    // startup journal row once first so a replaced or
+                    // retargeted RAW cannot appear in that snapshot and then
+                    // disappear immediately afterward.
+                    let mut latest_sequence_by_owner = pending
+                        .keys()
+                        .cloned()
+                        .map(|owner| (owner, 0_u64))
+                        .collect::<HashMap<_, _>>();
+                    flush_due(&mut pending, &mut latest_sequence_by_owner, Some(&db), true);
+                    database_ready.store(true, Ordering::Release);
+                    if let Some(notify) = database_ready_notify
+                        && std::panic::catch_unwind(std::panic::AssertUnwindSafe(notify)).is_err()
+                    {
+                        eprintln!(
+                            "rating database readiness callback panicked; continuing persistence"
+                        );
+                    }
+                    persist_thread(rx, Some(&db), debounce, dirty, backlog, pending);
                     return;
                 }
                 Err(error) => {
@@ -364,7 +585,11 @@ fn persist_configured_thread(
                         last_error = Some(message);
                     }
                     retry_at = Instant::now()
-                        + if Db::is_lock_contention(&error) {
+                        + if matches!(
+                            &error,
+                            ConfiguredDbOpenError::Database(error)
+                                if Db::is_lock_contention(error)
+                        ) {
                             DB_OPEN_LOCK_RETRY
                         } else {
                             DB_OPEN_OTHER_RETRY
@@ -383,10 +608,10 @@ fn persist_configured_thread(
                 backlog.push_back(Cmd::Flush { done: None });
             }
             Ok(Cmd::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
-                match Db::open_with_timeout(path, DB_OPEN_ATTEMPT_TIMEOUT) {
-                    Ok(db) => {
+                match open_configured_db(path) {
+                    Ok((db, pending)) => {
                         backlog.push_back(Cmd::Shutdown);
-                        persist_thread(rx, Some(&db), debounce, dirty, backlog);
+                        persist_thread(rx, Some(&db), debounce, dirty, backlog, pending);
                     }
                     Err(error) => {
                         let unpersisted = backlog
@@ -414,40 +639,52 @@ fn persist_configured_thread(
     }
 }
 
+fn open_configured_db(
+    path: &std::path::Path,
+) -> Result<(Db, HashMap<PathBuf, Pending>), ConfiguredDbOpenError> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|source| {
+            ConfiguredDbOpenError::CreateDirectory {
+                path: parent.to_path_buf(),
+                source,
+            }
+        })?;
+    }
+    let db = Db::open_with_timeout(path, DB_OPEN_ATTEMPT_TIMEOUT)?;
+    let pending = db
+        .pending_sidecars_with_owners()?
+        .into_iter()
+        .map(|row| {
+            (
+                row.owner,
+                Pending {
+                    path: row.pending.path,
+                    owner_resolved: true,
+                    sequence: 0,
+                    size: row.pending.size,
+                    mtime_ns: row.pending.mtime_ns,
+                    rating: row.pending.rating,
+                    journaled: true,
+                    journal_predecessor: None,
+                    due: Instant::now(),
+                },
+            )
+        })
+        .collect();
+    Ok((db, pending))
+}
+
 fn persist_thread(
     rx: &Receiver<Cmd>,
     db: Option<&Db>,
     debounce: Duration,
     dirty: &AtomicBool,
     mut backlog: VecDeque<Cmd>,
+    mut pending: HashMap<PathBuf, Pending>,
 ) {
-    let mut pending: HashMap<PathBuf, Pending> = db
-        .map(|db| match db.pending_sidecars_with_owners() {
-            Ok(rows) => rows
-                .into_iter()
-                .map(|row| {
-                    (
-                        row.owner,
-                        Pending {
-                            path: row.pending.path,
-                            owner_resolved: true,
-                            sequence: 0,
-                            size: row.pending.size,
-                            mtime_ns: row.pending.mtime_ns,
-                            rating: row.pending.rating,
-                            journaled: true,
-                            journal_predecessor: None,
-                            due: Instant::now(),
-                        },
-                    )
-                })
-                .collect(),
-            Err(error) => {
-                eprintln!("failed to load pending sidecars: {error}");
-                HashMap::new()
-            }
-        })
-        .unwrap_or_default();
     let mut latest_sequence_by_owner = pending
         .keys()
         .cloned()
@@ -496,7 +733,8 @@ fn persist_thread(
                         db.rating_owner_snapshot(&path)
                             .map(JournalPredecessor::Owner)
                     } else {
-                        db.rating_global_snapshot().map(JournalPredecessor::Global)
+                        db.rating_global_snapshot(&path)
+                            .map(JournalPredecessor::Global)
                     };
                     match snapshot {
                         Ok(predecessor) => Some(predecessor),
@@ -638,7 +876,7 @@ fn flush_due(
         if let Some(db) = db
             && !p.journaled
         {
-            let Some(predecessor) = p.journal_predecessor else {
+            let Some(predecessor) = p.journal_predecessor.clone() else {
                 eprintln!(
                     "retaining unjournaled rating for {} because safe retry ownership \
                      could not be established",
@@ -688,16 +926,32 @@ fn flush_due(
             }
         }
         if let Some(db) = db {
-            match db.synchronize_pending_sidecar(&path, p.size, p.mtime_ns, p.rating, || {
-                match write_sidecar_for_identity(&path, p.size, p.mtime_ns, p.rating) {
+            match db.synchronize_pending_sidecar(
+                &path,
+                p.size,
+                p.mtime_ns,
+                p.rating,
+                |publication_path| match write_sidecar_for_identity(
+                    publication_path,
+                    p.size,
+                    p.mtime_ns,
+                    p.rating,
+                ) {
                     Ok(mtime) => PendingSidecarWrite::Written(mtime),
                     Err(SidecarWriteError::RawReplaced { .. }) => PendingSidecarWrite::Discard,
                     Err(error) => PendingSidecarWrite::Failed(error),
-                }
-            }) {
+                },
+            ) {
                 Ok(PendingSidecarSync::Written | PendingSidecarSync::Superseded) => {}
                 Ok(PendingSidecarSync::Discarded) => {
                     eprintln!("discarding rating for replaced RAW file {}", path.display());
+                }
+                Ok(PendingSidecarSync::OwnerChanged) => {
+                    eprintln!(
+                        "quarantining rating because the RAW path now resolves to a different \
+                         sidecar owner: {}; rate the photo again to publish it safely",
+                        path.display()
+                    );
                 }
                 Ok(PendingSidecarSync::WriteFailed(error)) => {
                     eprintln!("{error}");
@@ -896,6 +1150,120 @@ mod tests {
     }
 
     #[test]
+    fn load_ratings_reads_a_legacy_dirty_journal_before_background_migration() {
+        let directory = tempfile::tempdir().unwrap();
+        let entry = entry(directory.path().join("legacy-dirty.ARW"));
+        xmp::write_rating(&entry.sidecar_path(), 1).unwrap();
+        let database_path = directory.path().join("legacy.db");
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE images (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO images
+                    (path, size, mtime_ns, rating, sidecar_mtime_ns,
+                     sidecar_dirty, last_seen)
+                 VALUES (?1, ?2, ?3, 5, ?4, 1, 0)",
+                rusqlite::params![
+                    entry.path.to_str().unwrap(),
+                    entry.size,
+                    entry.mtime_ns,
+                    sidecar_mtime(&entry),
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let db = Db::try_open_for_read(&database_path).unwrap().unwrap();
+
+        assert_eq!(
+            load_ratings(std::slice::from_ref(&entry), Some(&db)),
+            HashMap::from([(0, 5)]),
+            "an accepted but unpublished legacy rating must beat older XMP"
+        );
+        assert!(
+            db.pending_sidecars().is_err(),
+            "legacy reads must not expose unvalidated rows for publication"
+        );
+        drop(db);
+
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*)
+                       FROM pragma_table_info('images')
+                      WHERE name = 'sidecar_owner'",
+                    [],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+            0,
+            "the latency-sensitive read path must not run migrations"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*)
+                       FROM sqlite_schema
+                      WHERE type = 'table'
+                        AND name = 'viewr_schema_migrations'",
+                    [],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn fallible_rating_load_surfaces_snapshot_conversion_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let entry = entry(directory.path().join("invalid-rating.ARW"));
+        let database_path = directory.path().join("legacy-invalid.db");
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE images (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO images
+                    (path, size, mtime_ns, rating, sidecar_dirty)
+                 VALUES (?1, ?2, ?3, 'invalid', 1)",
+                rusqlite::params![entry.path.to_str().unwrap(), entry.size, entry.mtime_ns,],
+            )
+            .unwrap();
+        drop(connection);
+        let db = Db::try_open_for_read(&database_path).unwrap().unwrap();
+
+        assert!(
+            try_load_ratings_with_owners(std::slice::from_ref(&entry), Some(&db)).is_err(),
+            "callers that coordinate recovery must be able to retry a failed snapshot"
+        );
+    }
+
+    #[test]
     fn load_ratings_ignores_database_rows_for_a_replaced_raw() {
         let dir = tempfile::tempdir().unwrap();
         let entry = entry(dir.path().join("replaced.ARW"));
@@ -943,6 +1311,44 @@ mod tests {
     }
 
     #[test]
+    fn owned_dirty_rating_overrides_a_leftover_clean_legacy_alias() {
+        let directory = tempfile::tempdir().unwrap();
+        let arw = entry(directory.path().join("photo.ARW"));
+        let dng = entry(directory.path().join("photo.DNG"));
+        let db = Db::open_in_memory().unwrap();
+        put_db_rating(&db, &dng, Some(2), 0);
+        db.record_rating_pending_sidecar_canonical(&arw.path, arw.size, arw.mtime_ns, 5)
+            .unwrap();
+
+        assert_eq!(
+            load_ratings(&[arw, dng], Some(&db)),
+            HashMap::from([(0, 5), (1, 5)])
+        );
+    }
+
+    #[test]
+    fn owned_clean_rating_overrides_a_conflicting_clean_legacy_alias() {
+        let directory = tempfile::tempdir().unwrap();
+        let arw = entry(directory.path().join("photo.ARW"));
+        let dng = entry(directory.path().join("photo.DNG"));
+        let db = Db::open_in_memory().unwrap();
+        put_db_rating(&db, &dng, Some(2), 0);
+        db.upsert_rating(
+            arw.path.to_str().unwrap(),
+            arw.size,
+            arw.mtime_ns,
+            Some(5),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_ratings(&[arw, dng], Some(&db)),
+            HashMap::from([(0, 5), (1, 5)])
+        );
+    }
+
+    #[test]
     fn singleton_legacy_clean_rating_applies_to_its_sidecar_owner_group() {
         let directory = tempfile::tempdir().unwrap();
         let arw = entry(directory.path().join("photo.ARW"));
@@ -966,6 +1372,363 @@ mod tests {
         put_db_rating(&db, &dng, Some(5), 0);
 
         assert!(load_ratings(&[arw, dng], Some(&db)).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unrequested_legacy_clean_alias_conflicts_fail_closed_for_both_schemas() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let physical = directory.path().join("physical");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&physical).unwrap();
+        symlink(&physical, &alias).unwrap();
+        let arw = entry(physical.join("photo.ARW"));
+        let dng = entry(physical.join("photo.DNG"));
+
+        for owner_aware in [false, true] {
+            let database_path = directory
+                .path()
+                .join(format!("legacy-clean-conflict-{owner_aware}.db"));
+            let connection = rusqlite::Connection::open(&database_path).unwrap();
+            if owner_aware {
+                connection
+                    .execute_batch(
+                        "CREATE TABLE images (
+                            path TEXT PRIMARY KEY,
+                            size INTEGER NOT NULL,
+                            mtime_ns INTEGER NOT NULL,
+                            rating INTEGER,
+                            sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                            sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+                            sidecar_quarantined INTEGER NOT NULL DEFAULT 0,
+                            sidecar_owner,
+                            revision INTEGER NOT NULL DEFAULT 0,
+                            last_seen INTEGER NOT NULL DEFAULT 0
+                        );
+                        CREATE TABLE viewr_schema_migrations (
+                            name TEXT PRIMARY KEY
+                        ) WITHOUT ROWID;
+                        INSERT INTO viewr_schema_migrations (name)
+                        VALUES ('rating-generation-and-owner-v6');
+                        CREATE UNIQUE INDEX images_sidecar_owners
+                            ON images(sidecar_owner)
+                         WHERE sidecar_owner IS NOT NULL;",
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO images
+                            (path, size, mtime_ns, rating, sidecar_owner)
+                         VALUES
+                            (?1, ?2, ?3, 2, ?4),
+                            (?5, ?6, ?7, 5, ?8)",
+                        rusqlite::params![
+                            arw.path.to_str().unwrap(),
+                            arw.size,
+                            arw.mtime_ns,
+                            arw.sidecar_path().to_str().unwrap(),
+                            alias.join("photo.DNG").to_str().unwrap(),
+                            dng.size,
+                            dng.mtime_ns,
+                            alias.join("photo.xmp").to_str().unwrap(),
+                        ],
+                    )
+                    .unwrap();
+            } else {
+                connection
+                    .execute_batch(
+                        "CREATE TABLE images (
+                            path TEXT PRIMARY KEY,
+                            size INTEGER NOT NULL,
+                            mtime_ns INTEGER NOT NULL,
+                            rating INTEGER,
+                            sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                            sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+                            last_seen INTEGER NOT NULL DEFAULT 0
+                        );",
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO images
+                            (path, size, mtime_ns, rating)
+                         VALUES
+                            (?1, ?2, ?3, 2),
+                            (?4, ?5, ?6, 5)",
+                        rusqlite::params![
+                            arw.path.to_str().unwrap(),
+                            arw.size,
+                            arw.mtime_ns,
+                            alias.join("photo.DNG").to_str().unwrap(),
+                            dng.size,
+                            dng.mtime_ns,
+                        ],
+                    )
+                    .unwrap();
+            }
+            drop(connection);
+            let db = Db::try_open_for_read(&database_path).unwrap().unwrap();
+
+            assert!(
+                load_ratings(std::slice::from_ref(&arw), Some(&db)).is_empty(),
+                "schema owner_aware={owner_aware} must include the unrequested alias"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_dirty_symlink_spelling_uses_only_the_current_sidecar_before_migration() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let physical = directory.path().join("physical");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&physical).unwrap();
+        symlink(&physical, &alias).unwrap();
+        let entry = entry(physical.join("photo.ARW"));
+        xmp::write_rating(&entry.sidecar_path(), 1).unwrap();
+        let database_path = directory.path().join("legacy-alias.db");
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE images (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO images
+                    (path, size, mtime_ns, rating, sidecar_dirty)
+                 VALUES (?1, ?2, ?3, 5, 1)",
+                rusqlite::params![
+                    alias.join("photo.ARW").to_str().unwrap(),
+                    entry.size,
+                    entry.mtime_ns,
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        let db = Db::try_open_for_read(&database_path).unwrap().unwrap();
+
+        assert_eq!(
+            load_ratings(std::slice::from_ref(&entry), Some(&db)),
+            HashMap::from([(0, 1)]),
+            "an ownerless alias spelling must not override the current sidecar"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ambiguous_legacy_alias_history_suppresses_same_name_dirty_fallbacks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let first_dir = directory.path().join("first");
+        let second_dir = directory.path().join("second");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&first_dir).unwrap();
+        std::fs::create_dir(&second_dir).unwrap();
+        let mut first = entry(first_dir.join("photo.ARW"));
+        let mut second = entry(second_dir.join("photo.ARW"));
+        let fixed = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for candidate in [&mut first, &mut second] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&candidate.path)
+                .unwrap()
+                .set_modified(fixed)
+                .unwrap();
+            let metadata = std::fs::metadata(&candidate.path).unwrap();
+            candidate.size = metadata.len();
+            candidate.mtime_ns = metadata
+                .modified()
+                .unwrap()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as i64;
+        }
+        assert_eq!((first.size, first.mtime_ns), (second.size, second.mtime_ns));
+        xmp::write_rating(&first.sidecar_path(), 2).unwrap();
+        symlink(&first_dir, &alias).unwrap();
+        let aliased_raw = alias.join("photo.ARW");
+        let database_path = directory.path().join("ambiguous-history.db");
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE images (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO images
+                    (path, size, mtime_ns, rating, sidecar_dirty)
+                 VALUES
+                    (?1, ?2, ?3, 1, 1),
+                    (?4, ?2, ?3, 5, 1)",
+                rusqlite::params![
+                    first.path.to_str().unwrap(),
+                    first.size,
+                    first.mtime_ns,
+                    aliased_raw.to_str().unwrap(),
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        std::fs::remove_file(&alias).unwrap();
+        symlink(&second_dir, &alias).unwrap();
+        let db = Db::try_open_for_read(&database_path).unwrap().unwrap();
+
+        assert_eq!(
+            load_ratings(&[first, second], Some(&db)),
+            HashMap::from([(0, 2)]),
+            "unordered legacy path histories must not override either current sidecar owner"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_dirty_alias_remains_authoritative_after_the_alias_is_removed() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let physical = directory.path().join("physical");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&physical).unwrap();
+        let entry = entry(physical.join("photo.ARW"));
+        xmp::write_rating(&entry.sidecar_path(), 1).unwrap();
+        symlink(&physical, &alias).unwrap();
+        let aliased_raw = alias.join("photo.ARW");
+        let db = Db::open_in_memory().unwrap();
+        db.record_rating_pending_sidecar_path(&aliased_raw, entry.size, entry.mtime_ns, 5)
+            .unwrap();
+
+        std::fs::remove_file(&alias).unwrap();
+
+        assert_eq!(
+            load_ratings(std::slice::from_ref(&entry), Some(&db)),
+            HashMap::from([(0, 5)]),
+            "a validated physical owner must outlive its legacy alias spelling"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_dirty_alias_retarget_with_equal_identity_does_not_transfer_rating() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let first_dir = directory.path().join("first");
+        let second_dir = directory.path().join("second");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&first_dir).unwrap();
+        std::fs::create_dir(&second_dir).unwrap();
+        let mut first = entry(first_dir.join("photo.ARW"));
+        let mut second = entry(second_dir.join("photo.ARW"));
+        let fixed = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for candidate in [&mut first, &mut second] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&candidate.path)
+                .unwrap()
+                .set_modified(fixed)
+                .unwrap();
+            let metadata = std::fs::metadata(&candidate.path).unwrap();
+            candidate.size = metadata.len();
+            candidate.mtime_ns = metadata
+                .modified()
+                .unwrap()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as i64;
+        }
+        assert_eq!((first.size, first.mtime_ns), (second.size, second.mtime_ns));
+
+        symlink(&first_dir, &alias).unwrap();
+        let aliased_raw = alias.join("photo.ARW");
+        let db = Db::open_in_memory().unwrap();
+        db.record_rating_pending_sidecar_path(&aliased_raw, first.size, first.mtime_ns, 5)
+            .unwrap();
+
+        std::fs::remove_file(&alias).unwrap();
+        symlink(&second_dir, &alias).unwrap();
+
+        assert!(
+            load_ratings(&[first, second], Some(&db)).is_empty(),
+            "a current owned row cannot become a legacy fallback for a new physical owner"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_dirty_alias_with_a_clean_sibling_fails_closed_before_migration() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let physical = directory.path().join("physical");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&physical).unwrap();
+        symlink(&physical, &alias).unwrap();
+        let arw = entry(physical.join("photo.ARW"));
+        let dng = entry(physical.join("photo.DNG"));
+        xmp::write_rating(&arw.sidecar_path(), 1).unwrap();
+        let database_path = directory.path().join("legacy-conflict.db");
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE images (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO images
+                    (path, size, mtime_ns, rating, sidecar_dirty)
+                 VALUES
+                    (?1, ?2, ?3, 5, 1),
+                    (?4, ?5, ?6, 2, 0)",
+                rusqlite::params![
+                    alias.join("photo.ARW").to_str().unwrap(),
+                    arw.size,
+                    arw.mtime_ns,
+                    alias.join("photo.DNG").to_str().unwrap(),
+                    dng.size,
+                    dng.mtime_ns,
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        let db = Db::try_open_for_read(&database_path).unwrap().unwrap();
+
+        assert_eq!(
+            load_ratings(&[arw], Some(&db)),
+            HashMap::from([(0, 1)]),
+            "ambiguous legacy rows must not suppress the current sidecar"
+        );
     }
 
     #[test]
@@ -996,9 +1759,37 @@ mod tests {
     fn flush_without_a_new_rating_is_a_local_noop() {
         let library = Library::start_with(None, Duration::from_secs(60));
 
+        assert!(!library.database_configured());
         assert!(!library.dirty.load(Ordering::Acquire));
         library.flush();
         assert!(!library.dirty.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn database_ready_callback_panic_does_not_stop_persistence() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("viewr.db");
+        let entry = entry(directory.path().join("photo.ARW"));
+        let library = Library::start_with_notify(
+            Some(database_path.clone()),
+            Duration::from_secs(60),
+            Some(Arc::new(|| panic!("readiness callback test panic"))),
+        );
+
+        worker_barrier(&library);
+        assert!(library.database_ready());
+        library.set_rating(&entry, 4);
+        library.flush();
+
+        assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(4));
+        assert_eq!(
+            Db::open(&database_path)
+                .unwrap()
+                .get_image_path(&entry.path)
+                .unwrap()
+                .rating,
+            Some(4)
+        );
     }
 
     #[test]
@@ -1035,6 +1826,51 @@ mod tests {
             .unwrap();
         assert_eq!(row.rating, Some(5));
         assert!(!row.sidecar_dirty);
+    }
+
+    #[test]
+    fn transient_database_directory_failure_never_falls_back_to_unowned_xmp() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocked_parent = directory.path().join("database");
+        std::fs::write(&blocked_parent, b"not a directory").unwrap();
+        let database_path = blocked_parent.join("viewr.db");
+        let entry = entry(directory.path().join("photo.ARW"));
+        let notified = Arc::new(AtomicBool::new(false));
+        let notify_flag = notified.clone();
+        let library = Library::start_with_notify(
+            Some(database_path.clone()),
+            Duration::from_secs(60),
+            Some(Arc::new(move || {
+                notify_flag.store(true, Ordering::Release);
+            })),
+        );
+        assert!(library.database_configured());
+        assert!(!library.database_ready());
+        assert!(!notified.load(Ordering::Acquire));
+
+        library.set_rating(&entry, 4);
+        library.flush();
+
+        assert!(library.dirty.load(Ordering::Acquire));
+        assert!(
+            !entry.sidecar_path().exists(),
+            "a temporary directory error must not become database-free publication"
+        );
+
+        std::fs::remove_file(&blocked_parent).unwrap();
+        worker_barrier(&library);
+        assert!(library.database_ready());
+        assert!(notified.load(Ordering::Acquire));
+        library.flush();
+
+        assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(4));
+        let row = Db::open(&database_path)
+            .unwrap()
+            .get_image_path(&entry.path)
+            .unwrap();
+        assert_eq!(row.rating, Some(4));
+        assert!(!row.sidecar_dirty);
+        assert!(!library.dirty.load(Ordering::Acquire));
     }
 
     #[test]
@@ -1220,6 +2056,79 @@ mod tests {
     }
 
     #[test]
+    fn obsolete_exact_path_writer_cannot_make_its_xmp_authoritative() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("viewr.db");
+        let entry = entry(directory.path().join("photo.ARW"));
+        xmp::write_rating(&entry.sidecar_path(), 5).unwrap();
+        let initial_sidecar_mtime = sidecar_mtime(&entry);
+        let db = Db::open(&database_path).unwrap();
+        db.upsert_rating(
+            entry.path.to_str().unwrap(),
+            entry.size,
+            entry.mtime_ns,
+            Some(5),
+            initial_sidecar_mtime,
+        )
+        .unwrap();
+        let obsolete = rusqlite::Connection::open(&database_path).unwrap();
+
+        assert_eq!(
+            obsolete
+                .execute(
+                    "INSERT INTO images
+                        (path, size, mtime_ns, rating, sidecar_mtime_ns,
+                         sidecar_dirty, last_seen)
+                     VALUES (?1, ?2, ?3, 1, 0, 1, unixepoch())
+                     ON CONFLICT(path) DO UPDATE SET
+                        size = excluded.size,
+                        mtime_ns = excluded.mtime_ns,
+                        rating = excluded.rating,
+                        sidecar_dirty = 1,
+                        last_seen = excluded.last_seen",
+                    rusqlite::params![entry.path.to_str().unwrap(), entry.size, entry.mtime_ns,],
+                )
+                .unwrap(),
+            0
+        );
+        xmp::write_rating(&entry.sidecar_path(), 1).unwrap();
+        let obsolete_sidecar_mtime = sidecar_mtime(&entry);
+        assert_eq!(
+            obsolete
+                .execute(
+                    "INSERT INTO images
+                        (path, size, mtime_ns, rating, sidecar_mtime_ns,
+                         sidecar_dirty, last_seen)
+                     VALUES (?1, ?2, ?3, 1, ?4, 0, unixepoch())
+                     ON CONFLICT(path) DO UPDATE SET
+                        size = excluded.size,
+                        mtime_ns = excluded.mtime_ns,
+                        rating = excluded.rating,
+                        sidecar_mtime_ns = excluded.sidecar_mtime_ns,
+                        sidecar_dirty = 0,
+                        last_seen = excluded.last_seen",
+                    rusqlite::params![
+                        entry.path.to_str().unwrap(),
+                        entry.size,
+                        entry.mtime_ns,
+                        obsolete_sidecar_mtime,
+                    ],
+                )
+                .unwrap(),
+            0
+        );
+
+        assert_eq!(
+            load_ratings(std::slice::from_ref(&entry), Some(&db)),
+            HashMap::from([(0, 5)]),
+            "the protected current row must outrank obsolete exact-path XMP"
+        );
+        let protected = db.get_image_path(&entry.path).unwrap();
+        assert_eq!(protected.rating, Some(5));
+        assert!(protected.sidecar_dirty);
+    }
+
+    #[test]
     fn failed_initial_journal_retry_cannot_overwrite_a_newer_completed_rating() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("viewr.db");
@@ -1258,12 +2167,23 @@ mod tests {
             .unwrap();
         assert!(matches!(
             newer
-                .synchronize_pending_sidecar(&entry.path, entry.size, entry.mtime_ns, 5, || {
-                    match write_sidecar_for_identity(&entry.path, entry.size, entry.mtime_ns, 5) {
-                        Ok(mtime) => PendingSidecarWrite::Written(mtime),
-                        Err(error) => PendingSidecarWrite::Failed(error),
-                    }
-                },)
+                .synchronize_pending_sidecar(
+                    &entry.path,
+                    entry.size,
+                    entry.mtime_ns,
+                    5,
+                    |publication_path| {
+                        match write_sidecar_for_identity(
+                            publication_path,
+                            entry.size,
+                            entry.mtime_ns,
+                            5,
+                        ) {
+                            Ok(mtime) => PendingSidecarWrite::Written(mtime),
+                            Err(error) => PendingSidecarWrite::Failed(error),
+                        }
+                    },
+                )
                 .unwrap(),
             PendingSidecarSync::Written
         ));
@@ -1872,11 +2792,28 @@ mod tests {
         }
         std::fs::write(&entry.path, b"a different raw payload").unwrap();
 
-        {
-            let library = Library::start_with(Some(db_path.clone()), Duration::from_secs(60));
-            drop(library);
-        }
+        let callback_saw_settled_database = Arc::new(AtomicBool::new(false));
+        let callback_result = callback_saw_settled_database.clone();
+        let callback_db_path = db_path.clone();
+        let callback_entry_path = entry.path.clone();
+        let library = Library::start_with_notify(
+            Some(db_path.clone()),
+            Duration::from_secs(60),
+            Some(Arc::new(move || {
+                let settled = Db::try_open_for_read(&callback_db_path)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|db| db.get_image_path(&callback_entry_path).is_none());
+                callback_result.store(settled, Ordering::Release);
+            })),
+        );
+        worker_barrier(&library);
 
+        assert!(library.database_ready());
+        assert!(
+            callback_saw_settled_database.load(Ordering::Acquire),
+            "readiness must follow the initial recovery disposition"
+        );
         assert_eq!(xmp::read_rating(&entry.sidecar_path()), Some(1));
         let db = Db::open(&db_path).unwrap();
         assert!(db.get_image_path(&entry.path).is_none());
@@ -1892,14 +2829,25 @@ mod tests {
             .unwrap();
 
         let result = db
-            .synchronize_pending_sidecar(&entry.path, entry.size, entry.mtime_ns, 5, || {
-                std::fs::write(&entry.path, b"a replacement RAW payload").unwrap();
-                match write_sidecar_for_identity(&entry.path, entry.size, entry.mtime_ns, 5) {
-                    Ok(mtime) => PendingSidecarWrite::Written(mtime),
-                    Err(SidecarWriteError::RawReplaced { .. }) => PendingSidecarWrite::Discard,
-                    Err(error) => PendingSidecarWrite::Failed(error),
-                }
-            })
+            .synchronize_pending_sidecar(
+                &entry.path,
+                entry.size,
+                entry.mtime_ns,
+                5,
+                |publication_path| {
+                    std::fs::write(publication_path, b"a replacement RAW payload").unwrap();
+                    match write_sidecar_for_identity(
+                        publication_path,
+                        entry.size,
+                        entry.mtime_ns,
+                        5,
+                    ) {
+                        Ok(mtime) => PendingSidecarWrite::Written(mtime),
+                        Err(SidecarWriteError::RawReplaced { .. }) => PendingSidecarWrite::Discard,
+                        Err(error) => PendingSidecarWrite::Failed(error),
+                    }
+                },
+            )
             .unwrap();
 
         assert!(matches!(result, PendingSidecarSync::Discarded));

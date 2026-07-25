@@ -118,6 +118,50 @@ pub(crate) fn sidecar_owner_key(path: &Path) -> io::Result<PathBuf> {
     owner_from_raw(&raw, case_insensitive)
 }
 
+/// Reconstructs a physical RAW spelling from a validated XMP owner.
+///
+/// This is used only when a journaled RAW spelling no longer resolves, such
+/// as after removal of a parent-directory symlink. The original RAW extension
+/// is retained, and the candidate must derive back to the same owner.
+pub(crate) fn raw_path_from_sidecar_owner(
+    owner: &Path,
+    journaled_raw: &Path,
+) -> io::Result<PathBuf> {
+    let extension = journaled_raw.extension().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "journaled RAW path has no extension",
+        )
+    })?;
+    let raw = normalize_physical_path(&owner.with_extension(extension));
+    if sidecar_owner_key(&raw)? != owner {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "reconstructed RAW does not match its sidecar owner",
+        ));
+    }
+    Ok(raw)
+}
+
+/// Returns a conservative filename identity for possible XMP-owner aliases.
+///
+/// Equal physical owners always have equal tokens, while equal tokens can
+/// still belong to unrelated directories. Callers use this only to narrow a
+/// legacy candidate scan before verifying each path against the filesystem.
+pub(crate) fn sidecar_owner_collision_token(path: &Path) -> Option<OsString> {
+    let stem = path.file_stem()?;
+    let Some(stem) = stem.to_str() else {
+        return Some(ascii_lower_native_name(stem));
+    };
+    let folded = CaseMapper::new().fold_string(stem);
+    Some(
+        DecomposingNormalizerBorrowed::new_nfd()
+            .normalize(folded.as_ref())
+            .into_owned()
+            .into(),
+    )
+}
+
 /// Resolves sidecar owners for a scanned folder with one physical-directory
 /// and ASCII case-semantics probe per distinct parent spelling. Non-ASCII
 /// transformations are verified against each exact RAW before they become an
@@ -428,8 +472,25 @@ pub fn outward_order(len: usize, start: usize) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_physical_path, outward_order, scan, sidecar_owner_key, sidecar_owner_keys,
+        normalize_physical_path, outward_order, scan, sidecar_owner_collision_token,
+        sidecar_owner_key, sidecar_owner_keys,
     };
+
+    #[test]
+    fn collision_tokens_cover_extension_case_and_unicode_aliases() {
+        assert_eq!(
+            sidecar_owner_collision_token(std::path::Path::new("/p/Photo.ARW")),
+            sidecar_owner_collision_token(std::path::Path::new("/p/photo.DNG"))
+        );
+        assert_eq!(
+            sidecar_owner_collision_token(std::path::Path::new("/p/caf\u{e9}.ARW")),
+            sidecar_owner_collision_token(std::path::Path::new("/p/cafe\u{301}.DNG"))
+        );
+        assert_ne!(
+            sidecar_owner_collision_token(std::path::Path::new("/p/first.ARW")),
+            sidecar_owner_collision_token(std::path::Path::new("/p/second.DNG"))
+        );
+    }
 
     #[test]
     fn scan_finds_supported_files_with_sorted_metadata() {
