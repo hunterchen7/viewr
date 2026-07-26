@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 jobs:
   quality:
@@ -313,6 +313,7 @@ jobs:
             throw "Repeated PowerShell 7 archive builds are not reproducible."
           }
       - name: Build and validate macOS installer
+        id: macos_installer
         if: ${{ !cancelled() && runner.os == 'macOS' && steps.build_viewr.outcome == 'success' }}
         shell: bash
         run: |
@@ -321,6 +322,13 @@ jobs:
             dist/viewr-macos-arm64.pkg
           scripts/validate-macos-pkg.sh \
             --test-open-events \
+            dist/viewr-macos-arm64.pkg
+      - name: Install and remove macOS installer
+        if: ${{ !cancelled() && runner.os == 'macOS' && steps.macos_installer.outcome == 'success' }}
+        shell: bash
+        run: |
+          scripts/test-macos-pkg-install.sh \
+            --allow-system-changes \
             dist/viewr-macos-arm64.pkg
       - name: Build and validate Windows installer
         if: ${{ !cancelled() && runner.os == 'Windows' && steps.build_viewr.outcome == 'success' }}

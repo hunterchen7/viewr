@@ -55,11 +55,17 @@ scripts/package-macos-pkg.sh \
 scripts/validate-macos-pkg.sh \
   --test-open-events \
   dist/viewr-macos-arm64.pkg
+scripts/test-macos-pkg-install.sh \
+  --allow-system-changes \
+  dist/viewr-macos-arm64.pkg
 ```
 
 The validator checks the package layout, arm64 and macOS 11 installer
 requirements, bundle data, ARW declaration, deployment target, signatures,
-licenses, and two sequential open events.
+licenses, and two sequential open events. Run the install test only on a
+disposable Mac. It installs the package in `/Applications`, checks the receipt,
+payload, permissions, command, Launch Services registration, and handler
+preferences. It then removes the app and receipt.
 
 Set `VIEWR_MACOS_APP_SIGN_IDENTITY` to use a Developer ID Application
 identity. Set `VIEWR_MACOS_INSTALLER_SIGN_IDENTITY` to use a Developer ID
@@ -68,6 +74,19 @@ package when these values are absent.
 
 The script does not notarize or staple the package. Add those release steps
 only after the repository has protected Apple signing credentials.
+
+To remove the macOS package manually, run:
+
+```bash
+launch_services=\
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+"$launch_services" -u /Applications/Viewr.app
+sudo /bin/rm -rf -- /Applications/Viewr.app
+sudo /usr/sbin/pkgutil --forget com.hunterchen.viewr.pkg
+```
+
+These commands remove only the installed app, package receipt, and Launch
+Services registration. They do not remove user settings, caches, or ratings.
 
 ### Windows
 
@@ -191,8 +210,8 @@ scripts/validate-source-archive.sh dist/viewr-*-source.tar.gz
 The source archive contains the repository files and versioned, vendored Rust
 dependencies. CI requires two source-package builds to be byte-identical. The
 validator rejects duplicate, noncanonical, linked, and special members. It
-checks offline Cargo metadata, the exact rawler license, and an offline compile
-after it prepares and edits a local rawler replacement. See
+checks offline Cargo metadata, the exact rawler license, and an offline release
+link after it prepares and edits a local rawler replacement. See
 `packaging/SOURCE-BUILD.md` inside the archive.
 
 ## License inventories
@@ -220,7 +239,8 @@ also be run manually for an existing draft tag.
 The release gate waits for the complete six-check main-branch CI workflow to
 pass for the exact tagged commit. It does not rerun those checks. Three
 isolated jobs then build and validate the platform files. A fourth job builds
-and validates the source archive.
+and validates the source archive. New main-branch pushes do not cancel an
+earlier commit's release-eligible CI run.
 
 The publication job starts only after all four jobs pass. It checks the exact
 local and remote file sets and every remote SHA-256 digest, creates
