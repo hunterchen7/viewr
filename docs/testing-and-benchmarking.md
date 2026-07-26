@@ -24,13 +24,13 @@ The test suite covers these areas:
   SQLite reopen behavior, and durable flushes.
 - Configuration parsing and loupe layout mathematics.
 
-CI runs six checks in parallel. It uses one shared quality check, one current
-macOS compatibility check, one Miri check, and one installer check for each
-release platform. The full test suite runs on current macOS, Windows, and
-Linux. The macOS and Windows checks also compile all-feature benchmark targets.
-The quality check runs formatting, Clippy, Rustdoc, the release build, release
-tests, pinned public-domain Sony RAW tests, and both optimized benchmark smoke
-tests once on Linux.
+CI reports five checks. It uses one shared Linux quality check, one current
+macOS compatibility check, and one installer check for each release platform.
+The full test suite runs on current macOS, Windows, and Linux. The macOS and
+Windows checks also compile all-feature benchmark targets. The quality check
+runs formatting, Clippy, Rustdoc, the release build, release tests, pinned
+public-domain Sony RAW tests, both optimized benchmark smoke tests, and the
+focused Miri checks.
 
 Windows-specific database tests recreate ordinary drive-path rows from the
 released ownerless schemas and from the pre-v8 owner schema. They verify clean
@@ -49,12 +49,13 @@ These checks are intentional: optimized-only parallel paths, code hidden behind
 compile.
 
 CI caches downloaded Cargo registry and Git sources plus compiled dependency
-artifacts. The quality check, current macOS check, three installer targets,
-manual benchmarks, and Miri use separate keys because their toolchains,
-platforms, and profiles are not interchangeable. Pull request jobs can restore
-default-branch caches, but only `main` writes new caches. This avoids filling
-the repository cache quota with merge-ref caches that cannot seed `main`. Miri
-caches sources only because its focused checks are not on the critical path.
+artifacts. The quality check, current macOS check, three installer targets, and
+manual benchmarks use separate keys because their platforms and profiles are
+not interchangeable. Pull request jobs can restore default-branch caches, but
+only `main` writes new caches. This avoids filling the repository cache quota
+with merge-ref caches that cannot seed `main`. The Miri steps reuse the quality
+job's downloaded sources but write nightly target artifacts to temporary
+runner storage so they do not enter the stable target cache.
 
 Workspace crate outputs are intentionally excluded from the shared cache.
 Fresh hosted checkouts can invalidate local-source artifacts by modification

@@ -65,10 +65,11 @@ scripts/test-macos-pkg-install.sh \
   dist/viewr-macos-arm64.pkg
 ```
 
-The validator checks the package layout, arm64 and macOS 11 installer
-requirements, bundle data, ARW declaration, deployment target, signatures,
-licenses, and two sequential open events. Run the install test only on a
-disposable Mac. It installs the package in `/Applications`, checks the receipt,
+The validator checks the package layout, arm64 support, and the macOS 11
+requirement. It also checks bundle data, the ARW declaration, the deployment
+target, signatures, and licenses. The open-event test checks one same-folder
+batch and two later open events. Run the install test only on a disposable Mac.
+The test installs the package in `/Applications`. It checks the receipt,
 payload, permissions, command, Launch Services registration, and handler
 preferences. It uses the ARW file to test Finder-equivalent default routing.
 It verifies that the file contents do not change. It then removes the app and
@@ -254,7 +255,7 @@ workflow directly. A repository-token release event is not used because those
 events do not start another GitHub Actions workflow. The release workflow can
 also be run manually for an existing draft tag.
 
-The release gate waits for the complete six-check main-branch CI workflow to
+The release gate waits for the complete five-check main-branch CI workflow to
 pass for the exact tagged commit. It does not rerun those checks. Three
 isolated jobs then build and validate the platform files. A fourth job builds
 and validates the source archive. New main-branch pushes do not cancel an

@@ -15,9 +15,9 @@ concurrency:
 
 jobs:
   quality:
-    name: Quality, release, and benchmarks
+    name: Quality, release, benchmarks, and Miri
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 105
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Linux build deps
@@ -98,6 +98,23 @@ jobs:
         run: |
           cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- --test
           cargo bench -p viewr --features benchmarks --bench filmstrip_scaling --locked -- --test
+      - name: Install pinned nightly Miri toolchain
+        id: miri_toolchain
+        if: ${{ !cancelled() }}
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: nightly-2026-07-21
+          components: miri
+      - name: Check pixel rotations with Miri
+        if: ${{ !cancelled() && steps.miri_toolchain.outcome == 'success' }}
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/viewr-miri-target
+        run: cargo +nightly-2026-07-21 miri test -p viewr-core --lib resize::tests::rotate_ --locked
+      - name: Check superpixel output initialization with Miri
+        if: ${{ !cancelled() && steps.miri_toolchain.outcome == 'success' }}
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/viewr-miri-target
+        run: cargo +nightly-2026-07-21 miri test -p viewr-core --lib develop::tests::superpixel_output_initialization_is_valid_under_miri --locked
 
   macos-compatibility:
     name: Compatibility (macOS latest)
@@ -379,23 +396,3 @@ jobs:
           )"
           cmp "$source_archive" "$reproducible_archive"
           scripts/validate-source-archive.sh "$source_archive"
-
-  miri:
-    name: Miri unsafe-path checks
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
-        with:
-          toolchain: nightly-2026-07-21
-          components: miri
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: miri
-          cache-targets: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Check pixel rotations
-        run: cargo +nightly-2026-07-21 miri test -p viewr-core --lib resize::tests::rotate_ --locked
-      - name: Check superpixel output initialization
-        run: cargo +nightly-2026-07-21 miri test -p viewr-core --lib develop::tests::superpixel_output_initialization_is_valid_under_miri --locked
