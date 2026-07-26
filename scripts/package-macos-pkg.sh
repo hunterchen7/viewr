@@ -41,15 +41,19 @@ binary_arg="$1"
 [[ -f "$binary_arg" ]] || fail "viewer binary does not exist: $binary_arg"
 binary_dir="$(cd "$(dirname "$binary_arg")" && pwd)"
 viewer_binary="$binary_dir/$(basename "$binary_arg")"
+product_requirements="$repo_root/packaging/macos/ProductRequirements.plist"
 
 output_arg="$2"
 /bin/mkdir -p "$(dirname "$output_arg")"
 output_dir="$(cd "$(dirname "$output_arg")" && pwd)"
 output_pkg="$output_dir/$(basename "$output_arg")"
 
-for command in codesign lipo pkgbuild plutil productbuild shasum vtool xcrun; do
+for command in codesign lipo pkgbuild plutil productbuild shasum vtool xattr xcrun; do
     command -v "$command" >/dev/null || fail "required command is unavailable: $command"
 done
+[[ -f "$product_requirements" ]] ||
+    fail "product requirements do not exist: $product_requirements"
+plutil -lint "$product_requirements" >/dev/null
 
 architectures="$(lipo -archs "$viewer_binary")"
 [[ "$architectures" == "arm64" ]] ||
@@ -122,6 +126,7 @@ actual_rawler_license_sha256="$(shasum -a 256 "$rawler_license" | awk '{ print $
     fail "rawler 0.7.2 LICENSE has unexpected SHA-256: $actual_rawler_license_sha256"
 /bin/cp "$rawler_license" "$resources_dir/rawler-LICENSE.txt"
 /bin/chmod 0644 "$app/Contents/Info.plist" "$app/Contents/PkgInfo" "$resources_dir"/*
+xattr -cr "$app"
 
 app_identity="${VIEWR_MACOS_APP_SIGN_IDENTITY:--}"
 if [[ "$app_identity" == "-" ]]; then
@@ -153,11 +158,15 @@ fi
 
 if [[ -n "${VIEWR_MACOS_INSTALLER_SIGN_IDENTITY:-}" ]]; then
     productbuild \
+        --product "$product_requirements" \
         --package "$component_pkg" \
         --sign "$VIEWR_MACOS_INSTALLER_SIGN_IDENTITY" \
         "$output_pkg"
 else
-    productbuild --package "$component_pkg" "$output_pkg"
+    productbuild \
+        --product "$product_requirements" \
+        --package "$component_pkg" \
+        "$output_pkg"
 fi
 
 echo "Created $output_pkg"

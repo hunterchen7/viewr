@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export LC_ALL=C
 
 usage() {
   echo "usage: scripts/validate-source-archive.sh <source-archive>" >&2
@@ -39,6 +40,23 @@ required=(
   "$top_level/vendor/rawler-0.7.2/LICENSE"
 )
 archive_listing="$(tar -tzf "$archive")"
+duplicate_paths="$(
+  awk 'seen[$0]++ == 1 { print }' <<<"$archive_listing"
+)"
+if [[ -n "$duplicate_paths" ]]; then
+  echo "source archive contains duplicate member names" >&2
+  printf '%s\n' "$duplicate_paths" >&2
+  exit 1
+fi
+unexpected_member_types="$(
+  tar -tvzf "$archive" |
+    awk 'substr($1, 1, 1) != "-" && substr($1, 1, 1) != "d" { print }'
+)"
+if [[ -n "$unexpected_member_types" ]]; then
+  echo "source archive contains a link or special file" >&2
+  printf '%s\n' "$unexpected_member_types" >&2
+  exit 1
+fi
 for path in "${required[@]}"; do
   if ! grep -Fxq "$path" <<<"$archive_listing"; then
     echo "source archive is missing $path" >&2
@@ -103,7 +121,7 @@ fi
     >>local/rawler-0.7.2/src/lib.rs
   rawler_source="$(
     cargo metadata --locked --offline --format-version 1 |
-      jq -er '
+      jq -r '
         [.packages[]
           | select(.name == "rawler" and .version == "0.7.2")
           | .source]

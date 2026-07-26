@@ -78,23 +78,56 @@ if [[ "${VIEWR_MACOS_REQUIRE_SIGNED:-0}" == "1" && "$package_is_signed" != "1" ]
 fi
 
 payload_listing="$work_dir/payload-files.txt"
-pkgutil --payload-files "$pkg" | sed 's#^\./##' >"$payload_listing"
-for required_path in \
-    "Viewr.app/Contents/Info.plist" \
-    "Viewr.app/Contents/MacOS/ViewrLauncher" \
-    "Viewr.app/Contents/MacOS/viewr-bin" \
-    "Viewr.app/Contents/Resources/LICENSE.txt" \
-    "Viewr.app/Contents/Resources/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html" \
-    "Viewr.app/Contents/Resources/THIRD-PARTY-NOTICES.txt" \
-    "Viewr.app/Contents/Resources/THIRD-PARTY-LICENSES.txt" \
-    "Viewr.app/Contents/Resources/SOURCE-BUILD.md" \
-    "Viewr.app/Contents/Resources/rawler-LICENSE.txt"; do
-    grep -Fx "$required_path" "$payload_listing" >/dev/null ||
-        fail "installer payload is missing $required_path"
-done
+pkgutil --payload-files "$pkg" | sed 's#^\./##' | LC_ALL=C sort >"$payload_listing"
+expected_payload="$(cat <<'EOF' | LC_ALL=C sort
+.
+Viewr.app
+Viewr.app/Contents
+Viewr.app/Contents/Info.plist
+Viewr.app/Contents/MacOS
+Viewr.app/Contents/MacOS/ViewrLauncher
+Viewr.app/Contents/MacOS/viewr-bin
+Viewr.app/Contents/PkgInfo
+Viewr.app/Contents/Resources
+Viewr.app/Contents/Resources/LICENSE.txt
+Viewr.app/Contents/Resources/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html
+Viewr.app/Contents/Resources/SOURCE-BUILD.md
+Viewr.app/Contents/Resources/THIRD-PARTY-LICENSES.txt
+Viewr.app/Contents/Resources/THIRD-PARTY-NOTICES.txt
+Viewr.app/Contents/Resources/rawler-LICENSE.txt
+Viewr.app/Contents/_CodeSignature
+Viewr.app/Contents/_CodeSignature/CodeResources
+EOF
+)"
+actual_payload="$(cat "$payload_listing")"
+[[ "$actual_payload" == "$expected_payload" ]] ||
+    fail "installer payload does not match the exact expected layout"
 
 expanded="$work_dir/expanded"
 pkgutil --expand "$pkg" "$expanded"
+distribution="$expanded/Distribution"
+[[ -f "$distribution" ]] || fail "expanded installer contains no Distribution"
+[[ "$(
+    xmllint \
+        --xpath \
+        'string(/installer-gui-script/options/@hostArchitectures)' \
+        "$distribution"
+)" == "arm64" ]] ||
+    fail "installer does not restrict installation to arm64 hosts"
+[[ "$(
+    xmllint \
+        --xpath \
+        'count(/installer-gui-script/volume-check/allowed-os-versions/os-version)' \
+        "$distribution"
+)" == "1" ]] ||
+    fail "installer must declare exactly one minimum macOS requirement"
+[[ "$(
+    xmllint \
+        --xpath \
+        'string(/installer-gui-script/volume-check/allowed-os-versions/os-version/@min)' \
+        "$distribution"
+)" == "11.0" ]] ||
+    fail "installer minimum host macOS version is not 11.0"
 package_info="$(find "$expanded" -type f -name PackageInfo -print -quit)"
 [[ -n "$package_info" ]] || fail "expanded installer contains no PackageInfo"
 package_attribute() {
