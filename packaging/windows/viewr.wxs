@@ -20,6 +20,7 @@
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/hunterchen7/viewr" />
+    <Property Id="DISABLEADVTSHORTCUTS" Value="1" />
 
     <UIRef Id="WixUI_Minimal" />
     <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtfPath)" />
@@ -74,11 +75,31 @@
           Name="viewr.exe"
           KeyPath="yes"
           Vital="yes" />
+      </Component>
+
+      <Component
+        Id="ViewrLauncher"
+        Guid="{A3732158-7DA7-4F45-9E7E-4151F4A7A20E}"
+        Win64="yes">
         <File
           Id="ViewrLauncherExe"
           Source="$(var.LauncherPath)"
           Name="ViewrLauncher.exe"
-          Vital="yes" />
+          KeyPath="yes"
+          Vital="yes">
+          <Shortcut
+            Id="ViewrStartMenuShortcut"
+            Directory="ApplicationProgramsFolder"
+            Name="Viewr"
+            Description="Open a folder in Viewr"
+            Advertise="yes"
+            Arguments="--pick-folder"
+            WorkingDirectory="INSTALLFOLDER" />
+        </File>
+        <RemoveFolder
+          Id="RemoveApplicationProgramsFolder"
+          Directory="ApplicationProgramsFolder"
+          On="uninstall" />
       </Component>
 
       <Component
@@ -105,12 +126,12 @@
           Root="HKLM"
           Key="Software\Classes\Viewr.ARW\DefaultIcon"
           Type="string"
-          Value="&quot;[#ViewrExe]&quot;,0" />
+          Value="&quot;[INSTALLFOLDER]viewr.exe&quot;,0" />
         <RegistryValue
           Root="HKLM"
           Key="Software\Classes\Viewr.ARW\shell\open\command"
           Type="string"
-          Value="&quot;[#ViewrLauncherExe]&quot; &quot;%1&quot;" />
+          Value="&quot;[INSTALLFOLDER]ViewrLauncher.exe&quot; &quot;%1&quot;" />
         <RegistryValue
           Root="HKLM"
           Key="Software\Classes\.arw\OpenWithProgids"
@@ -134,7 +155,7 @@
           Root="HKLM"
           Key="Software\Classes\Applications\ViewrLauncher.exe\shell\open\command"
           Type="string"
-          Value="&quot;[#ViewrLauncherExe]&quot; &quot;%1&quot;" />
+          Value="&quot;[INSTALLFOLDER]ViewrLauncher.exe&quot; &quot;%1&quot;" />
 
         <RegistryValue
           Root="HKLM"
@@ -165,7 +186,7 @@
           Root="HKLM"
           Key="Software\Microsoft\Windows\CurrentVersion\App Paths\viewr.exe"
           Type="string"
-          Value="[#ViewrExe]" />
+          Value="[INSTALLFOLDER]viewr.exe" />
         <RegistryValue
           Root="HKLM"
           Key="Software\Microsoft\Windows\CurrentVersion\App Paths\viewr.exe"
@@ -235,34 +256,11 @@
       </Component>
     </DirectoryRef>
 
-    <DirectoryRef Id="ApplicationProgramsFolder">
-      <Component
-        Id="StartMenuShortcut"
-        Guid="{328F13AD-39A0-402C-A61F-7EB89939DBB1}"
-        Win64="yes">
-        <Shortcut
-          Id="ViewrStartMenuShortcut"
-          Name="Viewr"
-          Description="Open a folder in Viewr"
-          Target="[#ViewrLauncherExe]"
-          Arguments="--pick-folder"
-          WorkingDirectory="INSTALLFOLDER" />
-        <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
-        <RegistryValue
-          Root="HKLM"
-          Key="Software\Viewr"
-          Name="StartMenuShortcut"
-          Type="integer"
-          Value="1"
-          KeyPath="yes" />
-      </Component>
-    </DirectoryRef>
-
     <Feature Id="Complete" Title="Viewr" Level="1" Absent="disallow">
       <ComponentRef Id="ViewrExecutable" />
+      <ComponentRef Id="ViewrLauncher" />
       <ComponentRef Id="FileAssociations" />
       <ComponentRef Id="LicenseFiles" />
-      <ComponentRef Id="StartMenuShortcut" />
     </Feature>
   </Product>
 </Wix>
