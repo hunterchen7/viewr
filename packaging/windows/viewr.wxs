@@ -20,7 +20,6 @@
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/hunterchen7/viewr" />
-    <Property Id="ARPNOMODIFY" Value="1" />
 
     <UIRef Id="WixUI_Minimal" />
     <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtfPath)" />
