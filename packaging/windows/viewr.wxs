@@ -1,0 +1,269 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product
+    Id="$(var.ProductCode)"
+    Name="Viewr"
+    Language="1033"
+    Version="$(var.ProductVersion)"
+    Manufacturer="Hunter Chen"
+    UpgradeCode="{C6173524-4B72-4B0E-9950-29024B49677C}">
+    <Package
+      InstallerVersion="500"
+      Compressed="yes"
+      InstallScope="perMachine"
+      Description="Viewr RAW image viewer" />
+
+    <MajorUpgrade
+      AllowSameVersionUpgrades="no"
+      DowngradeErrorMessage="A newer version of Viewr is already installed."
+      Schedule="afterInstallInitialize" />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/hunterchen7/viewr" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <UIRef Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtfPath)" />
+
+    <!--
+      The Shell does not reliably discover direct registry-table association
+      changes until SHChangeNotify invalidates its cache. These actions call a
+      bounded internal Viewr command after registration and before removal.
+    -->
+    <CustomAction
+      Id="NotifyAssociationsAfterInstall"
+      FileKey="ViewrExe"
+      ExeCommand="--notify-file-associations"
+      Execute="deferred"
+      Impersonate="yes"
+      Return="check" />
+    <CustomAction
+      Id="NotifyAssociationsAfterRemove"
+      FileKey="ViewrExe"
+      ExeCommand="--notify-file-associations"
+      Execute="deferred"
+      Impersonate="yes"
+      Return="check" />
+    <InstallExecuteSequence>
+      <Custom
+        Action="NotifyAssociationsAfterRemove"
+        After="RemoveRegistryValues">REMOVE~="ALL"</Custom>
+      <Custom
+        Action="NotifyAssociationsAfterInstall"
+        After="WriteRegistryValues">NOT Installed</Custom>
+    </InstallExecuteSequence>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="Viewr">
+          <Directory Id="LicensesFolder" Name="licenses" />
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ApplicationProgramsFolder" Name="Viewr" />
+      </Directory>
+    </Directory>
+
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component
+        Id="ViewrExecutable"
+        Guid="{8AE257BD-B612-41C8-8460-3239C231BA8A}"
+        Win64="yes">
+        <File
+          Id="ViewrExe"
+          Source="$(var.SourceDir)\viewr.exe"
+          Name="viewr.exe"
+          KeyPath="yes"
+          Vital="yes" />
+        <File
+          Id="ViewrLauncherExe"
+          Source="$(var.LauncherPath)"
+          Name="ViewrLauncher.exe"
+          Vital="yes" />
+      </Component>
+
+      <Component
+        Id="FileAssociations"
+        Guid="{B055D6E9-EFB3-4E48-A4F9-983786E0532F}"
+        Win64="yes">
+        <!--
+          Register Viewr as an available ARW handler. Do not set the default
+          value of Software\Classes\.arw and never write a UserChoice key.
+        -->
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\Classes\Viewr.ARW"
+          Type="string"
+          Value="Sony ARW raw image"
+          KeyPath="yes" />
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\Classes\Viewr.ARW"
+          Name="FriendlyTypeName"
+          Type="string"
+          Value="Sony ARW raw image" />
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\Classes\Viewr.ARW\DefaultIcon"
+          Type="string"
+          Value="&quot;[#ViewrExe]&quot;,0" />
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\Classes\Viewr.ARW\shell\open\command"
+          Type="string"
+          Value="&quot;[#ViewrLauncherExe]&quot; &quot;%1&quot;" />
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\Classes\.arw\OpenWithProgids"
+          Name="Viewr.ARW"
+          Type="string"
+          Value="" />
+
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\Classes\Applications\ViewrLauncher.exe"
+          Name="FriendlyAppName"
+          Type="string"
+          Value="Viewr" />
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\Classes\Applications\ViewrLauncher.exe\SupportedTypes"
+          Name=".arw"
+          Type="string"
+          Value="" />
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\Classes\Applications\ViewrLauncher.exe\shell\open\command"
+          Type="string"
+          Value="&quot;[#ViewrLauncherExe]&quot; &quot;%1&quot;" />
+
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\Viewr\Capabilities"
+          Name="ApplicationName"
+          Type="string"
+          Value="Viewr" />
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\Viewr\Capabilities"
+          Name="ApplicationDescription"
+          Type="string"
+          Value="View and rate Sony ARW raw images" />
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\Viewr\Capabilities\FileAssociations"
+          Name=".arw"
+          Type="string"
+          Value="Viewr.ARW" />
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\RegisteredApplications"
+          Name="Viewr"
+          Type="string"
+          Value="Software\Viewr\Capabilities" />
+
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\Microsoft\Windows\CurrentVersion\App Paths\viewr.exe"
+          Type="string"
+          Value="[#ViewrExe]" />
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\Microsoft\Windows\CurrentVersion\App Paths\viewr.exe"
+          Name="Path"
+          Type="string"
+          Value="[INSTALLFOLDER]" />
+
+        <RemoveRegistryKey
+          Id="RemoveViewrProgId"
+          Root="HKLM"
+          Key="Software\Classes\Viewr.ARW"
+          Action="removeOnUninstall" />
+        <RemoveRegistryKey
+          Id="RemoveViewrApplication"
+          Root="HKLM"
+          Key="Software\Classes\Applications\ViewrLauncher.exe"
+          Action="removeOnUninstall" />
+        <RemoveRegistryKey
+          Id="RemoveViewrCapabilities"
+          Root="HKLM"
+          Key="Software\Viewr\Capabilities"
+          Action="removeOnUninstall" />
+        <RemoveRegistryKey
+          Id="RemoveViewrAppPath"
+          Root="HKLM"
+          Key="Software\Microsoft\Windows\CurrentVersion\App Paths\viewr.exe"
+          Action="removeOnUninstall" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="LicensesFolder">
+      <Component
+        Id="LicenseFiles"
+        Guid="{2EF24AFD-2BC8-4F7B-BFBB-2367F42CEE41}"
+        Win64="yes">
+        <File
+          Id="ViewrLicense"
+          Source="$(var.ViewrLicensePath)"
+          Name="Viewr-LICENSE.txt"
+          KeyPath="yes"
+          Vital="yes" />
+        <File
+          Id="ThirdPartyNotices"
+          Source="$(var.ThirdPartyNoticesPath)"
+          Name="THIRD-PARTY-NOTICES.txt"
+          Vital="yes" />
+        <File
+          Id="ThirdPartyLicenses"
+          Source="$(var.ThirdPartyLicensesPath)"
+          Name="THIRD-PARTY-LICENSES.txt"
+          Vital="yes" />
+        <File
+          Id="RustStandardLibraryCopyright"
+          Source="$(var.RustCopyrightPath)"
+          Name="RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html"
+          Vital="yes" />
+        <File
+          Id="RawlerLicense"
+          Source="$(var.RawlerLicensePath)"
+          Name="rawler-0.7.2-LICENSE.txt"
+          Vital="yes" />
+        <File
+          Id="SourceBuildInstructions"
+          Source="$(var.SourceBuildPath)"
+          Name="SOURCE-BUILD.md"
+          Vital="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="ApplicationProgramsFolder">
+      <Component
+        Id="StartMenuShortcut"
+        Guid="{328F13AD-39A0-402C-A61F-7EB89939DBB1}"
+        Win64="yes">
+        <Shortcut
+          Id="ViewrStartMenuShortcut"
+          Name="Viewr"
+          Description="Open a folder in Viewr"
+          Target="[#ViewrLauncherExe]"
+          Arguments="--pick-folder"
+          WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\Viewr"
+          Name="StartMenuShortcut"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="Complete" Title="Viewr" Level="1" Absent="disallow">
+      <ComponentRef Id="ViewrExecutable" />
+      <ComponentRef Id="FileAssociations" />
+      <ComponentRef Id="LicenseFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Product>
+</Wix>

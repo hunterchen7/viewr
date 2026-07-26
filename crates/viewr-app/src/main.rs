@@ -27,6 +27,7 @@ use viewr_core::develop::{Quality, develop};
 enum Command {
     Browse(PathBuf),
     Develop { input: PathBuf, out_dir: PathBuf },
+    NotifyFileAssociations,
     PickFolder,
     PrintUsage,
 }
@@ -39,6 +40,7 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> Result<Command> {
     let args: Vec<OsString> = args.into_iter().collect();
     match args.as_slice() {
         [] => Ok(Command::PrintUsage),
+        [flag] if flag == "--notify-file-associations" => Ok(Command::NotifyFileAssociations),
         [flag] if flag == "--pick-folder" => Ok(Command::PickFolder),
         [command, input] if command == "dev" => Ok(Command::Develop {
             input: PathBuf::from(input),
@@ -53,6 +55,9 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> Result<Command> {
         }
         [flag, ..] if flag == "--pick-folder" => {
             bail!("usage: viewr --pick-folder");
+        }
+        [flag, ..] if flag == "--notify-file-associations" => {
+            bail!("usage: viewr --notify-file-associations");
         }
         [path] => Ok(Command::Browse(PathBuf::from(path))),
         _ => bail!("usage: viewr <folder|file.arw>"),
@@ -72,6 +77,7 @@ fn run(command: Command) -> Result<()> {
             }
         }
         Command::Develop { input, out_dir } => spike(&input, &out_dir),
+        Command::NotifyFileAssociations => notify_file_associations(),
         Command::PickFolder => {
             if let Some(path) = rfd::FileDialog::new().pick_folder() {
                 app::run(&path, None)
@@ -86,6 +92,31 @@ fn run(command: Command) -> Result<()> {
             Ok(())
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn notify_file_associations() -> Result<()> {
+    use std::ptr;
+    use windows_sys::Win32::UI::Shell::{
+        SHCNE_ASSOCCHANGED, SHCNF_FLUSHNOWAIT, SHCNF_IDLIST, SHChangeNotify,
+    };
+
+    // SAFETY: SHCNE_ASSOCCHANGED requires null item pointers with
+    // SHCNF_IDLIST. The call copies no caller-owned memory and returns no data.
+    unsafe {
+        SHChangeNotify(
+            SHCNE_ASSOCCHANGED as i32,
+            SHCNF_IDLIST | SHCNF_FLUSHNOWAIT,
+            ptr::null(),
+            ptr::null(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn notify_file_associations() -> Result<()> {
+    bail!("file-association notification is supported only on Windows")
 }
 
 /// M0 spike: decode + develop both tiers, dump JPEGs, print a timings table.
@@ -188,6 +219,20 @@ mod tests {
     fn parses_installer_folder_picker() {
         assert_eq!(parse(&["--pick-folder"]).unwrap(), Command::PickFolder);
         assert!(parse(&["--pick-folder", "extra"]).is_err());
+    }
+
+    #[test]
+    fn parses_windows_association_notification() {
+        assert_eq!(
+            parse(&["--notify-file-associations"]).unwrap(),
+            Command::NotifyFileAssociations
+        );
+        assert!(
+            parse(&["--notify-file-associations", "extra"])
+                .unwrap_err()
+                .to_string()
+                .contains("usage")
+        );
     }
 
     #[test]
