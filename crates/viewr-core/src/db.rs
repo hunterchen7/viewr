@@ -6441,8 +6441,8 @@ mod tests {
                     row.get::<_, usize>(0)
                 })
                 .unwrap(),
-            1,
-            "the clean nonverbatim history may remain, but cannot authorize publication"
+            0,
+            "the clean nonverbatim history must be discarded with the unsafe collision"
         );
     }
 
