@@ -15,13 +15,41 @@ final class ViewrAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func application(_ sender: NSApplication, openFiles filenames: [String]) {
-        var launchedEveryFile = !filenames.isEmpty
-        for filename in filenames {
-            launchedEveryFile = launchViewer(path: filename) && launchedEveryFile
+        let representatives = representativesByFolder(filenames)
+        var launchedEveryFolder = !representatives.isEmpty
+        for representative in representatives {
+            launchedEveryFolder =
+                launchViewer(path: representative) && launchedEveryFolder
         }
 
-        sender.reply(toOpenOrPrint: launchedEveryFile ? .success : .failure)
+        sender.reply(toOpenOrPrint: launchedEveryFolder ? .success : .failure)
         terminateIfIdle()
+    }
+
+    private func representativesByFolder(
+        _ filenames: [String]
+    ) -> [String] {
+        var seenFolders = Set<String>()
+        var representatives: [String] = []
+
+        for filename in filenames {
+            let fileURL = URL(fileURLWithPath: filename)
+                .resolvingSymlinksInPath()
+                .standardizedFileURL
+            var isDirectory = ObjCBool(false)
+            let exists = FileManager.default.fileExists(
+                atPath: fileURL.path,
+                isDirectory: &isDirectory
+            )
+            let folder = exists && isDirectory.boolValue
+                ? fileURL.path
+                : fileURL.deletingLastPathComponent().path
+            if seenFolders.insert(folder).inserted {
+                representatives.append(fileURL.path)
+            }
+        }
+
+        return representatives
     }
 
     private func chooseFolder() {
@@ -40,7 +68,8 @@ final class ViewrAppDelegate: NSObject, NSApplicationDelegate {
         panel.allowsMultipleSelection = false
 
         if panel.runModal() == .OK, let folder = panel.url {
-            _ = launchViewer(path: folder.path)
+            let path = folder.resolvingSymlinksInPath().standardizedFileURL.path
+            _ = launchViewer(path: path)
         }
 
         showingFolderPicker = false

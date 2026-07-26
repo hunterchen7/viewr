@@ -19,13 +19,26 @@ let activationPolicy = NSApplication.shared.activationPolicy() == .regular
 let entry = "\(getpid())\t\(getppid())\t\(activationPolicy)\t\(argument)\n"
 let data = Data(entry.utf8)
 
-if !FileManager.default.fileExists(atPath: logURL.path) {
-    FileManager.default.createFile(atPath: logURL.path, contents: nil)
+let descriptor = Darwin.open(
+    logURL.path,
+    O_WRONLY | O_CREAT | O_APPEND,
+    S_IRUSR | S_IWUSR
+)
+guard descriptor >= 0 else {
+    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
 }
-let handle = try FileHandle(forWritingTo: logURL)
-try handle.seekToEnd()
-try handle.write(contentsOf: data)
-try handle.close()
+
+let written = data.withUnsafeBytes { bytes in
+    Darwin.write(descriptor, bytes.baseAddress, bytes.count)
+}
+let writeError = errno
+let closeResult = Darwin.close(descriptor)
+guard written == data.count else {
+    throw POSIXError(POSIXErrorCode(rawValue: writeError) ?? .EIO)
+}
+guard closeResult == 0 else {
+    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+}
 
 // Keep each fake viewer alive long enough to prove that the launcher remains
 // available for a second Launch Services open-document event.

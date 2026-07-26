@@ -6,8 +6,9 @@ usage() {
 Usage: scripts/validate-macos-pkg.sh [--test-open-events] VIEWR_PKG
 
 Validate the Viewr macOS installer without installing it. The optional open
-event test launches an isolated copy with a probe executable and verifies two
-sequential Finder-style document opens reach the same live launcher.
+event test launches an isolated copy with a probe executable. It verifies that
+a same-folder batch starts one viewer and that later document opens reach the
+same live launcher.
 
 Optional environment variables:
   VIEWR_VERSION                 Expected package version. Defaults to Cargo.toml.
@@ -358,6 +359,24 @@ if [[ "$test_open_events" == "1" ]]; then
     probe="$test_app/Contents/MacOS/viewr-bin"
     probe_log="$work_dir/viewr-launcher-probe.log"
     /bin/rm -f -- "$probe_log"
+    canonical_test_path() {
+        local directory
+        directory="$(cd "$(dirname "$1")" && pwd -P)" || return
+        printf '%s/%s\n' "$directory" "$(basename "$1")"
+    }
+    probe_log_has_path() {
+        local expected_path
+        local logged_path
+        expected_path="$(canonical_test_path "$1")" || return 2
+        [[ -f "$probe_log" ]] || return 1
+        while IFS=$'\t' read -r _ _ _ logged_path; do
+            if [[ -n "$logged_path" &&
+                "$(canonical_test_path "$logged_path" 2>/dev/null)" == "$expected_path" ]]; then
+                return 0
+            fi
+        done <"$probe_log"
+        return 1
+    }
     xcrun --sdk macosx swiftc \
         -module-cache-path "$work_dir/swift-module-cache" \
         -target arm64-apple-macos11.0 \
@@ -371,18 +390,32 @@ if [[ "$test_open_events" == "1" ]]; then
 
     first_file="$work_dir/First.ARW"
     second_file="$work_dir/Second.ARW"
-    /usr/bin/touch "$first_file" "$second_file"
+    alias_dir="$work_dir/Alias"
+    third_dir="$work_dir/Other"
+    /bin/mkdir "$alias_dir" "$third_dir"
+    alias_file="$alias_dir/Alias.ARW"
+    third_file="$third_dir/Third.ARW"
+    /usr/bin/touch "$first_file" "$second_file" "$third_file"
+    /bin/ln -s "$first_file" "$alias_file"
 
     test_app_opened=1
-    /usr/bin/open -a "$test_app" "$first_file"
+    /usr/bin/open -a "$test_app" "$alias_file" "$second_file"
     for _ in {1..50}; do
-        [[ -f "$probe_log" ]] && grep -F "$first_file" "$probe_log" >/dev/null && break
+        probe_log_has_path "$first_file" && break
         /bin/sleep 0.1
     done
-    [[ -f "$probe_log" ]] && grep -F "$first_file" "$probe_log" >/dev/null ||
+    if ! probe_log_has_path "$first_file"; then
+        [[ ! -f "$probe_log" ]] || /bin/cat "$probe_log" >&2
         fail "first open-document event did not reach the viewer probe"
+    fi
     grep -F $'\tregular\t' "$probe_log" >/dev/null ||
         fail "spawned viewer does not use the regular macOS activation policy"
+    /bin/sleep 0.5
+    [[ "$(/usr/bin/wc -l <"$probe_log" | /usr/bin/tr -d '[:space:]')" == "1" ]] ||
+        fail "one same-folder open event launched more than one viewer"
+    if probe_log_has_path "$second_file"; then
+        fail "same-folder open event was not coalesced"
+    fi
 
     wrapper_pid="$(
         pgrep -f -x "$test_app/Contents/MacOS/ViewrLauncher" | head -1 || true
@@ -393,17 +426,25 @@ if [[ "$test_open_events" == "1" ]]; then
 
     /usr/bin/open -a "$test_app" "$second_file"
     for _ in {1..50}; do
-        grep -F "$second_file" "$probe_log" >/dev/null && break
+        probe_log_has_path "$second_file" && break
         /bin/sleep 0.1
     done
-    grep -F "$second_file" "$probe_log" >/dev/null ||
-        fail "second open-document event did not reach the viewer probe"
+    probe_log_has_path "$second_file" ||
+        fail "later same-folder open event did not reach the viewer probe"
+
+    /usr/bin/open -a "$test_app" "$third_file"
+    for _ in {1..50}; do
+        probe_log_has_path "$third_file" && break
+        /bin/sleep 0.1
+    done
+    probe_log_has_path "$third_file" ||
+        fail "different-folder open event did not reach the viewer probe"
     /bin/kill -0 "$wrapper_pid" ||
         fail "launcher did not remain alive across sequential open events"
     [[ "$(
         awk -F '\t' -v parent="$wrapper_pid" '$2 == parent { count++ } END { print count + 0 }' \
             "$probe_log"
-    )" == "2" ]] ||
+    )" == "3" ]] ||
         fail "open-document events did not reach the same live launcher"
 
     while IFS=$'\t' read -r process_id _; do
