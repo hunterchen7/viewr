@@ -52,17 +52,100 @@ temp_base="${TMPDIR:-/tmp}"
 work_dir="$(mktemp -d "${temp_base%/}/viewr-macos-validate.XXXXXX")"
 work_dir="$(cd "$work_dir" && pwd -P)"
 test_process_ids=""
+test_app=""
+test_app_opened=0
+probe_log=""
 cleanup() {
+    original_status=$?
+    trap - EXIT
+    trap '' INT TERM
+    cleanup_failed=0
+
+    if [[ -n "$probe_log" && -f "$probe_log" ]]; then
+        while IFS=$'\t' read -r process_id _; do
+            if [[ "$process_id" =~ ^[0-9]+$ ]]; then
+                test_process_ids="$test_process_ids $process_id"
+            fi
+        done <"$probe_log"
+    fi
+    if [[ -n "$test_app" ]]; then
+        while IFS= read -r process_id; do
+            if [[ "$process_id" =~ ^[0-9]+$ ]]; then
+                test_process_ids="$test_process_ids $process_id"
+            fi
+        done < <(
+            /bin/ps -axo pid=,command= |
+                awk \
+                    -v launcher="$test_app/Contents/MacOS/ViewrLauncher" \
+                    -v viewer="$test_app/Contents/MacOS/viewr-bin" '
+                        {
+                            process_id = $1
+                            sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "")
+                            if ($0 == launcher ||
+                                $0 == viewer ||
+                                index($0, viewer " ") == 1) {
+                                print process_id
+                            }
+                        }
+                    '
+        )
+    fi
     for process_id in $test_process_ids; do
         if [[ "$process_id" =~ ^[0-9]+$ ]]; then
             /bin/kill "$process_id" 2>/dev/null || true
         fi
     done
+    for _ in {1..50}; do
+        processes_alive=0
+        for process_id in $test_process_ids; do
+            if [[ "$process_id" =~ ^[0-9]+$ ]] &&
+                /bin/kill -0 "$process_id" 2>/dev/null; then
+                processes_alive=1
+            fi
+        done
+        [[ "$processes_alive" == "0" ]] && break
+        /bin/sleep 0.1
+    done
+    for process_id in $test_process_ids; do
+        if [[ "$process_id" =~ ^[0-9]+$ ]] &&
+            /bin/kill -0 "$process_id" 2>/dev/null; then
+            /bin/kill -KILL "$process_id" 2>/dev/null || cleanup_failed=1
+        fi
+    done
+    for _ in {1..50}; do
+        processes_alive=0
+        for process_id in $test_process_ids; do
+            if [[ "$process_id" =~ ^[0-9]+$ ]] &&
+                /bin/kill -0 "$process_id" 2>/dev/null; then
+                processes_alive=1
+            fi
+        done
+        [[ "$processes_alive" == "0" ]] && break
+        /bin/sleep 0.1
+    done
+    if [[ "$processes_alive" != "0" ]]; then
+        echo "error: macOS open-event test processes did not exit" >&2
+        cleanup_failed=1
+    fi
+
+    if [[ "$test_app_opened" == "1" ]]; then
+        launch_services="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+        if [[ ! -x "$launch_services" ]] ||
+            ! "$launch_services" -u "$test_app" >/dev/null 2>&1; then
+            echo "error: could not unregister the macOS open-event test app" >&2
+            cleanup_failed=1
+        fi
+    fi
     if [[ "${VIEWR_MACOS_KEEP_VALIDATION_DIR:-0}" == "1" ]]; then
         echo "Kept macOS validation directory: $work_dir" >&2
     elif [[ -n "${work_dir:-}" && -d "$work_dir" ]]; then
-        /bin/rm -rf -- "$work_dir"
+        /bin/rm -rf -- "$work_dir" || cleanup_failed=1
     fi
+
+    if [[ "$cleanup_failed" == "1" && "$original_status" == "0" ]]; then
+        original_status=1
+    fi
+    exit "$original_status"
 }
 trap cleanup EXIT
 
@@ -288,6 +371,7 @@ if [[ "$test_open_events" == "1" ]]; then
     second_file="$work_dir/Second.ARW"
     /usr/bin/touch "$first_file" "$second_file"
 
+    test_app_opened=1
     /usr/bin/open -a "$test_app" "$first_file"
     for _ in {1..50}; do
         [[ -f "$probe_log" ]] && grep -F "$first_file" "$probe_log" >/dev/null && break

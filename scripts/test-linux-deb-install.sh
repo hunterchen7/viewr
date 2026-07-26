@@ -12,7 +12,7 @@ fi
 package="$(realpath "$2")"
 
 for command in \
-  apt-get cat cmp cp dpkg dpkg-query grep mkdir mktemp realpath rm sudo \
+  apt-get awk cat cmp cp dpkg dpkg-query grep mkdir mktemp realpath rm sudo \
   timeout update-desktop-database xdg-mime
 do
   command -v "$command" >/dev/null 2>&1 || {
@@ -29,16 +29,70 @@ if dpkg-query --show --showformat='${Status}' viewr 2>/dev/null |
   echo "refusing to test over an existing Viewr installation" >&2
   exit 1
 fi
+for managed_path in \
+  /usr/bin/viewr \
+  /usr/share/applications/viewr.desktop \
+  /usr/share/applications/viewr-arw.desktop \
+  /usr/share/doc/viewr
+do
+  if [[ -e "$managed_path" || -L "$managed_path" ]]; then
+    echo "refusing to replace an existing $managed_path" >&2
+    exit 1
+  fi
+done
 sudo -n true
+
+mime_cache_has_viewr() {
+  local cache=/usr/share/applications/mimeinfo.cache
+  if [[ ! -e "$cache" && ! -L "$cache" ]]; then
+    return 1
+  fi
+  [[ -f "$cache" && -r "$cache" ]] || return 2
+  awk -F= '
+    $1 == "image/x-sony-arw" {
+      count = split($2, handlers, ";")
+      for (handler_index = 1; handler_index <= count; handler_index++) {
+        if (handlers[handler_index] == "viewr-arw.desktop") {
+          found = 1
+        }
+      }
+    }
+    END { exit found ? 0 : 1 }
+  ' "$cache"
+}
+
+if mime_cache_has_viewr; then
+  echo "refusing to replace a pre-existing Viewr ARW MIME-cache entry" >&2
+  exit 1
+else
+  mime_cache_status=$?
+  if [[ "$mime_cache_status" -ne 1 ]]; then
+    echo "could not inspect the desktop MIME cache before installation" >&2
+    exit 1
+  fi
+fi
 
 temporary_state="$(mktemp -d)"
 mimeapps_snapshot="$temporary_state/mimeapps.snapshot"
 installed=0
 cleanup() {
+  original_status=$?
+  trap - EXIT
+  trap '' INT TERM
+  cleanup_failed=0
+
   if [[ "$installed" == "1" ]]; then
-    sudo -n dpkg --purge viewr >/dev/null || true
+    if ! sudo -n dpkg --purge viewr >/dev/null; then
+      echo "cleanup could not purge the Viewr test package" >&2
+      cleanup_failed=1
+    fi
   fi
-  rm -rf "$temporary_state"
+  rm -rf "$temporary_state" || cleanup_failed=1
+
+  if [[ "$cleanup_failed" == "1" && "$original_status" == "0" ]]; then
+    original_status=1
+  fi
+  exit "$original_status"
 }
 trap cleanup EXIT
 
@@ -87,12 +141,17 @@ sudo -n apt-get install -y "$package"
   echo "installed desktop handler is missing" >&2
   exit 1
 }
-grep -Fxq \
-  'image/x-sony-arw=viewr-arw.desktop;' \
-  /usr/share/applications/mimeinfo.cache || {
-    echo "desktop-file-utils did not register the installed ARW handler" >&2
+if mime_cache_has_viewr; then
+  :
+else
+  mime_cache_status=$?
+  if [[ "$mime_cache_status" -ne 1 ]]; then
+    echo "could not inspect the desktop MIME cache after installation" >&2
     exit 1
-  }
+  fi
+  echo "desktop-file-utils did not register the installed ARW handler" >&2
+  exit 1
+fi
 usage_output="$(timeout 10s /usr/bin/viewr 2>&1)" || {
   echo "installed Viewr usage smoke test failed" >&2
   exit 1
@@ -120,6 +179,20 @@ installed=0
 }
 [[ ! -e /usr/share/applications/viewr-arw.desktop ]] || {
   echo "purge left the desktop handler behind" >&2
+  exit 1
+}
+if mime_cache_has_viewr; then
+  echo "purge left the ARW handler in the desktop MIME cache" >&2
+  exit 1
+else
+  mime_cache_status=$?
+  if [[ "$mime_cache_status" -ne 1 ]]; then
+    echo "could not inspect the desktop MIME cache after purge" >&2
+    exit 1
+  fi
+fi
+[[ ! -e /usr/share/doc/viewr ]] || {
+  echo "purge left the Viewr documentation directory behind" >&2
   exit 1
 }
 default_after_purge="$(xdg-mime query default image/x-sony-arw 2>/dev/null || true)"

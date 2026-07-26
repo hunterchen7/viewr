@@ -132,7 +132,11 @@ fi
     echo "Cargo did not select the editable local rawler source" >&2
     exit 1
   fi
-  cargo check --locked --offline -p viewr --bin viewr
+  cargo build --release --locked --offline -p viewr --bin viewr
+  if [[ ! -x target/release/viewr ]]; then
+    echo "offline release build did not produce the Viewr executable" >&2
+    exit 1
+  fi
 )
 
 echo "Validated $archive"
