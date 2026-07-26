@@ -9,7 +9,11 @@ Viewr supplies one native installer for each release platform.
 | Ubuntu 22.04+ or Debian 12+, x64 | `viewr-linux-x64.deb` | `viewr-linux-x64.tar.gz` |
 
 Each installer registers Viewr as an available Sony ARW viewer. No installer
-changes the current default viewer.
+overwrites an explicit user choice for the default viewer.
+
+On a macOS account without an explicit ARW choice, Launch Services can select
+Viewr as the inferred default after installation. The installer does not write
+this choice to the user preferences.
 
 ## Set the default ARW viewer
 
@@ -45,7 +49,7 @@ build also compares this version with the GitHub release tag.
 
 ### macOS
 
-Run these commands on an Apple Silicon Mac:
+Run these commands on an Apple Silicon Mac with macOS 12 or later:
 
 ```bash
 cargo build --release --locked --target aarch64-apple-darwin -p viewr --bin viewr
@@ -72,6 +76,14 @@ receipt.
 
 Use a valid Sony ARW file for `VIEWR_TEST_RAW`. CI downloads the pinned
 public-domain fixture that the core compatibility tests use.
+
+The install test requires exact preservation of explicit Launch Services
+preferences. On an account without an explicit ARW choice, Launch Services can
+recompute its inferred default while Viewr is installed. The test verifies
+that removal restores the prior effective default.
+
+The installer supports macOS 11. The install test requires macOS 12 because it
+uses newer Launch Services inspection APIs.
 
 Set `VIEWR_MACOS_APP_SIGN_IDENTITY` to use a Developer ID Application
 identity. Set `VIEWR_MACOS_INSTALLER_SIGN_IDENTITY` to use a Developer ID

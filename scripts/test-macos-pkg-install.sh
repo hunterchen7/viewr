@@ -6,9 +6,10 @@ usage() {
 Usage: scripts/test-macos-pkg-install.sh \
   --allow-system-changes VIEWR_PKG
 
-Install and remove Viewr on a disposable macOS host. The test refuses to
-replace an existing app, package receipt, or Launch Services registration.
-Set VIEWR_TEST_RAW to an existing Sony ARW file. The test does not change it.
+Install and remove Viewr on a disposable Apple Silicon Mac with macOS 12 or
+later. The test refuses to replace an existing app, package receipt, or Launch
+Services registration. Set VIEWR_TEST_RAW to an existing Sony ARW file. The
+test does not change it.
 EOF
 }
 
@@ -45,6 +46,10 @@ done
 pkgutil="/usr/sbin/pkgutil"
 [[ -x "$pkgutil" ]] || fail "macOS package utility is unavailable"
 [[ -x /usr/bin/defaults ]] || fail "macOS defaults command is unavailable"
+[[ -x /usr/bin/sw_vers ]] || fail "macOS version utility is unavailable"
+macos_major="$(/usr/bin/sw_vers -productVersion | awk -F. '{ print $1 }')"
+[[ "$macos_major" =~ ^[0-9]+$ && "$macos_major" -ge 12 ]] ||
+    fail "the macOS install test requires macOS 12 or later"
 
 app="/Applications/Viewr.app"
 receipt="com.hunterchen.viewr.pkg"
@@ -175,7 +180,8 @@ cleanup() {
                 "$app" \
                 "$fixture"
         )" || cleanup_failed=1
-        if [[ "${default_after_cleanup:-}" != "$default_before" ]]; then
+        if [[ "${default_after_cleanup:-}" != "$default_before" ||
+            "${type_default_after_cleanup:-}" != "$type_default_before" ]]; then
             echo "error: cleanup changed the default ARW application" >&2
             echo "file default before: ${default_before:-<none>}" >&2
             echo "file default after: ${default_after_cleanup:-<none>}" >&2
@@ -214,6 +220,8 @@ trap 'exit 143' TERM
 
 probe="$work_dir/installed-app-probe"
 xcrun --sdk macosx swiftc \
+    -warnings-as-errors \
+    -target arm64-apple-macosx12.0 \
     -module-cache-path "$work_dir/swift-module-cache" \
     -sdk "$(xcrun --sdk macosx --show-sdk-path)" \
     -O \
@@ -228,6 +236,16 @@ default_before="$(
 type_default_before="$(
     "$probe" type-default "$bundle_identifier" "$arw_type" "$app" "$fixture"
 )"
+explicit_binding_before="$(
+    "$probe" explicit-binding \
+        "$bundle_identifier" \
+        "$arw_type" \
+        "$app" \
+        "$fixture"
+)"
+[[ "$explicit_binding_before" == "present" ||
+    "$explicit_binding_before" == "absent" ]] ||
+    fail "could not classify the existing ARW handler preference"
 preferences_before="$(launch_services_preferences)"
 
 expanded="$work_dir/expanded"
@@ -340,16 +358,39 @@ default_after_install="$(
 type_default_after_install="$(
     "$probe" type-default "$bundle_identifier" "$arw_type" "$app" "$fixture"
 )"
-if [[ "$default_after_install" != "$default_before" ]]; then
-    echo "error: Installer changed the existing default ARW application" >&2
+preferences_after_install="$(launch_services_preferences)"
+[[ "$preferences_after_install" == "$preferences_before" ]] ||
+    fail "Installer changed Launch Services handler preferences"
+# Preview claims the generic camera-RAW parent type. On an account without an
+# explicit ARW binding, Launch Services can prefer Viewr's exact child-type
+# claim while it is registered even though Alternate is the lowest opener rank.
+if [[ "$default_after_install" != "$default_before" ||
+    "$type_default_after_install" != "$type_default_before" ]]; then
+    if [[ "$explicit_binding_before" == "present" ]]; then
+        echo "error: Installer displaced an explicit ARW default" >&2
+        echo "file default before: ${default_before:-<none>}" >&2
+        echo "file default after: ${default_after_install:-<none>}" >&2
+        echo "UTI default before: ${type_default_before:-<none>}" >&2
+        echo "UTI default after: ${type_default_after_install:-<none>}" >&2
+        exit 1
+    fi
+    if [[ "$default_before" != "/System/Applications/Preview.app" ||
+        "$type_default_before" != "/System/Applications/Preview.app" ||
+        "$default_after_install" != "$app" ||
+        "$type_default_after_install" != "$app" ]]; then
+        echo "error: Installer caused an unexpected ARW default transition" >&2
+        echo "file default before: ${default_before:-<none>}" >&2
+        echo "file default after: ${default_after_install:-<none>}" >&2
+        echo "UTI default before: ${type_default_before:-<none>}" >&2
+        echo "UTI default after: ${type_default_after_install:-<none>}" >&2
+        exit 1
+    fi
+    echo "Launch Services recomputed its implicit ARW default." >&2
+    echo "Explicit handler preferences remain unchanged." >&2
     echo "file default before: ${default_before:-<none>}" >&2
     echo "file default after: ${default_after_install:-<none>}" >&2
     echo "UTI default before: ${type_default_before:-<none>}" >&2
     echo "UTI default after: ${type_default_after_install:-<none>}" >&2
-    exit 1
 fi
-preferences_after_install="$(launch_services_preferences)"
-[[ "$preferences_after_install" == "$preferences_before" ]] ||
-    fail "Installer changed Launch Services handler preferences"
 
 test_completed=1
