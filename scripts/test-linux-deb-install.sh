@@ -11,7 +11,10 @@ if [[ "${1:-}" != "--allow-system-changes" || $# -ne 2 ]]; then
 fi
 package="$(realpath "$2")"
 
-for command in apt-get cmp dpkg dpkg-query grep realpath sudo timeout xdg-mime; do
+for command in \
+  apt-get cat cmp cp dpkg dpkg-query grep mkdir mktemp realpath rm sudo \
+  timeout update-desktop-database xdg-mime
+do
   command -v "$command" >/dev/null 2>&1 || {
     echo "required command is unavailable: $command" >&2
     exit 1
@@ -28,23 +31,46 @@ if dpkg-query --show --showformat='${Status}' viewr 2>/dev/null |
 fi
 sudo -n true
 
-mimeapps="$HOME/.config/mimeapps.list"
+temporary_state="$(mktemp -d)"
+mimeapps_snapshot="$temporary_state/mimeapps.snapshot"
+installed=0
+cleanup() {
+  if [[ "$installed" == "1" ]]; then
+    sudo -n dpkg --purge viewr >/dev/null || true
+  fi
+  rm -rf "$temporary_state"
+}
+trap cleanup EXIT
+
+export XDG_CONFIG_HOME="$temporary_state/config"
+export XDG_DATA_HOME="$temporary_state/data"
+mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME/applications"
+cat >"$XDG_DATA_HOME/applications/viewr-test-existing.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Existing ARW viewer
+Exec=/bin/true %f
+MimeType=image/x-sony-arw;
+NoDisplay=true
+EOF
+update-desktop-database "$XDG_DATA_HOME/applications"
+xdg-mime default viewr-test-existing.desktop image/x-sony-arw
+
+mimeapps="$XDG_CONFIG_HOME/mimeapps.list"
+[[ -f "$mimeapps" ]] || {
+  echo "xdg-mime did not create the explicit default test fixture" >&2
+  exit 1
+}
 mimeapps_existed=0
-mimeapps_snapshot="$(mktemp)"
 if [[ -e "$mimeapps" ]]; then
   mimeapps_existed=1
   cp "$mimeapps" "$mimeapps_snapshot"
 fi
 default_before="$(xdg-mime query default image/x-sony-arw 2>/dev/null || true)"
-installed=0
-
-cleanup() {
-  if [[ "$installed" == "1" ]]; then
-    sudo -n dpkg --purge viewr >/dev/null || true
-  fi
-  rm -f "$mimeapps_snapshot"
+[[ "$default_before" == "viewr-test-existing.desktop" ]] || {
+  echo "could not establish the unrelated ARW default test fixture" >&2
+  exit 1
 }
-trap cleanup EXIT
 
 installed=1
 sudo -n apt-get install -y "$package"

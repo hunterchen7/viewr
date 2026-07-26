@@ -45,11 +45,31 @@ for path in "${required[@]}"; do
     exit 1
   fi
 done
-if grep -Eq "(^|/)(\.git|target)(/|$)" <<<"$archive_listing"; then
-  echo "source archive contains a repository or build-output directory" >&2
+noncanonical_paths="$(
+  awk '$0 ~ /\/\.\.?($|\/)/ || $0 ~ /\/\//' <<<"$archive_listing"
+)"
+if [[ -n "$noncanonical_paths" ]]; then
+  echo "source archive contains a noncanonical path" >&2
+  printf '%s\n' "$noncanonical_paths" >&2
   exit 1
 fi
-unexpected_paths="$(grep -Ev "^$top_level(/|$)" <<<"$archive_listing" || true)"
+forbidden_paths="$(
+  awk -v root="$top_level" '
+    $0 ~ /(^|\/)\.git(\/|$)/ ||
+    $0 == root "/target" ||
+    index($0, root "/target/") == 1
+  ' <<<"$archive_listing"
+)"
+if [[ -n "$forbidden_paths" ]]; then
+  echo "source archive contains a repository or build-output directory" >&2
+  printf '%s\n' "$forbidden_paths" >&2
+  exit 1
+fi
+unexpected_paths="$(
+  awk -v root="$top_level" '
+    $0 != root && index($0, root "/") != 1
+  ' <<<"$archive_listing"
+)"
 if [[ -n "$unexpected_paths" ]]; then
   echo "source archive contains a path outside $top_level" >&2
   exit 1

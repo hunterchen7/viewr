@@ -29,11 +29,42 @@ function Invoke-NativeCommand {
         [string[]] $Arguments
     )
 
-    $output = & $Command @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "'$Command' exited with code $LASTEXITCODE."
+    $stderrPath = [IO.Path]::GetTempFileName()
+    try {
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            # Windows PowerShell can promote redirected native stderr to an
+            # ErrorRecord. Keep it separate from stdout so cargo metadata
+            # remains valid JSON and inspect the native exit code ourselves.
+            $ErrorActionPreference = "Continue"
+            $output = & $Command @Arguments 2> $stderrPath
+            $exitCode = $LASTEXITCODE
+        }
+        finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+
+        $diagnostics = [IO.File]::ReadAllText($stderrPath).TrimEnd()
+        if ($exitCode -ne 0) {
+            $failureOutput = @()
+            $stdoutText = ($output | Out-String).TrimEnd()
+            if (-not [string]::IsNullOrWhiteSpace($stdoutText)) {
+                $failureOutput += $stdoutText
+            }
+            if (-not [string]::IsNullOrWhiteSpace($diagnostics)) {
+                $failureOutput += $diagnostics
+            }
+            $failureDetails = $failureOutput -join [Environment]::NewLine
+            throw "'$Command' exited with code $exitCode.`n$failureDetails"
+        }
+        if (-not [string]::IsNullOrWhiteSpace($diagnostics)) {
+            Write-Host $diagnostics
+        }
+        return $output
     }
-    return $output
+    finally {
+        Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Find-WixTool {
