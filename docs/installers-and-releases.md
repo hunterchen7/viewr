@@ -240,7 +240,10 @@ gh workflow run release-binaries.yml \
 ```
 
 The workflow rejects a release tag whose commit does not match the workflow
-invocation commit. This keeps artifact provenance tied to the released source.
+invocation commit. All downstream jobs check out that approved commit SHA, not
+the mutable tag reference. Before the workflow uploads files and before it
+publishes the release, it verifies that the tag still identifies the approved
+commit. This keeps artifact provenance tied to the released source.
 
 Verify an attestation with:
 
