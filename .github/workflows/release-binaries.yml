@@ -27,7 +27,10 @@ jobs:
   gate:
     name: Validate release request
     runs-on: ubuntu-22.04
-    timeout-minutes: 5
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
     steps:
       - name: Require an existing draft release
         env:
@@ -56,6 +59,7 @@ jobs:
         with:
           ref: refs/tags/${{ inputs.release_tag }}
       - name: Match workflow provenance to the release tag
+        id: release_commit
         env:
           WORKFLOW_SHA: ${{ github.sha }}
         run: |
@@ -65,6 +69,38 @@ jobs:
             echo "::error::Manually dispatch this workflow with --ref set to the release tag."
             exit 1
           fi
+          printf 'sha=%s\n' "$release_sha" >> "$GITHUB_OUTPUT"
+      - name: Require successful CI for the tagged source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
+        run: |
+          ci_run_id=""
+          for _ in $(seq 1 60); do
+            ci_run_id="$(
+              gh run list \
+                --repo "$GITHUB_REPOSITORY" \
+                --workflow ci.yml \
+                --commit "$RELEASE_SHA" \
+                --event push \
+                --limit 1 \
+                --json databaseId \
+                --jq '.[0].databaseId // empty'
+            )"
+            if [[ -n "$ci_run_id" ]]; then
+              break
+            fi
+            sleep 10
+          done
+          if [[ -z "$ci_run_id" ]]; then
+            echo "::error::No main-branch CI run exists for release commit $RELEASE_SHA."
+            exit 1
+          fi
+          gh run watch \
+            "$ci_run_id" \
+            --repo "$GITHUB_REPOSITORY" \
+            --exit-status \
+            --interval 10
 
   packages:
     name: Release assets (${{ matrix.platform }})

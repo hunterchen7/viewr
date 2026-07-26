@@ -23,7 +23,7 @@ jobs:
       - name: Linux build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+          sudo apt-get install -y curl jq libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
       - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
         with:
           components: rustfmt, clippy
@@ -41,7 +41,9 @@ jobs:
       - name: Validate third-party license inventories
         run: scripts/validate-third-party-licenses.sh
       - name: Test release asset verification
-        run: scripts/test-verify-remote-release-assets.sh
+        run: |
+          scripts/test-verify-release-assets.sh
+          scripts/test-verify-remote-release-assets.sh
       - name: Format
         run: cargo fmt --all --check
       - name: Lint all targets and features
@@ -56,6 +58,31 @@ jobs:
       - name: Test workspace release behavior
         if: ${{ !cancelled() }}
         run: cargo test --workspace --release --locked
+      - name: Test public-domain Sony RAW fixture
+        if: ${{ !cancelled() }}
+        env:
+          VIEWR_TEST_RAW: ${{ runner.temp }}/viewr-public-domain-sony.ARW
+        run: |
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            --retry-all-errors \
+            --show-error \
+            --silent \
+            https://raw.pixls.us/data/Sony/DSC-RX100/DSC00838.ARW \
+            --output "$VIEWR_TEST_RAW"
+          printf '%s  %s\n' \
+            579a485b5126a25cbd55cbd5dadfa7d09cf021c99cc7d4869f9e56e3f759390b \
+            "$VIEWR_TEST_RAW" |
+            sha256sum --check -
+          cargo test \
+            -p viewr-core \
+            --release \
+            --locked \
+            real_sony_raw_ \
+            -- \
+            --ignored
       - name: Smoke-test optimized benchmark harnesses
         if: ${{ !cancelled() }}
         run: |
@@ -93,7 +120,7 @@ jobs:
             portable_platform: macos-arm64
             rustflags: ''
           - platform: Windows x64
-            os: windows-2025
+            os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: viewr-windows-x64.zip
             portable_platform: windows-x64
@@ -147,13 +174,13 @@ jobs:
         run: |
           fixture_dir="testdata/real-raw-corpus"
           if [[ -f "$fixture_dir/HCA04875.ARW" && -f "$fixture_dir/HCA05417.ARW" ]]; then
-            fixture_status="Available but not run: real-RAW tests are opt-in because they are marked ignored."
+            fixture_status="The quality check runs pinned Sony DSC-RX100 decode and develop coverage. The optional private portrait and camera corpus is available locally but remains opt-in."
           else
-            fixture_status="Not run: optional local RAW fixtures are absent, so the ignored real-RAW tests have no fixture coverage in this CI run."
+            fixture_status="The quality check runs pinned Sony DSC-RX100 decode and develop coverage. The optional private portrait and broader camera corpus is absent from this runner."
           fi
-          echo "::notice title=Optional real-RAW fixture tests::$fixture_status"
+          echo "::notice title=Real-RAW fixture coverage::$fixture_status"
           {
-            echo "### Optional real-RAW fixture coverage"
+            echo "### Real-RAW fixture coverage"
             echo
             echo "$fixture_status"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -226,6 +253,41 @@ jobs:
           ./scripts/test-windows-portable-archive.ps1 `
             -ArchivePath "dist/${{ matrix.archive }}" `
             -ExpectedBinaryPath "target/${{ matrix.target }}/release/viewr.exe"
+      - name: Validate Windows portable archive under PowerShell 7
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.build_viewr.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $archiveDirectory = Join-Path `
+            $env:RUNNER_TEMP `
+            "viewr-portable-pwsh7"
+          New-Item `
+            -ItemType Directory `
+            -Path $archiveDirectory `
+            -Force | Out-Null
+          $archive = Join-Path `
+            $archiveDirectory `
+            "${{ matrix.archive }}"
+          ./scripts/package-portable-archive.ps1 `
+            -Platform "${{ matrix.portable_platform }}" `
+            -BinaryPath "target/${{ matrix.target }}/release/viewr.exe" `
+            -OutputPath $archive
+          ./scripts/validate-portable-archive.ps1 `
+            -Platform "${{ matrix.portable_platform }}" `
+            -ArchivePath $archive `
+            -ExpectedBinaryPath "target/${{ matrix.target }}/release/viewr.exe"
+          $productionHash = (
+            Get-FileHash `
+              -LiteralPath "dist/${{ matrix.archive }}" `
+              -Algorithm SHA256
+          ).Hash
+          $pwsh7Hash = (
+            Get-FileHash `
+              -LiteralPath $archive `
+              -Algorithm SHA256
+          ).Hash
+          if ($productionHash -cne $pwsh7Hash) {
+            throw "PowerShell 5.1 and 7 archive builds are not identical."
+          }
       - name: Build and validate macOS installer
         if: ${{ !cancelled() && runner.os == 'macOS' && steps.build_viewr.outcome == 'success' }}
         shell: bash
@@ -262,8 +324,14 @@ jobs:
         if: ${{ !cancelled() && runner.os == 'Linux' && steps.build_viewr.outcome == 'success' }}
         shell: bash
         run: |
-          scripts/package-source-archive.sh dist
-          scripts/validate-source-archive.sh dist/viewr-*-source.tar.gz
+          source_archive="$(scripts/package-source-archive.sh dist)"
+          reproducible_dir="$RUNNER_TEMP/viewr-source-repro"
+          mkdir -p "$reproducible_dir"
+          reproducible_archive="$(
+            scripts/package-source-archive.sh "$reproducible_dir"
+          )"
+          cmp "$source_archive" "$reproducible_archive"
+          scripts/validate-source-archive.sh "$source_archive"
 
   miri:
     name: Miri unsafe-path checks

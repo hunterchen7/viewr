@@ -57,8 +57,9 @@ scripts/validate-macos-pkg.sh \
   dist/viewr-macos-arm64.pkg
 ```
 
-The validator checks the package layout, bundle data, ARW declaration,
-deployment target, signatures, licenses, and two sequential open events.
+The validator checks the package layout, arm64 and macOS 11 installer
+requirements, bundle data, ARW declaration, deployment target, signatures,
+licenses, and two sequential open events.
 
 Set `VIEWR_MACOS_APP_SIGN_IDENTITY` to use a Developer ID Application
 identity. Set `VIEWR_MACOS_INSTALLER_SIGN_IDENTITY` to use a Developer ID
@@ -169,7 +170,9 @@ On Windows, run:
   -ExpectedBinaryPath target/x86_64-pc-windows-msvc/release/viewr.exe
 ```
 
-The Windows validator requires 7-Zip on `PATH`.
+The Windows validator requires 7-Zip on `PATH`. CI builds and validates the
+same archive under Windows PowerShell 5.1 and PowerShell 7 and requires
+byte-identical output.
 
 The validators require the exact binary and license file set. They reject
 extra files, changed file contents, and an incorrect binary architecture. The
@@ -185,9 +188,11 @@ scripts/validate-source-archive.sh dist/viewr-*-source.tar.gz
 ```
 
 The source archive contains the repository files and versioned, vendored Rust
-dependencies. The validator checks offline Cargo metadata, the exact rawler
-license, and an offline compile after it prepares and edits a local rawler
-replacement. See `packaging/SOURCE-BUILD.md` inside the archive.
+dependencies. CI requires two source-package builds to be byte-identical. The
+validator rejects duplicate, noncanonical, linked, and special members. It
+checks offline Cargo metadata, the exact rawler license, and an offline compile
+after it prepares and edits a local rawler replacement. See
+`packaging/SOURCE-BUILD.md` inside the archive.
 
 ## License inventories
 
@@ -211,7 +216,9 @@ workflow directly. A repository-token release event is not used because those
 events do not start another GitHub Actions workflow. The release workflow can
 also be run manually for an existing draft tag.
 
-Three isolated jobs build and validate the platform files. A fourth job builds
+The release gate waits for the complete six-check main-branch CI workflow to
+pass for the exact tagged commit. It does not rerun those checks. Three
+isolated jobs then build and validate the platform files. A fourth job builds
 and validates the source archive.
 
 The publication job starts only after all four jobs pass. It checks the exact
