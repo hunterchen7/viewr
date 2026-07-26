@@ -44,7 +44,7 @@ All promoted performance decisions use later isolated target runs.
 | Priority | Finding | Decision and result |
 | --- | --- | --- |
 | P1 | Disk-cache GC followed arbitrary shard paths and treated unrelated files as cache objects. | Fixed. GC now accepts only real hexadecimal shards, valid cache names, and Viewr temporary files. Symlink and external-sentinel tests pass. |
-| P1 | SQLite used lossy path text as the rating key. Two native paths could use one row. | Fixed. Valid UTF-8 paths keep compatible text keys. Other native paths use reversible BLOB keys. |
+| P1 | SQLite used lossy path text as the rating key. Two native paths could use one row. | Fixed. Valid UTF-8 paths keep compatible text keys. Other native paths use reversible BLOB keys, and mixed TEXT/BLOB or Windows component-equivalent keys fail closed instead of collapsing in memory. |
 | P1 | A rating row did not verify the RAW size and modification time during folder load. | Fixed. A row applies only to the matching RAW identity. |
 | P1 | Startup recovery could write an old rating beside a replaced RAW file. | Fixed. Recovery checks the current RAW identity before each write. A conditional delete cannot remove a newer journal row. |
 | P1 | An old sidecar completion could clear a newer dirty rating. | Fixed. Completion uses a conditional compare operation on path, identity, and rating. |
@@ -55,6 +55,8 @@ All promoted performance decisions use later isolated target runs.
 | P1 | A damaged or interrupted schema repair could reuse an optimistic retry token or expose stale ownership through the read-only startup path. | Fixed. Repair intent is durable, every retry domain crosses a barrier, malformed counters fail closed before arithmetic, and read-only startup rejects incomplete repair state. |
 | P1 | Simultaneous first opens could combine schema observations from different migration states and reject an otherwise valid database. | Fixed. Readiness decisions use one SQLite snapshot, repair selection is serialized, stale forced-repair decisions accept a capability state completed by another opener, and final verification tolerates a cooperating opener's temporary repair sentinel. The process test runs four independent eight-writer start bursts, and damaged-schema openers have a separate concurrency test. |
 | P1 | A removed clean legacy alias did not invalidate unordered dirty same-name history, and a partially migrated database handled ownerless/owned ambiguity asymmetrically. | Fixed. Clean unresolved paths poison only dirty recovery candidates, mixed migration carries ambiguity in both directions, and focused read/migration tests cover distinct legacy owner spellings. |
+| P1 | An ownerless fallback could be displayed or promoted after a newer shared-owner/path ledger, even though the two states had no comparable per-owner position. | Fixed. Ownerless rows remain usable only when their exact representation family has no separate path history and their derived XMP owner has no ledger. A valid current owned row still outranks rejected ownerless history, and one failed startup owner probe cannot be reinterpreted later in the same snapshot. |
+| P1 | Older Windows databases could retain ordinary drive or UNC paths, while current canonicalization adds the verbatim namespace prefix and could mistake the same physical path for an unsafe alias. | Fixed. Migration accepts only an exact ordinary-to-verbatim prefix change, retains the historical path/revision key, assigns a filesystem-derived current owner only to resolvable identity-valid rows, and continues to quarantine component changes, target-owner/path tombstones, or colliding legacy histories. Canonical, uppercase-drive, and lowercase-drive keys are checked as one raw-spelling family without using `Path` equality. Indexed startup lookup keeps an offline clean row readable after reconnect when no newer history exists. Windows regressions cover pre-migration reads, clean fallback, dirty recovery/publication, pre-v8 owned rows, drive-case path and owner tombstones, mixed ownerless/owned collisions, duplicate raw keys, drive-root-relative rejection, and malformed UTF-16 keys. |
 | P1 | SQLite can store same-name indexes and triggers, allowing a valid object to mask a hostile opposite-type object. | Fixed. Readiness checks both namespaces and repair removes both before installing canonical objects. |
 | P1 | A panic in one decode job left its ID in flight and removed one worker. | Fixed. Each claimed job now has a panic boundary. Cleanup occurs before failure publication, and the worker continues. |
 | P1 | `ByteLru::remove` performed a required map removal inside `debug_assert_eq!`. | Fixed. Release builds now perform the removal before the assertion. The new release test gate found this defect. |
@@ -194,8 +196,10 @@ stress, pending scans, and cold migration:
 | Selective legacy load with 50,000 history rows | 13.9–22.1 ms |
 | Full-scan legacy reference with 50,000 history rows | 94–115 ms |
 | Cold released-v0.1.0/v0.1.1-to-v8 migration, 1,000/10,000 rows | Covered; stable baseline not yet recorded |
-| Cold v7-to-v8 migration, 1,000 rows | 17.9–19.1 ms |
-| Cold v7-to-v8 migration, 10,000 rows | 182.7–204.9 ms |
+| Cold released-v0.1.0/v0.1.1 all-online migration, 1,000 rows | Covered; stable baseline not yet recorded |
+| Cold unresolved v7-to-v8 migration, 1,000 rows | 17.9–19.1 ms |
+| Cold unresolved v7-to-v8 migration, 10,000 rows | 182.7–204.9 ms |
+| Cold online-owned v7-to-v8 migration, 1,000 rows | Covered; stable baseline not yet recorded |
 
 The current reopen results remained flat across the measured row counts.
 Legacy dirty and repeated-stem histories are intentionally conservative and
@@ -235,9 +239,12 @@ The benchmark suite now includes these production-adjacent costs:
 - Cold migration from both released ownerless schemas: v0.1.0 without the
   journal column and v0.1.1 with sparse unfinished work. Both use existing and
   missing RAWs, persistent WAL mode, correctness preflights, and a fresh
-  database copy for every timed iteration.
-- Cold v7-to-v8 migration from a fresh database copy on every measured
-  iteration.
+  database copy for every timed iteration; paired all-online cases exercise
+  successful clean owner assignment.
+- Cold migration from the exact released v7 column shape, including the
+  missing ownerless revision column, from a fresh database copy on every
+  measured iteration, with separate unresolved-removal and online-owner-rekey
+  corpora.
 - Indexed pending-journal scans with zero and one dirty row, plus journal
   updates against owner ledgers through 50,000 rows.
 - Production priority-queue synchronization.
@@ -307,6 +314,24 @@ spellings that the filesystem probe can verify. Linux bind mounts and unusual
 case-folded mount aliases can still canonicalize to different paths for the
 same file. Viewr cannot safely unify those spellings without a durable,
 cross-platform file-identity layer. Use one mount spelling for a photo folder.
+
+Windows migration treats `C:\...` and `\\?\C:\...` (and the corresponding UNC
+forms) as the same historical spelling only when every raw UTF-16 code unit
+after the namespace prefix is identical. Drive-root-relative paths, changed
+case or components, dot/separator rewrites, device namespaces, junctions, and
+symlinks remain unsafe. Valid resolvable rows keep their original path and
+revision ledger as journal provenance while receiving the verified canonical
+sidecar-owner key. Offline clean rows remain ownerless; indexed exact-prefix
+lookup makes them visible after reconnect, and a later write can assign the
+verified owner. Any target-owner ledger or separate member of the exact
+canonical/ordinary path-spelling family blocks ownerless fallback or
+publication so older work cannot overtake newer history.
+
+An owned dirty row with a `NULL` rating is a deliberate unrating tombstone
+created when the compatibility fence contains an obsolete writer. It is not a
+publishable pending sidecar, but it remains authoritative through forced
+schema repair so an obsolete XMP value cannot reappear. An ownerless dirty
+`NULL` has no durable publication identity and is quarantined during repair.
 
 When a pre-v8 parent alias is ambiguous, migration quarantines unfinished
 same-name histories across directories because the old schema has no
@@ -437,10 +462,10 @@ The ordinary and release test output reports the three absent private-RAW fixtur
 
 Final verification passed:
 
-- The debug and release workspace suites each reported 304 passed unit tests
+- The debug and release workspace suites each reported 312 passed unit tests
   and three ignored private-RAW tests.
 - The app reported 39 passed unit tests.
-- The core library reported 265 passed unit tests and three ignored private-RAW tests.
+- The core library reported 273 passed unit tests and three ignored private-RAW tests.
 - The Rustdoc suite reported one passed documentation test.
 - Clippy reported no warnings across all targets and features.
 - The all-feature release bins and benchmark targets built successfully.

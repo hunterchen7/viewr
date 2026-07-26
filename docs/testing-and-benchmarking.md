@@ -30,6 +30,14 @@ formatting, Clippy, Rustdoc, optimized benchmark runtime smoke, and release
 compilation run once on Linux. Miri uses one pinned Linux nightly job. The
 independent quality, test, optimized-build, and Miri jobs run in parallel.
 
+Windows-specific database tests recreate ordinary drive-path rows from the
+released ownerless schemas and from the pre-v8 owner schema. They verify clean
+fallback, dirty recovery to the canonical publication owner, exact
+ordinary-to-verbatim prefix matching, mixed-history quarantine, rejection of
+drive-root-relative spellings, raw drive-case path/owner tombstones, duplicate
+component-equivalent keys, lossless non-Unicode round-tripping, and fail-closed
+malformed native-path handling.
+
 The optimized-build job builds the application and both benchmark harnesses
 with one release-profile Cargo invocation using
 `--bins --benches --all-features`. It then runs the complete workspace test
@@ -99,9 +107,13 @@ The suite measures these workloads:
   ownerless schemas: v0.1.0 without the journal column and v0.1.1 with sparse
   recoverable and quarantined dirty rows. Both corpora combine existing and
   missing RAW paths and begin in the persistent WAL mode used by those
-  releases.
-- Cold v7-to-v8 migration of copied 1,000- and 10,000-row database templates.
-  Template creation and copy setup are outside the timed routine.
+  releases. Separate 1,000-row all-online clean corpora measure the successful
+  owner-assignment path.
+- Cold v7-to-v8 migration of copied 1,000- and 10,000-row unresolved database
+  templates, plus a 1,000-row all-online owned template. The templates remove
+  both v8 additions (`images.owner_key_version` and
+  `rating_global_revision.ownerless_revision`) before timing. Template
+  creation and copy setup are outside the timed routine.
 - Rating journal updates against owner ledgers of up to 50,000 rows, plus
   indexed pending-sidecar scans with zero and one dirty row.
 - Batched physical sidecar-owner discovery for up to 50,000 ordinary and
@@ -180,11 +192,10 @@ reviewer to run and interpret a controlled before/after comparison.
 The released-v0.1 migration corpora sample existing RAW files at a fixed
 stride and leave the rest unresolved. The v0.1.0 corpus covers the original
 clean mirror, while v0.1.1 also exercises recovery and quarantine. This avoids
-making every benchmark row a filesystem object. The cold v7 corpus
-intentionally uses only unresolved paths and therefore measures validation,
-removal, and ledger repair without depending on a particular host filesystem.
-None of these corpora represents a fully resident photo library that requires
-per-file case and Unicode probing.
+making every large benchmark row a filesystem object. Paired 1,000-row
+all-online clean corpora measure filesystem owner discovery and successful
+ledger creation. The cold v7 suite likewise retains 1,000- and 10,000-row
+unresolved-removal cases and adds a 1,000-row online-owner rekey case.
 
 The suite also does not yet benchmark contended sidecar publication: a durable
 XMP write holds SQLite's immediate transaction, so a slow external volume can
