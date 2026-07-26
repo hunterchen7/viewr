@@ -285,18 +285,32 @@ jobs:
             -Platform "${{ matrix.portable_platform }}" `
             -ArchivePath $archive `
             -ExpectedBinaryPath "target/${{ matrix.target }}/release/viewr.exe"
-          $productionHash = (
-            Get-FileHash `
-              -LiteralPath "dist/${{ matrix.archive }}" `
-              -Algorithm SHA256
-          ).Hash
-          $pwsh7Hash = (
+          $reproducibleDirectory = Join-Path `
+            $archiveDirectory `
+            "reproducible"
+          New-Item `
+            -ItemType Directory `
+            -Path $reproducibleDirectory `
+            -Force | Out-Null
+          $reproducibleArchive = Join-Path `
+            $reproducibleDirectory `
+            "${{ matrix.archive }}"
+          ./scripts/package-portable-archive.ps1 `
+            -Platform "${{ matrix.portable_platform }}" `
+            -BinaryPath "target/${{ matrix.target }}/release/viewr.exe" `
+            -OutputPath $reproducibleArchive
+          $firstHash = (
             Get-FileHash `
               -LiteralPath $archive `
               -Algorithm SHA256
           ).Hash
-          if ($productionHash -cne $pwsh7Hash) {
-            throw "PowerShell 5.1 and 7 archive builds are not identical."
+          $secondHash = (
+            Get-FileHash `
+              -LiteralPath $reproducibleArchive `
+              -Algorithm SHA256
+          ).Hash
+          if ($firstHash -cne $secondHash) {
+            throw "Repeated PowerShell 7 archive builds are not reproducible."
           }
       - name: Build and validate macOS installer
         if: ${{ !cancelled() && runner.os == 'macOS' && steps.build_viewr.outcome == 'success' }}

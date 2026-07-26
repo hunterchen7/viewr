@@ -171,8 +171,9 @@ On Windows, run:
 ```
 
 The Windows validator requires 7-Zip on `PATH`. CI builds and validates the
-same archive under Windows PowerShell 5.1 and PowerShell 7 and requires
-byte-identical output.
+archive under Windows PowerShell 5.1 and PowerShell 7. Repeated builds must be
+byte-identical within each runtime; both runtimes must produce the same exact
+validated file set and contents.
 
 The validators require the exact binary and license file set. They reject
 extra files, changed file contents, and an incorrect binary architecture. The
