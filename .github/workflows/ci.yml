@@ -23,7 +23,7 @@ jobs:
       - name: Linux build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+          sudo apt-get install -y jq libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
       - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
         with:
           components: rustfmt, clippy
@@ -40,6 +40,8 @@ jobs:
           cargo fetch --locked --target x86_64-unknown-linux-gnu
       - name: Validate third-party license inventories
         run: scripts/validate-third-party-licenses.sh
+      - name: Test release asset verification
+        run: scripts/test-verify-remote-release-assets.sh
       - name: Format
         run: cargo fmt --all --check
       - name: Lint all targets and features

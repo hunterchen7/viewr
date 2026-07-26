@@ -1,16 +1,74 @@
-# Builds and attaches versioned archives and native installers when
-# release-please creates a GitHub release.
+# Builds, validates, and attaches versioned archives and native installers to
+# a draft release. The release becomes public only after every check passes.
 name: Release binaries
+run-name: Release binaries for ${{ inputs.release_tag }}
 on:
-  release:
-    types: [created]
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Existing draft release tag to build and publish
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing draft release tag to build and publish
+        required: true
+        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: release-binaries-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
 jobs:
+  gate:
+    name: Validate release request
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.release_tag }}
+      - name: Match workflow provenance to the release tag
+        env:
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          release_sha="$(git rev-parse HEAD)"
+          if [[ "$release_sha" != "$WORKFLOW_SHA" ]]; then
+            echo "::error::Workflow commit $WORKFLOW_SHA does not match release commit $release_sha."
+            echo "::error::Manually dispatch this workflow with --ref set to the release tag."
+            exit 1
+          fi
+      - name: Require an existing draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [[ ! "$VIEWR_RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Release tag is not a stable semantic version: $VIEWR_RELEASE_TAG"
+            exit 1
+          fi
+
+          release_json="$(
+            gh release view \
+              "$VIEWR_RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isDraft,tagName
+          )"
+          if ! jq -e \
+            --arg tag "$VIEWR_RELEASE_TAG" \
+            '.tagName == $tag and .isDraft == true' \
+            <<< "$release_json" >/dev/null; then
+            echo "::error::Release $VIEWR_RELEASE_TAG must exist and remain a draft."
+            exit 1
+          fi
+
   packages:
     name: Release assets (${{ matrix.platform }})
+    needs: gate
     strategy:
       fail-fast: false
       matrix:
@@ -34,6 +92,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.release_tag }}
       - name: Linux build and package dependencies
         if: runner.os == 'Linux'
         run: |
@@ -97,7 +157,7 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         env:
-          VIEWR_RELEASE_TAG: ${{ github.event.release.tag_name }}
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           scripts/package-macos-pkg.sh \
             target/${{ matrix.target }}/release/viewr \
@@ -109,7 +169,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          VIEWR_RELEASE_TAG: ${{ github.event.release.tag_name }}
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           ./scripts/build-windows-msi.ps1 `
             -BinaryPath "target/${{ matrix.target }}/release/viewr.exe" `
@@ -123,7 +183,7 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         env:
-          VIEWR_RELEASE_TAG: ${{ github.event.release.tag_name }}
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           scripts/package-linux-deb.sh \
             --binary target/${{ matrix.target }}/release/viewr \
@@ -143,10 +203,13 @@ jobs:
 
   source:
     name: Release source
+    needs: gate
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.release_tag }}
       - name: Linux source-validation dependencies
         run: |
           sudo apt-get update
@@ -171,7 +234,7 @@ jobs:
         run: scripts/validate-third-party-licenses.sh
       - name: Build and validate vendored source archive
         env:
-          VIEWR_RELEASE_TAG: ${{ github.event.release.tag_name }}
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           scripts/package-source-archive.sh dist
           scripts/validate-source-archive.sh dist/viewr-*-source.tar.gz
@@ -185,16 +248,34 @@ jobs:
 
   publish:
     name: Publish release assets
-    needs: [packages, source]
+    needs: [gate, packages, source]
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     permissions:
+      actions: read
       contents: write
       id-token: write
       attestations: write
       artifact-metadata: write
     steps:
+      - name: Require release to remain a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [[ "$(
+            gh release view \
+              "$VIEWR_RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isDraft \
+              --jq '.isDraft'
+          )" != "true" ]]; then
+            echo "::error::Release $VIEWR_RELEASE_TAG is no longer a draft."
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.release_tag }}
       - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
       - name: Download release assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -204,7 +285,7 @@ jobs:
           merge-multiple: true
       - name: Verify assets and write checksums
         env:
-          VIEWR_RELEASE_TAG: ${{ github.event.release.tag_name }}
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           scripts/verify-release-assets.sh \
             dist \
@@ -212,7 +293,7 @@ jobs:
       - name: Reject unexpected existing release assets
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
-          VIEWR_RELEASE_TAG: ${{ github.event.release.tag_name }}
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
           GH_TOKEN: ${{ github.token }}
         run: |
           scripts/verify-remote-release-assets.sh \
@@ -230,7 +311,7 @@ jobs:
       - name: Upload all release assets
         env:
           GH_TOKEN: ${{ github.token }}
-          VIEWR_RELEASE_TAG: ${{ github.event.release.tag_name }}
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           gh release upload \
             "$VIEWR_RELEASE_TAG" \
@@ -239,9 +320,19 @@ jobs:
       - name: Verify published release assets
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
-          VIEWR_RELEASE_TAG: ${{ github.event.release.tag_name }}
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
           GH_TOKEN: ${{ github.token }}
         run: |
           scripts/verify-remote-release-assets.sh \
             dist \
             "$VIEWR_RELEASE_TAG"
+      - name: Publish validated release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          gh release edit \
+            "$VIEWR_RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --verify-tag

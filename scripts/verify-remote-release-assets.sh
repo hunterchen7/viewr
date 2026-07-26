@@ -35,17 +35,27 @@ command -v gh >/dev/null 2>&1 || {
   echo "gh is required" >&2
   exit 1
 }
+command -v jq >/dev/null 2>&1 || {
+  echo "jq is required" >&2
+  exit 1
+}
 
 local_names="$(
   find "$asset_dir" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; |
     LC_ALL=C sort
 )"
-remote_names="$(
+remote_json="$(
   gh release view \
     "$release_tag" \
     --repo "$repository" \
-    --json assets \
-    --jq '.assets[].name' |
+    --json assets
+)"
+if ! jq -e '.assets | type == "array"' <<< "$remote_json" >/dev/null; then
+  echo "GitHub did not return a release asset array" >&2
+  exit 1
+fi
+remote_names="$(
+  jq -r '.assets[].name' <<< "$remote_json" |
     LC_ALL=C sort
 )"
 
@@ -69,6 +79,49 @@ elif [[ "$local_names" != "$remote_names" ]]; then
     <(printf '%s\n' "$local_names") \
     <(printf '%s\n' "$remote_names") >&2 || true
   exit 1
+fi
+
+if [[ "$allow_missing" == "0" && -n "$local_names" ]]; then
+  if command -v sha256sum >/dev/null 2>&1; then
+    checksum_command=(sha256sum)
+  elif command -v shasum >/dev/null 2>&1; then
+    checksum_command=(shasum -a 256)
+  else
+    echo "sha256sum or shasum is required" >&2
+    exit 1
+  fi
+
+  while IFS= read -r asset_name; do
+    asset_json="$(
+      jq -cer \
+        --arg name "$asset_name" \
+        '
+          [.assets[] | select(.name == $name)]
+          | if length == 1 then .[0]
+            else error("expected one matching remote release asset")
+            end
+        ' \
+        <<< "$remote_json"
+    )"
+    remote_state="$(jq -er '.state' <<< "$asset_json")"
+    remote_size="$(jq -er '.size' <<< "$asset_json")"
+    remote_digest="$(jq -er '.digest | strings' <<< "$asset_json")"
+    local_size="$(wc -c < "$asset_dir/$asset_name" | tr -d '[:space:]')"
+    local_digest="sha256:$("${checksum_command[@]}" "$asset_dir/$asset_name" | awk '{print $1}')"
+
+    if [[ "$remote_state" != "uploaded" ]]; then
+      echo "remote release asset is not uploaded: $asset_name ($remote_state)" >&2
+      exit 1
+    fi
+    if [[ "$remote_size" != "$local_size" ]]; then
+      echo "remote release asset size does not match: $asset_name" >&2
+      exit 1
+    fi
+    if [[ "$remote_digest" != "$local_digest" ]]; then
+      echo "remote release asset digest does not match: $asset_name" >&2
+      exit 1
+    fi
+  done <<< "$local_names"
 fi
 
 echo "Verified remote assets for $repository release $release_tag"

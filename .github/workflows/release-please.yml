@@ -3,10 +3,7 @@ on:
   push:
     branches: [main]
 
-permissions:
-  actions: write
-  contents: write
-  pull-requests: write
+permissions: {}
 
 concurrency:
   group: release-please-${{ github.ref }}
@@ -15,6 +12,14 @@ concurrency:
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
       - id: release
         uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
@@ -72,3 +77,17 @@ jobs:
           RELEASE_BRANCH: ${{ steps.release_pr.outputs.branch }}
         # GITHUB_TOKEN pushes do not trigger push workflows, but dispatches do.
         run: gh workflow run ci.yml --ref "$RELEASE_BRANCH"
+
+  release-assets:
+    name: Validate and publish release
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    permissions:
+      actions: read
+      artifact-metadata: write
+      attestations: write
+      contents: write
+      id-token: write
+    uses: ./.github/workflows/release-binaries.yml
+    with:
+      release_tag: ${{ needs.release-please.outputs.tag_name }}

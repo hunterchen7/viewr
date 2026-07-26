@@ -169,15 +169,33 @@ Rust standard-library inventory matches the pinned toolchain.
 
 ## Release publication
 
-The release workflow starts after release-please creates a GitHub release.
+Release-please creates a draft release and its tag, then calls the release
+workflow directly. A repository-token release event is not used because those
+events do not start another GitHub Actions workflow. The release workflow can
+also be run manually for an existing draft tag.
+
 Three isolated jobs build and validate the platform files. A fourth job builds
 and validates the source archive.
 
 The publication job starts only after all four jobs pass. It checks the exact
-local and remote file sets, creates `SHA256SUMS`, creates GitHub provenance
-attestations for every artifact and for the checksum manifest, and uploads all
-files in one release command. Every external GitHub Action is pinned to a
-reviewed commit.
+local and remote file sets and every remote SHA-256 digest, creates
+`SHA256SUMS`, creates GitHub provenance attestations for every artifact and for
+the checksum manifest, and uploads all files in one release command. A
+per-tag concurrency lock prevents two publication attempts from interleaving.
+The workflow publishes the draft only after the final remote verification
+passes. Every external GitHub Action is pinned to a reviewed commit.
+
+To retry a failed draft release, dispatch the workflow at the release tag:
+
+```bash
+release_tag=v0.2.0
+gh workflow run release-binaries.yml \
+  --ref "$release_tag" \
+  -f release_tag="$release_tag"
+```
+
+The workflow rejects a release tag whose commit does not match the workflow
+invocation commit. This keeps artifact provenance tied to the released source.
 
 Verify an attestation with:
 
