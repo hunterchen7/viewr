@@ -73,7 +73,9 @@ Download one of these files from
   `viewr-linux-x64.deb`.
 
 Portable `.tar.gz` and `.zip` files remain available. The installers register
-Viewr as an ARW viewer. The installers do not change the default viewer.
+Viewr as an ARW viewer without overwriting an explicit default. On a macOS
+account without an explicit ARW choice, Launch Services can infer Viewr as the
+default while it is installed.
 
 The current release packages are unsigned preview installers. They do not have
 Apple Developer ID or Windows Authenticode signatures. macOS Gatekeeper or

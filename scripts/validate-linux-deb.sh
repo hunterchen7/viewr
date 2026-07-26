@@ -64,6 +64,8 @@ grep -Eq '(^|, )shared-mime-info([[:space:](,]|$)' <<<"${dependencies}" \
     || fail "package does not depend on shared-mime-info"
 grep -Eq '(^|, )desktop-file-utils([[:space:](,]|$)' <<<"${dependencies}" \
     || fail "package does not depend on desktop-file-utils"
+grep -Eq '(^|, )xdg-utils([[:space:](,]|$)' <<<"${dependencies}" \
+    || fail "package does not depend on xdg-utils"
 
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/viewr-deb-validation.XXXXXXXX")"
 cleanup() {

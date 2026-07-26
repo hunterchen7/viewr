@@ -206,7 +206,7 @@ shlibs_depends="${shlibs_output#shlibs:Depends=}"
     || fail "dpkg-shlibdeps did not produce dependency metadata"
 depends="$(
     printf '%s\n' \
-        "${shlibs_depends}, desktop-file-utils, libvulkan1, shared-mime-info" \
+        "${shlibs_depends}, desktop-file-utils, libvulkan1, shared-mime-info, xdg-utils" \
         | tr ',' '\n' \
         | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
         | sed '/^$/d' \
