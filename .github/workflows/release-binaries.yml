@@ -29,19 +29,6 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ inputs.release_tag }}
-      - name: Match workflow provenance to the release tag
-        env:
-          WORKFLOW_SHA: ${{ github.sha }}
-        run: |
-          release_sha="$(git rev-parse HEAD)"
-          if [[ "$release_sha" != "$WORKFLOW_SHA" ]]; then
-            echo "::error::Workflow commit $WORKFLOW_SHA does not match release commit $release_sha."
-            echo "::error::Manually dispatch this workflow with --ref set to the release tag."
-            exit 1
-          fi
       - name: Require an existing draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -63,6 +50,19 @@ jobs:
             '.tagName == $tag and .isDraft == true' \
             <<< "$release_json" >/dev/null; then
             echo "::error::Release $VIEWR_RELEASE_TAG must exist and remain a draft."
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: refs/tags/${{ inputs.release_tag }}
+      - name: Match workflow provenance to the release tag
+        env:
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          release_sha="$(git rev-parse HEAD)"
+          if [[ "$release_sha" != "$WORKFLOW_SHA" ]]; then
+            echo "::error::Workflow commit $WORKFLOW_SHA does not match release commit $release_sha."
+            echo "::error::Manually dispatch this workflow with --ref set to the release tag."
             exit 1
           fi
 
@@ -93,7 +93,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.release_tag }}
+          ref: refs/tags/${{ inputs.release_tag }}
       - name: Linux build and package dependencies
         if: runner.os == 'Linux'
         run: |
@@ -209,7 +209,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.release_tag }}
+          ref: refs/tags/${{ inputs.release_tag }}
       - name: Linux source-validation dependencies
         run: |
           sudo apt-get update
@@ -275,7 +275,7 @@ jobs:
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.release_tag }}
+          ref: refs/tags/${{ inputs.release_tag }}
       - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
       - name: Download release assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
