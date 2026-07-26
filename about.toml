@@ -1,0 +1,40 @@
+# This policy covers the dependency union shipped for the three release targets.
+# Keep the list explicit: adding a dependency under another license must fail until
+# that license is reviewed and deliberately added here.
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+]
+
+# Release binaries contain build and transitive dependencies, so only dependencies
+# used exclusively for development are excluded.
+ignore-build-dependencies = false
+ignore-dev-dependencies = true
+ignore-transitive-dependencies = false
+
+# Keep reciprocal and component-specific terms scoped to the crates that require
+# them. A new crate under one of these licenses must receive a separate review.
+[epaint_default_fonts]
+accepted = ["OFL-1.1", "Ubuntu-font-1.0"]
+
+[jpeg-encoder]
+accepted = ["IJG"]
+
+[option-ext]
+accepted = ["MPL-2.0"]
+
+[rawler]
+accepted = ["LGPL-2.1"]

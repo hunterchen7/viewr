@@ -1,0 +1,34 @@
+Viewr Third-Party Rust Dependency Licenses
+==========================================
+
+This file lists the Rust crates included by at least one supported release target:
+aarch64-apple-darwin, x86_64-pc-windows-msvc, or x86_64-unknown-linux-gnu.
+Dependencies used only for development are not included.
+
+Components
+==========
+{{#each crates}}
+{{#if package.source}}
+{{package.name}} {{package.version}}
+License: {{license}}
+{{#if package.repository}}Source: {{package.repository}}
+{{else}}Source: https://crates.io/crates/{{package.name}}
+{{/if}}
+{{/if}}
+{{/each}}
+License Texts
+=============
+{{#each licenses}}
+------------------------------------------------------------------------------
+{{name}}
+
+Used by:
+{{#each used_by}}
+{{#if crate.source}}
+- {{crate.name}} {{crate.version}}
+{{/if}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}
