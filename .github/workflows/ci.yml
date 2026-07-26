@@ -76,13 +76,23 @@ jobs:
             579a485b5126a25cbd55cbd5dadfa7d09cf021c99cc7d4869f9e56e3f759390b \
             "$VIEWR_TEST_RAW" |
             sha256sum --check -
+          test_log="$RUNNER_TEMP/viewr-real-raw-tests.log"
           cargo test \
             -p viewr-core \
+            --lib \
             --release \
             --locked \
             real_sony_raw_ \
             -- \
-            --ignored
+            --ignored \
+            --test-threads=1 2>&1 |
+            tee "$test_log"
+          if ! grep -Fq \
+            "test result: ok. 3 passed; 0 failed; 0 ignored;" \
+            "$test_log"; then
+            echo "::error::Expected exactly three pinned real-RAW tests to pass."
+            exit 1
+          fi
       - name: Smoke-test optimized benchmark harnesses
         if: ${{ !cancelled() }}
         run: |

@@ -27,7 +27,7 @@ jobs:
   gate:
     name: Validate release request
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    timeout-minutes: 120
     permissions:
       actions: read
       contents: read
@@ -77,7 +77,7 @@ jobs:
         run: |
           ci_run_id=""
           for _ in $(seq 1 60); do
-            ci_run_id="$(
+            if ! ci_run_id="$(
               gh run list \
                 --repo "$GITHUB_REPOSITORY" \
                 --workflow ci.yml \
@@ -86,7 +86,10 @@ jobs:
                 --limit 1 \
                 --json databaseId \
                 --jq '.[0].databaseId // empty'
-            )"
+            )"; then
+              echo "::warning::Could not query CI yet; retrying."
+              ci_run_id=""
+            fi
             if [[ -n "$ci_run_id" ]]; then
               break
             fi
