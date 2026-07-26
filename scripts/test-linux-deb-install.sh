@@ -95,6 +95,8 @@ cleanup() {
   exit "$original_status"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 export XDG_CONFIG_HOME="$temporary_state/config"
 export XDG_DATA_HOME="$temporary_state/data"

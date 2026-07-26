@@ -148,6 +148,8 @@ cleanup() {
     exit "$original_status"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 signature_report="$work_dir/package-signature.txt"
 if pkgutil --check-signature "$pkg" >"$signature_report" 2>&1; then
