@@ -107,6 +107,132 @@ pub fn normalize_physical_path(path: &Path) -> PathBuf {
     absolute
 }
 
+/// Returns whether a stored path already names its normalized physical
+/// spelling, allowing only Windows' ordinary-to-verbatim namespace prefix.
+///
+/// Older Windows releases stored paths such as `C:\photos\image.ARW`, while
+/// [`std::fs::canonicalize`] returns `\\?\C:\photos\image.ARW`. That prefix
+/// change is not an alias. Every remaining component must still match exactly
+/// so junctions, symlinks, case changes, and drive-relative paths remain
+/// untrusted legacy history.
+pub(crate) fn path_spelling_is_stable(stored: &Path, normalized: &Path) -> bool {
+    if stored.as_os_str() == normalized.as_os_str() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        differs_only_by_windows_verbatim_prefix(stored, normalized)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg(windows)]
+fn differs_only_by_windows_verbatim_prefix(stored: &Path, normalized: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::path::{Component, Prefix};
+
+    let mut stored_components = stored.components();
+    let mut normalized_components = normalized.components();
+    let (Some(Component::Prefix(stored_prefix)), Some(Component::Prefix(normalized_prefix))) =
+        (stored_components.next(), normalized_components.next())
+    else {
+        return false;
+    };
+    let prefix_matches = match (stored_prefix.kind(), normalized_prefix.kind()) {
+        (Prefix::Disk(stored_drive), Prefix::VerbatimDisk(normalized_drive)) => {
+            stored_drive.eq_ignore_ascii_case(&normalized_drive)
+        }
+        (
+            Prefix::UNC(stored_server, stored_share),
+            Prefix::VerbatimUNC(normalized_server, normalized_share),
+        ) => stored_server == normalized_server && stored_share == normalized_share,
+        _ => false,
+    };
+    if !prefix_matches {
+        return false;
+    }
+    let stored_prefix_len = stored_prefix.as_os_str().encode_wide().count();
+    let normalized_prefix_len = normalized_prefix.as_os_str().encode_wide().count();
+    let stored_units = stored.as_os_str().encode_wide().collect::<Vec<_>>();
+    let normalized_units = normalized.as_os_str().encode_wide().collect::<Vec<_>>();
+    stored_units[stored_prefix_len..] == normalized_units[normalized_prefix_len..]
+}
+
+/// Returns the exact ordinary Windows spellings that older releases could
+/// have stored for one current verbatim path.
+///
+/// Drive letters are returned in both ASCII cases because Windows treats
+/// those prefixes case-insensitively. UNC server/share spelling and every
+/// code unit after the prefix are preserved exactly.
+pub(crate) fn legacy_windows_path_spellings(path: &Path) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+        use std::path::{Component, Prefix};
+
+        let Some(Component::Prefix(prefix)) = path.components().next() else {
+            return Vec::new();
+        };
+        let path_units = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        let prefix_len = prefix.as_os_str().encode_wide().count();
+        let tail = &path_units[prefix_len..];
+        match prefix.kind() {
+            Prefix::VerbatimDisk(drive) => {
+                let mut spellings = Vec::with_capacity(2);
+                for drive in [drive.to_ascii_uppercase(), drive.to_ascii_lowercase()] {
+                    let mut units = vec![u16::from(drive), u16::from(b':')];
+                    units.extend_from_slice(tail);
+                    let spelling = PathBuf::from(OsString::from_wide(&units));
+                    if spellings
+                        .iter()
+                        .all(|existing: &PathBuf| existing.as_os_str() != spelling.as_os_str())
+                    {
+                        spellings.push(spelling);
+                    }
+                }
+                spellings
+            }
+            Prefix::VerbatimUNC(server, share) => {
+                let mut units = vec![u16::from(b'\\'), u16::from(b'\\')];
+                units.extend(server.encode_wide());
+                units.push(u16::from(b'\\'));
+                units.extend(share.encode_wide());
+                units.extend_from_slice(tail);
+                vec![PathBuf::from(OsString::from_wide(&units))]
+            }
+            _ => Vec::new(),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Vec::new()
+    }
+}
+
+/// Returns every exact database spelling in the compatible representation
+/// family for a normalized path.
+///
+/// The first element is always `path`. On Windows, a verbatim drive or UNC
+/// path is followed by the ordinary spellings that older releases stored.
+/// Callers compare the raw [`OsStr`] values so `Path` component normalization
+/// cannot merge distinct database keys.
+pub(crate) fn path_spelling_family(path: &Path) -> Vec<PathBuf> {
+    let mut family = vec![path.to_path_buf()];
+    for spelling in legacy_windows_path_spellings(path) {
+        if family
+            .iter()
+            .all(|existing| existing.as_os_str() != spelling.as_os_str())
+        {
+            family.push(spelling);
+        }
+    }
+    family
+}
+
 /// Returns the database/in-memory ownership key for a RAW's XMP target.
 ///
 /// The containing directory is probed rather than inferred from the operating
@@ -134,7 +260,7 @@ pub(crate) fn raw_path_from_sidecar_owner(
         )
     })?;
     let raw = normalize_physical_path(&owner.with_extension(extension));
-    if sidecar_owner_key(&raw)? != owner {
+    if sidecar_owner_key(&raw)?.as_os_str() != owner.as_os_str() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "reconstructed RAW does not match its sidecar owner",
@@ -471,6 +597,8 @@ pub fn outward_order(len: usize, start: usize) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::{legacy_windows_path_spellings, path_spelling_family, path_spelling_is_stable};
     use super::{
         normalize_physical_path, outward_order, scan, sidecar_owner_collision_token,
         sidecar_owner_key, sidecar_owner_keys,
@@ -591,6 +719,116 @@ mod tests {
         assert_eq!(
             scan(&alias).unwrap()[0].path,
             scan(&physical).unwrap()[0].path
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stable_windows_spelling_accepts_only_a_verbatim_prefix_change() {
+        use std::path::Path;
+
+        assert!(path_spelling_is_stable(
+            Path::new(r"C:\photos\photo.ARW"),
+            Path::new(r"\\?\c:\photos\photo.ARW"),
+        ));
+        assert!(path_spelling_is_stable(
+            Path::new(r"\\server\share\photos\photo.ARW"),
+            Path::new(r"\\?\UNC\server\share\photos\photo.ARW"),
+        ));
+        assert!(!path_spelling_is_stable(
+            Path::new(r"C:\alias\photo.ARW"),
+            Path::new(r"\\?\C:\physical\photo.ARW"),
+        ));
+        assert!(!path_spelling_is_stable(
+            Path::new(r"C:\Photos\photo.ARW"),
+            Path::new(r"\\?\C:\photos\photo.ARW"),
+        ));
+        assert!(!path_spelling_is_stable(
+            Path::new(r"C:\photos\.\photo.ARW"),
+            Path::new(r"\\?\C:\photos\photo.ARW"),
+        ));
+        assert!(!path_spelling_is_stable(
+            Path::new(r"C:/photos/photo.ARW"),
+            Path::new(r"\\?\C:\photos\photo.ARW"),
+        ));
+        assert!(!path_spelling_is_stable(
+            Path::new(r"\photos\photo.ARW"),
+            Path::new(r"\\?\C:\photos\photo.ARW"),
+        ));
+        assert!(!path_spelling_is_stable(
+            Path::new(r"\\.\C:\photos\photo.ARW"),
+            Path::new(r"\\?\C:\photos\photo.ARW"),
+        ));
+        assert!(!path_spelling_is_stable(
+            Path::new(r"\\?\C:\photos\\photo.ARW"),
+            Path::new(r"\\?\C:\photos\photo.ARW"),
+        ));
+        assert!(!path_spelling_is_stable(
+            Path::new(r"\\?\C:\photos\.\photo.ARW"),
+            Path::new(r"\\?\C:\photos\photo.ARW"),
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_windows_spellings_rewrite_only_the_verbatim_prefix_losslessly() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+        use std::path::{Path, PathBuf};
+
+        let drive_spellings = legacy_windows_path_spellings(Path::new(r"\\?\C:\photos\photo.ARW"));
+        assert_eq!(drive_spellings.len(), 2);
+        assert_eq!(
+            drive_spellings[0]
+                .as_os_str()
+                .encode_wide()
+                .collect::<Vec<_>>(),
+            r"C:\photos\photo.ARW".encode_utf16().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            drive_spellings[1]
+                .as_os_str()
+                .encode_wide()
+                .collect::<Vec<_>>(),
+            r"c:\photos\photo.ARW".encode_utf16().collect::<Vec<_>>()
+        );
+        assert_ne!(
+            drive_spellings[0].as_os_str(),
+            drive_spellings[1].as_os_str()
+        );
+        assert_eq!(
+            legacy_windows_path_spellings(Path::new(r"\\?\UNC\server\share\photos\photo.ARW")),
+            [PathBuf::from(r"\\server\share\photos\photo.ARW")]
+        );
+        assert!(legacy_windows_path_spellings(Path::new(r"\\?\Volume{abc}\photo.ARW")).is_empty());
+        assert!(legacy_windows_path_spellings(Path::new(r"\\.\C:\photos\photo.ARW")).is_empty());
+
+        let mut malformed = r"\\?\C:\photos\".encode_utf16().collect::<Vec<_>>();
+        malformed.push(0xd800);
+        malformed.extend(".ARW".encode_utf16());
+        let malformed = PathBuf::from(OsString::from_wide(&malformed));
+        let ordinary = legacy_windows_path_spellings(&malformed);
+        assert_eq!(ordinary.len(), 2);
+        let ordinary_units = ordinary[0].as_os_str().encode_wide().collect::<Vec<_>>();
+        assert_eq!(
+            &ordinary_units[2..],
+            &malformed.as_os_str().encode_wide().collect::<Vec<_>>()[6..]
+        );
+        assert!(path_spelling_is_stable(&ordinary[0], &malformed));
+        let family = path_spelling_family(Path::new(r"\\?\C:\photos\photo.ARW"));
+        assert_eq!(family.len(), 3);
+        assert_eq!(
+            family
+                .iter()
+                .map(|path| path.as_os_str().encode_wide().collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            [
+                r"\\?\C:\photos\photo.ARW"
+                    .encode_utf16()
+                    .collect::<Vec<_>>(),
+                r"C:\photos\photo.ARW".encode_utf16().collect::<Vec<_>>(),
+                r"c:\photos\photo.ARW".encode_utf16().collect::<Vec<_>>(),
+            ]
         );
     }
 

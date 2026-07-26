@@ -20,8 +20,9 @@ use crate::db::{
     RatingOwnerSnapshot, configured_db_path,
 };
 use crate::folder::{
-    FolderEntry, normalize_physical_path, raw_path_from_sidecar_owner,
-    sidecar_owner_collision_token, sidecar_owner_key, sidecar_owner_keys,
+    FolderEntry, normalize_physical_path, path_spelling_family, path_spelling_is_stable,
+    raw_path_from_sidecar_owner, sidecar_owner_collision_token, sidecar_owner_key,
+    sidecar_owner_keys,
 };
 use crate::xmp;
 
@@ -179,13 +180,22 @@ fn resolve_rating_snapshot(
     let entry_by_path = entries
         .iter()
         .enumerate()
-        .map(|(index, entry)| (entry.path.as_path(), index))
+        .map(|(index, entry)| (entry.path.as_os_str(), index))
         .collect::<HashMap<_, _>>();
     let mut fallback_by_owner = HashMap::<PathBuf, Vec<_>>::new();
     let mut rejected_legacy_history_tokens = HashSet::new();
     for row in snapshot.by_path.values() {
-        if snapshot.legacy_owners_require_derivation
-            && (normalize_physical_path(&row.path) != row.path
+        let normalized = normalize_physical_path(&row.path);
+        let requires_owner_derivation =
+            snapshot.legacy_owners_require_derivation || row.has_ownerless_identity();
+        let representation_has_newer_history = path_spelling_is_stable(&row.path, &normalized)
+            && path_spelling_family(&normalized).iter().any(|candidate| {
+                candidate.as_os_str() != row.path.as_os_str()
+                    && snapshot.legacy_path_history.contains(candidate.as_os_str())
+            });
+        if requires_owner_derivation
+            && (!path_spelling_is_stable(&row.path, &normalized)
+                || representation_has_newer_history
                 || sidecar_owner_key(&row.path).is_err())
         {
             // Legacy schemas did not retain proof of the physical owner seen
@@ -198,20 +208,42 @@ fn resolve_rating_snapshot(
             }
             continue;
         }
-        let (derived_owner, identity_matches) =
-            if let Some(index) = entry_by_path.get(row.path.as_path()) {
-                (
-                    owners[*index].clone(),
-                    entries[*index].size == row.size && entries[*index].mtime_ns == row.mtime_ns,
-                )
-            } else if row.sidecar_dirty || snapshot.legacy_owners_require_derivation {
-                (
-                    sidecar_owner_key(&row.path).ok(),
-                    current_raw_identity(&row.path).ok() == Some((row.size, row.mtime_ns)),
-                )
-            } else {
-                (None, false)
-            };
+        let matching_entry = entry_by_path
+            .get(row.path.as_os_str())
+            .copied()
+            .or_else(|| {
+                path_spelling_is_stable(&row.path, &normalized)
+                    .then(|| entry_by_path.get(normalized.as_os_str()).copied())
+                    .flatten()
+            });
+        let (derived_owner, identity_matches) = if let Some(index) = matching_entry {
+            (
+                owners[index].clone(),
+                entries[index].size == row.size && entries[index].mtime_ns == row.mtime_ns,
+            )
+        } else if row.sidecar_dirty || requires_owner_derivation {
+            (
+                sidecar_owner_key(&row.path).ok(),
+                current_raw_identity(&row.path).ok() == Some((row.size, row.mtime_ns)),
+            )
+        } else {
+            (None, false)
+        };
+        let target_owner_has_separate_history = requires_owner_derivation
+            && derived_owner.as_ref().is_some_and(|owner| {
+                path_spelling_family(owner).iter().any(|candidate| {
+                    snapshot
+                        .legacy_owner_history
+                        .contains(candidate.as_os_str())
+                        && row
+                            .legacy_sidecar_owner
+                            .as_ref()
+                            .is_none_or(|stored| stored.as_os_str() != candidate.as_os_str())
+                })
+            });
+        if target_owner_has_separate_history {
+            continue;
+        }
         if let Some(derived_owner) = derived_owner
             && (row.sidecar_owner.is_none() || snapshot.legacy_owners_require_derivation)
             && row.sidecar_owner.as_ref() != Some(&derived_owner)
@@ -224,21 +256,11 @@ fn resolve_rating_snapshot(
     }
 
     for (owner, members) in members_by_owner {
-        if sidecar_owner_collision_token(&owner)
-            .is_some_and(|token| rejected_legacy_history_tokens.contains(&token))
-        {
-            if let Some(rating) = sidecar_mtime_ns(&entries[members[0]].sidecar_path())
-                .and_then(|_| xmp::read_rating(&entries[members[0]].sidecar_path()))
-            {
-                install_group_rating(&mut out, &members, rating);
-            }
-            continue;
-        }
         let owned = snapshot.by_owner.get(&owner).filter(|row| {
             members
                 .iter()
                 .map(|index| &entries[*index])
-                .find(|entry| entry.path == row.path)
+                .find(|entry| entry.path.as_os_str() == row.path.as_os_str())
                 .map_or_else(
                     || stored_owner_identity_matches(&owner, row),
                     |entry| entry.size == row.size && entry.mtime_ns == row.mtime_ns,
@@ -263,6 +285,17 @@ fn resolve_rating_snapshot(
                 .and_then(|_| xmp::read_rating(&sidecar))
                 .or(owned.rating);
             if let Some(rating) = rating {
+                install_group_rating(&mut out, &members, rating);
+            }
+            continue;
+        }
+
+        if sidecar_owner_collision_token(&owner)
+            .is_some_and(|token| rejected_legacy_history_tokens.contains(&token))
+        {
+            if let Some(rating) = sidecar_mtime_ns(&entries[members[0]].sidecar_path())
+                .and_then(|_| xmp::read_rating(&entries[members[0]].sidecar_path()))
+            {
                 install_group_rating(&mut out, &members, rating);
             }
             continue;
@@ -313,13 +346,14 @@ fn resolve_rating_snapshot(
         let row = snapshot
             .by_path
             .get(&entry.path)
+            .filter(|row| row.path.as_os_str() == entry.path.as_os_str())
             .filter(|row| row.size == entry.size && row.mtime_ns == entry.mtime_ns)
+            // Owner discovery is one startup snapshot. Retrying it here could
+            // let an ownerless row bypass the owner/path histories queried
+            // from the original `None` result. A current owned row remains
+            // safe to use by exact path because its durable owner is stored.
             .filter(|row| {
-                !snapshot.legacy_owners_require_derivation
-                    || (normalize_physical_path(&row.path) == row.path
-                        && sidecar_owner_key(&row.path).is_ok()
-                        && sidecar_owner_collision_token(&row.path)
-                            .is_none_or(|token| !rejected_legacy_history_tokens.contains(&token)))
+                !snapshot.legacy_owners_require_derivation && !row.has_ownerless_identity()
             });
         if let Some(rating) = row
             .filter(|row| row.sidecar_dirty)
@@ -348,7 +382,7 @@ fn stored_owner_identity_matches(
     row: &crate::db::StoredRatingRow,
 ) -> bool {
     let raw = match sidecar_owner_key(&row.path) {
-        Ok(current_owner) if current_owner == owner => row.path.clone(),
+        Ok(current_owner) if current_owner.as_os_str() == owner.as_os_str() => row.path.clone(),
         Ok(_) => return false,
         Err(_) => match raw_path_from_sidecar_owner(owner, &row.path) {
             Ok(raw) => raw,
@@ -1228,6 +1262,70 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn unresolved_owner_probe_cannot_bypass_a_known_owner_tombstone() {
+        let directory = tempfile::tempdir().unwrap();
+        let entry = entry(directory.path().join("photo.ARW"));
+        let owner = sidecar_owner_key(&entry.path).unwrap();
+        let row = crate::db::StoredRatingRow {
+            path: entry.path.clone(),
+            size: entry.size,
+            mtime_ns: entry.mtime_ns,
+            rating: Some(3),
+            sidecar_mtime_ns: 0,
+            sidecar_dirty: false,
+            sidecar_owner: None,
+            legacy_sidecar_owner: None,
+        };
+        let snapshot = crate::db::RatingSnapshot {
+            by_path: HashMap::from([(entry.path.clone(), row)]),
+            legacy_owner_history: HashSet::from([owner.as_os_str().to_os_string()]),
+            ..crate::db::RatingSnapshot::default()
+        };
+
+        let (ratings, _) = resolve_rating_snapshot(&[entry], vec![None], snapshot);
+        assert!(
+            ratings.is_empty(),
+            "a later successful single-path probe must not reinterpret the original owner snapshot"
+        );
+    }
+
+    #[test]
+    fn current_owned_dirty_row_outranks_rejected_ownerless_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let entry = entry(directory.path().join("photo.ARW"));
+        let owner = sidecar_owner_key(&entry.path).unwrap();
+        let rejected_path = directory.path().join("missing").join("photo.ARW");
+        let rejected = crate::db::StoredRatingRow {
+            path: rejected_path.clone(),
+            size: entry.size,
+            mtime_ns: entry.mtime_ns,
+            rating: Some(3),
+            sidecar_mtime_ns: 0,
+            sidecar_dirty: false,
+            sidecar_owner: None,
+            legacy_sidecar_owner: None,
+        };
+        let current = crate::db::StoredRatingRow {
+            path: entry.path.clone(),
+            size: entry.size,
+            mtime_ns: entry.mtime_ns,
+            rating: Some(5),
+            sidecar_mtime_ns: 0,
+            sidecar_dirty: true,
+            sidecar_owner: Some(owner.clone()),
+            legacy_sidecar_owner: None,
+        };
+        let snapshot = crate::db::RatingSnapshot {
+            by_path: HashMap::from([(rejected_path, rejected)]),
+            by_owner: HashMap::from([(owner.clone(), current)]),
+            ..crate::db::RatingSnapshot::default()
+        };
+
+        let (ratings, _) = resolve_rating_snapshot(&[entry], vec![Some(owner)], snapshot);
+        assert_eq!(ratings, HashMap::from([(0, 5)]));
     }
 
     #[test]

@@ -13,7 +13,8 @@ use rusqlite::types::{Type, Value, ValueRef};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior};
 
 use crate::folder::{
-    normalize_physical_path, raw_path_from_sidecar_owner, sidecar_owner_collision_token,
+    legacy_windows_path_spellings, normalize_physical_path, path_spelling_family,
+    path_spelling_is_stable, raw_path_from_sidecar_owner, sidecar_owner_collision_token,
     sidecar_owner_key,
 };
 
@@ -60,8 +61,7 @@ const LEGACY_OWNER_UPDATE_FENCE_SQL: &str = "CREATE TRIGGER images_reject_legacy
 const PENDING_SIDECAR_INDEX_SQL: &str = "CREATE INDEX images_pending_sidecars
     ON images(path)
  WHERE sidecar_dirty = 1
-   AND sidecar_quarantined = 0
-   AND rating IS NOT NULL";
+   AND sidecar_quarantined = 0";
 const UNOWNED_DIRTY_INSERT_FENCE_SQL: &str = "CREATE TRIGGER images_reject_unowned_dirty_insert
      BEFORE INSERT ON images
      WHEN NEW.sidecar_dirty = 1
@@ -248,6 +248,13 @@ pub(crate) struct StoredRatingRow {
     pub sidecar_mtime_ns: i64,
     pub sidecar_dirty: bool,
     pub sidecar_owner: Option<PathBuf>,
+    pub legacy_sidecar_owner: Option<PathBuf>,
+}
+
+impl StoredRatingRow {
+    pub(crate) fn has_ownerless_identity(&self) -> bool {
+        self.sidecar_owner.is_none() && self.legacy_sidecar_owner.is_none()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -255,6 +262,8 @@ pub(crate) struct RatingSnapshot {
     pub by_path: HashMap<PathBuf, StoredRatingRow>,
     pub by_owner: HashMap<PathBuf, StoredRatingRow>,
     pub legacy_owners_require_derivation: bool,
+    pub legacy_owner_history: HashSet<OsString>,
+    pub legacy_path_history: HashSet<OsString>,
 }
 
 #[derive(Debug)]
@@ -391,7 +400,7 @@ impl Db {
         let original = Path::new(path);
         let normalized = normalize_physical_path(original);
         self.get_image_path(&normalized).or_else(|| {
-            (normalized != original)
+            (normalized.as_os_str() != original.as_os_str())
                 .then(|| self.get_image_path(original))
                 .flatten()
         })
@@ -773,14 +782,18 @@ impl Db {
         } else {
             self.read_schema
         };
-        let path_keys = deduplicated_paths(paths);
-        let owner_keys = match (read_schema, full_legacy_scan) {
+        let mut path_keys = deduplicated_paths(paths);
+        extend_with_path_spelling_families(&mut path_keys);
+        let mut owner_keys = match (read_schema, full_legacy_scan) {
             (RatingReadSchema::LegacyOwner | RatingReadSchema::LegacyDirty, true) => Vec::new(),
             (RatingReadSchema::Owner, _) | (RatingReadSchema::LegacyOwner, false) => {
                 deduplicated_paths(owners.iter().filter_map(Option::as_deref))
             }
             (RatingReadSchema::LegacyDirty, false) => Vec::new(),
         };
+        if read_schema == RatingReadSchema::LegacyOwner {
+            extend_with_path_spelling_families(&mut owner_keys);
+        }
         let mut rows = HashMap::with_capacity(path_keys.len().saturating_add(owner_keys.len()));
         match read_schema {
             RatingReadSchema::LegacyDirty => {
@@ -840,11 +853,53 @@ impl Db {
                 }
             }
         }
+        let has_current_ownerless_rows = read_schema == RatingReadSchema::Owner
+            && rows.values().any(StoredRatingRow::has_ownerless_identity);
+        let needs_legacy_history =
+            read_schema != RatingReadSchema::Owner || has_current_ownerless_rows;
+        let legacy_owner_history = if needs_legacy_history
+            && schema_object_exists(&transaction, "table", "sidecar_owner_revisions")?
+        {
+            if full_legacy_scan {
+                query_all_sidecar_owner_revision_keys(&transaction)?
+            } else {
+                let mut owner_history_keys = owner_keys.clone();
+                owner_history_keys.extend(
+                    rows.values()
+                        .filter(|row| {
+                            read_schema != RatingReadSchema::Owner || row.has_ownerless_identity()
+                        })
+                        .filter_map(|row| sidecar_owner_key(&row.path).ok()),
+                );
+                owner_history_keys =
+                    deduplicated_paths(owner_history_keys.iter().map(PathBuf::as_path));
+                extend_with_path_spelling_families(&mut owner_history_keys);
+                query_sidecar_owner_revision_keys(&transaction, &owner_history_keys)?
+            }
+        } else {
+            HashSet::new()
+        };
+        let legacy_path_history = if needs_legacy_history
+            && schema_object_exists(&transaction, "table", "image_revisions")?
+        {
+            let mut path_history_keys = rows
+                .values()
+                .filter(|row| {
+                    read_schema != RatingReadSchema::Owner || row.has_ownerless_identity()
+                })
+                .map(|row| normalize_physical_path(&row.path))
+                .collect::<Vec<_>>();
+            path_history_keys = deduplicated_paths(path_history_keys.iter().map(PathBuf::as_path));
+            extend_with_path_spelling_families(&mut path_history_keys);
+            query_image_revision_keys(&transaction, &path_history_keys)?
+        } else {
+            HashSet::new()
+        };
         if read_schema == RatingReadSchema::LegacyOwner {
             // Pre-v8 owner spellings are only query hints. Filesystem-derived
             // identity remains authoritative for grouping these rows.
             for row in rows.values_mut() {
-                row.sidecar_owner = None;
+                row.legacy_sidecar_owner = row.sidecar_owner.take();
             }
         }
         transaction.commit()?;
@@ -853,6 +908,8 @@ impl Db {
             by_path: HashMap::with_capacity(rows.len()),
             by_owner: HashMap::with_capacity(owner_keys.len()),
             legacy_owners_require_derivation: read_schema != RatingReadSchema::Owner,
+            legacy_owner_history,
+            legacy_path_history,
         };
         for row in rows.into_values() {
             snapshot.by_path.insert(row.path.clone(), row.clone());
@@ -1269,19 +1326,101 @@ fn pending_sidecars_on(conn: &Connection) -> Result<Vec<OwnedPendingSidecar>, ru
         })
     })?;
     let rows = rows.collect::<Result<Vec<_>, _>>()?;
-    let mut owners = HashSet::with_capacity(rows.len());
-    if rows.iter().any(|row| !owners.insert(row.owner.clone())) {
+    let mut owners = HashSet::<OsString>::with_capacity(rows.len());
+    if rows
+        .iter()
+        .any(|row| !owners.insert(row.owner.as_os_str().to_os_string()))
+    {
         return Err(rusqlite::Error::InvalidQuery);
     }
     Ok(rows)
 }
 
 fn deduplicated_paths<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Vec<PathBuf> {
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::<OsString>::new();
     paths
         .into_iter()
-        .filter(|path| seen.insert((*path).to_path_buf()))
+        .filter(|path| seen.insert(path.as_os_str().to_os_string()))
         .map(Path::to_path_buf)
+        .collect()
+}
+
+fn extend_with_path_spelling_families(paths: &mut Vec<PathBuf>) {
+    let mut seen = paths
+        .iter()
+        .map(|path| path.as_os_str().to_os_string())
+        .collect::<HashSet<_>>();
+    let aliases = paths
+        .iter()
+        .flat_map(|path| legacy_windows_path_spellings(path))
+        .collect::<Vec<_>>();
+    paths.extend(
+        aliases
+            .into_iter()
+            .filter(|path| seen.insert(path.as_os_str().to_os_string())),
+    );
+}
+
+fn query_sidecar_owner_revision_keys(
+    conn: &Connection,
+    keys: &[PathBuf],
+) -> Result<HashSet<OsString>, rusqlite::Error> {
+    let mut owners = HashSet::new();
+    for chunk in keys.chunks(900) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT owner
+               FROM sidecar_owner_revisions
+              WHERE owner IN ({placeholders})"
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let rows = statement.query_map(
+            rusqlite::params_from_iter(chunk.iter().map(|path| path_value(path))),
+            |row| Ok(row_path(row, 0)?.into_os_string()),
+        )?;
+        owners.extend(rows.collect::<Result<Vec<_>, _>>()?);
+    }
+    Ok(owners)
+}
+
+fn query_image_revision_keys(
+    conn: &Connection,
+    keys: &[PathBuf],
+) -> Result<HashSet<OsString>, rusqlite::Error> {
+    let mut paths = HashSet::new();
+    for chunk in keys.chunks(900) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT path
+               FROM image_revisions
+              WHERE path IN ({placeholders})"
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let rows = statement.query_map(
+            rusqlite::params_from_iter(chunk.iter().map(|path| path_value(path))),
+            |row| Ok(row_path(row, 0)?.into_os_string()),
+        )?;
+        paths.extend(rows.collect::<Result<Vec<_>, _>>()?);
+    }
+    Ok(paths)
+}
+
+fn query_all_sidecar_owner_revision_keys(
+    conn: &Connection,
+) -> Result<HashSet<OsString>, rusqlite::Error> {
+    let mut statement = conn.prepare("SELECT owner FROM sidecar_owner_revisions")?;
+    statement
+        .query_map([], |row| Ok(row_path(row, 0)?.into_os_string()))?
         .collect()
 }
 
@@ -1320,12 +1459,12 @@ fn query_rating_rows(
                     ValueRef::Null => None,
                     _ => Some(row_path(row, 6)?),
                 },
+                legacy_sidecar_owner: None,
             })
         },
     )?;
     for row in mapped {
-        let row = row?;
-        rows.insert(row.path.clone(), row);
+        insert_rating_snapshot_row(rows, row?)?;
     }
     Ok(())
 }
@@ -1353,8 +1492,7 @@ fn query_legacy_rating_rows(
         legacy_rating_row,
     )?;
     for row in mapped {
-        let row = row?;
-        rows.insert(row.path.clone(), row);
+        insert_rating_snapshot_row(rows, row?)?;
     }
     Ok(())
 }
@@ -1371,8 +1509,7 @@ fn query_all_dirty_legacy_rating_rows(
     )?;
     let mapped = statement.query_map([], legacy_rating_row)?;
     for row in mapped {
-        let row = row?;
-        rows.insert(row.path.clone(), row);
+        insert_rating_snapshot_row(rows, row?)?;
     }
     Ok(())
 }
@@ -1388,8 +1525,7 @@ fn query_all_legacy_rating_rows(
     )?;
     let mapped = statement.query_map([], legacy_rating_row)?;
     for row in mapped {
-        let row = row?;
-        rows.insert(row.path.clone(), row);
+        insert_rating_snapshot_row(rows, row?)?;
     }
     Ok(())
 }
@@ -1436,6 +1572,7 @@ fn legacy_rating_row(row: &Row<'_>) -> Result<StoredRatingRow, rusqlite::Error> 
         sidecar_mtime_ns: row.get(4)?,
         sidecar_dirty: row.get(5)?,
         sidecar_owner: None,
+        legacy_sidecar_owner: None,
     })
 }
 
@@ -1462,11 +1599,11 @@ fn query_all_dirty_owner_rating_rows(
                 ValueRef::Null => None,
                 _ => Some(row_path(row, 6)?),
             },
+            legacy_sidecar_owner: None,
         })
     })?;
     for row in mapped {
-        let row = row?;
-        rows.insert(row.path.clone(), row);
+        insert_rating_snapshot_row(rows, row?)?;
     }
     Ok(())
 }
@@ -1493,12 +1630,28 @@ fn query_all_legacy_owner_rating_rows(
                 ValueRef::Null => None,
                 _ => Some(row_path(row, 6)?),
             },
+            legacy_sidecar_owner: None,
         })
     })?;
     for row in mapped {
-        let row = row?;
-        rows.insert(row.path.clone(), row);
+        insert_rating_snapshot_row(rows, row?)?;
     }
+    Ok(())
+}
+
+fn insert_rating_snapshot_row(
+    rows: &mut HashMap<PathBuf, StoredRatingRow>,
+    row: StoredRatingRow,
+) -> Result<(), rusqlite::Error> {
+    if rows
+        .get(&row.path)
+        .is_some_and(|existing| existing.path.as_os_str() != row.path.as_os_str())
+    {
+        // `Path` equality normalizes some Windows spellings. SQLite does not,
+        // so retaining either decoded row would make its history ambiguous.
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    rows.insert(row.path.clone(), row);
     Ok(())
 }
 
@@ -1521,7 +1674,7 @@ fn migrate_legacy_source_alias(
     source: &Path,
     canonical: &Path,
 ) -> Result<(), rusqlite::Error> {
-    if source == canonical {
+    if source.as_os_str() == canonical.as_os_str() {
         return Ok(());
     }
     conn.execute(
@@ -1696,6 +1849,7 @@ fn migrate_legacy_dirty_ratings(conn: &Connection) -> Result<(usize, usize), rus
         dirty: bool,
         has_rating: bool,
         unsafe_alias_history: bool,
+        owner_history_conflict: bool,
         owner: Option<PathBuf>,
     }
 
@@ -1714,17 +1868,35 @@ fn migrate_legacy_dirty_ratings(conn: &Connection) -> Result<(usize, usize), rus
                     dirty: row.get(3)?,
                     has_rating: row.get(4)?,
                     unsafe_alias_history: false,
+                    owner_history_conflict: false,
                     owner: None,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?
     };
 
+    let stored_paths = read_all_image_history_paths(conn)?;
+    // Capture pre-migration owner history before any quarantine or promotion
+    // advances a ledger. An ownerless row cannot have created such a ledger,
+    // so a pre-existing derived owner makes its history unordered.
+    let existing_owner_history = read_sidecar_owner_revision_states(conn)?;
     let mut rows = rows;
     for row in &mut rows {
+        let normalized = normalize_physical_path(&row.path);
+        let stable_spelling = path_spelling_is_stable(&row.path, &normalized);
+        let representation_collision = stable_spelling
+            && path_spelling_family(&normalized).iter().any(|candidate| {
+                candidate.as_os_str() != row.path.as_os_str()
+                    && stored_paths.contains(candidate.as_os_str())
+            });
         row.owner = sidecar_owner_key(&row.path).ok();
+        row.owner_history_conflict = row.owner.as_ref().is_some_and(|owner| {
+            path_spelling_family(owner)
+                .iter()
+                .any(|candidate| existing_owner_history.contains_key(candidate.as_os_str()))
+        });
         row.unsafe_alias_history =
-            normalize_physical_path(&row.path) != row.path || (row.dirty && row.owner.is_none());
+            !stable_spelling || representation_collision || (row.dirty && row.owner.is_none());
     }
     let mut unsafe_history_tokens = rows
         .iter()
@@ -1754,8 +1926,17 @@ fn migrate_legacy_dirty_ratings(conn: &Connection) -> Result<(usize, usize), rus
             let Some(token) = sidecar_owner_collision_token(&path) else {
                 continue;
             };
+            let normalized = normalize_physical_path(&path);
+            let stable_spelling = path_spelling_is_stable(&path, &normalized);
+            let representation_collision = stable_spelling
+                && path_spelling_family(&normalized).iter().any(|candidate| {
+                    candidate.as_os_str() != path.as_os_str()
+                        && stored_paths.contains(candidate.as_os_str())
+                });
             if dirty_ownerless_tokens.contains(&token)
-                && (normalize_physical_path(&path) != path || sidecar_owner_key(&path).is_err())
+                && (!stable_spelling
+                    || representation_collision
+                    || sidecar_owner_key(&path).is_err())
             {
                 unsafe_history_tokens.insert(token);
             }
@@ -1824,14 +2005,31 @@ fn migrate_legacy_dirty_ratings(conn: &Connection) -> Result<(usize, usize), rus
                FROM images
               WHERE sidecar_owner IS NOT NULL",
         )?;
-        statement
-            .query_map([], |row| Ok((row_path(row, 0)?, row_path(row, 1)?)))?
-            .collect::<Result<HashMap<_, _>, _>>()?
+        let mapped = statement.query_map([], |row| {
+            Ok((
+                row_path(row, 0)?.into_os_string(),
+                row_path(row, 1)?.into_os_string(),
+            ))
+        })?;
+        let mut paths = HashMap::<OsString, HashSet<OsString>>::new();
+        for row in mapped {
+            let (owner, path) = row?;
+            paths.entry(owner).or_default().insert(path);
+        }
+        paths
     };
     let mut by_owner: HashMap<PathBuf, Vec<LegacyDirty>> = HashMap::new();
     let mut quarantine = Vec::new();
     let mut discard = Vec::new();
     for row in rows {
+        if row.owner_history_conflict {
+            if row.dirty {
+                quarantine.push(row.path);
+            } else {
+                discard.push(row.path);
+            }
+            continue;
+        }
         // Ownerless formats recorded only a path spelling, not the physical
         // publication owner observed when the rating was accepted. A path
         // that is now unresolved or resolves through an alias could have
@@ -1872,9 +2070,10 @@ fn migrate_legacy_dirty_ratings(conn: &Connection) -> Result<(usize, usize), rus
             continue;
         }
         let row = rows.pop().expect("single legacy owner row");
-        if !row.dirty {
-            continue;
-        }
+        // Promote identity-valid clean rows as well as unfinished work.
+        // Current startup can then find an ordinary pre-0.2 Windows spelling
+        // through its canonical owner without rewriting the path/revision
+        // ledger that records the historical journal identity.
         let identity_matches = std::fs::metadata(&row.path).ok().is_some_and(|metadata| {
             let mtime_ns = metadata
                 .modified()
@@ -1884,15 +2083,25 @@ fn migrate_legacy_dirty_ratings(conn: &Connection) -> Result<(usize, usize), rus
                 .unwrap_or(0);
             metadata.len() == row.size && mtime_ns == row.mtime_ns
         });
-        if !row.has_rating || !identity_matches {
-            quarantine.push(row.path);
+        if (row.dirty && !row.has_rating) || !identity_matches {
+            if row.dirty {
+                quarantine.push(row.path);
+            }
             continue;
         }
         let owner_conflicts = existing_owner_paths
-            .get(&owner)
-            .is_some_and(|path| path != &row.path);
+            .get(owner.as_os_str())
+            .is_some_and(|paths| {
+                paths
+                    .iter()
+                    .any(|path| path.as_os_str() != row.path.as_os_str())
+            });
         if owner_conflicts {
-            quarantine.push(row.path);
+            if row.dirty {
+                quarantine.push(row.path);
+            } else {
+                discard.push(row.path);
+            }
             continue;
         }
         let changed = conn.execute(
@@ -1900,13 +2109,12 @@ fn migrate_legacy_dirty_ratings(conn: &Connection) -> Result<(usize, usize), rus
                 SET sidecar_owner = ?2,
                     owner_key_version = MAX(owner_key_version + 1, 8)
               WHERE path = ?1
-                AND sidecar_dirty = 1
                 AND sidecar_owner IS NULL",
             rusqlite::params![path_value(&row.path), path_value(&owner)],
         )?;
         if changed == 1 {
             advance_sidecar_owner_revision(conn, &owner)?;
-            recovered += 1;
+            recovered += usize::from(row.dirty);
         }
     }
 
@@ -1943,7 +2151,7 @@ fn migrate_legacy_dirty_ratings(conn: &Connection) -> Result<(usize, usize), rus
     Ok((recovered, quarantined))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct StoredOwnerKeyRow {
     owner: PathBuf,
     size: u64,
@@ -1957,6 +2165,23 @@ struct StoredOwnerKeyRow {
     owner_key_version: i64,
 }
 
+impl PartialEq for StoredOwnerKeyRow {
+    fn eq(&self, other: &Self) -> bool {
+        self.owner.as_os_str() == other.owner.as_os_str()
+            && self.size == other.size
+            && self.mtime_ns == other.mtime_ns
+            && self.rating == other.rating
+            && self.sidecar_mtime_ns == other.sidecar_mtime_ns
+            && self.sidecar_dirty == other.sidecar_dirty
+            && self.sidecar_quarantined == other.sidecar_quarantined
+            && self.revision == other.revision
+            && self.last_seen == other.last_seen
+            && self.owner_key_version == other.owner_key_version
+    }
+}
+
+impl Eq for StoredOwnerKeyRow {}
+
 #[derive(Debug, Clone)]
 struct PlannedOwnerKeyRow {
     path: PathBuf,
@@ -1964,11 +2189,12 @@ struct PlannedOwnerKeyRow {
     owner: Option<PathBuf>,
     identity_matches: bool,
     path_is_physical: bool,
+    owner_history_conflict: bool,
 }
 
 fn read_stored_owner_key_rows(
     conn: &Connection,
-) -> Result<HashMap<PathBuf, StoredOwnerKeyRow>, rusqlite::Error> {
+) -> Result<HashMap<OsString, StoredOwnerKeyRow>, rusqlite::Error> {
     let mut statement = conn.prepare(
         "SELECT path, sidecar_owner, size, mtime_ns, rating,
                 sidecar_mtime_ns, sidecar_dirty, sidecar_quarantined,
@@ -1976,36 +2202,139 @@ fn read_stored_owner_key_rows(
            FROM images
           WHERE sidecar_owner IS NOT NULL",
     )?;
+    let mapped = statement.query_map([], |row| {
+        Ok((
+            row_path(row, 0)?.into_os_string(),
+            StoredOwnerKeyRow {
+                owner: row_path(row, 1)?,
+                size: row.get(2)?,
+                mtime_ns: row.get(3)?,
+                rating: row.get(4)?,
+                sidecar_mtime_ns: row.get(5)?,
+                sidecar_dirty: row.get(6)?,
+                sidecar_quarantined: row.get(7)?,
+                revision: row.get(8)?,
+                last_seen: row.get(9)?,
+                owner_key_version: row.get(10)?,
+            },
+        ))
+    })?;
+    let mut stored = HashMap::new();
+    for row in mapped {
+        let (path, value) = row?;
+        if stored.insert(path, value).is_some() {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+    }
+    Ok(stored)
+}
+
+fn read_all_image_history_paths(conn: &Connection) -> Result<HashSet<OsString>, rusqlite::Error> {
+    let mut statement = conn.prepare(
+        "SELECT path FROM images
+         UNION ALL
+         SELECT path FROM image_revisions",
+    )?;
     statement
-        .query_map([], |row| {
-            Ok((
-                row_path(row, 0)?,
-                StoredOwnerKeyRow {
-                    owner: row_path(row, 1)?,
-                    size: row.get(2)?,
-                    mtime_ns: row.get(3)?,
-                    rating: row.get(4)?,
-                    sidecar_mtime_ns: row.get(5)?,
-                    sidecar_dirty: row.get(6)?,
-                    sidecar_quarantined: row.get(7)?,
-                    revision: row.get(8)?,
-                    last_seen: row.get(9)?,
-                    owner_key_version: row.get(10)?,
-                },
-            ))
-        })?
+        .query_map([], |row| Ok(row_path(row, 0)?.into_os_string()))?
+        .collect::<Result<HashSet<_>, _>>()
+}
+
+fn read_sidecar_owner_revision_states(
+    conn: &Connection,
+) -> Result<HashMap<OsString, (i64, i64)>, rusqlite::Error> {
+    let mut statement =
+        conn.prepare("SELECT owner, revision, global_revision FROM sidecar_owner_revisions")?;
+    let mapped = statement.query_map([], |row| {
+        Ok((
+            row_path(row, 0)?.into_os_string(),
+            (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
+        ))
+    })?;
+    let mut states = HashMap::new();
+    for row in mapped {
+        let (owner, state) = row?;
+        if states.insert(owner, state).is_some() {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+    }
+    Ok(states)
+}
+
+fn read_image_path_states(
+    conn: &Connection,
+) -> Result<HashMap<OsString, (bool, i64)>, rusqlite::Error> {
+    let mut statement =
+        conn.prepare("SELECT path, sidecar_owner IS NOT NULL, owner_key_version FROM images")?;
+    let mapped = statement.query_map([], |row| {
+        Ok((
+            row_path(row, 0)?.into_os_string(),
+            (row.get::<_, bool>(1)?, row.get::<_, i64>(2)?),
+        ))
+    })?;
+    let mut states = HashMap::new();
+    for row in mapped {
+        let (path, state) = row?;
+        if states.insert(path, state).is_some() {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+    }
+    Ok(states)
+}
+
+fn ownerless_unsafe_history_tokens(
+    path_states: &HashMap<OsString, (bool, i64)>,
+    path_history: &HashSet<OsString>,
+) -> HashSet<OsString> {
+    path_states
+        .iter()
+        .filter(|(_, (has_owner, version))| !has_owner && *version < CURRENT_OWNER_KEY_VERSION)
+        .filter(|(path, _)| {
+            let path = Path::new(path);
+            let normalized = normalize_physical_path(path);
+            !path_spelling_is_stable(path, &normalized)
+                || sidecar_owner_key(path).is_err()
+                || path_spelling_family(&normalized).iter().any(|candidate| {
+                    candidate.as_os_str() != path.as_os_str()
+                        && path_history.contains(candidate.as_os_str())
+                })
+        })
+        .filter_map(|(path, _)| sidecar_owner_collision_token(Path::new(path)))
         .collect()
 }
 
-fn plan_owner_key_rows(stored: &HashMap<PathBuf, StoredOwnerKeyRow>) -> Vec<PlannedOwnerKeyRow> {
+fn plan_owner_key_rows(
+    stored: &HashMap<OsString, StoredOwnerKeyRow>,
+    path_history: &HashSet<OsString>,
+    owner_history: &HashMap<OsString, (i64, i64)>,
+) -> Vec<PlannedOwnerKeyRow> {
     stored
         .iter()
-        .map(|(path, stored)| PlannedOwnerKeyRow {
-            path: path.clone(),
-            stored: stored.clone(),
-            owner: sidecar_owner_key(path).ok(),
-            identity_matches: raw_identity_matches(path, stored.size, stored.mtime_ns),
-            path_is_physical: normalize_physical_path(path) == *path,
+        .map(|(path, row)| {
+            let path = Path::new(path);
+            let normalized = normalize_physical_path(path);
+            let representation_collision =
+                path_spelling_family(&normalized).iter().any(|candidate| {
+                    candidate.as_os_str() != path.as_os_str()
+                        && path_history.contains(candidate.as_os_str())
+                });
+            let owner = sidecar_owner_key(path).ok();
+            let owner_history_conflict = row.owner_key_version < CURRENT_OWNER_KEY_VERSION
+                && owner.as_ref().is_some_and(|owner| {
+                    path_spelling_family(owner).iter().any(|candidate| {
+                        candidate.as_os_str() != row.owner.as_os_str()
+                            && owner_history.contains_key(candidate.as_os_str())
+                    })
+                });
+            PlannedOwnerKeyRow {
+                path: path.to_path_buf(),
+                stored: row.clone(),
+                owner,
+                identity_matches: raw_identity_matches(path, row.size, row.mtime_ns),
+                path_is_physical: path_spelling_is_stable(path, &normalized)
+                    && !representation_collision,
+                owner_history_conflict,
+            }
         })
         .collect()
 }
@@ -2257,6 +2586,7 @@ fn current_owner_schema_is_ready(conn: &Connection) -> Result<bool, rusqlite::Er
         && migration_is_complete(conn, SIDECAR_OWNER_KEY_MIGRATION)?
         && !migration_is_complete(conn, SIDECAR_OWNER_REPAIR_REQUIRED)?
         && sidecar_owner_index_is_valid(conn)?
+        && pending_sidecar_owners_are_complete(conn)?
         && schema_object_sql_is(
             conn,
             "trigger",
@@ -2271,6 +2601,20 @@ fn current_owner_schema_is_ready(conn: &Connection) -> Result<bool, rusqlite::Er
             LEGACY_OWNER_UPDATE_FENCE_SQL,
         )?
         && !schema_object_exists(conn, "index", "images_reject_legacy_rating_update")?)
+}
+
+fn pending_sidecar_owners_are_complete(conn: &Connection) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT NOT EXISTS(
+             SELECT 1
+              FROM images INDEXED BY images_pending_sidecars
+              WHERE sidecar_dirty = 1
+                AND sidecar_quarantined = 0
+                AND sidecar_owner IS NULL
+         )",
+        [],
+        |row| row.get(0),
+    )
 }
 
 fn rating_generation_schema_is_ready(conn: &Connection) -> Result<bool, rusqlite::Error> {
@@ -2572,17 +2916,43 @@ fn migrate_sidecar_owner_keys(
     // can prevent such a process from writing XMP after its SQL is rejected.
     let fence_transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     install_owner_key_fence(&fence_transaction)?;
+    // A ready v7 database can still contain clean ownerless rows, and a
+    // damaged current database can contain an actionable ownerless dirty row
+    // after its generation fence is restored. Reconcile both before taking
+    // the owned-row optimistic snapshot. The routine may delete ambiguous
+    // pre-v8 owners, so planning must observe its committed result.
+    fence_transaction.execute_batch("DROP TRIGGER IF EXISTS images_sidecar_owners;")?;
+    let (recovered_ownerless, quarantined_ownerless) =
+        migrate_legacy_dirty_ratings(&fence_transaction)?;
     fence_transaction.commit()?;
+    if recovered_ownerless > 0 {
+        eprintln!("recovered {recovered_ownerless} unambiguous unfinished ownerless rating(s)");
+    }
+    if quarantined_ownerless > 0 {
+        eprintln!(
+            "quarantined {quarantined_ownerless} conflicting or unverifiable unfinished \
+             ownerless rating(s); rate those photos again to publish a sidecar safely"
+        );
+    }
 
     loop {
-        let (global_revision, stored) = {
+        let (global_revision, stored, path_states, path_history, owner_history) = {
             let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
             let global_revision = rating_global_revisions_on(&transaction)?.0;
             let stored = read_stored_owner_key_rows(&transaction)?;
+            let path_states = read_image_path_states(&transaction)?;
+            let path_history = read_all_image_history_paths(&transaction)?;
+            let owner_history = read_sidecar_owner_revision_states(&transaction)?;
             transaction.commit()?;
-            (global_revision, stored)
+            (
+                global_revision,
+                stored,
+                path_states,
+                path_history,
+                owner_history,
+            )
         };
-        let planned = plan_owner_key_rows(&stored);
+        let planned = plan_owner_key_rows(&stored, &path_history, &owner_history);
         let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
         // Another opener may have completed the forced repair after this
         // connection observed the sentinel. Its current capability snapshot
@@ -2594,6 +2964,9 @@ fn migrate_sidecar_owner_keys(
         }
         if rating_global_revisions_on(&transaction)?.0 != global_revision
             || read_stored_owner_key_rows(&transaction)? != stored
+            || read_image_path_states(&transaction)? != path_states
+            || read_all_image_history_paths(&transaction)? != path_history
+            || read_sidecar_owner_revision_states(&transaction)? != owner_history
         {
             transaction.rollback()?;
             continue;
@@ -2607,14 +2980,17 @@ fn migrate_sidecar_owner_keys(
              DROP TRIGGER IF EXISTS images_reject_legacy_rating_update;",
         )?;
 
-        let unsafe_history_tokens = planned
-            .iter()
-            .filter(|row| {
-                row.stored.owner_key_version < CURRENT_OWNER_KEY_VERSION
-                    && (!row.path_is_physical || row.owner.is_none())
-            })
-            .filter_map(|row| sidecar_owner_collision_token(&row.path))
-            .collect::<HashSet<_>>();
+        let mut unsafe_history_tokens =
+            ownerless_unsafe_history_tokens(&path_states, &path_history);
+        unsafe_history_tokens.extend(
+            planned
+                .iter()
+                .filter(|row| {
+                    row.stored.owner_key_version < CURRENT_OWNER_KEY_VERSION
+                        && (!row.path_is_physical || row.owner.is_none())
+                })
+                .filter_map(|row| sidecar_owner_collision_token(&row.path)),
+        );
         let mut removals = Vec::new();
         let mut by_owner: HashMap<PathBuf, Vec<PlannedOwnerKeyRow>> = HashMap::new();
         for row in planned {
@@ -2626,7 +3002,10 @@ fn migrate_sidecar_owner_keys(
             if row.stored.sidecar_quarantined
                 || !row.identity_matches
                 || row.owner.is_none()
-                || (row.stored.sidecar_dirty && row.stored.rating.is_none())
+                || row.owner_history_conflict
+                || (row.stored.owner_key_version < CURRENT_OWNER_KEY_VERSION
+                    && row.stored.sidecar_dirty
+                    && row.stored.rating.is_none())
                 // Pre-v8 path spellings have no durable proof of their
                 // historical physical owner. An ambiguous alias makes every
                 // same-name legacy candidate unordered, so remove clean
@@ -2650,18 +3029,18 @@ fn migrate_sidecar_owner_keys(
                 removals.extend(rows);
             }
         }
-        let mut touched_owners = HashSet::new();
+        let mut touched_owners = HashSet::<OsString>::new();
         for row in &removals {
-            touched_owners.insert(row.stored.owner.clone());
+            touched_owners.insert(row.stored.owner.as_os_str().to_os_string());
             if let Some(owner) = &row.owner {
-                touched_owners.insert(owner.clone());
+                touched_owners.insert(owner.as_os_str().to_os_string());
             }
         }
         for row in &retained {
             let owner = row.owner.as_ref().expect("retained owner");
-            if &row.stored.owner != owner {
-                touched_owners.insert(row.stored.owner.clone());
-                touched_owners.insert(owner.clone());
+            if row.stored.owner.as_os_str() != owner.as_os_str() {
+                touched_owners.insert(row.stored.owner.as_os_str().to_os_string());
+                touched_owners.insert(owner.as_os_str().to_os_string());
             }
         }
 
@@ -2698,7 +3077,7 @@ fn migrate_sidecar_owner_keys(
                  ON CONFLICT(owner) DO UPDATE SET
                     revision = sidecar_owner_revisions.revision + 1,
                     global_revision = excluded.global_revision",
-                rusqlite::params![path_value(&owner), barrier],
+                rusqlite::params![path_value(Path::new(&owner)), barrier],
             )?;
         }
 
@@ -2730,7 +3109,7 @@ fn migrate_sidecar_owner_keys(
 
         for row in &retained {
             let owner = row.owner.as_deref().expect("retained owner");
-            if row.stored.owner == owner {
+            if row.stored.owner.as_os_str() == owner.as_os_str() {
                 continue;
             }
             let changed = transaction.execute(
@@ -3070,8 +3449,7 @@ fn initialize_rating_generation_schema(conn: &Connection) -> Result<(), DbError>
         CREATE INDEX IF NOT EXISTS images_pending_sidecars
             ON images(path)
          WHERE sidecar_dirty = 1
-           AND sidecar_quarantined = 0
-           AND rating IS NOT NULL;
+           AND sidecar_quarantined = 0;
 
         CREATE TRIGGER IF NOT EXISTS images_reject_unowned_dirty_insert
         BEFORE INSERT ON images
@@ -3477,6 +3855,23 @@ mod tests {
             .unwrap()
             .as_nanos() as i64;
         (metadata.len(), mtime_ns)
+    }
+
+    #[cfg(windows)]
+    fn ordinary_windows_spelling(canonical: &Path) -> PathBuf {
+        let canonical = canonical
+            .to_str()
+            .expect("temporary Windows paths must be Unicode");
+        let ordinary = if let Some(path) = canonical.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{path}")
+        } else if let Some(path) = canonical.strip_prefix(r"\\?\") {
+            path.to_owned()
+        } else {
+            panic!("Windows canonical path did not use verbatim syntax: {canonical}");
+        };
+        let ordinary = PathBuf::from(ordinary);
+        assert!(path_spelling_is_stable(&ordinary, Path::new(canonical)));
+        ordinary
     }
 
     #[cfg(unix)]
@@ -3977,36 +4372,42 @@ mod tests {
 
     #[test]
     fn sidecar_compare_and_swap_requires_every_identity_field() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("concurrent.arw");
+        std::fs::write(&path, b"raw").unwrap();
+        let path = normalize_physical_path(&path);
         let db = Db::open_in_memory().unwrap();
-        let path = Path::new("/p/concurrent.arw");
-        db.record_rating_pending_sidecar_path(path, 10, 1, 5)
+        db.record_rating_pending_sidecar_path(&path, 10, 1, 5)
             .unwrap();
 
         for (size, mtime_ns, rating) in [(11, 1, 5), (10, 2, 5), (10, 1, 4)] {
             assert!(
-                !db.complete_pending_sidecar(path, size, mtime_ns, rating, 99)
+                !db.complete_pending_sidecar(&path, size, mtime_ns, rating, 99)
                     .unwrap()
             );
             assert!(
-                !db.discard_pending_sidecar(path, size, mtime_ns, rating)
+                !db.discard_pending_sidecar(&path, size, mtime_ns, rating)
                     .unwrap()
             );
-            let row = db.get_image_path(path).unwrap();
+            let row = db.get_image_path(&path).unwrap();
             assert_eq!(row.rating, Some(5));
             assert!(row.sidecar_dirty);
         }
 
-        assert!(db.complete_pending_sidecar(path, 10, 1, 5, 100).unwrap());
-        let row = db.get_image_path(path).unwrap();
+        assert!(db.complete_pending_sidecar(&path, 10, 1, 5, 100).unwrap());
+        let row = db.get_image_path(&path).unwrap();
         assert_eq!(row.rating, Some(5));
         assert_eq!(row.sidecar_mtime_ns, 100);
         assert!(!row.sidecar_dirty);
 
-        assert!(!db.complete_pending_sidecar(path, 10, 1, 5, 101).unwrap());
-        assert!(!db.discard_pending_sidecar(path, 10, 1, 5).unwrap());
-        let missing = Path::new("/p/missing.arw");
-        assert!(!db.complete_pending_sidecar(missing, 10, 1, 5, 101).unwrap());
-        assert!(!db.discard_pending_sidecar(missing, 10, 1, 5).unwrap());
+        assert!(!db.complete_pending_sidecar(&path, 10, 1, 5, 101).unwrap());
+        assert!(!db.discard_pending_sidecar(&path, 10, 1, 5).unwrap());
+        let missing = path.with_file_name("missing.arw");
+        assert!(
+            !db.complete_pending_sidecar(&missing, 10, 1, 5, 101)
+                .unwrap()
+        );
+        assert!(!db.discard_pending_sidecar(&missing, 10, 1, 5).unwrap());
     }
 
     #[test]
@@ -4345,6 +4746,10 @@ mod tests {
     fn migration_durably_quarantines_unverifiable_legacy_dirty_rows() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy-dirty.db");
+        let offline = normalize_physical_path(&dir.path().join("offline"));
+        let dirty = offline.join("dirty-legacy.arw");
+        let clean = offline.join("clean-legacy.arw");
+        let old_writer = offline.join("old-writer.arw");
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(
@@ -4356,29 +4761,33 @@ mod tests {
                     sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
                     sidecar_dirty INTEGER NOT NULL DEFAULT 0,
                     last_seen INTEGER NOT NULL DEFAULT 0
-                );
-                INSERT INTO images
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO images
                     (path, size, mtime_ns, rating, sidecar_mtime_ns,
                      sidecar_dirty, last_seen)
-                VALUES
-                    ('/p/dirty-legacy.arw', 42, 7, 4, 123, 1, 0),
-                    ('/p/clean-legacy.arw', 42, 7, 3, 123, 0, 0);",
+                 VALUES
+                    (?1, 42, 7, 4, 123, 1, 0),
+                    (?2, 42, 7, 3, 123, 0, 0)",
+                rusqlite::params![path_value(&dirty), path_value(&clean)],
             )
             .unwrap();
         }
 
         let db = Db::open(&path).unwrap();
 
-        assert!(db.get_image("/p/dirty-legacy.arw").is_none());
-        assert_eq!(db.get_image("/p/clean-legacy.arw").unwrap().rating, Some(3));
+        assert!(db.get_image_path(&dirty).is_none());
+        assert_eq!(db.get_image_path(&clean).unwrap().rating, Some(3));
         assert!(db.pending_sidecars().unwrap().is_empty());
         assert_eq!(
             db.conn
                 .query_row(
                     "SELECT rating
                        FROM quarantined_legacy_ratings
-                      WHERE path = '/p/dirty-legacy.arw'",
-                    [],
+                      WHERE path = ?1",
+                    [path_value(&dirty)],
                     |row| row.get::<_, u8>(0),
                 )
                 .unwrap(),
@@ -4389,8 +4798,8 @@ mod tests {
                 .query_row(
                     "SELECT COUNT(*)
                        FROM images
-                      WHERE path = '/p/dirty-legacy.arw'",
-                    [],
+                      WHERE path = ?1",
+                    [path_value(&dirty)],
                     |row| row.get::<_, usize>(0),
                 )
                 .unwrap(),
@@ -4401,8 +4810,8 @@ mod tests {
                 .execute(
                     "INSERT INTO images
                         (path, size, mtime_ns, rating, sidecar_dirty)
-                     VALUES ('/p/old-writer.arw', 42, 7, 5, 1)",
-                    [],
+                     VALUES (?1, 42, 7, 5, 1)",
+                    [path_value(&old_writer)],
                 )
                 .is_err(),
             "pre-owner SQL must not recreate a live unowned dirty row"
@@ -4410,7 +4819,7 @@ mod tests {
         drop(db);
 
         let reopened = Db::open(&path).unwrap();
-        assert!(reopened.get_image("/p/dirty-legacy.arw").is_none());
+        assert!(reopened.get_image_path(&dirty).is_none());
         assert!(reopened.pending_sidecars().unwrap().is_empty());
     }
 
@@ -4477,6 +4886,848 @@ mod tests {
                     [],
                     |row| row.get::<_, usize>(0),
                 )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn migration_quarantines_ownerless_dirty_work_behind_a_newer_owner_tombstone() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("ownerless-owner-tombstone.db");
+        let old_raw = directory.path().join("photo.ARW");
+        let newer_raw = directory.path().join("photo.DNG");
+        std::fs::write(&old_raw, b"old").unwrap();
+        std::fs::write(&newer_raw, b"newer").unwrap();
+        let old_raw = normalize_physical_path(&old_raw);
+        let newer_raw = normalize_physical_path(&newer_raw);
+        let (old_size, old_mtime_ns) = file_identity(&old_raw);
+        let (newer_size, newer_mtime_ns) = file_identity(&newer_raw);
+        let owner = sidecar_owner_key(&old_raw).unwrap();
+        assert_eq!(sidecar_owner_key(&newer_raw).unwrap(), owner);
+        crate::xmp::write_rating(&owner, 2).unwrap();
+        {
+            let db = Db::open(&database_path).unwrap();
+            db.record_rating_pending_sidecar_canonical(&newer_raw, newer_size, newer_mtime_ns, 2)
+                .unwrap();
+            db.conn
+                .execute(
+                    "DELETE FROM images WHERE path = ?1",
+                    [path_value(&newer_raw)],
+                )
+                .unwrap();
+            remove_v8_marker_and_fence(&db.conn);
+            db.conn
+                .execute_batch("DROP TRIGGER images_reject_unowned_dirty_insert;")
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO images
+                        (path, size, mtime_ns, rating, sidecar_dirty,
+                         owner_key_version)
+                     VALUES (?1, ?2, ?3, 5, 1, 0)",
+                    rusqlite::params![path_value(&old_raw), old_size, old_mtime_ns],
+                )
+                .unwrap();
+            assert!(sidecar_owner_revision_on(&db.conn, &owner).unwrap() > 0);
+        }
+
+        let entries = crate::folder::scan(directory.path()).unwrap();
+        let old_index = entries
+            .iter()
+            .position(|entry| entry.path == old_raw)
+            .unwrap();
+        let read = Db::try_open_for_read(&database_path).unwrap().unwrap();
+        assert_eq!(
+            crate::library::load_ratings(&entries, Some(&read)).get(&old_index),
+            Some(&2)
+        );
+        drop(read);
+
+        let db = Db::open(&database_path).unwrap();
+        assert!(db.pending_sidecars().unwrap().is_empty());
+        assert!(db.get_image_path(&old_raw).is_none());
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT rating
+                       FROM quarantined_legacy_ratings
+                      WHERE path = ?1",
+                    [path_value(&old_raw)],
+                    |row| row.get::<_, u8>(0),
+                )
+                .unwrap(),
+            5
+        );
+        assert_eq!(crate::xmp::read_rating(&owner), Some(2));
+    }
+
+    #[test]
+    fn current_ownerless_fallback_cannot_cross_a_shared_owner_tombstone() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("current-ownerless-tombstone.db");
+        let old_raw = directory.path().join("photo.ARW");
+        let newer_raw = directory.path().join("photo.DNG");
+        std::fs::write(&old_raw, b"old").unwrap();
+        std::fs::write(&newer_raw, b"newer").unwrap();
+        let old_raw = normalize_physical_path(&old_raw);
+        let newer_raw = normalize_physical_path(&newer_raw);
+        let (old_size, old_mtime_ns) = file_identity(&old_raw);
+        let (newer_size, newer_mtime_ns) = file_identity(&newer_raw);
+        let owner = sidecar_owner_key(&old_raw).unwrap();
+        assert_eq!(sidecar_owner_key(&newer_raw).unwrap(), owner);
+
+        let db = Db::open(&database_path).unwrap();
+        db.upsert_rating_path(&old_raw, old_size, old_mtime_ns, Some(3), 0)
+            .unwrap();
+        db.record_rating_pending_sidecar_canonical(&newer_raw, newer_size, newer_mtime_ns, 5)
+            .unwrap();
+        db.conn
+            .execute(
+                "DELETE FROM images WHERE path = ?1",
+                [path_value(&newer_raw)],
+            )
+            .unwrap();
+        assert!(sidecar_owner_revision_on(&db.conn, &owner).unwrap() > 0);
+        assert!(!owner.exists());
+
+        let entries = crate::folder::scan(directory.path()).unwrap();
+        let ratings = crate::library::load_ratings(&entries, Some(&db));
+        assert!(
+            ratings.is_empty(),
+            "an ownerless fallback has no ordering proof across the newer owner ledger"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn migration_quarantines_nonverbatim_dirty_work_behind_a_canonical_path_tombstone() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("prefix-path-tombstone.db");
+        let raw = directory.path().join("photo.ARW");
+        std::fs::write(&raw, b"raw").unwrap();
+        let canonical = normalize_physical_path(&raw);
+        let legacy = ordinary_windows_spelling(&canonical);
+        let (size, mtime_ns) = file_identity(&canonical);
+        let owner = sidecar_owner_key(&canonical).unwrap();
+        crate::xmp::write_rating(&owner, 2).unwrap();
+        {
+            let db = Db::open(&database_path).unwrap();
+            db.record_rating_pending_sidecar_canonical(&canonical, size, mtime_ns, 2)
+                .unwrap();
+            db.conn
+                .execute(
+                    "DELETE FROM images WHERE path = ?1",
+                    [path_value(&canonical)],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "DELETE FROM sidecar_owner_revisions WHERE owner = ?1",
+                    [path_value(&owner)],
+                )
+                .unwrap();
+            remove_v8_marker_and_fence(&db.conn);
+            db.conn
+                .execute_batch("DROP TRIGGER images_reject_unowned_dirty_insert;")
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO images
+                        (path, size, mtime_ns, rating, sidecar_dirty,
+                         owner_key_version)
+                     VALUES (?1, ?2, ?3, 5, 1, 0)",
+                    rusqlite::params![path_value(&legacy), size, mtime_ns],
+                )
+                .unwrap();
+        }
+
+        let entries = crate::folder::scan(directory.path()).unwrap();
+        let read = Db::try_open_for_read(&database_path).unwrap().unwrap();
+        assert_eq!(
+            crate::library::load_ratings(&entries, Some(&read)).get(&0),
+            Some(&2)
+        );
+        drop(read);
+
+        let db = Db::open(&database_path).unwrap();
+        assert!(db.pending_sidecars().unwrap().is_empty());
+        assert!(db.get_image_path(&legacy).is_none());
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT rating
+                       FROM quarantined_legacy_ratings
+                      WHERE path = ?1",
+                    [path_value(&legacy)],
+                    |row| row.get::<_, u8>(0),
+                )
+                .unwrap(),
+            5
+        );
+        assert_eq!(crate::xmp::read_rating(&owner), Some(2));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn migration_quarantines_dirty_work_behind_a_drive_case_path_tombstone() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("drive-case-path-tombstone.db");
+        let raw = directory.path().join("photo.ARW");
+        std::fs::write(&raw, b"raw").unwrap();
+        let canonical = normalize_physical_path(&raw);
+        let spellings = legacy_windows_path_spellings(&canonical);
+        if spellings.len() < 2 {
+            return;
+        }
+        let legacy = spellings[0].clone();
+        let sibling = spellings[1].clone();
+        assert_ne!(legacy.as_os_str(), sibling.as_os_str());
+        let (size, mtime_ns) = file_identity(&canonical);
+        let owner = sidecar_owner_key(&canonical).unwrap();
+        crate::xmp::write_rating(&owner, 2).unwrap();
+        {
+            let db = Db::open(&database_path).unwrap();
+            db.record_rating_pending_sidecar_canonical(&canonical, size, mtime_ns, 2)
+                .unwrap();
+            db.conn
+                .execute(
+                    "DELETE FROM images WHERE path = ?1",
+                    [path_value(&canonical)],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "UPDATE image_revisions
+                        SET path = ?2
+                      WHERE path = ?1",
+                    rusqlite::params![path_value(&canonical), path_value(&sibling)],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "DELETE FROM sidecar_owner_revisions WHERE owner = ?1",
+                    [path_value(&owner)],
+                )
+                .unwrap();
+            remove_v8_marker_and_fence(&db.conn);
+            db.conn
+                .execute_batch("DROP TRIGGER images_reject_unowned_dirty_insert;")
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO images
+                        (path, size, mtime_ns, rating, sidecar_dirty,
+                         owner_key_version)
+                     VALUES (?1, ?2, ?3, 5, 1, 0)",
+                    rusqlite::params![path_value(&legacy), size, mtime_ns],
+                )
+                .unwrap();
+        }
+
+        let entries = crate::folder::scan(directory.path()).unwrap();
+        let read = Db::try_open_for_read(&database_path).unwrap().unwrap();
+        assert_eq!(
+            crate::library::load_ratings(&entries, Some(&read)).get(&0),
+            Some(&2)
+        );
+        drop(read);
+
+        let db = Db::open(&database_path).unwrap();
+        assert!(db.pending_sidecars().unwrap().is_empty());
+        assert!(db.get_image_path(&legacy).is_none());
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT rating
+                       FROM quarantined_legacy_ratings
+                      WHERE path = ?1",
+                    [path_value(&legacy)],
+                    |row| row.get::<_, u8>(0),
+                )
+                .unwrap(),
+            5
+        );
+        assert_eq!(crate::xmp::read_rating(&owner), Some(2));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn owner_key_migration_rejects_a_separate_drive_case_owner_ledger() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("drive-case-owner-ledger.db");
+        let raw = directory.path().join("photo.ARW");
+        std::fs::write(&raw, b"raw").unwrap();
+        let canonical = normalize_physical_path(&raw);
+        let spellings = legacy_windows_path_spellings(&canonical);
+        if spellings.len() < 2 {
+            return;
+        }
+        let legacy = spellings[0].clone();
+        let sibling = spellings[1].clone();
+        let current_owner = sidecar_owner_key(&canonical).unwrap();
+        let legacy_owner = legacy.with_extension("xmp");
+        let sibling_owner = sibling.with_extension("xmp");
+        assert_ne!(legacy_owner.as_os_str(), sibling_owner.as_os_str());
+        let (size, mtime_ns) = file_identity(&canonical);
+        crate::xmp::write_rating(&current_owner, 2).unwrap();
+        {
+            let db = Db::open(&database_path).unwrap();
+            db.record_rating_pending_sidecar_canonical(&canonical, size, mtime_ns, 5)
+                .unwrap();
+            remove_v8_marker_and_fence(&db.conn);
+            let transaction =
+                Transaction::new_unchecked(&db.conn, TransactionBehavior::Immediate).unwrap();
+            transaction
+                .execute(
+                    "UPDATE images
+                        SET path = ?2,
+                            sidecar_owner = ?3,
+                            owner_key_version = 0
+                      WHERE path = ?1",
+                    rusqlite::params![
+                        path_value(&canonical),
+                        path_value(&legacy),
+                        path_value(&legacy_owner),
+                    ],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "UPDATE image_revisions
+                        SET path = ?2
+                      WHERE path = ?1",
+                    rusqlite::params![path_value(&canonical), path_value(&legacy)],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "UPDATE sidecar_owner_revisions
+                        SET owner = ?2
+                      WHERE owner = ?1",
+                    rusqlite::params![path_value(&current_owner), path_value(&legacy_owner),],
+                )
+                .unwrap();
+            let barrier = advance_global_revision(&transaction).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO sidecar_owner_revisions
+                        (owner, revision, global_revision)
+                     VALUES (?1, 1, ?2)",
+                    rusqlite::params![path_value(&sibling_owner), barrier],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        let entries = crate::folder::scan(directory.path()).unwrap();
+        let read = Db::try_open_for_read(&database_path).unwrap().unwrap();
+        assert_eq!(
+            crate::library::load_ratings(&entries, Some(&read)).get(&0),
+            Some(&2)
+        );
+        drop(read);
+
+        let db = Db::open(&database_path).unwrap();
+        assert!(db.pending_sidecars().unwrap().is_empty());
+        assert!(db.get_image_path(&legacy).is_none());
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT rating
+                       FROM quarantined_legacy_ratings
+                      WHERE path = ?1",
+                    [path_value(&legacy)],
+                    |row| row.get::<_, u8>(0),
+                )
+                .unwrap(),
+            5
+        );
+        assert_eq!(crate::xmp::read_rating(&current_owner), Some(2));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn current_owned_dirty_row_wins_over_rejected_ordinary_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("current-owner-precedence.db");
+        let raw = directory.path().join("photo.ARW");
+        std::fs::write(&raw, b"raw").unwrap();
+        let canonical = normalize_physical_path(&raw);
+        let legacy = ordinary_windows_spelling(&canonical);
+        let (size, mtime_ns) = file_identity(&canonical);
+        let db = Db::open(&database_path).unwrap();
+        db.upsert_rating_path(&legacy, size, mtime_ns, Some(3), 0)
+            .unwrap();
+        db.record_rating_pending_sidecar_canonical(&canonical, size, mtime_ns, 5)
+            .unwrap();
+
+        let entries = crate::folder::scan(directory.path()).unwrap();
+        assert_eq!(
+            crate::library::load_ratings(&entries, Some(&db)).get(&0),
+            Some(&5),
+            "a valid current owner must outrank leftover ownerless history"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn v01_nonverbatim_clean_path_survives_current_migrations() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("v01-nonverbatim-clean.db");
+        let raw = directory.path().join("legacy-clean.ARW");
+        std::fs::write(&raw, b"raw").unwrap();
+        let canonical = normalize_physical_path(&raw);
+        let legacy = ordinary_windows_spelling(&canonical);
+        assert_eq!(normalize_physical_path(&legacy), canonical);
+        let (size, mtime_ns) = file_identity(&canonical);
+
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE images (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO images
+                    (path, size, mtime_ns, rating, sidecar_mtime_ns, last_seen)
+                 VALUES (?1, ?2, ?3, 3, 0, 0)",
+                rusqlite::params![path_value(&legacy), size, mtime_ns],
+            )
+            .unwrap();
+        drop(connection);
+
+        let entries = crate::folder::scan(directory.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, canonical);
+        let db = Db::open(&database_path).unwrap();
+        assert_eq!(
+            crate::library::load_ratings(&entries, Some(&db)).get(&0),
+            Some(&3)
+        );
+        let (owner, owner_key_version) = db
+            .conn
+            .query_row(
+                "SELECT sidecar_owner, owner_key_version
+                   FROM images
+                  WHERE path = ?1",
+                [path_value(&legacy)],
+                |row| Ok((row_path(row, 0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(owner, sidecar_owner_key(&canonical).unwrap());
+        assert!(owner_key_version >= CURRENT_OWNER_KEY_VERSION);
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM quarantined_legacy_ratings",
+                    [],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+            0
+        );
+        drop(db);
+
+        let reopened = Db::open(&database_path).unwrap();
+        assert_eq!(
+            crate::library::load_ratings(&entries, Some(&reopened)).get(&0),
+            Some(&3)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_dirty_nonverbatim_path_loads_before_background_migration() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("legacy-dirty-read.db");
+        let raw = directory.path().join("legacy-dirty.ARW");
+        std::fs::write(&raw, b"raw").unwrap();
+        let canonical = normalize_physical_path(&raw);
+        let legacy = ordinary_windows_spelling(&canonical);
+        let (size, mtime_ns) = file_identity(&canonical);
+        crate::xmp::write_rating(&canonical.with_extension("xmp"), 2).unwrap();
+
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE images (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO images
+                    (path, size, mtime_ns, rating, sidecar_dirty, last_seen)
+                 VALUES (?1, ?2, ?3, 5, 1, 0)",
+                rusqlite::params![path_value(&legacy), size, mtime_ns],
+            )
+            .unwrap();
+        drop(connection);
+
+        let entries = crate::folder::scan(directory.path()).unwrap();
+        let read = Db::try_open_for_read(&database_path).unwrap().unwrap();
+        assert!(!read.rating_schema_is_current());
+        assert_eq!(
+            crate::library::load_ratings(&entries, Some(&read)).get(&0),
+            Some(&5)
+        );
+        assert!(!schema_object_exists(&read.conn, "table", "viewr_schema_migrations").unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_drive_case_duplicates_fail_closed_during_snapshot_and_migration() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("drive-case-duplicates.db");
+        let raw = directory.path().join("photo.ARW");
+        std::fs::write(&raw, b"raw").unwrap();
+        let canonical = normalize_physical_path(&raw);
+        let spellings = legacy_windows_path_spellings(&canonical);
+        if spellings.len() < 2 {
+            return;
+        }
+        assert_ne!(spellings[0].as_os_str(), spellings[1].as_os_str());
+        let (size, mtime_ns) = file_identity(&canonical);
+        let owner = sidecar_owner_key(&canonical).unwrap();
+        crate::xmp::write_rating(&owner, 2).unwrap();
+
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE images (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        for (path, rating) in spellings.iter().zip([4_u8, 5]) {
+            connection
+                .execute(
+                    "INSERT INTO images
+                        (path, size, mtime_ns, rating, sidecar_dirty, last_seen)
+                     VALUES (?1, ?2, ?3, ?4, 1, 0)",
+                    rusqlite::params![path_value(path), size, mtime_ns, rating],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let entries = crate::folder::scan(directory.path()).unwrap();
+        let read = Db::try_open_for_read(&database_path).unwrap().unwrap();
+        assert!(
+            crate::library::try_load_ratings_with_owners(&entries, Some(&read)).is_err(),
+            "component-equivalent database keys must not collapse to one arbitrary row"
+        );
+        assert_eq!(
+            crate::library::load_ratings(&entries, Some(&read)).get(&0),
+            Some(&2)
+        );
+        drop(read);
+
+        let db = Db::open(&database_path).unwrap();
+        assert!(db.pending_sidecars().unwrap().is_empty());
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM quarantined_legacy_ratings",
+                    [],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(crate::xmp::read_rating(&owner), Some(2));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ready_v7_nonverbatim_clean_path_loads_before_and_after_v8_migration() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("v7-nonverbatim-clean.db");
+        let raw = directory.path().join("v7-clean.ARW");
+        std::fs::write(&raw, b"raw").unwrap();
+        let canonical = normalize_physical_path(&raw);
+        let legacy = ordinary_windows_spelling(&canonical);
+        let current_owner = sidecar_owner_key(&canonical).unwrap();
+        let legacy_owner = legacy.with_extension("xmp");
+        let (size, mtime_ns) = file_identity(&canonical);
+        {
+            let db = Db::open(&database_path).unwrap();
+            db.upsert_rating_path(&canonical, size, mtime_ns, Some(4), 0)
+                .unwrap();
+            remove_v8_marker_and_fence(&db.conn);
+            let transaction =
+                Transaction::new_unchecked(&db.conn, TransactionBehavior::Immediate).unwrap();
+            transaction
+                .execute(
+                    "UPDATE images
+                        SET path = ?2,
+                            sidecar_owner = ?3,
+                            owner_key_version = 0
+                      WHERE path = ?1",
+                    rusqlite::params![
+                        path_value(&canonical),
+                        path_value(&legacy),
+                        path_value(&legacy_owner),
+                    ],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "UPDATE image_revisions
+                        SET path = ?2
+                      WHERE path = ?1",
+                    rusqlite::params![path_value(&canonical), path_value(&legacy)],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "UPDATE sidecar_owner_revisions
+                        SET owner = ?2
+                      WHERE owner = ?1",
+                    rusqlite::params![path_value(&current_owner), path_value(&legacy_owner)],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+            assert!(rating_generation_schema_is_ready(&db.conn).unwrap());
+        }
+
+        let entries = crate::folder::scan(directory.path()).unwrap();
+        let read = Db::try_open_for_read(&database_path).unwrap().unwrap();
+        assert!(!read.rating_schema_is_current());
+        assert_eq!(
+            crate::library::load_ratings(&entries, Some(&read)).get(&0),
+            Some(&4)
+        );
+        assert!(!migration_is_complete(&read.conn, SIDECAR_OWNER_KEY_MIGRATION).unwrap());
+        drop(read);
+
+        let migrated = Db::open(&database_path).unwrap();
+        assert_eq!(
+            crate::library::load_ratings(&entries, Some(&migrated)).get(&0),
+            Some(&4)
+        );
+        assert_eq!(
+            migrated
+                .conn
+                .query_row(
+                    "SELECT sidecar_owner
+                       FROM images
+                      WHERE path = ?1",
+                    [path_value(&legacy)],
+                    |row| row_path(row, 0),
+                )
+                .unwrap(),
+            current_owner
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn offline_v01_nonverbatim_clean_path_loads_after_reconnect() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("offline-v01-clean.db");
+        let raw_root = directory.path().join("external");
+        std::fs::create_dir(&raw_root).unwrap();
+        let raw = raw_root.join("offline-clean.ARW");
+        std::fs::write(&raw, b"raw").unwrap();
+        let canonical = normalize_physical_path(&raw);
+        let ordinary = ordinary_windows_spelling(&canonical);
+        let legacy = legacy_windows_path_spellings(&canonical)
+            .into_iter()
+            .find(|candidate| candidate.as_os_str() != ordinary.as_os_str())
+            .unwrap_or(ordinary);
+        let metadata = std::fs::metadata(&canonical).unwrap();
+        let modified = metadata.modified().unwrap();
+        let (size, mtime_ns) = file_identity(&canonical);
+
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE images (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO images
+                    (path, size, mtime_ns, rating, sidecar_mtime_ns, last_seen)
+                 VALUES (?1, ?2, ?3, 3, 0, 0)",
+                rusqlite::params![path_value(&legacy), size, mtime_ns],
+            )
+            .unwrap();
+        drop(connection);
+        std::fs::remove_file(&canonical).unwrap();
+        std::fs::remove_dir(&raw_root).unwrap();
+
+        {
+            let migrated = Db::open(&database_path).unwrap();
+            assert_eq!(
+                migrated
+                    .conn
+                    .query_row(
+                        "SELECT sidecar_owner IS NULL
+                           FROM images
+                          WHERE path = ?1",
+                        [path_value(&legacy)],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap(),
+                true
+            );
+        }
+
+        std::fs::create_dir(&raw_root).unwrap();
+        std::fs::write(&raw, b"raw").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&raw)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_eq!(file_identity(&raw), (size, mtime_ns));
+
+        let entries = crate::folder::scan(&raw_root).unwrap();
+        let read = Db::try_open_for_read(&database_path).unwrap().unwrap();
+        assert!(read.rating_schema_is_current());
+        assert_eq!(
+            crate::library::load_ratings(&entries, Some(&read)).get(&0),
+            Some(&3)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn preowner_nonverbatim_dirty_path_recovers_to_canonical_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("preowner-nonverbatim-dirty.db");
+        let raw = directory.path().join("legacy-dirty.ARW");
+        std::fs::write(&raw, b"raw").unwrap();
+        let canonical = normalize_physical_path(&raw);
+        let legacy = ordinary_windows_spelling(&canonical);
+        assert_eq!(normalize_physical_path(&legacy), canonical);
+        let (size, mtime_ns) = file_identity(&canonical);
+        let owner = sidecar_owner_key(&canonical).unwrap();
+
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE images (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO images
+                    (path, size, mtime_ns, rating, sidecar_dirty, last_seen)
+                 VALUES (?1, ?2, ?3, 5, 1, 0)",
+                rusqlite::params![path_value(&legacy), size, mtime_ns],
+            )
+            .unwrap();
+        drop(connection);
+
+        let entries = crate::folder::scan(directory.path()).unwrap();
+        let db = Db::open(&database_path).unwrap();
+        assert_eq!(
+            crate::library::load_ratings(&entries, Some(&db)).get(&0),
+            Some(&5)
+        );
+        let pending = db.pending_sidecars_with_owners().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].owner, owner);
+        assert_eq!(pending[0].pending.path, legacy);
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM quarantined_legacy_ratings",
+                    [],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        assert!(matches!(
+            db.synchronize_pending_sidecar(&legacy, size, mtime_ns, 5, |publication| {
+                assert_eq!(publication, canonical);
+                PendingSidecarWrite::<()>::Written(99)
+            })
+            .unwrap(),
+            PendingSidecarSync::Written
+        ));
+        assert!(!db.get_image_path(&legacy).unwrap().sidecar_dirty);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn migration_discards_a_clean_drive_root_relative_spelling() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("root-relative-clean.db");
+        let raw = Path::new(r"\photos\legacy-clean.ARW");
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE images (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO images
+                    (path, size, mtime_ns, rating, last_seen)
+                 VALUES (?1, 42, 7, 3, 0)",
+                [path_value(raw)],
+            )
+            .unwrap();
+        drop(connection);
+
+        let db = Db::open(&database_path).unwrap();
+        assert!(db.get_image_path(raw).is_none());
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM images", [], |row| {
+                    row.get::<_, usize>(0)
+                })
                 .unwrap(),
             0
         );
@@ -4845,6 +6096,12 @@ mod tests {
             compatible.get_image_path(&owned_raw).unwrap().rating,
             Some(5)
         );
+        let entries = crate::folder::scan(directory.path()).unwrap();
+        assert_eq!(
+            crate::library::load_ratings(&entries, Some(&compatible)).get(&0),
+            Some(&5),
+            "the read-compatible v6 snapshot must not require v8 columns"
+        );
         assert!(
             !has_column(
                 &compatible.conn,
@@ -4907,6 +6164,14 @@ mod tests {
                     rusqlite::params![path_value(&raw), path_value(&legacy_owner)],
                 )
                 .unwrap();
+            db.conn
+                .execute(
+                    "UPDATE sidecar_owner_revisions
+                        SET owner = ?2
+                      WHERE owner = ?1",
+                    rusqlite::params![path_value(&current_owner), path_value(&legacy_owner)],
+                )
+                .unwrap();
         }
 
         let db = Db::open(&database_path).unwrap();
@@ -4943,6 +6208,242 @@ mod tests {
         let changes = db.conn.total_changes();
         initialize_schema(&db.conn).unwrap();
         assert_eq!(db.conn.total_changes(), changes);
+    }
+
+    #[test]
+    fn owner_key_migration_quarantines_work_behind_a_newer_target_owner_tombstone() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("owner-key-target-tombstone.db");
+        let old_raw = directory.path().join("photo.ARW");
+        let newer_raw = directory.path().join("photo.DNG");
+        std::fs::write(&old_raw, b"old").unwrap();
+        std::fs::write(&newer_raw, b"newer").unwrap();
+        let old_raw = normalize_physical_path(&old_raw);
+        let newer_raw = normalize_physical_path(&newer_raw);
+        let (old_size, old_mtime_ns) = file_identity(&old_raw);
+        let (newer_size, newer_mtime_ns) = file_identity(&newer_raw);
+        let current_owner = sidecar_owner_key(&old_raw).unwrap();
+        let legacy_owner = directory.path().join("legacy-photo.xmp");
+        assert_eq!(sidecar_owner_key(&newer_raw).unwrap(), current_owner);
+        crate::xmp::write_rating(&current_owner, 2).unwrap();
+        {
+            let db = Db::open(&database_path).unwrap();
+            db.record_rating_pending_sidecar_canonical(&old_raw, old_size, old_mtime_ns, 5)
+                .unwrap();
+            db.conn
+                .execute(
+                    "UPDATE images
+                        SET sidecar_owner = ?2,
+                            owner_key_version = 9
+                      WHERE path = ?1",
+                    rusqlite::params![path_value(&old_raw), path_value(&legacy_owner)],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "UPDATE images
+                        SET owner_key_version = 0
+                      WHERE path = ?1",
+                    [path_value(&old_raw)],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "UPDATE sidecar_owner_revisions
+                        SET owner = ?2
+                      WHERE owner = ?1",
+                    rusqlite::params![path_value(&current_owner), path_value(&legacy_owner)],
+                )
+                .unwrap();
+            db.record_rating_pending_sidecar_canonical(&newer_raw, newer_size, newer_mtime_ns, 2)
+                .unwrap();
+            db.conn
+                .execute(
+                    "DELETE FROM images WHERE path = ?1",
+                    [path_value(&newer_raw)],
+                )
+                .unwrap();
+            assert!(sidecar_owner_revision_on(&db.conn, &legacy_owner).unwrap() > 0);
+            assert!(sidecar_owner_revision_on(&db.conn, &current_owner).unwrap() > 0);
+            remove_v8_marker_and_fence(&db.conn);
+        }
+
+        let entries = crate::folder::scan(directory.path()).unwrap();
+        let old_index = entries
+            .iter()
+            .position(|entry| entry.path == old_raw)
+            .unwrap();
+        let read = Db::try_open_for_read(&database_path).unwrap().unwrap();
+        assert_eq!(
+            crate::library::load_ratings(&entries, Some(&read)).get(&old_index),
+            Some(&2)
+        );
+        drop(read);
+
+        let db = Db::open(&database_path).unwrap();
+        assert!(db.pending_sidecars().unwrap().is_empty());
+        assert!(db.get_image_path(&old_raw).is_none());
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT rating
+                       FROM quarantined_legacy_ratings
+                      WHERE path = ?1",
+                    [path_value(&old_raw)],
+                    |row| row.get::<_, u8>(0),
+                )
+                .unwrap(),
+            5
+        );
+        assert!(sidecar_owner_revision_on(&db.conn, &legacy_owner).unwrap() > 0);
+        assert!(sidecar_owner_revision_on(&db.conn, &current_owner).unwrap() > 0);
+        assert_eq!(crate::xmp::read_rating(&current_owner), Some(2));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn owner_key_migration_retains_a_nonverbatim_pending_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("owner-key-nonverbatim.db");
+        let raw = directory.path().join("photo.ARW");
+        std::fs::write(&raw, b"raw").unwrap();
+        let canonical = normalize_physical_path(&raw);
+        let legacy = ordinary_windows_spelling(&canonical);
+        let (size, mtime_ns) = file_identity(&canonical);
+        let current_owner = sidecar_owner_key(&canonical).unwrap();
+        let legacy_owner = legacy.with_extension("xmp");
+        {
+            let db = Db::open(&database_path).unwrap();
+            db.record_rating_pending_sidecar(canonical.to_str().unwrap(), size, mtime_ns, 5)
+                .unwrap();
+            remove_v8_marker_and_fence(&db.conn);
+            let transaction =
+                Transaction::new_unchecked(&db.conn, TransactionBehavior::Immediate).unwrap();
+            transaction
+                .execute(
+                    "UPDATE images
+                        SET path = ?2,
+                            sidecar_owner = ?3,
+                            owner_key_version = 0
+                      WHERE path = ?1",
+                    rusqlite::params![
+                        path_value(&canonical),
+                        path_value(&legacy),
+                        path_value(&legacy_owner),
+                    ],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "UPDATE image_revisions
+                        SET path = ?2
+                      WHERE path = ?1",
+                    rusqlite::params![path_value(&canonical), path_value(&legacy)],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "UPDATE sidecar_owner_revisions
+                        SET owner = ?2
+                      WHERE owner = ?1",
+                    rusqlite::params![path_value(&current_owner), path_value(&legacy_owner)],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        let db = Db::open(&database_path).unwrap();
+        let pending = db.pending_sidecars_with_owners().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].pending.path, legacy);
+        assert_eq!(pending[0].owner, current_owner);
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM image_revisions WHERE path = ?1",
+                    [path_value(&legacy)],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM image_revisions WHERE path = ?1",
+                    [path_value(&canonical)],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            crate::library::load_ratings(
+                &crate::folder::scan(directory.path()).unwrap(),
+                Some(&db)
+            )
+            .get(&0),
+            Some(&5)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn owner_key_migration_quarantines_dirty_history_colliding_with_nonverbatim_clean_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("owner-key-prefix-collision.db");
+        let raw = directory.path().join("photo.ARW");
+        std::fs::write(&raw, b"raw").unwrap();
+        let canonical = normalize_physical_path(&raw);
+        let legacy = ordinary_windows_spelling(&canonical);
+        let (size, mtime_ns) = file_identity(&canonical);
+        {
+            let db = Db::open(&database_path).unwrap();
+            db.record_rating_pending_sidecar(canonical.to_str().unwrap(), size, mtime_ns, 5)
+                .unwrap();
+            remove_v8_marker_and_fence(&db.conn);
+            db.conn
+                .execute(
+                    "UPDATE images
+                        SET owner_key_version = 0
+                      WHERE path = ?1",
+                    [path_value(&canonical)],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO images
+                        (path, size, mtime_ns, rating, sidecar_dirty,
+                         sidecar_owner, owner_key_version)
+                     VALUES (?1, ?2, ?3, 3, 0, NULL, 0)",
+                    rusqlite::params![path_value(&legacy), size, mtime_ns],
+                )
+                .unwrap();
+        }
+
+        let db = Db::open(&database_path).unwrap();
+        assert!(db.pending_sidecars().unwrap().is_empty());
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT rating
+                       FROM quarantined_legacy_ratings
+                      WHERE path = ?1",
+                    [path_value(&canonical)],
+                    |row| row.get::<_, u8>(0),
+                )
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM images", [], |row| {
+                    row.get::<_, usize>(0)
+                })
+                .unwrap(),
+            1,
+            "the clean nonverbatim history may remain, but cannot authorize publication"
+        );
     }
 
     #[test]
@@ -5389,6 +6890,68 @@ mod tests {
         assert!(!second_dir.join("photo.xmp").exists());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn mixed_migration_quarantines_canonical_dirty_with_nonverbatim_owned_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("mixed-prefix-owner-history.db");
+        let raw = directory.path().join("photo.ARW");
+        std::fs::write(&raw, b"raw").unwrap();
+        let canonical = normalize_physical_path(&raw);
+        let legacy = ordinary_windows_spelling(&canonical);
+        let (size, mtime_ns) = file_identity(&canonical);
+        {
+            let db = Db::open(&database_path).unwrap();
+            remove_v8_marker_and_fence(&db.conn);
+            db.conn
+                .execute(
+                    "DELETE FROM viewr_schema_migrations WHERE name = ?1",
+                    [RATING_GENERATION_MIGRATION],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO images
+                        (path, size, mtime_ns, rating, sidecar_dirty,
+                         sidecar_owner, owner_key_version)
+                     VALUES
+                        (?1, ?2, ?3, 5, 1, NULL, 0),
+                        (?4, ?2, ?3, 3, 0, ?5, 0)",
+                    rusqlite::params![
+                        path_value(&canonical),
+                        size,
+                        mtime_ns,
+                        path_value(&legacy),
+                        path_value(&legacy.with_extension("xmp")),
+                    ],
+                )
+                .unwrap();
+        }
+
+        let db = Db::open(&database_path).unwrap();
+        assert!(db.pending_sidecars().unwrap().is_empty());
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT rating
+                       FROM quarantined_legacy_ratings
+                      WHERE path = ?1",
+                    [path_value(&canonical)],
+                    |row| row.get::<_, u8>(0),
+                )
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM images", [], |row| {
+                    row.get::<_, usize>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn mixed_migration_quarantines_owned_alias_and_ownerless_physical_history() {
@@ -5614,8 +7177,7 @@ mod tests {
                      DROP TRIGGER images_reject_legacy_owner_insert;
                      DROP TRIGGER images_reject_legacy_rating_update;
                      UPDATE images
-                        SET sidecar_owner = 'legacy-photo.xmp',
-                            owner_key_version = 0;
+                        SET sidecar_owner = 'legacy-photo.xmp';
                      CREATE TRIGGER images_reject_legacy_owner_insert
                      BEFORE INSERT ON images BEGIN SELECT 1; END;
                      CREATE TRIGGER images_reject_legacy_rating_update
@@ -5702,8 +7264,7 @@ mod tests {
                     "DROP TRIGGER images_reject_legacy_owner_insert;
                      DROP TRIGGER images_reject_legacy_rating_update;
                      UPDATE images
-                        SET sidecar_owner = 'stale-owner.xmp',
-                            owner_key_version = 0;
+                        SET sidecar_owner = 'stale-owner.xmp';
                      CREATE TRIGGER images_reject_legacy_owner_insert
                      BEFORE INSERT ON images BEGIN SELECT 1; END;
                      CREATE TRIGGER images_reject_legacy_rating_update
@@ -5726,7 +7287,7 @@ mod tests {
                     |row| Ok((row_path(row, 0)?, row.get::<_, i64>(1)?)),
                 )
                 .unwrap(),
-            (current_owner, CURRENT_OWNER_KEY_VERSION)
+            (current_owner, CURRENT_OWNER_KEY_VERSION + 1)
         );
     }
 
@@ -5748,8 +7309,7 @@ mod tests {
                     "DROP TRIGGER images_reject_legacy_owner_insert;
                      DROP TRIGGER images_reject_legacy_rating_update;
                      UPDATE images
-                        SET sidecar_owner = 'stale-owner.xmp',
-                            owner_key_version = 0;",
+                        SET sidecar_owner = 'stale-owner.xmp';",
                 )
                 .unwrap();
             invalidate_owner_key_marker(&db.conn).unwrap();
@@ -5780,7 +7340,7 @@ mod tests {
                     |row| Ok((row_path(row, 0)?, row.get::<_, i64>(1)?)),
                 )
                 .unwrap(),
-            (owner, CURRENT_OWNER_KEY_VERSION)
+            (owner, CURRENT_OWNER_KEY_VERSION + 1)
         );
     }
 
@@ -5802,8 +7362,7 @@ mod tests {
                     "DROP TRIGGER images_reject_legacy_owner_insert;
                      DROP TRIGGER images_reject_legacy_rating_update;
                      UPDATE images
-                        SET sidecar_owner = 'stale-owner.xmp',
-                            owner_key_version = 0;",
+                        SET sidecar_owner = 'stale-owner.xmp';",
                 )
                 .unwrap();
             install_owner_key_fence(&db.conn).unwrap();
@@ -5830,7 +7389,7 @@ mod tests {
                     |row| Ok((row_path(row, 0)?, row.get::<_, i64>(1)?)),
                 )
                 .unwrap(),
-            (owner, CURRENT_OWNER_KEY_VERSION)
+            (owner, CURRENT_OWNER_KEY_VERSION + 1)
         );
     }
 
@@ -6156,6 +7715,48 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn owner_migration_rejects_text_and_blob_keys_that_decode_identically() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("mixed-storage-duplicate.db");
+        let raw = directory.path().join("photo.ARW");
+        std::fs::write(&raw, b"raw").unwrap();
+        let raw = normalize_physical_path(&raw);
+        let (size, mtime_ns) = file_identity(&raw);
+        {
+            let db = Db::open(&database_path).unwrap();
+            remove_v8_marker_and_fence(&db.conn);
+            db.conn
+                .execute_batch("DROP INDEX images_sidecar_owners;")
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO images
+                        (path, size, mtime_ns, rating, sidecar_dirty,
+                         sidecar_owner, owner_key_version)
+                     VALUES (?1, ?2, ?3, 3, 0, '/first.xmp', 0)",
+                    rusqlite::params![path_value(&raw), size, mtime_ns],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO images
+                        (path, size, mtime_ns, rating, sidecar_dirty,
+                         sidecar_owner, owner_key_version)
+                     VALUES (CAST(?1 AS BLOB), ?2, ?3, 4, 0, '/second.xmp', 0)",
+                    rusqlite::params![path_value(&raw), size, mtime_ns],
+                )
+                .unwrap();
+        }
+
+        assert!(Db::try_open_for_read(&database_path).unwrap().is_none());
+        assert!(matches!(
+            Db::open(&database_path),
+            Err(DbError::Sqlite(rusqlite::Error::InvalidQuery))
+        ));
+    }
+
     #[test]
     fn malformed_revision_values_fail_before_repair_arithmetic() {
         for (name, damage) in [
@@ -6280,6 +7881,9 @@ mod tests {
                     rusqlite::params![path_value(&raw), size, mtime_ns],
                 )
                 .unwrap();
+            install_rating_generation_objects(&db.conn).unwrap();
+            assert!(rating_generation_schema_is_ready(&db.conn).unwrap());
+            assert!(!current_owner_schema_is_ready(&db.conn).unwrap());
         }
 
         assert!(Db::try_open_for_read(&database_path).unwrap().is_none());
@@ -6289,6 +7893,29 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].owner, owner);
         assert_eq!(pending[0].pending.path, raw);
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*)
+                       FROM images
+                      WHERE sidecar_dirty = 1
+                        AND sidecar_owner IS NULL",
+                    [],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM quarantined_legacy_ratings",
+                    [],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+            0
+        );
         assert!(
             db.conn
                 .query_row(
@@ -6298,6 +7925,146 @@ mod tests {
                 )
                 .unwrap()
                 > CURRENT_OWNER_KEY_VERSION
+        );
+    }
+
+    #[test]
+    fn marker_present_unowned_dirty_null_rating_is_quarantined_during_repair() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("unowned-dirty-null-repair.db");
+        let raw = directory.path().join("photo.ARW");
+        std::fs::write(&raw, b"raw").unwrap();
+        let raw = normalize_physical_path(&raw);
+        let (size, mtime_ns) = file_identity(&raw);
+        {
+            let db = Db::open(&database_path).unwrap();
+            db.conn
+                .execute_batch("DROP TRIGGER images_reject_unowned_dirty_insert;")
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO images
+                        (path, size, mtime_ns, rating, sidecar_dirty,
+                         owner_key_version)
+                     VALUES (?1, ?2, ?3, NULL, 1, 8)",
+                    rusqlite::params![path_value(&raw), size, mtime_ns],
+                )
+                .unwrap();
+            install_rating_generation_objects(&db.conn).unwrap();
+            assert!(rating_generation_schema_is_ready(&db.conn).unwrap());
+            assert!(!current_owner_schema_is_ready(&db.conn).unwrap());
+        }
+
+        assert!(Db::try_open_for_read(&database_path).unwrap().is_none());
+        let db = Db::open(&database_path).unwrap();
+        assert!(current_owner_schema_is_ready(&db.conn).unwrap());
+        assert!(db.get_image_path(&raw).is_none());
+        assert!(db.pending_sidecars().unwrap().is_empty());
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*)
+                       FROM quarantined_legacy_ratings
+                      WHERE path = ?1
+                        AND rating IS NULL",
+                    [path_value(&raw)],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn obsolete_writer_fence_preserves_an_owned_unrated_tombstone() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("owned-unrated-tombstone.db");
+        let raw = directory.path().join("unrated.ARW");
+        std::fs::write(&raw, b"raw").unwrap();
+        let raw = normalize_physical_path(&raw);
+        let (size, mtime_ns) = file_identity(&raw);
+        let owner = sidecar_owner_key(&raw).unwrap();
+        let db = Db::open(&database_path).unwrap();
+        db.upsert_rating(raw.to_str().unwrap(), size, mtime_ns, None, 0)
+            .unwrap();
+
+        assert_eq!(
+            db.conn
+                .execute(
+                    "INSERT INTO images
+                        (path, size, mtime_ns, rating, sidecar_dirty)
+                     VALUES (?1, ?2, ?3, 4, 1)
+                     ON CONFLICT(path) DO UPDATE SET
+                        rating = excluded.rating,
+                        sidecar_dirty = excluded.sidecar_dirty",
+                    rusqlite::params![path_value(&raw), size, mtime_ns],
+                )
+                .unwrap(),
+            0
+        );
+        let (rating, dirty, owned) = db
+            .conn
+            .query_row(
+                "SELECT rating, sidecar_dirty, sidecar_owner IS NOT NULL
+                   FROM images
+                  WHERE path = ?1",
+                [path_value(&raw)],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<u8>>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(rating, None);
+        assert!(dirty);
+        assert!(owned);
+        assert!(db.pending_sidecars().unwrap().is_empty());
+        assert!(
+            current_owner_schema_is_ready(&db.conn).unwrap(),
+            "an owned dirty NULL is an intentional tombstone that suppresses an obsolete writer"
+        );
+        crate::xmp::write_rating(&owner, 4).unwrap();
+        assert!(
+            crate::library::load_ratings(
+                &crate::folder::scan(directory.path()).unwrap(),
+                Some(&db)
+            )
+            .is_empty()
+        );
+        db.conn
+            .execute_batch("DROP TRIGGER images_reject_legacy_rating_update;")
+            .unwrap();
+        drop(db);
+
+        assert!(Db::try_open_for_read(&database_path).unwrap().is_none());
+        let repaired = Db::open(&database_path).unwrap();
+        let (rating, dirty, owned) = repaired
+            .conn
+            .query_row(
+                "SELECT rating, sidecar_dirty, sidecar_owner IS NOT NULL
+                   FROM images
+                  WHERE path = ?1",
+                [path_value(&raw)],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<u8>>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!((rating, dirty, owned), (None, true, true));
+        assert!(
+            crate::library::load_ratings(
+                &crate::folder::scan(directory.path()).unwrap(),
+                Some(&repaired)
+            )
+            .is_empty(),
+            "forced repair must retain the tombstone over the obsolete XMP"
         );
     }
 
@@ -6473,6 +8240,7 @@ mod tests {
         let raw = normalize_physical_path(&raw);
         let (size, mtime_ns) = file_identity(&raw);
         let current_owner = sidecar_owner_key(&raw).unwrap();
+        let legacy_owner = directory.path().join("legacy.xmp");
         {
             let db = Db::open(&database_path).unwrap();
             db.record_rating_pending_sidecar(raw.to_str().unwrap(), size, mtime_ns, 5)
@@ -6484,10 +8252,15 @@ mod tests {
                         SET sidecar_owner = ?2,
                             owner_key_version = 0
                       WHERE path = ?1",
-                    rusqlite::params![
-                        path_value(&raw),
-                        path_value(&directory.path().join("legacy.xmp"))
-                    ],
+                    rusqlite::params![path_value(&raw), path_value(&legacy_owner)],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "UPDATE sidecar_owner_revisions
+                        SET owner = ?2
+                      WHERE owner = ?1",
+                    rusqlite::params![path_value(&current_owner), path_value(&legacy_owner)],
                 )
                 .unwrap();
         }
@@ -6787,6 +8560,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("concurrent-legacy.db");
+        let raw = normalize_physical_path(&dir.path().join("offline/concurrent-legacy.arw"));
         {
             let conn = Connection::open(&path).unwrap();
             conn.pragma_update(None, "journal_mode", "WAL").unwrap();
@@ -6798,10 +8572,14 @@ mod tests {
                     rating INTEGER,
                     sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
                     last_seen INTEGER NOT NULL DEFAULT 0
-                );
-                INSERT INTO images
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO images
                     (path, size, mtime_ns, rating, sidecar_mtime_ns, last_seen)
-                VALUES ('/p/concurrent-legacy.arw', 42, 7, 3, 123, 0);",
+                 VALUES (?1, 42, 7, 3, 123, 0)",
+                [path_value(&raw)],
             )
             .unwrap();
         }
@@ -6811,13 +8589,11 @@ mod tests {
             .map(|_| {
                 let barrier = barrier.clone();
                 let path = path.clone();
+                let raw = raw.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
                     let db = Db::open(&path).unwrap();
-                    assert_eq!(
-                        db.get_image("/p/concurrent-legacy.arw").unwrap().rating,
-                        Some(3)
-                    );
+                    assert_eq!(db.get_image_path(&raw).unwrap().rating, Some(3));
                 })
             })
             .collect::<Vec<_>>();
@@ -6838,8 +8614,7 @@ mod tests {
             .unwrap();
         assert_eq!(migration_rows, 1);
         assert_eq!(
-            db.rating_revision_snapshot(Path::new("/p/concurrent-legacy.arw"))
-                .unwrap(),
+            db.rating_revision_snapshot(&raw).unwrap(),
             ImageRevisionSnapshot::Present { revision: 0 }
         );
     }
@@ -7110,11 +8885,23 @@ mod tests {
             .conn
             .execute(
                 "INSERT INTO images
-                    (path, size, mtime_ns, rating, sidecar_dirty, sidecar_owner)
-                 VALUES (?1, 1, 1, 1, 1, '/p/owner.xmp')",
-                rusqlite::params![vec![0xff_u8]],
+                    (path, size, mtime_ns, rating, sidecar_dirty, sidecar_owner,
+                     owner_key_version)
+                 VALUES (?1, 1, 1, 1, 1, ?2, ?3)",
+                rusqlite::params![
+                    vec![0xff_u8],
+                    path_value(Path::new(r"C:\photos\owner.xmp")),
+                    CURRENT_OWNER_KEY_VERSION,
+                ],
             )
             .unwrap();
-        assert!(malformed.pending_sidecars().is_err());
+        assert!(matches!(
+            malformed.pending_sidecars(),
+            Err(DbError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                Type::Blob,
+                _
+            )))
+        ));
     }
 }
