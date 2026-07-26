@@ -138,6 +138,43 @@ installs and purges the package on a disposable CI host. It checks
 desktop-handler registration and verifies that the current user's MIME
 default does not change.
 
+## Build and validate a portable file
+
+On macOS, run:
+
+```bash
+scripts/package-portable-archive.sh \
+  --platform macos-arm64 \
+  --binary target/aarch64-apple-darwin/release/viewr \
+  --output dist/viewr-macos-arm64.tar.gz
+scripts/validate-portable-archive.sh \
+  --platform macos-arm64 \
+  --archive dist/viewr-macos-arm64.tar.gz \
+  --expected-binary target/aarch64-apple-darwin/release/viewr
+```
+
+On Linux, use `linux-x64`, `viewr-linux-x64.tar.gz`, and the
+`x86_64-unknown-linux-gnu` binary path with the same two scripts.
+
+On Windows, run:
+
+```powershell
+./scripts/package-portable-archive.ps1 `
+  -Platform windows-x64 `
+  -BinaryPath target/x86_64-pc-windows-msvc/release/viewr.exe `
+  -OutputPath dist/viewr-windows-x64.zip
+./scripts/validate-portable-archive.ps1 `
+  -Platform windows-x64 `
+  -ArchivePath dist/viewr-windows-x64.zip `
+  -ExpectedBinaryPath target/x86_64-pc-windows-msvc/release/viewr.exe
+```
+
+The Windows validator requires 7-Zip on `PATH`.
+
+The validators require the exact binary and license file set. They reject
+extra files, changed file contents, and an incorrect binary architecture. The
+tar validator also checks file modes.
+
 ## Build the release source
 
 Run this procedure on Linux:

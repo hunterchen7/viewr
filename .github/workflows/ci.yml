@@ -89,14 +89,20 @@ jobs:
           - platform: macOS arm64
             os: macos-15
             target: aarch64-apple-darwin
+            archive: viewr-macos-arm64.tar.gz
+            portable_platform: macos-arm64
             rustflags: ''
           - platform: Windows x64
             os: windows-2025
             target: x86_64-pc-windows-msvc
+            archive: viewr-windows-x64.zip
+            portable_platform: windows-x64
             rustflags: -C target-feature=+crt-static
           - platform: Debian x64
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+            archive: viewr-linux-x64.tar.gz
+            portable_platform: linux-x64
             rustflags: ''
     runs-on: ${{ matrix.os }}
     timeout-minutes: 75
@@ -157,8 +163,71 @@ jobs:
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release --locked --target ${{ matrix.target }} -p viewr --bin viewr
+      - name: Build and validate portable archive
+        if: ${{ !cancelled() && runner.os != 'Windows' && steps.build_viewr.outcome == 'success' }}
+        shell: bash
+        run: |
+          scripts/package-portable-archive.sh \
+            --platform "${{ matrix.portable_platform }}" \
+            --binary "target/${{ matrix.target }}/release/viewr" \
+            --output "dist/${{ matrix.archive }}"
+          scripts/validate-portable-archive.sh \
+            --platform "${{ matrix.portable_platform }}" \
+            --archive "dist/${{ matrix.archive }}" \
+            --expected-binary "target/${{ matrix.target }}/release/viewr"
+          reproducible_dir="$RUNNER_TEMP/viewr-portable-repro"
+          mkdir -p "$reproducible_dir"
+          scripts/package-portable-archive.sh \
+            --platform "${{ matrix.portable_platform }}" \
+            --binary "target/${{ matrix.target }}/release/viewr" \
+            --output "$reproducible_dir/${{ matrix.archive }}"
+          cmp \
+            "dist/${{ matrix.archive }}" \
+            "$reproducible_dir/${{ matrix.archive }}"
+      - name: Build and validate Windows portable archive
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.build_viewr.outcome == 'success' }}
+        shell: powershell
+        run: |
+          ./scripts/package-portable-archive.ps1 `
+            -Platform "${{ matrix.portable_platform }}" `
+            -BinaryPath "target/${{ matrix.target }}/release/viewr.exe" `
+            -OutputPath "dist/${{ matrix.archive }}"
+          ./scripts/validate-portable-archive.ps1 `
+            -Platform "${{ matrix.portable_platform }}" `
+            -ArchivePath "dist/${{ matrix.archive }}" `
+            -ExpectedBinaryPath "target/${{ matrix.target }}/release/viewr.exe"
+          $reproducibleDirectory = Join-Path `
+            $env:RUNNER_TEMP `
+            "viewr-portable-repro"
+          New-Item `
+            -ItemType Directory `
+            -Path $reproducibleDirectory `
+            -Force | Out-Null
+          $reproducibleArchive = Join-Path `
+            $reproducibleDirectory `
+            "${{ matrix.archive }}"
+          ./scripts/package-portable-archive.ps1 `
+            -Platform "${{ matrix.portable_platform }}" `
+            -BinaryPath "target/${{ matrix.target }}/release/viewr.exe" `
+            -OutputPath $reproducibleArchive
+          $firstHash = (
+            Get-FileHash `
+              -LiteralPath "dist/${{ matrix.archive }}" `
+              -Algorithm SHA256
+          ).Hash
+          $secondHash = (
+            Get-FileHash `
+              -LiteralPath $reproducibleArchive `
+              -Algorithm SHA256
+          ).Hash
+          if ($firstHash -cne $secondHash) {
+            throw "Repeated portable archive builds are not reproducible."
+          }
+          ./scripts/test-windows-portable-archive.ps1 `
+            -ArchivePath "dist/${{ matrix.archive }}" `
+            -ExpectedBinaryPath "target/${{ matrix.target }}/release/viewr.exe"
       - name: Build and validate macOS installer
-        if: ${{ runner.os == 'macOS' && steps.build_viewr.outcome == 'success' }}
+        if: ${{ !cancelled() && runner.os == 'macOS' && steps.build_viewr.outcome == 'success' }}
         shell: bash
         run: |
           scripts/package-macos-pkg.sh \
@@ -168,7 +237,7 @@ jobs:
             --test-open-events \
             dist/viewr-macos-arm64.pkg
       - name: Build and validate Windows installer
-        if: ${{ runner.os == 'Windows' && steps.build_viewr.outcome == 'success' }}
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.build_viewr.outcome == 'success' }}
         shell: pwsh
         run: |
           ./scripts/build-windows-msi.ps1 `
@@ -179,7 +248,7 @@ jobs:
             -ExpectedBinaryPath "target/${{ matrix.target }}/release/viewr.exe" `
             -AllowMachineChanges
       - name: Build and validate Debian installer
-        if: ${{ runner.os == 'Linux' && steps.build_viewr.outcome == 'success' }}
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.build_viewr.outcome == 'success' }}
         shell: bash
         run: |
           scripts/package-linux-deb.sh \
@@ -190,7 +259,7 @@ jobs:
             --allow-system-changes \
             dist/viewr-linux-x64.deb
       - name: Build and validate release source
-        if: ${{ runner.os == 'Linux' && steps.build_viewr.outcome == 'success' }}
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.build_viewr.outcome == 'success' }}
         shell: bash
         run: |
           scripts/package-source-archive.sh dist

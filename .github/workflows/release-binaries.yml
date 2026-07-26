@@ -77,16 +77,19 @@ jobs:
             os: macos-15
             target: aarch64-apple-darwin
             archive: viewr-macos-arm64.tar.gz
+            portable_platform: macos-arm64
             rustflags: ''
           - platform: Windows x64
             os: windows-2025
             target: x86_64-pc-windows-msvc
             archive: viewr-windows-x64.zip
+            portable_platform: windows-x64
             rustflags: -C target-feature=+crt-static
           - platform: Debian x64
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             archive: viewr-linux-x64.tar.gz
+            portable_platform: linux-x64
             rustflags: ''
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -116,45 +119,36 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - name: Build Viewr
+        id: build_viewr
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release --locked --target ${{ matrix.target }} -p viewr --bin viewr
-      - name: Package portable archive
-        if: runner.os != 'Windows'
+      - name: Build and validate portable archive
+        if: ${{ !cancelled() && runner.os != 'Windows' && steps.build_viewr.outcome == 'success' }}
         shell: bash
-        env:
-          ARCHIVE_NAME: ${{ matrix.archive }}
         run: |
-          stage="$RUNNER_TEMP/viewr-portable"
-          mkdir -p "$stage"
-          install -m 0755 target/${{ matrix.target }}/release/viewr "$stage/viewr"
-          install -m 0644 LICENSE "$stage/LICENSE"
-          install -m 0644 packaging/THIRD-PARTY-LICENSES.txt "$stage/THIRD-PARTY-LICENSES.txt"
-          install -m 0644 packaging/THIRD-PARTY-NOTICES.txt "$stage/THIRD-PARTY-NOTICES.txt"
-          install -m 0644 packaging/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html "$stage/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html"
-          install -m 0644 packaging/SOURCE-BUILD.md "$stage/SOURCE-BUILD.md"
-          install -m 0644 packaging/licenses/rawler-0.7.2-LICENSE "$stage/rawler-0.7.2-LICENSE"
-          mkdir -p dist
-          COPYFILE_DISABLE=1 tar -czf "dist/$ARCHIVE_NAME" -C "$stage" .
-      - name: Package Windows portable archive
-        if: runner.os == 'Windows'
+          scripts/package-portable-archive.sh \
+            --platform "${{ matrix.portable_platform }}" \
+            --binary "target/${{ matrix.target }}/release/viewr" \
+            --output "dist/${{ matrix.archive }}"
+          scripts/validate-portable-archive.sh \
+            --platform "${{ matrix.portable_platform }}" \
+            --archive "dist/${{ matrix.archive }}" \
+            --expected-binary "target/${{ matrix.target }}/release/viewr"
+      - name: Build and validate Windows portable archive
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.build_viewr.outcome == 'success' }}
         shell: pwsh
-        env:
-          ARCHIVE_NAME: ${{ matrix.archive }}
         run: |
-          $stage = Join-Path $env:RUNNER_TEMP "viewr-portable"
-          New-Item -ItemType Directory -Path $stage -Force | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/viewr.exe" "$stage/viewr.exe"
-          Copy-Item LICENSE "$stage/LICENSE"
-          Copy-Item packaging/THIRD-PARTY-LICENSES.txt "$stage/THIRD-PARTY-LICENSES.txt"
-          Copy-Item packaging/THIRD-PARTY-NOTICES.txt "$stage/THIRD-PARTY-NOTICES.txt"
-          Copy-Item packaging/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html "$stage/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html"
-          Copy-Item packaging/SOURCE-BUILD.md "$stage/SOURCE-BUILD.md"
-          Copy-Item packaging/licenses/rawler-0.7.2-LICENSE "$stage/rawler-0.7.2-LICENSE"
-          New-Item -ItemType Directory -Path dist -Force | Out-Null
-          Compress-Archive -Path "$stage/*" -DestinationPath "dist/$env:ARCHIVE_NAME"
+          ./scripts/package-portable-archive.ps1 `
+            -Platform "${{ matrix.portable_platform }}" `
+            -BinaryPath "target/${{ matrix.target }}/release/viewr.exe" `
+            -OutputPath "dist/${{ matrix.archive }}"
+          ./scripts/validate-portable-archive.ps1 `
+            -Platform "${{ matrix.portable_platform }}" `
+            -ArchivePath "dist/${{ matrix.archive }}" `
+            -ExpectedBinaryPath "target/${{ matrix.target }}/release/viewr.exe"
       - name: Build and validate macOS installer
-        if: runner.os == 'macOS'
+        if: ${{ !cancelled() && runner.os == 'macOS' && steps.build_viewr.outcome == 'success' }}
         shell: bash
         env:
           VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
@@ -166,7 +160,7 @@ jobs:
             --test-open-events \
             dist/viewr-macos-arm64.pkg
       - name: Build and validate Windows installer
-        if: runner.os == 'Windows'
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.build_viewr.outcome == 'success' }}
         shell: pwsh
         env:
           VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
@@ -180,7 +174,7 @@ jobs:
             -ExpectedBinaryPath "target/${{ matrix.target }}/release/viewr.exe" `
             -AllowMachineChanges
       - name: Build and validate Debian installer
-        if: runner.os == 'Linux'
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.build_viewr.outcome == 'success' }}
         shell: bash
         env:
           VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
