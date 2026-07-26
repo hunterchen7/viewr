@@ -58,7 +58,9 @@ cleanup() {
             /bin/kill "$process_id" 2>/dev/null || true
         fi
     done
-    if [[ -n "${work_dir:-}" && -d "$work_dir" ]]; then
+    if [[ "${VIEWR_MACOS_KEEP_VALIDATION_DIR:-0}" == "1" ]]; then
+        echo "Kept macOS validation directory: $work_dir" >&2
+    elif [[ -n "${work_dir:-}" && -d "$work_dir" ]]; then
         /bin/rm -rf -- "$work_dir"
     fi
 }
@@ -82,7 +84,9 @@ for required_path in \
     "Viewr.app/Contents/MacOS/ViewrLauncher" \
     "Viewr.app/Contents/MacOS/viewr-bin" \
     "Viewr.app/Contents/Resources/LICENSE.txt" \
+    "Viewr.app/Contents/Resources/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html" \
     "Viewr.app/Contents/Resources/THIRD-PARTY-NOTICES.txt" \
+    "Viewr.app/Contents/Resources/THIRD-PARTY-LICENSES.txt" \
     "Viewr.app/Contents/Resources/SOURCE-BUILD.md" \
     "Viewr.app/Contents/Resources/rawler-LICENSE.txt"; do
     grep -Fx "$required_path" "$payload_listing" >/dev/null ||
@@ -104,6 +108,13 @@ package_attribute() {
     fail "installer destination is not /Applications"
 [[ "$(package_attribute relocatable)" == "false" ]] ||
     fail "installer component must not be relocatable"
+[[ "$(
+    xmllint \
+        --xpath \
+        'count(/pkg-info/upgrade-bundle/bundle[@id="com.hunterchen.viewr"])' \
+        "$package_info"
+)" == "1" ]] ||
+    fail "installer does not declare the Viewr bundle upgrade"
 
 payload="$(find "$expanded" -type f -name Payload -print -quit)"
 [[ -n "$payload" ]] || fail "expanded installer contains no component payload"
@@ -129,6 +140,9 @@ plist_value() {
     fail "unexpected bundle version"
 [[ "$(plist_value LSMinimumSystemVersion)" == "11.0" ]] ||
     fail "bundle minimum macOS version is not 11.0"
+if plutil -extract LSUIElement raw -o - "$info" >/dev/null 2>&1; then
+    fail "bundle-wide LSUIElement would hide the spawned viewer from the Dock"
+fi
 [[ "$(plist_value CFBundleDocumentTypes.0.CFBundleTypeRole)" == "Viewer" ]] ||
     fail "ARW document role is not Viewer"
 [[ "$(plist_value CFBundleDocumentTypes.0.LSHandlerRank)" == "Alternate" ]] ||
@@ -155,6 +169,13 @@ plist_value() {
 
 launcher="$app/Contents/MacOS/ViewrLauncher"
 viewer="$app/Contents/MacOS/viewr-bin"
+macos_files="$(
+    find "$app/Contents/MacOS" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; |
+        LC_ALL=C sort
+)"
+expected_macos_files="$(printf 'ViewrLauncher\nviewr-bin')"
+[[ "$macos_files" == "$expected_macos_files" ]] ||
+    fail "bundle contains unexpected executable payload files"
 for executable in "$launcher" "$viewer"; do
     [[ -x "$executable" ]] || fail "payload executable is not executable: $executable"
     [[ "$(lipo -archs "$executable")" == "arm64" ]] ||
@@ -167,6 +188,8 @@ codesign --verify --deep --strict --verbose=2 "$app"
 
 for resource in \
     "$app/Contents/Resources/LICENSE.txt" \
+    "$app/Contents/Resources/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html" \
+    "$app/Contents/Resources/THIRD-PARTY-LICENSES.txt" \
     "$app/Contents/Resources/THIRD-PARTY-NOTICES.txt" \
     "$app/Contents/Resources/SOURCE-BUILD.md" \
     "$app/Contents/Resources/rawler-LICENSE.txt"; do
@@ -174,6 +197,14 @@ for resource in \
 done
 /usr/bin/cmp -s "$repo_root/LICENSE" "$app/Contents/Resources/LICENSE.txt" ||
     fail "bundled Viewr LICENSE differs from the repository LICENSE"
+/usr/bin/cmp -s \
+    "$repo_root/packaging/THIRD-PARTY-LICENSES.txt" \
+    "$app/Contents/Resources/THIRD-PARTY-LICENSES.txt" ||
+    fail "bundled third-party licenses differ from the generated inventory"
+/usr/bin/cmp -s \
+    "$repo_root/packaging/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html" \
+    "$app/Contents/Resources/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html" ||
+    fail "bundled Rust standard-library notices differ from the pinned copy"
 /usr/bin/cmp -s \
     "$repo_root/packaging/THIRD-PARTY-NOTICES.txt" \
     "$app/Contents/Resources/THIRD-PARTY-NOTICES.txt" ||
@@ -231,6 +262,8 @@ if [[ "$test_open_events" == "1" ]]; then
     done
     [[ -f "$probe_log" ]] && grep -F "$first_file" "$probe_log" >/dev/null ||
         fail "first open-document event did not reach the viewer probe"
+    grep -F $'\tregular\t' "$probe_log" >/dev/null ||
+        fail "spawned viewer does not use the regular macOS activation policy"
 
     wrapper_pid="$(
         pgrep -f -x "$test_app/Contents/MacOS/ViewrLauncher" | head -1 || true
@@ -248,6 +281,11 @@ if [[ "$test_open_events" == "1" ]]; then
         fail "second open-document event did not reach the viewer probe"
     /bin/kill -0 "$wrapper_pid" ||
         fail "launcher did not remain alive across sequential open events"
+    [[ "$(
+        awk -F '\t' -v parent="$wrapper_pid" '$2 == parent { count++ } END { print count + 0 }' \
+            "$probe_log"
+    )" == "2" ]] ||
+        fail "open-document events did not reach the same live launcher"
 
     while IFS=$'\t' read -r process_id _; do
         if [[ "$process_id" =~ ^[0-9]+$ ]]; then

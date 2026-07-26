@@ -1,3 +1,4 @@
+import AppKit
 import Darwin
 import Foundation
 
@@ -12,7 +13,10 @@ let logURL = validationDirectory.appendingPathComponent(
     isDirectory: false
 )
 let argument = CommandLine.arguments.dropFirst().first ?? "<missing>"
-let entry = "\(getpid())\t\(argument)\n"
+let activationPolicy = NSApplication.shared.activationPolicy() == .regular
+    ? "regular"
+    : "nonregular"
+let entry = "\(getpid())\t\(getppid())\t\(activationPolicy)\t\(argument)\n"
 let data = Data(entry.utf8)
 
 if !FileManager.default.fileExists(atPath: logURL.path) {

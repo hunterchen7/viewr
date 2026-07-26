@@ -105,6 +105,12 @@ xcrun --sdk macosx swiftc \
 /bin/cp \
     "$repo_root/packaging/THIRD-PARTY-NOTICES.txt" \
     "$resources_dir/THIRD-PARTY-NOTICES.txt"
+/bin/cp \
+    "$repo_root/packaging/THIRD-PARTY-LICENSES.txt" \
+    "$resources_dir/THIRD-PARTY-LICENSES.txt"
+/bin/cp \
+    "$repo_root/packaging/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html" \
+    "$resources_dir/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html"
 /bin/cp "$repo_root/packaging/SOURCE-BUILD.md" "$resources_dir/SOURCE-BUILD.md"
 
 rawler_license="${RAWLER_LICENSE_PATH:-$repo_root/packaging/licenses/rawler-0.7.2-LICENSE}"
