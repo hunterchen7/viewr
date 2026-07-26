@@ -204,7 +204,22 @@ jobs:
       - name: Install and remove macOS installer
         if: ${{ !cancelled() && runner.os == 'macOS' && steps.macos_installer.outcome == 'success' }}
         shell: bash
+        env:
+          VIEWR_TEST_RAW: ${{ runner.temp }}/viewr-public-domain-sony.ARW
         run: |
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            --retry-all-errors \
+            --show-error \
+            --silent \
+            https://raw.pixls.us/data/Sony/DSC-RX100/DSC00838.ARW \
+            --output "$VIEWR_TEST_RAW"
+          printf '%s  %s\n' \
+            579a485b5126a25cbd55cbd5dadfa7d09cf021c99cc7d4869f9e56e3f759390b \
+            "$VIEWR_TEST_RAW" |
+            shasum -a 256 --check -
           scripts/test-macos-pkg-install.sh \
             --allow-system-changes \
             dist/viewr-macos-arm64.pkg

@@ -55,6 +55,7 @@ scripts/package-macos-pkg.sh \
 scripts/validate-macos-pkg.sh \
   --test-open-events \
   dist/viewr-macos-arm64.pkg
+VIEWR_TEST_RAW=/absolute/path/photo.ARW \
 scripts/test-macos-pkg-install.sh \
   --allow-system-changes \
   dist/viewr-macos-arm64.pkg
@@ -65,7 +66,12 @@ requirements, bundle data, ARW declaration, deployment target, signatures,
 licenses, and two sequential open events. Run the install test only on a
 disposable Mac. It installs the package in `/Applications`, checks the receipt,
 payload, permissions, command, Launch Services registration, and handler
-preferences. It then removes the app and receipt.
+preferences. It uses the ARW file to test Finder-equivalent default routing.
+It verifies that the file contents do not change. It then removes the app and
+receipt.
+
+Use a valid Sony ARW file for `VIEWR_TEST_RAW`. CI downloads the pinned
+public-domain fixture that the core compatibility tests use.
 
 Set `VIEWR_MACOS_APP_SIGN_IDENTITY` to use a Developer ID Application
 identity. Set `VIEWR_MACOS_INSTALLER_SIGN_IDENTITY` to use a Developer ID

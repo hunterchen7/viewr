@@ -8,6 +8,7 @@ Usage: scripts/test-macos-pkg-install.sh \
 
 Install and remove Viewr on a disposable macOS host. The test refuses to
 replace an existing app, package receipt, or Launch Services registration.
+Set VIEWR_TEST_RAW to an existing Sony ARW file. The test does not change it.
 EOF
 }
 
@@ -34,7 +35,7 @@ pkg="$pkg_dir/$(basename "$pkg_arg")"
 
 for command in \
     awk basename codesign diff dirname ditto find grep mktemp plutil \
-    sed sort stat sudo uname xcrun
+    sed shasum sort stat sudo uname xcrun
 do
     command -v "$command" >/dev/null ||
         fail "required command is unavailable: $command"
@@ -52,6 +53,24 @@ arw_type="com.sony.arw-raw-image"
 launch_services="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 [[ -x "$launch_services" ]] ||
     fail "Launch Services registration tool is unavailable"
+
+fixture_arg="${VIEWR_TEST_RAW:-}"
+[[ -n "$fixture_arg" ]] ||
+    fail "VIEWR_TEST_RAW must name an existing Sony ARW file"
+[[ -f "$fixture_arg" && -s "$fixture_arg" && -r "$fixture_arg" ]] ||
+    fail "ARW fixture is missing, empty, or unreadable: $fixture_arg"
+case "${fixture_arg##*.}" in
+    [Aa][Rr][Ww]) ;;
+    *) fail "ARW fixture must have an .arw extension: $fixture_arg" ;;
+esac
+fixture_dir="$(cd "$(dirname "$fixture_arg")" && pwd -P)"
+fixture="$fixture_dir/$(basename "$fixture_arg")"
+case "$fixture" in
+    "$app"|"$app"/*)
+        fail "ARW fixture cannot be inside $app"
+        ;;
+esac
+fixture_sha256="$(shasum -a 256 "$fixture" | awk '{ print $1 }')"
 
 workspace_version="$(
     awk -F'"' '/^version = "/ { print $2; exit }' "$repo_root/Cargo.toml"
@@ -126,13 +145,19 @@ cleanup() {
             if "$probe" absent \
                 "$bundle_identifier" \
                 "$arw_type" \
-                "$app" >/dev/null 2>&1; then
+                "$app" \
+                "$fixture" >/dev/null 2>&1; then
                 launch_services_absent=1
                 break
             fi
             /bin/sleep 0.1
         done
         if [[ "$launch_services_absent" != "1" ]]; then
+            "$probe" absent \
+                "$bundle_identifier" \
+                "$arw_type" \
+                "$app" \
+                "$fixture" || true
             echo "error: cleanup left a Viewr Launch Services registration" >&2
             cleanup_failed=1
         fi
@@ -140,11 +165,22 @@ cleanup() {
             "$probe" default \
                 "$bundle_identifier" \
                 "$arw_type" \
-                "$app"
+                "$app" \
+                "$fixture"
         )" || cleanup_failed=1
-        if [[ -n "$default_before" &&
-            "${default_after_cleanup:-}" != "$default_before" ]]; then
+        type_default_after_cleanup="$(
+            "$probe" type-default \
+                "$bundle_identifier" \
+                "$arw_type" \
+                "$app" \
+                "$fixture"
+        )" || cleanup_failed=1
+        if [[ "${default_after_cleanup:-}" != "$default_before" ]]; then
             echo "error: cleanup changed the default ARW application" >&2
+            echo "file default before: ${default_before:-<none>}" >&2
+            echo "file default after: ${default_after_cleanup:-<none>}" >&2
+            echo "UTI default before: ${type_default_before:-<none>}" >&2
+            echo "UTI default after: ${type_default_after_cleanup:-<none>}" >&2
             cleanup_failed=1
         fi
         preferences_after_cleanup="$(
@@ -154,6 +190,12 @@ cleanup() {
             echo "error: cleanup changed Launch Services handler preferences" >&2
             cleanup_failed=1
         fi
+    fi
+
+    if [[ ! -f "$fixture" ||
+        "$(shasum -a 256 "$fixture" | awk '{ print $1 }')" != "$fixture_sha256" ]]; then
+        echo "error: integration test changed the ARW fixture" >&2
+        cleanup_failed=1
     fi
 
     /bin/rm -rf -- "$work_dir" || cleanup_failed=1
@@ -178,10 +220,13 @@ xcrun --sdk macosx swiftc \
     "$repo_root/packaging/macos/InstalledAppProbe.swift" \
     -o "$probe"
 
-"$probe" absent "$bundle_identifier" "$arw_type" "$app" ||
+"$probe" absent "$bundle_identifier" "$arw_type" "$app" "$fixture" ||
     fail "refusing to replace an existing Launch Services registration"
 default_before="$(
-    "$probe" default "$bundle_identifier" "$arw_type" "$app"
+    "$probe" default "$bundle_identifier" "$arw_type" "$app" "$fixture"
+)"
+type_default_before="$(
+    "$probe" type-default "$bundle_identifier" "$arw_type" "$app" "$fixture"
 )"
 preferences_before="$(launch_services_preferences)"
 
@@ -274,20 +319,34 @@ for _ in {1..300}; do
     if "$probe" present \
         "$bundle_identifier" \
         "$arw_type" \
-        "$app" >/dev/null 2>&1; then
+        "$app" \
+        "$fixture" >/dev/null 2>&1; then
         launch_services_ready=1
         break
     fi
     /bin/sleep 0.1
 done
-[[ "$launch_services_ready" == "1" ]] ||
+if [[ "$launch_services_ready" != "1" ]]; then
+    "$probe" present \
+        "$bundle_identifier" \
+        "$arw_type" \
+        "$app" \
+        "$fixture" || true
     fail "Installer did not register Viewr and its ARW handler with Launch Services"
+fi
 default_after_install="$(
-    "$probe" default "$bundle_identifier" "$arw_type" "$app"
+    "$probe" default "$bundle_identifier" "$arw_type" "$app" "$fixture"
 )"
-if [[ -n "$default_before" ]]; then
-    [[ "$default_after_install" == "$default_before" ]] ||
-        fail "Installer changed the existing default ARW application"
+type_default_after_install="$(
+    "$probe" type-default "$bundle_identifier" "$arw_type" "$app" "$fixture"
+)"
+if [[ "$default_after_install" != "$default_before" ]]; then
+    echo "error: Installer changed the existing default ARW application" >&2
+    echo "file default before: ${default_before:-<none>}" >&2
+    echo "file default after: ${default_after_install:-<none>}" >&2
+    echo "UTI default before: ${type_default_before:-<none>}" >&2
+    echo "UTI default after: ${type_default_after_install:-<none>}" >&2
+    exit 1
 fi
 preferences_after_install="$(launch_services_preferences)"
 [[ "$preferences_after_install" == "$preferences_before" ]] ||

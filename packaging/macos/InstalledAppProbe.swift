@@ -8,25 +8,42 @@ func fail(_ message: String) -> Never {
 }
 
 let arguments = CommandLine.arguments
-guard arguments.count == 5 else {
-    fail("usage: probe present|absent|default BUNDLE-ID UTI APP-PATH")
+guard arguments.count == 6 else {
+    fail(
+        "usage: probe present|absent|default|type-default " +
+            "BUNDLE-ID UTI APP-PATH ARW-FILE"
+    )
 }
 
-let expectedPath = URL(fileURLWithPath: arguments[4])
-    .resolvingSymlinksInPath()
-    .standardizedFileURL
-    .path
+func standardizedPath(_ url: URL) -> String {
+    url.resolvingSymlinksInPath().standardizedFileURL.path
+}
+
+let expectedPath = standardizedPath(URL(fileURLWithPath: arguments[4]))
+let arwURL = URL(fileURLWithPath: arguments[5])
+var isDirectory = ObjCBool(false)
+guard FileManager.default.fileExists(
+    atPath: arwURL.path,
+    isDirectory: &isDirectory
+), !isDirectory.boolValue else {
+    fail("ARW fixture is not a regular file")
+}
+
 let bundlePaths = NSWorkspace.shared
     .urlsForApplications(withBundleIdentifier: arguments[2])
-    .map { $0.resolvingSymlinksInPath().standardizedFileURL.path }
+    .map(standardizedPath)
 let typePaths = NSWorkspace.shared
     .urlsForApplications(toOpen: UTType(importedAs: arguments[3]))
-    .map { $0.resolvingSymlinksInPath().standardizedFileURL.path }
-let defaultPath = NSWorkspace.shared
+    .map(standardizedPath)
+let filePaths = NSWorkspace.shared
+    .urlsForApplications(toOpen: arwURL)
+    .map(standardizedPath)
+let typeDefaultPath = NSWorkspace.shared
     .urlForApplication(toOpen: UTType(importedAs: arguments[3]))?
-    .resolvingSymlinksInPath()
-    .standardizedFileURL
-    .path
+    .resolvingSymlinksInPath().standardizedFileURL.path
+let fileDefaultPath = NSWorkspace.shared
+    .urlForApplication(toOpen: arwURL)?
+    .resolvingSymlinksInPath().standardizedFileURL.path
 
 switch arguments[1] {
 case "present":
@@ -34,15 +51,25 @@ case "present":
         fail("Launch Services bundle lookup did not resolve only the installed app")
     }
     guard typePaths.contains(expectedPath) else {
-        fail("Launch Services did not register the installed ARW handler")
+        fail("Launch Services did not register the installed ARW UTI handler")
+    }
+    guard filePaths.contains(expectedPath) else {
+        fail("Launch Services did not register the installed ARW file handler")
     }
 case "absent":
-    guard bundlePaths.isEmpty, !typePaths.contains(expectedPath) else {
+    guard bundlePaths.isEmpty,
+          !typePaths.contains(expectedPath),
+          !filePaths.contains(expectedPath)
+    else {
         fail("Launch Services still resolves the removed app")
     }
 case "default":
-    if let defaultPath {
-        FileHandle.standardOutput.write(Data((defaultPath + "\n").utf8))
+    if let fileDefaultPath {
+        FileHandle.standardOutput.write(Data((fileDefaultPath + "\n").utf8))
+    }
+case "type-default":
+    if let typeDefaultPath {
+        FileHandle.standardOutput.write(Data((typeDefaultPath + "\n").utf8))
     }
 default:
     fail("unknown probe mode")
