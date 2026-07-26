@@ -41,18 +41,24 @@ expected=(
   "viewr-windows-x64.zip"
 )
 
-mapfile -t actual < <(
-  find "$asset_dir" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort
-)
-mapfile -t sorted_expected < <(printf '%s\n' "${expected[@]}" | LC_ALL=C sort)
+actual="$(
+  find "$asset_dir" \
+    -mindepth 1 \
+    -maxdepth 1 \
+    -type f \
+    ! -name SHA256SUMS \
+    -exec basename {} \; |
+    LC_ALL=C sort
+)"
+sorted_expected="$(printf '%s\n' "${expected[@]}" | LC_ALL=C sort)"
 
-if [[ "${actual[*]}" != "${sorted_expected[*]}" ]]; then
+if [[ "$actual" != "$sorted_expected" ]]; then
   echo "release asset set does not match the expected files" >&2
   diff \
     --label expected \
     --label actual \
-    <(printf '%s\n' "${sorted_expected[@]}") \
-    <(printf '%s\n' "${actual[@]}") >&2 || true
+    <(printf '%s\n' "$sorted_expected") \
+    <(printf '%s\n' "$actual") >&2 || true
   exit 1
 fi
 
@@ -63,9 +69,18 @@ for asset in "${expected[@]}"; do
   fi
 done
 
+if command -v sha256sum >/dev/null 2>&1; then
+  checksum_command=(sha256sum)
+elif command -v shasum >/dev/null 2>&1; then
+  checksum_command=(shasum -a 256)
+else
+  echo "sha256sum or shasum is required" >&2
+  exit 1
+fi
+
 (
   cd "$asset_dir"
-  sha256sum "${sorted_expected[@]}" >SHA256SUMS
+  "${checksum_command[@]}" "${expected[@]}" >SHA256SUMS
 )
 
 echo "$asset_dir/SHA256SUMS"

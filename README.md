@@ -39,6 +39,7 @@ RAW-derived Browse render is still in flight.
 
 ```
 viewr <folder|file.arw>        browse a folder of raws
+viewr --pick-folder            choose a folder in a native dialog
 viewr dev <file.arw> [out]     decode one file, print per-stage timings
 ```
 
@@ -63,8 +64,23 @@ is written on first run).
 
 ## Install
 
-Grab a binary from [Releases](https://github.com/hunterchen7/viewr/releases)
-(macOS Apple Silicon, Windows x64, Linux x64), or build from source:
+Download one of these files from
+[Releases](https://github.com/hunterchen7/viewr/releases):
+
+- macOS 11 or later, Apple Silicon: `viewr-macos-arm64.pkg`.
+- Windows 10 or later, x64: `viewr-windows-x64.msi`.
+- Ubuntu 22.04 or later, or Debian 12 or later, x64:
+  `viewr-linux-x64.deb`.
+
+Portable `.tar.gz` and `.zip` files remain available. The installers register
+Viewr as an ARW viewer. The installers do not change the default viewer.
+
+The current release packages are unsigned preview installers. They do not have
+Apple Developer ID or Windows Authenticode signatures. macOS Gatekeeper or
+Windows SmartScreen can show a security prompt. Verify the downloaded artifact
+with its GitHub provenance attestation and `SHA256SUMS` before installation.
+
+To build from source, run:
 
 ```
 cargo build --release        # binary at target/release/viewr
@@ -75,10 +91,14 @@ cargo doc --workspace --no-deps  # API and architecture contracts
 Rust 1.96 is pinned; the application stack uses egui/wgpu → Metal on macOS,
 DX12/Vulkan on Windows, and Vulkan on Linux. The bundled SQLite library is
 native C. CI builds and tests all three platforms.
-Linux builds need `libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev
-libxcb-xfixes0-dev libxkbcommon-dev`. RAW decoding by
+Linux builds need `build-essential pkg-config libgtk-3-dev
+libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+libxkbcommon-dev`. RAW decoding by
 [rawler](https://github.com/dnglab/dnglab) — Sony ARW first-class
 including lossless compressed; DNG comes along for free.
+
+See [installer and release procedures](docs/installers-and-releases.md) for
+package validation, default-viewer steps, and release architecture.
 
 ## Notes
 
@@ -110,12 +130,15 @@ including lossless compressed; DNG comes along for free.
 ## License
 
 viewr is MIT-licensed. It links [rawler](https://github.com/dnglab/dnglab)
-(LGPL-2.1) for raw decoding; distributed binaries include that LGPL
-component, whose source and license are available at the link above.
+(LGPL-2.1) for raw decoding. Each package contains the exact rawler license,
+the complete generated dependency-license inventory, Rust standard-library
+notices, and source-build instructions. Each release contains a
+version-matched source archive with vendored dependencies and a tested local
+rawler replacement workflow.
 
 ## Releases
 
 Automated with release-please: commits to `main` using
 [Conventional Commits](https://www.conventionalcommits.org) (`feat:`,
 `fix:`, …) accumulate into a release PR; merging it tags a version,
-generates the changelog, and CI attaches macOS, Windows, and Linux binaries.
+generates the changelog, and CI attaches archives and native installers.

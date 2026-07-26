@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - id: release
-        uses: googleapis/release-please-action@v4
+        uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
@@ -35,12 +35,12 @@ jobs:
           printf 'branch=%s\n' "$release_branch" >> "$GITHUB_OUTPUT"
       - name: Check out release pull request
         if: ${{ steps.release.outputs.prs_created == 'true' }}
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ steps.release_pr.outputs.branch }}
       - name: Install Rust
         if: ${{ steps.release.outputs.prs_created == 'true' }}
-        uses: dtolnay/rust-toolchain@1.96
+        uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
       - name: Sync release lockfile
         if: ${{ steps.release.outputs.prs_created == 'true' }}
         env:

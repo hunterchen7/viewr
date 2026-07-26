@@ -1,49 +1,247 @@
-# Builds and attaches binaries when a GitHub release is created —
-# which only happens when the release-please PR is merged.
+# Builds and attaches versioned archives and native installers when
+# release-please creates a GitHub release.
 name: Release binaries
 on:
   release:
     types: [created]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build:
+  packages:
+    name: Release assets (${{ matrix.platform }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
+          - platform: macOS arm64
+            os: macos-15
             target: aarch64-apple-darwin
-            asset: viewr-macos-arm64.tar.gz
-          - os: windows-latest
+            archive: viewr-macos-arm64.tar.gz
+            rustflags: ''
+          - platform: Windows x64
+            os: windows-2025
             target: x86_64-pc-windows-msvc
-            asset: viewr-windows-x64.zip
-          - os: ubuntu-latest
+            archive: viewr-windows-x64.zip
+            rustflags: -C target-feature=+crt-static
+          - platform: Debian x64
+            os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            asset: viewr-linux-x64.tar.gz
+            archive: viewr-linux-x64.tar.gz
+            rustflags: ''
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
-      - name: Linux build deps
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Linux build and package dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
-      - uses: dtolnay/rust-toolchain@1.96
+          sudo apt-get install -y \
+            binutils \
+            desktop-file-utils \
+            dpkg-dev \
+            jq \
+            libgtk-3-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libvulkan1 \
+            lintian \
+            shared-mime-info \
+            xdg-utils
+      - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
         with:
           targets: ${{ matrix.target }}
-      - run: cargo build --release --locked --target ${{ matrix.target }}
-      - name: Package (unix)
+      - name: Build Viewr
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release --locked --target ${{ matrix.target }} -p viewr --bin viewr
+      - name: Package portable archive
         if: runner.os != 'Windows'
+        shell: bash
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive }}
         run: |
-          tar -czf ${{ matrix.asset }} -C target/${{ matrix.target }}/release viewr
-      - name: Package (Windows)
+          stage="$RUNNER_TEMP/viewr-portable"
+          mkdir -p "$stage"
+          install -m 0755 target/${{ matrix.target }}/release/viewr "$stage/viewr"
+          install -m 0644 LICENSE "$stage/LICENSE"
+          install -m 0644 packaging/THIRD-PARTY-LICENSES.txt "$stage/THIRD-PARTY-LICENSES.txt"
+          install -m 0644 packaging/THIRD-PARTY-NOTICES.txt "$stage/THIRD-PARTY-NOTICES.txt"
+          install -m 0644 packaging/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html "$stage/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html"
+          install -m 0644 packaging/SOURCE-BUILD.md "$stage/SOURCE-BUILD.md"
+          install -m 0644 packaging/licenses/rawler-0.7.2-LICENSE "$stage/rawler-0.7.2-LICENSE"
+          mkdir -p dist
+          COPYFILE_DISABLE=1 tar -czf "dist/$ARCHIVE_NAME" -C "$stage" .
+      - name: Package Windows portable archive
         if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ARCHIVE_NAME: ${{ matrix.archive }}
         run: |
-          Compress-Archive -Path "target/${{ matrix.target }}/release/viewr.exe" -DestinationPath "${{ matrix.asset }}"
-      - name: Upload to release
+          $stage = Join-Path $env:RUNNER_TEMP "viewr-portable"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/viewr.exe" "$stage/viewr.exe"
+          Copy-Item LICENSE "$stage/LICENSE"
+          Copy-Item packaging/THIRD-PARTY-LICENSES.txt "$stage/THIRD-PARTY-LICENSES.txt"
+          Copy-Item packaging/THIRD-PARTY-NOTICES.txt "$stage/THIRD-PARTY-NOTICES.txt"
+          Copy-Item packaging/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html "$stage/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html"
+          Copy-Item packaging/SOURCE-BUILD.md "$stage/SOURCE-BUILD.md"
+          Copy-Item packaging/licenses/rawler-0.7.2-LICENSE "$stage/rawler-0.7.2-LICENSE"
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/$env:ARCHIVE_NAME"
+      - name: Build and validate macOS installer
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          VIEWR_RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          scripts/package-macos-pkg.sh \
+            target/${{ matrix.target }}/release/viewr \
+            dist/viewr-macos-arm64.pkg
+          scripts/validate-macos-pkg.sh \
+            --test-open-events \
+            dist/viewr-macos-arm64.pkg
+      - name: Build and validate Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VIEWR_RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          ./scripts/build-windows-msi.ps1 `
+            -BinaryPath "target/${{ matrix.target }}/release/viewr.exe" `
+            -OutputDirectory dist `
+            -ReleaseTag $env:VIEWR_RELEASE_TAG
+          ./scripts/test-windows-msi.ps1 `
+            -MsiPath dist/viewr-windows-x64.msi `
+            -ExpectedBinaryPath "target/${{ matrix.target }}/release/viewr.exe" `
+            -AllowMachineChanges
+      - name: Build and validate Debian installer
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          VIEWR_RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          scripts/package-linux-deb.sh \
+            --binary target/${{ matrix.target }}/release/viewr \
+            --output-dir dist \
+            --release-tag "$VIEWR_RELEASE_TAG"
+          scripts/validate-linux-deb.sh dist/viewr-linux-x64.deb
+          scripts/test-linux-deb-install.sh \
+            --allow-system-changes \
+            dist/viewr-linux-x64.deb
+      - name: Upload platform assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  source:
+    name: Release source
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Linux source-validation dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            jq \
+            libgtk-3-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            pkg-config
+      - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
+      - name: Install license inventory tool
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
+      - name: Fetch all release target dependency graphs
+        run: |
+          cargo fetch --locked --target aarch64-apple-darwin
+          cargo fetch --locked --target x86_64-pc-windows-msvc
+          cargo fetch --locked --target x86_64-unknown-linux-gnu
+      - name: Validate third-party license inventories
+        run: scripts/validate-third-party-licenses.sh
+      - name: Build and validate vendored source archive
+        env:
+          VIEWR_RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          scripts/package-source-archive.sh dist
+          scripts/validate-source-archive.sh dist/viewr-*-source.tar.gz
+      - name: Upload source asset
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-source
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish release assets
+    needs: [packages, source]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
+      - name: Download release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Verify assets and write checksums
+        env:
+          VIEWR_RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          scripts/verify-release-assets.sh \
+            dist \
+            "$VIEWR_RELEASE_TAG"
+      - name: Reject unexpected existing release assets
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          VIEWR_RELEASE_TAG: ${{ github.event.release.tag_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/verify-remote-release-assets.sh \
+            --allow-missing \
+            dist \
+            "$VIEWR_RELEASE_TAG"
+      - name: Attest release assets
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
+        with:
+          subject-checksums: dist/SHA256SUMS
+      - name: Attest checksum manifest
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
+        with:
+          subject-path: dist/SHA256SUMS
+      - name: Upload all release assets
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload ${{ github.event.release.tag_name }} ${{ matrix.asset }}
+          VIEWR_RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release upload \
+            "$VIEWR_RELEASE_TAG" \
+            dist/* \
+            --clobber
+      - name: Verify published release assets
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          VIEWR_RELEASE_TAG: ${{ github.event.release.tag_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/verify-remote-release-assets.sh \
+            dist \
+            "$VIEWR_RELEASE_TAG"
