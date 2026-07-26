@@ -15,9 +15,9 @@ concurrency:
 
 jobs:
   quality:
-    name: Quality gates
+    name: Quality, release, and benchmarks
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Linux build deps
@@ -50,75 +50,38 @@ jobs:
         run: cargo doc --workspace --no-deps --all-features --locked
         env:
           RUSTDOCFLAGS: -D warnings
-
-  test:
-    name: Tests (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Linux build deps
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
-      - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: tests
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Test workspace
-        run: cargo test --workspace --locked
-      - name: Check benchmark targets
-        if: runner.os != 'Linux'
-        run: cargo check --workspace --benches --all-features --locked
-      - name: Report optional real-RAW fixture coverage
-        if: ${{ always() && runner.os == 'Linux' }}
-        shell: bash
-        run: |
-          fixture_dir="testdata/real-raw-corpus"
-          if [[ -f "$fixture_dir/HCA04875.ARW" && -f "$fixture_dir/HCA05417.ARW" ]]; then
-            fixture_status="Available but not run: real-RAW tests are opt-in because they are marked ignored."
-          else
-            fixture_status="Not run: optional local RAW fixtures are absent, so the ignored real-RAW tests have no fixture coverage in this CI run."
-          fi
-          echo "::notice title=Optional real-RAW fixture tests::$fixture_status"
-          {
-            echo "### Optional real-RAW fixture coverage"
-            echo
-            echo "$fixture_status"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  build:
-    name: Release and benchmark builds
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Linux build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
-      - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: builds
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build release and benchmark targets
+        if: ${{ !cancelled() }}
         run: cargo build --workspace --release --bins --benches --all-features --locked
       - name: Test workspace release behavior
+        if: ${{ !cancelled() }}
         run: cargo test --workspace --release --locked
       - name: Smoke-test optimized benchmark harnesses
+        if: ${{ !cancelled() }}
         run: |
           cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- --test
           cargo bench -p viewr --features benchmarks --bench filmstrip_scaling --locked -- --test
 
-  installers:
-    name: Installer (${{ matrix.platform }})
+  macos-compatibility:
+    name: Compatibility (macOS latest)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: macos-latest
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Test workspace
+        id: test_workspace
+        run: cargo test --workspace --locked
+      - name: Check benchmark targets
+        if: ${{ !cancelled() }}
+        run: cargo check --workspace --benches --all-features --locked
+
+  platform:
+    name: Platform (${{ matrix.platform }})
     strategy:
       fail-fast: false
       matrix:
@@ -136,7 +99,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             rustflags: ''
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Linux build and package dependencies
@@ -164,12 +127,38 @@ jobs:
         with:
           shared-key: installers-${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Test workspace
+        id: test_workspace
+        if: runner.os != 'macOS'
+        run: cargo test --workspace --locked
+      - name: Check benchmark targets
+        id: check_benchmarks
+        if: ${{ runner.os == 'Windows' && (success() || steps.test_workspace.outcome == 'failure') }}
+        run: cargo check --workspace --benches --all-features --locked
+      - name: Report optional real-RAW fixture coverage
+        if: ${{ always() && runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          fixture_dir="testdata/real-raw-corpus"
+          if [[ -f "$fixture_dir/HCA04875.ARW" && -f "$fixture_dir/HCA05417.ARW" ]]; then
+            fixture_status="Available but not run: real-RAW tests are opt-in because they are marked ignored."
+          else
+            fixture_status="Not run: optional local RAW fixtures are absent, so the ignored real-RAW tests have no fixture coverage in this CI run."
+          fi
+          echo "::notice title=Optional real-RAW fixture tests::$fixture_status"
+          {
+            echo "### Optional real-RAW fixture coverage"
+            echo
+            echo "$fixture_status"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Build Viewr
+        id: build_viewr
+        if: ${{ success() || steps.test_workspace.outcome == 'failure' || steps.check_benchmarks.outcome == 'failure' }}
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release --locked --target ${{ matrix.target }} -p viewr --bin viewr
       - name: Build and validate macOS installer
-        if: runner.os == 'macOS'
+        if: ${{ runner.os == 'macOS' && steps.build_viewr.outcome == 'success' }}
         shell: bash
         run: |
           scripts/package-macos-pkg.sh \
@@ -179,7 +168,7 @@ jobs:
             --test-open-events \
             dist/viewr-macos-arm64.pkg
       - name: Build and validate Windows installer
-        if: runner.os == 'Windows'
+        if: ${{ runner.os == 'Windows' && steps.build_viewr.outcome == 'success' }}
         shell: pwsh
         run: |
           ./scripts/build-windows-msi.ps1 `
@@ -190,7 +179,7 @@ jobs:
             -ExpectedBinaryPath "target/${{ matrix.target }}/release/viewr.exe" `
             -AllowMachineChanges
       - name: Build and validate Debian installer
-        if: runner.os == 'Linux'
+        if: ${{ runner.os == 'Linux' && steps.build_viewr.outcome == 'success' }}
         shell: bash
         run: |
           scripts/package-linux-deb.sh \
@@ -201,7 +190,7 @@ jobs:
             --allow-system-changes \
             dist/viewr-linux-x64.deb
       - name: Build and validate release source
-        if: runner.os == 'Linux'
+        if: ${{ runner.os == 'Linux' && steps.build_viewr.outcome == 'success' }}
         shell: bash
         run: |
           scripts/package-source-archive.sh dist
