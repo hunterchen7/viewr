@@ -202,6 +202,9 @@ grep -Fq 'Class:                             ELF64' <<<"${elf_header}" \
     || fail "packaged executable is not ELF64"
 grep -Eq 'Machine:[[:space:]]+Advanced Micro Devices X86-64' <<<"${elf_header}" \
     || fail "packaged executable is not x86-64"
+if readelf --wide --sections "${binary}" | grep -Eq '\.(debug_|symtab)'; then
+    fail "packaged executable contains debug or symbol table sections"
+fi
 if readelf -d "${binary}" | grep -Eq '\((RPATH|RUNPATH)\)'; then
     fail "packaged executable contains RPATH or RUNPATH"
 fi

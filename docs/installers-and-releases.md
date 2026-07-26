@@ -133,10 +133,10 @@ scripts/test-linux-deb-install.sh \
 ```
 
 The structural validator checks package data, files, permissions, MIME data,
-ELF data, linked libraries, and lintian errors. The integration test installs
-and purges the package on a disposable CI host. It checks desktop-handler
-registration and verifies that the current user's MIME default does not
-change.
+stripped ELF data, linked libraries, and lintian errors. The integration test
+installs and purges the package on a disposable CI host. It checks
+desktop-handler registration and verifies that the current user's MIME
+default does not change.
 
 ## Build the release source
 

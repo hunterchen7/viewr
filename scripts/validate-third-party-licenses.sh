@@ -46,6 +46,9 @@ cargo about generate \
     --output-file "$generated_licenses" \
     about.hbs
 
+# Match the platform-independent output produced by the generation script.
+LC_ALL=C perl -pi -e 's/\r\n?/\n/g' "$generated_licenses"
+
 if ! cmp -s "$generated_licenses" packaging/THIRD-PARTY-LICENSES.txt; then
     echo "error: packaging/THIRD-PARTY-LICENSES.txt is stale" >&2
     diff -u packaging/THIRD-PARTY-LICENSES.txt "$generated_licenses" || true

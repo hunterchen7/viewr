@@ -46,6 +46,10 @@ cargo about generate \
     --output-file "$generated_licenses" \
     about.hbs
 
+# cargo-about preserves the line endings in upstream license files. Normalize
+# them so macOS and Linux generate the same byte-for-byte inventory.
+LC_ALL=C perl -pi -e 's/\r\n?/\n/g' "$generated_licenses"
+
 rust_sysroot="$(rustc --print sysroot)"
 rust_copyright_source="${rust_sysroot}/share/doc/rust/COPYRIGHT-library.html"
 if [[ ! -f "$rust_copyright_source" ]]; then

@@ -67,7 +67,7 @@ done
 
 for command_name in \
     awk cargo cat date dpkg dpkg-deb dpkg-shlibdeps du find git grep gzip \
-    install jq md5sum mktemp readelf sed sha256sum sort touch tr uname xargs
+    install jq md5sum mktemp readelf sed sha256sum sort strip touch tr uname xargs
 do
     require_command "${command_name}"
 done
@@ -134,6 +134,7 @@ install -d -m 0755 \
     "${package_root}/usr/share/applications" \
     "${package_root}/usr/share/doc/viewr"
 install -m 0755 "${binary_path}" "${package_root}/usr/bin/viewr"
+strip --strip-unneeded "${package_root}/usr/bin/viewr"
 install -m 0644 \
     "${repo_root}/packaging/linux/viewr.desktop" \
     "${package_root}/usr/share/applications/viewr.desktop"

@@ -1,7 +1,12 @@
 # Auto detect text files and perform LF normalization
 * text=auto
 
-# These are exact, generated upstream/license artifacts. Preserve their bytes
-# and do not report upstream-required trailing whitespace as a local error.
-packaging/THIRD-PARTY-LICENSES.txt -text whitespace=-trailing-space,-blank-at-eof
+# Normalize the generated dependency inventory on every checkout. Preserve
+# upstream-required whitespace when Git checks the generated text.
+packaging/THIRD-PARTY-LICENSES.txt text eol=lf whitespace=-trailing-space,-blank-at-eof
+
+# Keep exact license hashes stable on Windows checkouts.
+packaging/licenses/rawler-0.7.2-LICENSE text eol=lf
+
+# This is an exact copy from the pinned Rust toolchain.
 packaging/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html -text whitespace=-trailing-space,-blank-at-eof
