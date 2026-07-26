@@ -1,11 +1,13 @@
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=Viewr
-Comment=View and rate Sony ARW raw images
+Name=Viewr ARW Handler
+Comment=Open a Sony ARW raw image in Viewr
 TryExec=viewr
-Exec=viewr --pick-folder
+Exec=viewr %f
 Icon=image-x-generic
 Terminal=false
+NoDisplay=true
 Categories=Graphics;Photography;Viewer;
+MimeType=image/x-sony-arw;
 StartupNotify=true

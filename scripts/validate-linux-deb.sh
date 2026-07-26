@@ -62,6 +62,8 @@ grep -Eq '(^|, )libvulkan1([[:space:](,]|$)' <<<"${dependencies}" \
     || fail "package does not depend on libvulkan1"
 grep -Eq '(^|, )shared-mime-info([[:space:](,]|$)' <<<"${dependencies}" \
     || fail "package does not depend on shared-mime-info"
+grep -Eq '(^|, )desktop-file-utils([[:space:](,]|$)' <<<"${dependencies}" \
+    || fail "package does not depend on desktop-file-utils"
 
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/viewr-deb-validation.XXXXXXXX")"
 cleanup() {
@@ -83,9 +85,12 @@ actual_files="$(
 )"
 expected_files="$(cat <<'EOF'
 /usr/bin/viewr
+/usr/share/applications/viewr-arw.desktop
 /usr/share/applications/viewr.desktop
 /usr/share/doc/viewr/LICENSE
+/usr/share/doc/viewr/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html
 /usr/share/doc/viewr/SOURCE-BUILD.md
+/usr/share/doc/viewr/THIRD-PARTY-LICENSES.txt
 /usr/share/doc/viewr/THIRD-PARTY-NOTICES.txt
 /usr/share/doc/viewr/changelog.Debian.gz
 /usr/share/doc/viewr/changelog.gz
@@ -113,9 +118,12 @@ expected_control_files="$(printf 'control\nmd5sums')"
 [[ "$(stat -c '%a' "${package_root}/usr/bin/viewr")" == "755" ]] \
     || fail "Viewr executable mode is not 0755"
 for data_file in \
+    "${package_root}/usr/share/applications/viewr-arw.desktop" \
     "${package_root}/usr/share/applications/viewr.desktop" \
     "${package_root}/usr/share/doc/viewr/LICENSE" \
+    "${package_root}/usr/share/doc/viewr/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html" \
     "${package_root}/usr/share/doc/viewr/SOURCE-BUILD.md" \
+    "${package_root}/usr/share/doc/viewr/THIRD-PARTY-LICENSES.txt" \
     "${package_root}/usr/share/doc/viewr/THIRD-PARTY-NOTICES.txt" \
     "${package_root}/usr/share/doc/viewr/changelog.Debian.gz" \
     "${package_root}/usr/share/doc/viewr/changelog.gz" \
@@ -149,6 +157,13 @@ cmp --silent "${repo_root}/LICENSE" \
 cmp --silent "${repo_root}/packaging/THIRD-PARTY-NOTICES.txt" \
     "${package_root}/usr/share/doc/viewr/THIRD-PARTY-NOTICES.txt" \
     || fail "package third-party notice does not match the release notice"
+cmp --silent "${repo_root}/packaging/THIRD-PARTY-LICENSES.txt" \
+    "${package_root}/usr/share/doc/viewr/THIRD-PARTY-LICENSES.txt" \
+    || fail "package third-party licenses do not match the generated inventory"
+cmp --silent \
+    "${repo_root}/packaging/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html" \
+    "${package_root}/usr/share/doc/viewr/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html" \
+    || fail "package Rust notices do not match the pinned toolchain copy"
 cmp --silent "${repo_root}/packaging/SOURCE-BUILD.md" \
     "${package_root}/usr/share/doc/viewr/SOURCE-BUILD.md" \
     || fail "package source build instructions do not match the release instructions"
@@ -156,13 +171,20 @@ cmp --silent "${repo_root}/packaging/SOURCE-BUILD.md" \
     "c1228ae47a5ada0464e9cc2f1c253e2437432866570b9ac6244bceb4d75c0f10" ]] \
     || fail "package does not contain the exact rawler 0.7.2 LICENSE"
 
-desktop_file="${package_root}/usr/share/applications/viewr.desktop"
-desktop-file-validate "${desktop_file}"
-grep -Fxq 'Exec=viewr %f' "${desktop_file}" \
+launcher_file="${package_root}/usr/share/applications/viewr.desktop"
+handler_file="${package_root}/usr/share/applications/viewr-arw.desktop"
+desktop-file-validate "${launcher_file}"
+desktop-file-validate "${handler_file}"
+grep -Fxq 'Exec=viewr --pick-folder' "${launcher_file}" \
+    || fail "desktop launcher must open Viewr's folder picker"
+if grep -Fxq 'NoDisplay=true' "${launcher_file}"; then
+    fail "desktop launcher must be visible in application menus"
+fi
+grep -Fxq 'Exec=viewr %f' "${handler_file}" \
     || fail "desktop handler must pass one selected file to Viewr"
-grep -Fxq 'NoDisplay=true' "${desktop_file}" \
+grep -Fxq 'NoDisplay=true' "${handler_file}" \
     || fail "desktop handler must remain hidden from application menus"
-grep -Fxq 'MimeType=image/x-sony-arw;' "${desktop_file}" \
+grep -Fxq 'MimeType=image/x-sony-arw;' "${handler_file}" \
     || fail "desktop handler does not register the Sony ARW MIME type"
 grep -Fq 'image/x-sony-arw:' /usr/share/mime/globs2 \
     || fail "host shared-mime-info does not define image/x-sony-arw"
@@ -170,7 +192,7 @@ grep -Fq 'image/x-sony-arw:' /usr/share/mime/globs2 \
 # This updates only the temporary extracted tree. It never reads or writes the
 # invoking user's mimeapps.list.
 update-desktop-database "${package_root}/usr/share/applications"
-grep -Fxq 'image/x-sony-arw=viewr.desktop;' \
+grep -Fxq 'image/x-sony-arw=viewr-arw.desktop;' \
     "${package_root}/usr/share/applications/mimeinfo.cache" \
     || fail "desktop MIME cache does not expose Viewr as an ARW handler"
 

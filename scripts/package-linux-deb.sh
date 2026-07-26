@@ -137,6 +137,9 @@ install -m 0755 "${binary_path}" "${package_root}/usr/bin/viewr"
 install -m 0644 \
     "${repo_root}/packaging/linux/viewr.desktop" \
     "${package_root}/usr/share/applications/viewr.desktop"
+install -m 0644 \
+    "${repo_root}/packaging/linux/viewr-arw.desktop" \
+    "${package_root}/usr/share/applications/viewr-arw.desktop"
 install -m 0644 "${repo_root}/LICENSE" \
     "${package_root}/usr/share/doc/viewr/LICENSE"
 install -m 0644 "${repo_root}/LICENSE" \
@@ -145,6 +148,11 @@ install -m 0644 "${rawler_license_path}" \
     "${package_root}/usr/share/doc/viewr/rawler-LICENSE"
 install -m 0644 "${repo_root}/packaging/THIRD-PARTY-NOTICES.txt" \
     "${package_root}/usr/share/doc/viewr/THIRD-PARTY-NOTICES.txt"
+install -m 0644 "${repo_root}/packaging/THIRD-PARTY-LICENSES.txt" \
+    "${package_root}/usr/share/doc/viewr/THIRD-PARTY-LICENSES.txt"
+install -m 0644 \
+    "${repo_root}/packaging/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html" \
+    "${package_root}/usr/share/doc/viewr/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html"
 install -m 0644 "${repo_root}/packaging/SOURCE-BUILD.md" \
     "${package_root}/usr/share/doc/viewr/SOURCE-BUILD.md"
 
@@ -196,7 +204,8 @@ shlibs_depends="${shlibs_output#shlibs:Depends=}"
 [[ -n "${shlibs_depends}" && "${shlibs_depends}" != "${shlibs_output}" ]] \
     || fail "dpkg-shlibdeps did not produce dependency metadata"
 depends="$(
-    printf '%s\n' "${shlibs_depends}, libvulkan1, shared-mime-info" \
+    printf '%s\n' \
+        "${shlibs_depends}, desktop-file-utils, libvulkan1, shared-mime-info" \
         | tr ',' '\n' \
         | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
         | sed '/^$/d' \
