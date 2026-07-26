@@ -746,23 +746,47 @@ impl V01Release {
     }
 }
 
+#[derive(Clone, Copy)]
+enum V01Corpus {
+    MixedOffline,
+    OnlineClean,
+}
+
+impl V01Corpus {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::MixedOffline => "mixed-offline",
+            Self::OnlineClean => "online-clean",
+        }
+    }
+}
+
 fn create_v01_migration_template(
     path: &std::path::Path,
     rows: usize,
     release: V01Release,
+    corpus: V01Corpus,
 ) -> V01MigrationExpectations {
     const EXISTING_STRIDE: usize = 250;
     const DIRTY_STRIDE: usize = 997;
 
     let fixture_root = path.parent().expect("v0.1 migration template has a parent");
-    let existing_root = fixture_root.join(format!("existing-{}-{rows}", release.label()));
+    let existing_root = fixture_root.join(format!(
+        "existing-{}-{}-{rows}",
+        release.label(),
+        corpus.label()
+    ));
     std::fs::create_dir(&existing_root).expect("v0.1 existing RAW directory initializes");
     let existing_root =
         std::fs::canonicalize(existing_root).expect("v0.1 existing RAW directory canonicalizes");
     let missing_root = existing_root
         .parent()
         .expect("v0.1 existing RAW directory has a parent")
-        .join(format!("missing-{}-{rows}", release.label()));
+        .join(format!(
+            "missing-{}-{}-{rows}",
+            release.label(),
+            corpus.label()
+        ));
     assert!(
         !missing_root.exists(),
         "v0.1 missing RAW directory must stay unresolved"
@@ -826,10 +850,14 @@ fn create_v01_migration_template(
         .expect("v0.1 migration template insert prepares");
     let mut existing_dirty = 0_usize;
     let mut missing_dirty = 0_usize;
+    let mut existing_rows = 0_usize;
     for index in 0..rows {
-        let exists = index % EXISTING_STRIDE == 0;
-        let dirty = release.has_dirty_column() && index % DIRTY_STRIDE == 0;
+        let exists = matches!(corpus, V01Corpus::OnlineClean) || index % EXISTING_STRIDE == 0;
+        let dirty = matches!(corpus, V01Corpus::MixedOffline)
+            && release.has_dirty_column()
+            && index % DIRTY_STRIDE == 0;
         let raw = if exists {
+            existing_rows += 1;
             let raw = existing_root.join(format!("photo-{index:08}.ARW"));
             std::fs::write(&raw, b"raw").expect("v0.1 existing RAW placeholder writes");
             raw
@@ -868,25 +896,20 @@ fn create_v01_migration_template(
         .expect("v0.1 migration template transaction commits");
     drop(connection);
 
-    match release {
-        V01Release::V010 => V01MigrationExpectations {
-            surviving_images: rows,
-            owner_ledgers: 0,
-            pending_sidecars: 0,
-            quarantined_ratings: 0,
-        },
-        V01Release::V011 => {
-            assert!(
-                existing_dirty > 0 && missing_dirty > 0,
-                "v0.1.1 corpus must include recoverable and quarantined dirty rows"
-            );
-            V01MigrationExpectations {
-                surviving_images: rows - missing_dirty,
-                owner_ledgers: existing_dirty,
-                pending_sidecars: existing_dirty,
-                quarantined_ratings: missing_dirty,
-            }
-        }
+    if matches!(
+        (release, corpus),
+        (V01Release::V011, V01Corpus::MixedOffline)
+    ) {
+        assert!(
+            existing_dirty > 0 && missing_dirty > 0,
+            "v0.1.1 mixed corpus must include recoverable and quarantined dirty rows"
+        );
+    }
+    V01MigrationExpectations {
+        surviving_images: rows - missing_dirty,
+        owner_ledgers: existing_rows,
+        pending_sidecars: existing_dirty,
+        quarantined_ratings: missing_dirty,
     }
 }
 
@@ -897,89 +920,136 @@ fn bench_rating_db_cold_released_migrations(c: &mut Criterion) {
     group.measurement_time(Duration::from_millis(1_500));
 
     for release in [V01Release::V010, V01Release::V011] {
-        for rows in [1_000_usize, 10_000] {
-            let template_directory = tempfile::tempdir().expect("v0.1 template directory");
-            let template_path = template_directory
-                .path()
-                .join(format!("viewr-{}.db", release.label()));
-            let expected = create_v01_migration_template(&template_path, rows, release);
+        for corpus in [V01Corpus::MixedOffline, V01Corpus::OnlineClean] {
+            let row_counts: &[usize] = match corpus {
+                V01Corpus::MixedOffline => &[1_000, 10_000],
+                V01Corpus::OnlineClean => &[1_000],
+            };
+            for &rows in row_counts {
+                let template_directory = tempfile::tempdir().expect("v0.1 template directory");
+                let template_path = template_directory.path().join(format!(
+                    "viewr-{}-{}.db",
+                    release.label(),
+                    corpus.label()
+                ));
+                let expected = create_v01_migration_template(&template_path, rows, release, corpus);
 
-            let preflight_directory = tempfile::tempdir().expect("v0.1 preflight directory");
-            let preflight_path = preflight_directory.path().join("viewr.db");
-            std::fs::copy(&template_path, &preflight_path)
-                .expect("v0.1 migration preflight template copies");
-            let preflight = Db::open(&preflight_path).expect("v0.1 migration preflight succeeds");
-            assert_eq!(
-                benchmark_rating_cardinalities(&preflight)
-                    .expect("v0.1 migration cardinalities read"),
-                (expected.surviving_images, expected.owner_ledgers),
-                "released migration must retain the expected history and unfinished work"
-            );
-            assert_eq!(
-                preflight
-                    .pending_sidecars()
-                    .expect("v0.1 migrated pending sidecars read")
-                    .len(),
-                expected.pending_sidecars,
-                "released migration must retain only recoverable unfinished work"
-            );
-            drop(preflight);
-            let quarantine = rusqlite::Connection::open(&preflight_path)
-                .expect("v0.1 migrated preflight database reopens")
-                .query_row(
-                    "SELECT COUNT(*) FROM quarantined_legacy_ratings",
-                    [],
-                    |row| row.get::<_, usize>(0),
-                )
-                .expect("v0.1 migration quarantine cardinality reads");
-            assert_eq!(
-                quarantine, expected.quarantined_ratings,
-                "released migration must archive every unresolved unfinished row"
-            );
-
-            group.bench_with_input(BenchmarkId::new(release.label(), rows), &rows, |b, _| {
-                b.iter_batched(
-                    || {
-                        let directory =
-                            tempfile::tempdir().expect("v0.1 migration iteration directory");
-                        let database_path = directory.path().join("viewr.db");
-                        std::fs::copy(&template_path, &database_path)
-                            .expect("v0.1 migration iteration template copies");
-                        (directory, database_path)
-                    },
-                    |(directory, database_path)| {
-                        let db =
-                            Db::open(black_box(&database_path)).expect("v0.1 migration succeeds");
-                        black_box((db, directory))
-                    },
-                    BatchSize::SmallInput,
+                let preflight_directory = tempfile::tempdir().expect("v0.1 preflight directory");
+                let preflight_path = preflight_directory.path().join("viewr.db");
+                std::fs::copy(&template_path, &preflight_path)
+                    .expect("v0.1 migration preflight template copies");
+                let preflight =
+                    Db::open(&preflight_path).expect("v0.1 migration preflight succeeds");
+                assert_eq!(
+                    benchmark_rating_cardinalities(&preflight)
+                        .expect("v0.1 migration cardinalities read"),
+                    (expected.surviving_images, expected.owner_ledgers),
+                    "released migration must retain the expected history and unfinished work"
                 );
-            });
+                assert_eq!(
+                    preflight
+                        .pending_sidecars()
+                        .expect("v0.1 migrated pending sidecars read")
+                        .len(),
+                    expected.pending_sidecars,
+                    "released migration must retain only recoverable unfinished work"
+                );
+                drop(preflight);
+                let quarantine = rusqlite::Connection::open(&preflight_path)
+                    .expect("v0.1 migrated preflight database reopens")
+                    .query_row(
+                        "SELECT COUNT(*) FROM quarantined_legacy_ratings",
+                        [],
+                        |row| row.get::<_, usize>(0),
+                    )
+                    .expect("v0.1 migration quarantine cardinality reads");
+                assert_eq!(
+                    quarantine, expected.quarantined_ratings,
+                    "released migration must archive every unresolved unfinished row"
+                );
+
+                group.bench_with_input(
+                    BenchmarkId::new(format!("{}-{}", release.label(), corpus.label()), rows),
+                    &rows,
+                    |b, _| {
+                        b.iter_batched(
+                            || {
+                                let directory = tempfile::tempdir()
+                                    .expect("v0.1 migration iteration directory");
+                                let database_path = directory.path().join("viewr.db");
+                                std::fs::copy(&template_path, &database_path)
+                                    .expect("v0.1 migration iteration template copies");
+                                (directory, database_path)
+                            },
+                            |(directory, database_path)| {
+                                let db = Db::open(black_box(&database_path))
+                                    .expect("v0.1 migration succeeds");
+                                black_box((db, directory))
+                            },
+                            BatchSize::SmallInput,
+                        );
+                    },
+                );
+            }
         }
     }
 
     group.finish();
 }
 
-fn create_v7_migration_template(path: &std::path::Path, rows: usize) {
+#[derive(Clone, Copy)]
+enum V7Corpus {
+    Unresolved,
+    OnlineOwned,
+}
+
+impl V7Corpus {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Unresolved => "unresolved-removal",
+            Self::OnlineOwned => "online-owned",
+        }
+    }
+}
+
+fn create_v7_migration_template(path: &std::path::Path, rows: usize, corpus: V7Corpus) {
     let db = Db::open(path).expect("migration template database opens");
-    let missing_root = path
-        .parent()
-        .expect("migration template has a parent")
-        .join("unresolved-v7");
-    assert!(
-        !missing_root.exists(),
-        "migration fixture paths must remain unresolved"
-    );
+    let fixture_root = path.parent().expect("migration template has a parent");
+    let unresolved_root = fixture_root.join("unresolved-v7");
+    let mut online_root = fixture_root.join("online-v7");
+    if matches!(corpus, V7Corpus::OnlineOwned) {
+        std::fs::create_dir(&online_root).expect("online v7 fixture directory initializes");
+        online_root =
+            std::fs::canonicalize(online_root).expect("online v7 fixture directory canonicalizes");
+    } else {
+        assert!(
+            !unresolved_root.exists(),
+            "migration fixture paths must remain unresolved"
+        );
+    }
     for index in 0..rows {
-        benchmark_insert_rating(
-            &db,
-            &missing_root.join(format!("photo-{index:08}.ARW")),
-            index as u64,
-            index as i64,
-            4,
-        )
-        .expect("migration template row inserts");
+        let raw = match corpus {
+            V7Corpus::Unresolved => unresolved_root.join(format!("photo-{index:08}.ARW")),
+            V7Corpus::OnlineOwned => {
+                let raw = online_root.join(format!("photo-{index:08}.ARW"));
+                std::fs::write(&raw, b"raw").expect("online v7 RAW placeholder writes");
+                raw
+            }
+        };
+        let (size, mtime_ns) = if matches!(corpus, V7Corpus::OnlineOwned) {
+            let metadata = std::fs::metadata(&raw).expect("online v7 RAW metadata reads");
+            let mtime_ns = metadata
+                .modified()
+                .expect("online v7 RAW mtime reads")
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("online v7 RAW mtime follows epoch")
+                .as_nanos() as i64;
+            (metadata.len(), mtime_ns)
+        } else {
+            (index as u64, index as i64)
+        };
+        benchmark_insert_rating(&db, &raw, size, mtime_ns, 4)
+            .expect("migration template row inserts");
     }
     drop(db);
 
@@ -993,6 +1063,7 @@ fn create_v7_migration_template(path: &std::path::Path, rows: usize) {
              DROP TRIGGER images_reject_unowned_dirty_insert;
              DROP TRIGGER images_reject_unowned_dirty_update;
              ALTER TABLE images DROP COLUMN owner_key_version;
+             ALTER TABLE rating_global_revision DROP COLUMN ownerless_revision;
              CREATE TRIGGER images_reject_unowned_dirty_insert
              BEFORE INSERT ON images
              WHEN NEW.sidecar_dirty = 1 AND NEW.sidecar_owner IS NULL
@@ -1016,39 +1087,52 @@ fn bench_rating_db_cold_v7_migration(c: &mut Criterion) {
     group.warm_up_time(Duration::from_millis(300));
     group.measurement_time(Duration::from_millis(1_500));
 
-    for rows in [1_000_usize, 10_000] {
-        let template_directory = tempfile::tempdir().expect("migration template directory");
-        let template_path = template_directory.path().join("viewr-v7.db");
-        create_v7_migration_template(&template_path, rows);
+    for corpus in [V7Corpus::Unresolved, V7Corpus::OnlineOwned] {
+        let row_counts: &[usize] = match corpus {
+            V7Corpus::Unresolved => &[1_000, 10_000],
+            V7Corpus::OnlineOwned => &[1_000],
+        };
+        for &rows in row_counts {
+            let template_directory = tempfile::tempdir().expect("migration template directory");
+            let template_path = template_directory
+                .path()
+                .join(format!("viewr-v7-{}.db", corpus.label()));
+            create_v7_migration_template(&template_path, rows, corpus);
 
-        let preflight_directory = tempfile::tempdir().expect("migration preflight directory");
-        let preflight_path = preflight_directory.path().join("viewr.db");
-        std::fs::copy(&template_path, &preflight_path)
-            .expect("migration preflight template copies");
-        let preflight = Db::open(&preflight_path).expect("v7 migration preflight succeeds");
-        assert_eq!(
-            benchmark_rating_cardinalities(&preflight).expect("migration cardinalities"),
-            (0, rows),
-            "missing v7 image rows are removed while ordering ledgers remain"
-        );
-        drop(preflight);
-
-        group.bench_with_input(BenchmarkId::from_parameter(rows), &rows, |b, _| {
-            b.iter_batched(
-                || {
-                    let directory = tempfile::tempdir().expect("migration iteration directory");
-                    let database_path = directory.path().join("viewr.db");
-                    std::fs::copy(&template_path, &database_path)
-                        .expect("migration iteration template copies");
-                    (directory, database_path)
-                },
-                |(directory, database_path)| {
-                    let db = Db::open(black_box(&database_path)).expect("v7 migration succeeds");
-                    black_box((db, directory))
-                },
-                BatchSize::SmallInput,
+            let preflight_directory = tempfile::tempdir().expect("migration preflight directory");
+            let preflight_path = preflight_directory.path().join("viewr.db");
+            std::fs::copy(&template_path, &preflight_path)
+                .expect("migration preflight template copies");
+            let preflight = Db::open(&preflight_path).expect("v7 migration preflight succeeds");
+            let expected_images = match corpus {
+                V7Corpus::Unresolved => 0,
+                V7Corpus::OnlineOwned => rows,
+            };
+            assert_eq!(
+                benchmark_rating_cardinalities(&preflight).expect("migration cardinalities"),
+                (expected_images, rows),
+                "v7 migration must preserve online rows and retain ordering tombstones"
             );
-        });
+            drop(preflight);
+
+            group.bench_with_input(BenchmarkId::new(corpus.label(), rows), &rows, |b, _| {
+                b.iter_batched(
+                    || {
+                        let directory = tempfile::tempdir().expect("migration iteration directory");
+                        let database_path = directory.path().join("viewr.db");
+                        std::fs::copy(&template_path, &database_path)
+                            .expect("migration iteration template copies");
+                        (directory, database_path)
+                    },
+                    |(directory, database_path)| {
+                        let db =
+                            Db::open(black_box(&database_path)).expect("v7 migration succeeds");
+                        black_box((db, directory))
+                    },
+                    BatchSize::SmallInput,
+                );
+            });
+        }
     }
 
     group.finish();
