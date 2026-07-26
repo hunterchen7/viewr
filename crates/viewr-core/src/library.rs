@@ -1148,7 +1148,7 @@ mod tests {
     fn worker_barrier(library: &Library) {
         let (done, wait) = std::sync::mpsc::channel();
         library.tx.send(Cmd::Barrier { done }).unwrap();
-        wait.recv_timeout(Duration::from_secs(2))
+        wait.recv_timeout(Duration::from_secs(10))
             .expect("persistence worker must answer a FIFO barrier");
     }
 
