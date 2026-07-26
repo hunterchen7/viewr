@@ -24,11 +24,13 @@ The test suite covers these areas:
   SQLite reopen behavior, and durable flushes.
 - Configuration parsing and loupe layout mathematics.
 
-CI runs the full test suite on macOS, Windows, and Linux. The macOS and Windows
-jobs also compile all-feature benchmark targets. Platform-independent
-formatting, Clippy, Rustdoc, optimized benchmark runtime smoke, and release
-compilation run once on Linux. Miri uses one pinned Linux nightly job. The
-independent quality, test, optimized-build, and Miri jobs run in parallel.
+CI reports five checks. It uses one shared Linux quality check, one current
+macOS compatibility check, and one installer check for each release platform.
+The full test suite runs on current macOS, Windows, and Linux. The macOS and
+Windows checks also compile all-feature benchmark targets. The quality check
+runs formatting, Clippy, Rustdoc, the release build, release tests, pinned
+public-domain Sony RAW tests, both optimized benchmark smoke tests, and the
+focused Miri checks.
 
 Windows-specific database tests recreate ordinary drive-path rows from the
 released ownerless schemas and from the pre-v8 owner schema. They verify clean
@@ -38,8 +40,8 @@ drive-root-relative spellings, raw drive-case path/owner tombstones, duplicate
 component-equivalent keys, lossless non-Unicode round-tripping, and fail-closed
 malformed native-path handling.
 
-The optimized-build job builds the application and both benchmark harnesses
-with one release-profile Cargo invocation using
+The quality check builds the application and both benchmark harnesses with one
+release-profile Cargo invocation using
 `--bins --benches --all-features`. It then runs the complete workspace test
 suite in release mode and executes both Criterion harnesses in smoke-test mode.
 These checks are intentional: optimized-only parallel paths, code hidden behind
@@ -47,12 +49,13 @@ These checks are intentional: optimized-only parallel paths, code hidden behind
 compile.
 
 CI caches downloaded Cargo registry and Git sources plus compiled dependency
-artifacts. Quality, test, optimized-build, benchmark, and Miri jobs use separate
-keys because their toolchains and profiles are not interchangeable. Pull
-request jobs can restore default-branch caches, but only `main` writes new
-caches. This avoids filling the repository cache quota with merge-ref caches
-that cannot seed `main`. Miri caches sources only because its focused checks are
-not on the critical path.
+artifacts. The quality check, current macOS check, three installer targets, and
+manual benchmarks use separate keys because their platforms and profiles are
+not interchangeable. Pull request jobs can restore default-branch caches, but
+only `main` writes new caches. This avoids filling the repository cache quota
+with merge-ref caches that cannot seed `main`. The Miri steps reuse the quality
+job's downloaded sources but write nightly target artifacts to temporary
+runner storage so they do not enter the stable target cache.
 
 Workspace crate outputs are intentionally excluded from the shared cache.
 Fresh hosted checkouts can invalidate local-source artifacts by modification
@@ -61,8 +64,7 @@ cache only after a hosted cold/warm comparison shows a net benefit. A July 2026
 hosted comparison rejected `sccache`: its fully warm build had a 100% cache-hit
 rate but took 10m34, only eight seconds less than the Cargo target cache's
 10m42 warm build, while its cold build took 17m11 and created hundreds of cache
-objects. The optimized-build job therefore retains the simpler Cargo target
-cache.
+objects. The quality check therefore retains the simpler Cargo target cache.
 
 Normal test builds exclude Criterion and use an unoptimized test profile. This
 keeps correctness feedback fast without changing the optimized development,
@@ -202,6 +204,22 @@ XMP write holds SQLite's immediate transaction, so a slow external volume can
 delay unrelated rating writers.
 
 ## Real RAW benchmarks
+
+CI downloads the public-domain Sony DSC-RX100 `DSC00838.ARW` fixture from
+[raw.pixls.us](https://raw.pixls.us/) and verifies its SHA-256 digest
+`579a485b5126a25cbd55cbd5dadfa7d09cf021c99cc7d4869f9e56e3f759390b`
+before use. The focused ignored tests cover raw-pixel decode, embedded
+thumbnail and metadata consistency, analytical-versus-table transfer output,
+and copied-versus-strided crop output. The pinned fixture gives the decoder
+and develop pipeline one real-camera compatibility gate without storing a
+20 MB binary in Git.
+
+Set `VIEWR_TEST_RAW` to run the same focused tests with another Sony RAW file:
+
+```sh
+VIEWR_TEST_RAW=/absolute/path/photo.ARW \
+  cargo test -p viewr-core --release --locked real_sony_raw_ -- --ignored
+```
 
 Set `VIEWR_BENCH_RAW` to one ARW or DNG file.
 The file must remain untracked. It can stay outside the repository or under

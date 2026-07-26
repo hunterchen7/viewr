@@ -447,7 +447,17 @@ mod tests {
     use rawler::imgop::sensor::bayer::{Demosaic, superpixel::Superpixel3Channel};
     use rawler::imgop::{Dim2, Point, Rect};
     use rawler::pixarray::PixF32;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
+
+    fn real_sony_raw_fixture() -> PathBuf {
+        std::env::var_os("VIEWR_TEST_RAW")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../testdata/real-raw-corpus/HCA04875.ARW")
+            })
+    }
 
     #[test]
     fn malformed_color_calibration_values_fail_closed() {
@@ -657,10 +667,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the local ignored 36 MB Sony RAW fixture"]
+    #[ignore = "requires the pinned public-domain Sony RAW fixture or VIEWR_TEST_RAW"]
     fn real_sony_raw_lut_output_never_differs_by_more_than_one_level() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../testdata/real-raw-corpus/HCA04875.ARW");
+        let path = real_sony_raw_fixture();
 
         for quality in [super::Quality::Browse, super::Quality::Full] {
             let raw = crate::decode::load(&path).expect("fixture decodes").raw;
@@ -690,10 +699,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the local ignored 36 MB Sony RAW fixture"]
+    #[ignore = "requires the pinned public-domain Sony RAW fixture or VIEWR_TEST_RAW"]
     fn real_sony_raw_strided_region_matches_copied_crop_exactly() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../testdata/real-raw-corpus/HCA04875.ARW");
+        let path = real_sony_raw_fixture();
 
         for quality in [super::Quality::Browse, super::Quality::Full] {
             let raw = crate::decode::load(&path).expect("fixture decodes").raw;

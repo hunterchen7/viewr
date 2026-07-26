@@ -1,0 +1,29 @@
+Viewr third-party notices
+=========================
+
+rawler 0.7.2
+------------
+
+Viewr links rawler 0.7.2 for camera RAW decoding.
+
+Copyright:
+  Daniel Vogelbacher <daniel@chaospixel.com>
+  Pedro Côrte-Real <pedro@pedrocr.net>
+  Other rawler contributors
+
+License: GNU Lesser General Public License, version 2.1 (LGPL-2.1)
+Project: https://github.com/dnglab/dnglab
+Package source: https://crates.io/crates/rawler/0.7.2
+
+Each installer contains the complete rawler license. Each GitHub release also
+contains a version-matched source archive with Viewr, its build scripts, and
+vendored Rust dependencies. You can change rawler in that source archive and
+rebuild Viewr with the replacement.
+
+Each binary package also contains `THIRD-PARTY-LICENSES.txt`, which is the
+generated license inventory for the Rust dependency union used by the macOS,
+Windows, and Linux releases. The package contains
+`RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html` for the linked Rust standard
+library and its in-tree components.
+
+Viewr itself is available under the MIT license. See the LICENSE file.

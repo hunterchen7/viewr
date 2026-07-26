@@ -10,27 +10,40 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 jobs:
   quality:
-    name: Quality gates
+    name: Quality, release, benchmarks, and Miri
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 105
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Linux build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
-      - uses: dtolnay/rust-toolchain@1.96
+          sudo apt-get install -y curl jq libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+      - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: quality
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install license inventory tool
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
+      - name: Fetch all release target dependency graphs
+        run: |
+          cargo fetch --locked --target aarch64-apple-darwin
+          cargo fetch --locked --target x86_64-pc-windows-msvc
+          cargo fetch --locked --target x86_64-unknown-linux-gnu
+      - name: Validate third-party license inventories
+        run: scripts/validate-third-party-licenses.sh
+      - name: Test release asset verification
+        run: |
+          scripts/test-verify-release-assets.sh
+          scripts/test-verify-remote-release-assets.sh
       - name: Format
         run: cargo fmt --all --check
       - name: Lint all targets and features
@@ -39,31 +52,148 @@ jobs:
         run: cargo doc --workspace --no-deps --all-features --locked
         env:
           RUSTDOCFLAGS: -D warnings
+      - name: Build release and benchmark targets
+        if: ${{ !cancelled() }}
+        run: cargo build --workspace --release --bins --benches --all-features --locked
+      - name: Test workspace release behavior
+        if: ${{ !cancelled() }}
+        run: cargo test --workspace --release --locked
+      - name: Test public-domain Sony RAW fixture
+        if: ${{ !cancelled() }}
+        env:
+          VIEWR_TEST_RAW: ${{ runner.temp }}/viewr-public-domain-sony.ARW
+        run: |
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            --retry-all-errors \
+            --show-error \
+            --silent \
+            https://raw.pixls.us/data/Sony/DSC-RX100/DSC00838.ARW \
+            --output "$VIEWR_TEST_RAW"
+          printf '%s  %s\n' \
+            579a485b5126a25cbd55cbd5dadfa7d09cf021c99cc7d4869f9e56e3f759390b \
+            "$VIEWR_TEST_RAW" |
+            sha256sum --check -
+          test_log="$RUNNER_TEMP/viewr-real-raw-tests.log"
+          cargo test \
+            -p viewr-core \
+            --lib \
+            --release \
+            --locked \
+            real_sony_raw_ \
+            -- \
+            --ignored \
+            --test-threads=1 2>&1 |
+            tee "$test_log"
+          if ! grep -Fq \
+            "test result: ok. 3 passed; 0 failed; 0 ignored;" \
+            "$test_log"; then
+            echo "::error::Expected exactly three pinned real-RAW tests to pass."
+            exit 1
+          fi
+      - name: Smoke-test optimized benchmark harnesses
+        if: ${{ !cancelled() }}
+        run: |
+          cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- --test
+          cargo bench -p viewr --features benchmarks --bench filmstrip_scaling --locked -- --test
+      - name: Install pinned nightly Miri toolchain
+        id: miri_toolchain
+        if: ${{ !cancelled() }}
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: nightly-2026-07-21
+          components: miri
+      - name: Check pixel rotations with Miri
+        if: ${{ !cancelled() && steps.miri_toolchain.outcome == 'success' }}
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/viewr-miri-target
+        run: cargo +nightly-2026-07-21 miri test -p viewr-core --lib resize::tests::rotate_ --locked
+      - name: Check superpixel output initialization with Miri
+        if: ${{ !cancelled() && steps.miri_toolchain.outcome == 'success' }}
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/viewr-miri-target
+        run: cargo +nightly-2026-07-21 miri test -p viewr-core --lib develop::tests::superpixel_output_initialization_is_valid_under_miri --locked
 
-  test:
-    name: Tests (${{ matrix.os }})
+  macos-compatibility:
+    name: Compatibility (macOS latest)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: macos-latest
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Test workspace
+        id: test_workspace
+        run: cargo test --workspace --locked
+      - name: Check benchmark targets
+        if: ${{ !cancelled() }}
+        run: cargo check --workspace --benches --all-features --locked
+
+  platform:
+    name: Platform (${{ matrix.platform }})
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest, ubuntu-latest]
+        include:
+          - platform: macOS arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+            archive: viewr-macos-arm64.tar.gz
+            portable_platform: macos-arm64
+            rustflags: ''
+          - platform: Windows x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: viewr-windows-x64.zip
+            portable_platform: windows-x64
+            rustflags: -C target-feature=+crt-static
+          - platform: Debian x64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            archive: viewr-linux-x64.tar.gz
+            portable_platform: linux-x64
+            rustflags: ''
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
-      - uses: actions/checkout@v7
-      - name: Linux build deps
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Linux build and package dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
-      - uses: dtolnay/rust-toolchain@1.96
-      - uses: Swatinem/rust-cache@v2
+          sudo apt-get install -y \
+            binutils \
+            desktop-file-utils \
+            dpkg-dev \
+            jq \
+            libgtk-3-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libvulkan1 \
+            lintian \
+            shared-mime-info \
+            xdg-utils
+      - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
         with:
-          shared-key: tests
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: installers-${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test workspace
+        id: test_workspace
+        if: runner.os != 'macOS'
         run: cargo test --workspace --locked
       - name: Check benchmark targets
-        if: runner.os != 'Linux'
+        id: check_benchmarks
+        if: ${{ runner.os == 'Windows' && (success() || steps.test_workspace.outcome == 'failure') }}
         run: cargo check --workspace --benches --all-features --locked
       - name: Report optional real-RAW fixture coverage
         if: ${{ always() && runner.os == 'Linux' }}
@@ -71,57 +201,198 @@ jobs:
         run: |
           fixture_dir="testdata/real-raw-corpus"
           if [[ -f "$fixture_dir/HCA04875.ARW" && -f "$fixture_dir/HCA05417.ARW" ]]; then
-            fixture_status="Available but not run: real-RAW tests are opt-in because they are marked ignored."
+            fixture_status="The quality check runs pinned Sony DSC-RX100 decode and develop coverage. The optional private portrait and camera corpus is available locally but remains opt-in."
           else
-            fixture_status="Not run: optional local RAW fixtures are absent, so the ignored real-RAW tests have no fixture coverage in this CI run."
+            fixture_status="The quality check runs pinned Sony DSC-RX100 decode and develop coverage. The optional private portrait and broader camera corpus is absent from this runner."
           fi
-          echo "::notice title=Optional real-RAW fixture tests::$fixture_status"
+          echo "::notice title=Real-RAW fixture coverage::$fixture_status"
           {
-            echo "### Optional real-RAW fixture coverage"
+            echo "### Real-RAW fixture coverage"
             echo
             echo "$fixture_status"
           } >> "$GITHUB_STEP_SUMMARY"
-
-  build:
-    name: Release and benchmark builds
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v7
-      - name: Linux build deps
+      - name: Build Viewr
+        id: build_viewr
+        if: ${{ success() || steps.test_workspace.outcome == 'failure' || steps.check_benchmarks.outcome == 'failure' }}
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release --locked --target ${{ matrix.target }} -p viewr --bin viewr
+      - name: Build and validate portable archive
+        if: ${{ !cancelled() && runner.os != 'Windows' && steps.build_viewr.outcome == 'success' }}
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
-      - uses: dtolnay/rust-toolchain@1.96
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: builds
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Build release and benchmark targets
-        run: cargo build --workspace --release --bins --benches --all-features --locked
-      - name: Test workspace release behavior
-        run: cargo test --workspace --release --locked
-      - name: Smoke-test optimized benchmark harnesses
+          scripts/package-portable-archive.sh \
+            --platform "${{ matrix.portable_platform }}" \
+            --binary "target/${{ matrix.target }}/release/viewr" \
+            --output "dist/${{ matrix.archive }}"
+          scripts/validate-portable-archive.sh \
+            --platform "${{ matrix.portable_platform }}" \
+            --archive "dist/${{ matrix.archive }}" \
+            --expected-binary "target/${{ matrix.target }}/release/viewr"
+          reproducible_dir="$RUNNER_TEMP/viewr-portable-repro"
+          mkdir -p "$reproducible_dir"
+          scripts/package-portable-archive.sh \
+            --platform "${{ matrix.portable_platform }}" \
+            --binary "target/${{ matrix.target }}/release/viewr" \
+            --output "$reproducible_dir/${{ matrix.archive }}"
+          cmp \
+            "dist/${{ matrix.archive }}" \
+            "$reproducible_dir/${{ matrix.archive }}"
+      - name: Build and validate Windows portable archive
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.build_viewr.outcome == 'success' }}
+        shell: powershell
         run: |
-          cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- --test
-          cargo bench -p viewr --features benchmarks --bench filmstrip_scaling --locked -- --test
-
-  miri:
-    name: Miri unsafe-path checks
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-07-21
-          components: miri
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: miri
-          cache-targets: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Check pixel rotations
-        run: cargo +nightly-2026-07-21 miri test -p viewr-core --lib resize::tests::rotate_ --locked
-      - name: Check superpixel output initialization
-        run: cargo +nightly-2026-07-21 miri test -p viewr-core --lib develop::tests::superpixel_output_initialization_is_valid_under_miri --locked
+          ./scripts/package-portable-archive.ps1 `
+            -Platform "${{ matrix.portable_platform }}" `
+            -BinaryPath "target/${{ matrix.target }}/release/viewr.exe" `
+            -OutputPath "dist/${{ matrix.archive }}"
+          ./scripts/validate-portable-archive.ps1 `
+            -Platform "${{ matrix.portable_platform }}" `
+            -ArchivePath "dist/${{ matrix.archive }}" `
+            -ExpectedBinaryPath "target/${{ matrix.target }}/release/viewr.exe"
+          $reproducibleDirectory = Join-Path `
+            $env:RUNNER_TEMP `
+            "viewr-portable-repro"
+          New-Item `
+            -ItemType Directory `
+            -Path $reproducibleDirectory `
+            -Force | Out-Null
+          $reproducibleArchive = Join-Path `
+            $reproducibleDirectory `
+            "${{ matrix.archive }}"
+          ./scripts/package-portable-archive.ps1 `
+            -Platform "${{ matrix.portable_platform }}" `
+            -BinaryPath "target/${{ matrix.target }}/release/viewr.exe" `
+            -OutputPath $reproducibleArchive
+          $firstHash = (
+            Get-FileHash `
+              -LiteralPath "dist/${{ matrix.archive }}" `
+              -Algorithm SHA256
+          ).Hash
+          $secondHash = (
+            Get-FileHash `
+              -LiteralPath $reproducibleArchive `
+              -Algorithm SHA256
+          ).Hash
+          if ($firstHash -cne $secondHash) {
+            throw "Repeated portable archive builds are not reproducible."
+          }
+          ./scripts/test-windows-portable-archive.ps1 `
+            -ArchivePath "dist/${{ matrix.archive }}" `
+            -ExpectedBinaryPath "target/${{ matrix.target }}/release/viewr.exe"
+      - name: Validate Windows portable archive under PowerShell 7
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.build_viewr.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $archiveDirectory = Join-Path `
+            $env:RUNNER_TEMP `
+            "viewr-portable-pwsh7"
+          New-Item `
+            -ItemType Directory `
+            -Path $archiveDirectory `
+            -Force | Out-Null
+          $archive = Join-Path `
+            $archiveDirectory `
+            "${{ matrix.archive }}"
+          ./scripts/package-portable-archive.ps1 `
+            -Platform "${{ matrix.portable_platform }}" `
+            -BinaryPath "target/${{ matrix.target }}/release/viewr.exe" `
+            -OutputPath $archive
+          ./scripts/validate-portable-archive.ps1 `
+            -Platform "${{ matrix.portable_platform }}" `
+            -ArchivePath $archive `
+            -ExpectedBinaryPath "target/${{ matrix.target }}/release/viewr.exe"
+          $reproducibleDirectory = Join-Path `
+            $archiveDirectory `
+            "reproducible"
+          New-Item `
+            -ItemType Directory `
+            -Path $reproducibleDirectory `
+            -Force | Out-Null
+          $reproducibleArchive = Join-Path `
+            $reproducibleDirectory `
+            "${{ matrix.archive }}"
+          ./scripts/package-portable-archive.ps1 `
+            -Platform "${{ matrix.portable_platform }}" `
+            -BinaryPath "target/${{ matrix.target }}/release/viewr.exe" `
+            -OutputPath $reproducibleArchive
+          $firstHash = (
+            Get-FileHash `
+              -LiteralPath $archive `
+              -Algorithm SHA256
+          ).Hash
+          $secondHash = (
+            Get-FileHash `
+              -LiteralPath $reproducibleArchive `
+              -Algorithm SHA256
+          ).Hash
+          if ($firstHash -cne $secondHash) {
+            throw "Repeated PowerShell 7 archive builds are not reproducible."
+          }
+      - name: Build and validate macOS installer
+        id: macos_installer
+        if: ${{ !cancelled() && runner.os == 'macOS' && steps.build_viewr.outcome == 'success' }}
+        shell: bash
+        run: |
+          scripts/package-macos-pkg.sh \
+            target/${{ matrix.target }}/release/viewr \
+            dist/viewr-macos-arm64.pkg
+          scripts/validate-macos-pkg.sh \
+            --test-open-events \
+            dist/viewr-macos-arm64.pkg
+      - name: Install and remove macOS installer
+        if: ${{ !cancelled() && runner.os == 'macOS' && steps.macos_installer.outcome == 'success' }}
+        shell: bash
+        env:
+          VIEWR_TEST_RAW: ${{ runner.temp }}/viewr-public-domain-sony.ARW
+        run: |
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            --retry-all-errors \
+            --show-error \
+            --silent \
+            https://raw.pixls.us/data/Sony/DSC-RX100/DSC00838.ARW \
+            --output "$VIEWR_TEST_RAW"
+          printf '%s  %s\n' \
+            579a485b5126a25cbd55cbd5dadfa7d09cf021c99cc7d4869f9e56e3f759390b \
+            "$VIEWR_TEST_RAW" |
+            shasum -a 256 --check -
+          scripts/test-macos-pkg-install.sh \
+            --allow-system-changes \
+            dist/viewr-macos-arm64.pkg
+      - name: Build and validate Windows installer
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.build_viewr.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          ./scripts/build-windows-msi.ps1 `
+            -BinaryPath "target/${{ matrix.target }}/release/viewr.exe" `
+            -OutputDirectory dist
+          ./scripts/test-windows-msi.ps1 `
+            -MsiPath dist/viewr-windows-x64.msi `
+            -ExpectedBinaryPath "target/${{ matrix.target }}/release/viewr.exe" `
+            -AllowMachineChanges
+      - name: Build and validate Debian installer
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.build_viewr.outcome == 'success' }}
+        shell: bash
+        run: |
+          scripts/package-linux-deb.sh \
+            --binary target/${{ matrix.target }}/release/viewr \
+            --output-dir dist
+          scripts/validate-linux-deb.sh dist/viewr-linux-x64.deb
+          scripts/test-linux-deb-install.sh \
+            --allow-system-changes \
+            dist/viewr-linux-x64.deb
+      - name: Build and validate release source
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.build_viewr.outcome == 'success' }}
+        shell: bash
+        run: |
+          source_archive="$(scripts/package-source-archive.sh dist)"
+          reproducible_dir="$RUNNER_TEMP/viewr-source-repro"
+          mkdir -p "$reproducible_dir"
+          reproducible_archive="$(
+            scripts/package-source-archive.sh "$reproducible_dir"
+          )"
+          cmp "$source_archive" "$reproducible_archive"
+          scripts/validate-source-archive.sh "$source_archive"

@@ -147,6 +147,40 @@ mod tests {
     use super::*;
     use crate::types::Orient;
 
+    fn real_sony_raw_fixture() -> std::path::PathBuf {
+        std::env::var_os("VIEWR_TEST_RAW")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../testdata/real-raw-corpus/HCA04875.ARW")
+            })
+    }
+
+    #[test]
+    #[ignore = "requires the pinned public-domain Sony RAW fixture or VIEWR_TEST_RAW"]
+    fn real_sony_raw_decode_thumbnail_and_metadata_are_consistent() {
+        let path = real_sony_raw_fixture();
+
+        let decoded = load(&path).expect("fixture raw pixels decode");
+        let result = thumb_and_meta(&path, 360).expect("fixture thumbnail decodes");
+        let metadata = metadata(&path).expect("fixture metadata decodes");
+
+        assert!(decoded.raw.width > 0);
+        assert!(decoded.raw.height > 0);
+        assert_eq!(metadata.orient, result.meta.orient);
+        assert_eq!(metadata.rating, result.meta.rating);
+        assert_eq!(metadata.camera, result.meta.camera);
+        assert!(!metadata.camera.is_empty());
+        assert!(result.thumb.width > 0);
+        assert!(result.thumb.height > 0);
+        assert!(result.thumb.width <= 360);
+        assert!(result.thumb.height <= 360);
+        assert_eq!(
+            result.thumb.rgba.len(),
+            result.thumb.width as usize * result.thumb.height as usize * 4
+        );
+    }
+
     #[test]
     #[ignore = "requires the local ignored portrait Sony RAW fixture"]
     fn portrait_arw_thumbnail_uses_embedded_orientation() {

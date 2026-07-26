@@ -1,49 +1,438 @@
-# Builds and attaches binaries when a GitHub release is created —
-# which only happens when the release-please PR is merged.
+# Builds, validates, and attaches versioned archives and native installers to
+# a draft release. The release becomes public only after every check passes.
 name: Release binaries
+run-name: Release binaries for ${{ inputs.release_tag }}
 on:
-  release:
-    types: [created]
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Existing draft release tag to build and publish
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing draft release tag to build and publish
+        required: true
+        type: string
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-binaries-${{ inputs.release_tag }}
+  cancel-in-progress: false
 
 jobs:
-  build:
+  gate:
+    name: Validate release request
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    outputs:
+      release_sha: ${{ steps.release_commit.outputs.sha }}
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Require an existing draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [[ ! "$VIEWR_RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Release tag is not a stable semantic version: $VIEWR_RELEASE_TAG"
+            exit 1
+          fi
+
+          release_json="$(
+            gh release view \
+              "$VIEWR_RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isDraft,tagName
+          )"
+          if ! jq -e \
+            --arg tag "$VIEWR_RELEASE_TAG" \
+            '.tagName == $tag and .isDraft == true' \
+            <<< "$release_json" >/dev/null; then
+            echo "::error::Release $VIEWR_RELEASE_TAG must exist and remain a draft."
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: refs/tags/${{ inputs.release_tag }}
+      - name: Match workflow provenance to the release tag
+        id: release_commit
+        env:
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          release_sha="$(git rev-parse HEAD)"
+          if [[ "$release_sha" != "$WORKFLOW_SHA" ]]; then
+            echo "::error::Workflow commit $WORKFLOW_SHA does not match release commit $release_sha."
+            echo "::error::Manually dispatch this workflow with --ref set to the release tag."
+            exit 1
+          fi
+          printf 'sha=%s\n' "$release_sha" >> "$GITHUB_OUTPUT"
+      - name: Require successful CI for the tagged source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
+        run: |
+          ci_run_id=""
+          for _ in $(seq 1 60); do
+            if ! ci_run_id="$(
+              gh run list \
+                --repo "$GITHUB_REPOSITORY" \
+                --workflow ci.yml \
+                --commit "$RELEASE_SHA" \
+                --event push \
+                --limit 1 \
+                --json databaseId \
+                --jq '.[0].databaseId // empty'
+            )"; then
+              echo "::warning::Could not query CI yet; retrying."
+              ci_run_id=""
+            fi
+            if [[ -n "$ci_run_id" ]]; then
+              break
+            fi
+            sleep 10
+          done
+          if [[ -z "$ci_run_id" ]]; then
+            echo "::error::No main-branch CI run exists for release commit $RELEASE_SHA."
+            exit 1
+          fi
+          gh run watch \
+            "$ci_run_id" \
+            --repo "$GITHUB_REPOSITORY" \
+            --exit-status \
+            --interval 10
+
+  packages:
+    name: Release assets (${{ matrix.platform }})
+    needs: gate
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
+          - platform: macOS arm64
+            os: macos-15
             target: aarch64-apple-darwin
-            asset: viewr-macos-arm64.tar.gz
-          - os: windows-latest
+            archive: viewr-macos-arm64.tar.gz
+            portable_platform: macos-arm64
+            rustflags: ''
+          - platform: Windows x64
+            os: windows-2025
             target: x86_64-pc-windows-msvc
-            asset: viewr-windows-x64.zip
-          - os: ubuntu-latest
+            archive: viewr-windows-x64.zip
+            portable_platform: windows-x64
+            rustflags: -C target-feature=+crt-static
+          - platform: Debian x64
+            os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            asset: viewr-linux-x64.tar.gz
+            archive: viewr-linux-x64.tar.gz
+            portable_platform: linux-x64
+            rustflags: ''
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
-      - name: Linux build deps
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.gate.outputs.release_sha }}
+      - name: Linux build and package dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
-      - uses: dtolnay/rust-toolchain@1.96
+          sudo apt-get install -y \
+            binutils \
+            desktop-file-utils \
+            dpkg-dev \
+            jq \
+            libgtk-3-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libvulkan1 \
+            lintian \
+            shared-mime-info \
+            xdg-utils
+      - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
         with:
           targets: ${{ matrix.target }}
-      - run: cargo build --release --locked --target ${{ matrix.target }}
-      - name: Package (unix)
-        if: runner.os != 'Windows'
+      - name: Build Viewr
+        id: build_viewr
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release --locked --target ${{ matrix.target }} -p viewr --bin viewr
+      - name: Build and validate portable archive
+        if: ${{ !cancelled() && runner.os != 'Windows' && steps.build_viewr.outcome == 'success' }}
+        shell: bash
         run: |
-          tar -czf ${{ matrix.asset }} -C target/${{ matrix.target }}/release viewr
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
+          scripts/package-portable-archive.sh \
+            --platform "${{ matrix.portable_platform }}" \
+            --binary "target/${{ matrix.target }}/release/viewr" \
+            --output "dist/${{ matrix.archive }}"
+          scripts/validate-portable-archive.sh \
+            --platform "${{ matrix.portable_platform }}" \
+            --archive "dist/${{ matrix.archive }}" \
+            --expected-binary "target/${{ matrix.target }}/release/viewr"
+      - name: Build and validate Windows portable archive
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.build_viewr.outcome == 'success' }}
+        shell: pwsh
         run: |
-          Compress-Archive -Path "target/${{ matrix.target }}/release/viewr.exe" -DestinationPath "${{ matrix.asset }}"
-      - name: Upload to release
+          ./scripts/package-portable-archive.ps1 `
+            -Platform "${{ matrix.portable_platform }}" `
+            -BinaryPath "target/${{ matrix.target }}/release/viewr.exe" `
+            -OutputPath "dist/${{ matrix.archive }}"
+          ./scripts/validate-portable-archive.ps1 `
+            -Platform "${{ matrix.portable_platform }}" `
+            -ArchivePath "dist/${{ matrix.archive }}" `
+            -ExpectedBinaryPath "target/${{ matrix.target }}/release/viewr.exe"
+      - name: Build and validate macOS installer
+        id: macos_installer
+        if: ${{ !cancelled() && runner.os == 'macOS' && steps.build_viewr.outcome == 'success' }}
+        shell: bash
+        env:
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          scripts/package-macos-pkg.sh \
+            target/${{ matrix.target }}/release/viewr \
+            dist/viewr-macos-arm64.pkg
+          scripts/validate-macos-pkg.sh \
+            --test-open-events \
+            dist/viewr-macos-arm64.pkg
+      - name: Install and remove macOS installer
+        if: ${{ !cancelled() && runner.os == 'macOS' && steps.macos_installer.outcome == 'success' }}
+        shell: bash
+        env:
+          VIEWR_TEST_RAW: ${{ runner.temp }}/viewr-public-domain-sony.ARW
+        run: |
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            --retry-all-errors \
+            --show-error \
+            --silent \
+            https://raw.pixls.us/data/Sony/DSC-RX100/DSC00838.ARW \
+            --output "$VIEWR_TEST_RAW"
+          printf '%s  %s\n' \
+            579a485b5126a25cbd55cbd5dadfa7d09cf021c99cc7d4869f9e56e3f759390b \
+            "$VIEWR_TEST_RAW" |
+            shasum -a 256 --check -
+          scripts/test-macos-pkg-install.sh \
+            --allow-system-changes \
+            dist/viewr-macos-arm64.pkg
+      - name: Build and validate Windows installer
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.build_viewr.outcome == 'success' }}
+        shell: pwsh
+        env:
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          ./scripts/build-windows-msi.ps1 `
+            -BinaryPath "target/${{ matrix.target }}/release/viewr.exe" `
+            -OutputDirectory dist `
+            -ReleaseTag $env:VIEWR_RELEASE_TAG
+          ./scripts/test-windows-msi.ps1 `
+            -MsiPath dist/viewr-windows-x64.msi `
+            -ExpectedBinaryPath "target/${{ matrix.target }}/release/viewr.exe" `
+            -AllowMachineChanges
+      - name: Build and validate Debian installer
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.build_viewr.outcome == 'success' }}
+        shell: bash
+        env:
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          scripts/package-linux-deb.sh \
+            --binary target/${{ matrix.target }}/release/viewr \
+            --output-dir dist \
+            --release-tag "$VIEWR_RELEASE_TAG"
+          scripts/validate-linux-deb.sh dist/viewr-linux-x64.deb
+          scripts/test-linux-deb-install.sh \
+            --allow-system-changes \
+            dist/viewr-linux-x64.deb
+      - name: Upload platform assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  source:
+    name: Release source
+    needs: gate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.gate.outputs.release_sha }}
+      - name: Linux source-validation dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            jq \
+            libgtk-3-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            pkg-config
+      - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
+      - name: Install license inventory tool
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
+      - name: Fetch all release target dependency graphs
+        run: |
+          cargo fetch --locked --target aarch64-apple-darwin
+          cargo fetch --locked --target x86_64-pc-windows-msvc
+          cargo fetch --locked --target x86_64-unknown-linux-gnu
+      - name: Validate third-party license inventories
+        run: scripts/validate-third-party-licenses.sh
+      - name: Build and validate vendored source archive
+        env:
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          scripts/package-source-archive.sh dist
+          scripts/validate-source-archive.sh dist/viewr-*-source.tar.gz
+      - name: Upload source asset
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-source
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish release assets
+    needs: [gate, packages, source]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Require release to remain a draft
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload ${{ github.event.release.tag_name }} ${{ matrix.asset }}
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [[ "$(
+            gh release view \
+              "$VIEWR_RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isDraft \
+              --jq '.isDraft'
+          )" != "true" ]]; then
+            echo "::error::Release $VIEWR_RELEASE_TAG is no longer a draft."
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.gate.outputs.release_sha }}
+      - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
+      - name: Download release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Verify assets and write checksums
+        env:
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          scripts/verify-release-assets.sh \
+            dist \
+            "$VIEWR_RELEASE_TAG"
+      - name: Reject unexpected existing release assets
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/verify-remote-release-assets.sh \
+            --allow-missing \
+            dist \
+            "$VIEWR_RELEASE_TAG"
+      - name: Attest release assets
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
+        with:
+          subject-checksums: dist/SHA256SUMS
+      - name: Attest checksum manifest
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
+        with:
+          subject-path: dist/SHA256SUMS
+      - name: Upload all release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VIEWR_RELEASE_SHA: ${{ needs.gate.outputs.release_sha }}
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          git fetch \
+            --force \
+            --no-tags \
+            origin \
+            "refs/tags/$VIEWR_RELEASE_TAG:refs/tags/$VIEWR_RELEASE_TAG"
+          current_release_sha="$(git rev-parse "$VIEWR_RELEASE_TAG^{commit}")"
+          if [[ "$current_release_sha" != "$VIEWR_RELEASE_SHA" ]]; then
+            echo "::error::Release tag moved from $VIEWR_RELEASE_SHA to $current_release_sha."
+            exit 1
+          fi
+          if [[ "$(
+            gh release view \
+              "$VIEWR_RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isDraft \
+              --jq '.isDraft'
+          )" != "true" ]]; then
+            echo "::error::Release $VIEWR_RELEASE_TAG is no longer a draft."
+            exit 1
+          fi
+          gh release upload \
+            "$VIEWR_RELEASE_TAG" \
+            dist/* \
+            --clobber
+      - name: Verify published release assets
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/verify-remote-release-assets.sh \
+            dist \
+            "$VIEWR_RELEASE_TAG"
+      - name: Publish validated release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VIEWR_RELEASE_SHA: ${{ needs.gate.outputs.release_sha }}
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          git fetch \
+            --force \
+            --no-tags \
+            origin \
+            "refs/tags/$VIEWR_RELEASE_TAG:refs/tags/$VIEWR_RELEASE_TAG"
+          current_release_sha="$(git rev-parse "$VIEWR_RELEASE_TAG^{commit}")"
+          if [[ "$current_release_sha" != "$VIEWR_RELEASE_SHA" ]]; then
+            echo "::error::Release tag moved from $VIEWR_RELEASE_SHA to $current_release_sha."
+            exit 1
+          fi
+          if [[ "$(
+            gh release view \
+              "$VIEWR_RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isDraft \
+              --jq '.isDraft'
+          )" != "true" ]]; then
+            echo "::error::Release $VIEWR_RELEASE_TAG is no longer a draft."
+            exit 1
+          fi
+          gh release edit \
+            "$VIEWR_RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --verify-tag
