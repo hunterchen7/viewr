@@ -46,6 +46,20 @@ const JPEG_QUALITY_FULL: u8 = 90;
 const PERSIST_WRITE_ATTEMPTS: usize = 3;
 const PERSIST_RETRY_BASE_DELAY: Duration = Duration::from_millis(2);
 
+fn jpeg_quality(tier: Tier) -> u8 {
+    match tier {
+        Tier::Full => JPEG_QUALITY_FULL,
+        Tier::Thumb | Tier::Browse => JPEG_QUALITY_BROWSE,
+    }
+}
+
+/// Returns the production persistence quality for a benchmark tier.
+#[cfg(feature = "benchmarks")]
+#[doc(hidden)]
+pub fn benchmark_jpeg_quality(tier: Tier) -> u8 {
+    jpeg_quality(tier)
+}
+
 #[derive(Debug)]
 /// Result notification published by [`Engine`] workers.
 ///
@@ -710,8 +724,57 @@ impl JobQueue {
         self.finish_with(id, token, JobCompletion::Complete);
     }
 
+    fn enqueue_current_event(
+        &self,
+        id: JobId,
+        token: &Arc<CancelToken>,
+        events: &Sender<Event>,
+        event: Event,
+    ) -> bool {
+        let state = self.state.lock().unwrap();
+        if !state
+            .in_flight
+            .get(&id)
+            .is_some_and(|current| Arc::ptr_eq(&current.token, token) && !token.cancelled())
+        {
+            return false;
+        }
+
+        // Sending on the unbounded worker channel cannot call application
+        // code. Keep the ownership check and enqueue under one lock so a
+        // replan linearizes either before both operations or after both.
+        let _ = events.send(event);
+        true
+    }
+
+    #[cfg(test)]
     fn finish_with(&self, id: JobId, token: &Arc<CancelToken>, completion: JobCompletion) {
+        self.finish_with_publication(id, token, completion, None);
+    }
+
+    fn finish_with_publication(
+        &self,
+        id: JobId,
+        token: &Arc<CancelToken>,
+        completion: JobCompletion,
+        publication: Option<(&Sender<Event>, Event)>,
+    ) -> bool {
         let mut state = self.state.lock().unwrap();
+        let publishable = state
+            .in_flight
+            .get(&id)
+            .is_some_and(|current| Arc::ptr_eq(&current.token, token) && !token.cancelled());
+        let published = if publishable {
+            publication.is_some_and(|(events, event)| {
+                // As in `enqueue_current_event`, enqueue before releasing
+                // generation ownership. User notification happens only after
+                // this method releases the queue-state lock.
+                let _ = events.send(event);
+                true
+            })
+        } else {
+            false
+        };
         let retry_action = state.background_in_flight.get(&id).and_then(|background| {
             Arc::ptr_eq(&background.token, token).then_some(background.action)
         });
@@ -740,6 +803,7 @@ impl JobQueue {
         }
         drop(state);
         self.cond.notify_one();
+        published
     }
 
     /// Make one backpressured warm job runnable after persistence capacity or
@@ -831,15 +895,44 @@ struct Shared {
 /// indices stable across events and cache keys. Interactive navigation plans
 /// replace one another, viewport thumbnail demand is replaceable, and
 /// folder-wide Browse warming occupies a persistent lowest-priority lane.
-/// Dropping the engine cancels queued work and joins decode, persistence, and
-/// disk-GC threads; no worker may outlive the engine. Drop can block until an
+/// Dropping the engine cancels queued work and joins decode and persistence
+/// threads; no image worker may outlive the engine. Drop can block until an
 /// active non-interruptible `rawler` decode or demosaic finishes and until
-/// accepted persistence and GC work has joined.
+/// accepted persistence work has joined. Disk-cache maintenance is detached,
+/// single-flight best-effort work and does not delay engine teardown.
 pub struct Engine {
     shared: Arc<Shared>,
     workers: Vec<std::thread::JoinHandle<()>>,
     persistence_worker: Option<std::thread::JoinHandle<()>>,
-    gc_worker: Option<std::thread::JoinHandle<()>>,
+}
+
+type EngineTask = Box<dyn FnOnce() + Send + 'static>;
+
+fn spawn_engine_threads(
+    engine: &mut Engine,
+    mut spawn: impl FnMut(String, EngineTask) -> std::io::Result<std::thread::JoinHandle<()>>,
+) -> std::io::Result<()> {
+    let shared = engine.shared.clone();
+    engine.persistence_worker = Some(spawn(
+        "viewr-persistence".into(),
+        Box::new(move || persistence_worker(&shared)),
+    )?);
+
+    for worker_index in 0..HEAVY_WORKERS {
+        let shared = engine.shared.clone();
+        engine.workers.push(spawn(
+            format!("viewr-heavy-{worker_index}"),
+            Box::new(move || worker(&shared, false)),
+        )?);
+    }
+    for worker_index in 0..LIGHT_WORKERS {
+        let shared = engine.shared.clone();
+        engine.workers.push(spawn(
+            format!("viewr-light-{worker_index}"),
+            Box::new(move || worker(&shared, true)),
+        )?);
+    }
+    Ok(())
 }
 
 fn navigation_pins(
@@ -906,55 +999,43 @@ impl Engine {
         notify: Arc<dyn Fn() + Send + Sync>,
     ) -> (Self, Receiver<Event>) {
         let (events, rx) = std::sync::mpsc::channel();
-        let shared = Arc::new(Shared {
-            entries,
-            cache,
-            disk,
-            events,
-            notify,
-            heavy: JobQueue::new(),
-            light: JobQueue::new(),
-            persistence: PersistenceQueue::new(),
-            navigation: Mutex::new(NavigationOrder::default()),
-        });
-
-        let persistence_worker = {
-            let shared = shared.clone();
-            std::thread::Builder::new()
-                .name("viewr-persistence".into())
-                .spawn(move || persistence_worker(&shared))
-                .expect("failed to spawn persistence worker")
+        // Construct the owner before spawning. If any later spawn panics via
+        // `expect`, `Engine::drop` closes both queues and joins every handle
+        // already installed by `spawn_engine_threads`.
+        let mut engine = Self {
+            shared: Arc::new(Shared {
+                entries,
+                cache,
+                disk,
+                events,
+                notify,
+                heavy: JobQueue::new(),
+                light: JobQueue::new(),
+                persistence: PersistenceQueue::new(),
+                navigation: Mutex::new(NavigationOrder::default()),
+            }),
+            workers: Vec::with_capacity(HEAVY_WORKERS + LIGHT_WORKERS),
+            persistence_worker: None,
         };
+        spawn_engine_threads(&mut engine, |name, task| {
+            std::thread::Builder::new().name(name).spawn(task)
+        })
+        .expect("failed to spawn engine worker");
+        let shared = &engine.shared;
 
-        let mut workers = Vec::with_capacity(HEAVY_WORKERS + LIGHT_WORKERS);
-        for worker_index in 0..HEAVY_WORKERS {
-            let shared = shared.clone();
-            workers.push(
-                std::thread::Builder::new()
-                    .name(format!("viewr-heavy-{worker_index}"))
-                    .spawn(move || worker(&shared, false))
-                    .expect("failed to spawn heavy worker"),
-            );
-        }
-        for worker_index in 0..LIGHT_WORKERS {
-            let shared = shared.clone();
-            workers.push(
-                std::thread::Builder::new()
-                    .name(format!("viewr-light-{worker_index}"))
-                    .spawn(move || worker(&shared, true))
-                    .expect("failed to spawn light worker"),
-            );
-        }
-
-        // Background disk-cache GC sweep on open.
-        let gc_worker = shared.disk.clone().map(|disk| {
-            std::thread::Builder::new()
+        // Background disk-cache GC sweep on open. A session does not own this
+        // best-effort maintenance task: a new sweep skips if the same cache
+        // root is already being scanned, and engine teardown never waits for
+        // it.
+        if let Some(disk) = shared.disk.clone()
+            && let Err(error) = std::thread::Builder::new()
                 .name("viewr-cache-gc".into())
                 .spawn(move || {
-                    disk.gc_to_budget();
+                    let _ = disk.try_gc_to_budget();
                 })
-                .expect("failed to spawn disk cache GC worker")
-        });
+        {
+            eprintln!("failed to spawn disk cache GC worker: {error}");
+        }
 
         // Discover embedded ratings and EXIF in the background without
         // decoding every preview JPEG. Thumbnail pixels are requested only by
@@ -967,15 +1048,7 @@ impl Engine {
                 .map(|(dist, index)| ((index, Tier::Thumb), 5, dist as u32, Action::Metadata)),
         );
 
-        (
-            Self {
-                shared,
-                workers,
-                persistence_worker: Some(persistence_worker),
-                gc_worker,
-            },
-            rx,
-        )
+        (engine, rx)
     }
 
     /// Recomputes and synchronizes the heavy plan for a navigation state.
@@ -1100,21 +1173,87 @@ impl Drop for Engine {
         if let Some(worker) = self.persistence_worker.take() {
             let _ = worker.join();
         }
-        if let Some(worker) = self.gc_worker.take() {
-            let _ = worker.join();
+    }
+}
+
+/// Production metadata queue fixture exposed only to the Criterion harness.
+#[cfg(feature = "benchmarks")]
+#[doc(hidden)]
+pub struct BenchmarkMetadataQueue {
+    queue: JobQueue,
+}
+
+#[cfg(feature = "benchmarks")]
+impl BenchmarkMetadataQueue {
+    /// Builds the production metadata queue without starting decoder threads.
+    pub fn new(len: usize) -> Self {
+        let queue = JobQueue::new();
+        queue.extend((0..len).map(|index| {
+            (
+                (index, Tier::Thumb),
+                5,
+                index.min(u32::MAX as usize) as u32,
+                Action::Metadata,
+            )
+        }));
+        Self { queue }
+    }
+
+    /// Returns the number of jobs retained by the production queue.
+    pub fn resident_jobs(&self) -> usize {
+        self.queue.state.lock().unwrap().heap.len()
+    }
+}
+
+/// Production priority-queue synchronization isolated from decoder threads.
+#[cfg(feature = "benchmarks")]
+#[doc(hidden)]
+pub struct BenchmarkNavigationQueue {
+    queue: JobQueue,
+    len: usize,
+}
+
+#[cfg(feature = "benchmarks")]
+impl BenchmarkNavigationQueue {
+    /// Creates an empty production queue for a synthetic folder.
+    pub fn new(len: usize) -> Self {
+        Self {
+            queue: JobQueue::new(),
+            len,
         }
+    }
+
+    /// Replans one fit-mode navigation and returns the queued target count.
+    pub fn navigate(&self, current: usize) -> usize {
+        let plan = build_plan_targets(self.len, current, 1, false, &[], false)
+            .into_iter()
+            .filter(|target| target.kind == PlanKind::Display)
+            .map(|target| {
+                (
+                    (target.index, target.tier),
+                    target.class,
+                    target.effective_distance,
+                    Action::Develop(Quality::Browse),
+                )
+            })
+            .collect();
+        self.queue.set_plan(plan, true);
+        self.queue.state.lock().unwrap().heap.len()
     }
 }
 
 fn worker(shared: &Shared, light: bool) {
     let queue = if light { &shared.light } else { &shared.heavy };
     while let Some((id, action, token)) = queue.pop() {
-        let completion = run_job(shared, id, action, &token);
-        let deferred_bytes = match completion {
-            JobCompletion::DeferBackground { required_bytes } => Some(required_bytes),
-            JobCompletion::Complete | JobCompletion::RetryBackground => None,
-        };
-        queue.finish_with(id, &token, completion);
+        let deferred_bytes = execute_claimed_job(
+            queue,
+            id,
+            action,
+            &token,
+            || run_job(shared, queue, id, action, &token),
+            &shared.events,
+            || notify_safely(shared.notify.as_ref()),
+        );
         // Close the race where persistence frees capacity immediately before
         // this worker parks its rejected warm item. A later completion also
         // runs the same one-at-a-time admission check.
@@ -1127,9 +1266,85 @@ fn worker(shared: &Shared, light: bool) {
     }
 }
 
+/// Run one claimed job without allowing a decoder panic to strand its queue
+/// identity or permanently remove a worker from the pool.
+///
+/// A panicking background job is completed rather than retried: repeating an
+/// identical panic would otherwise create an unbounded retry loop. Queue
+/// ownership validation, failure enqueue, and cleanup share one critical
+/// section; application notification happens only after that lock is released.
+fn execute_claimed_job(
+    queue: &JobQueue,
+    id: JobId,
+    action: Action,
+    token: &Arc<CancelToken>,
+    run: impl FnOnce() -> JobCompletion,
+    events: &Sender<Event>,
+    notify: impl FnOnce(),
+) -> Option<usize> {
+    let (completion, panic_payload) =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+            Ok(completion) => (completion, None),
+            Err(payload) => (JobCompletion::Complete, Some(payload)),
+        };
+    let deferred_bytes = match completion {
+        JobCompletion::DeferBackground { required_bytes } => Some(required_bytes),
+        JobCompletion::Complete | JobCompletion::RetryBackground => None,
+    };
+    let panic_event = panic_payload
+        .as_deref()
+        .and_then(|payload| worker_panic_event(id, action, payload));
+    if queue.finish_with_publication(
+        id,
+        token,
+        completion,
+        panic_event.map(|event| (events, event)),
+    ) {
+        notify();
+    }
+    deferred_bytes
+}
+
+fn worker_panic_event(
+    (index, tier): JobId,
+    action: Action,
+    payload: &(dyn std::any::Any + Send),
+) -> Option<Event> {
+    let detail = if let Some(message) = payload.downcast_ref::<&str>() {
+        *message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "non-string panic payload"
+    };
+    let error = format!("worker panicked: {detail}");
+    match action {
+        Action::Metadata => Some(Event::MetadataFailed { index, error }),
+        Action::Thumb | Action::Develop(_) | Action::Rehydrate => {
+            Some(Event::ImageFailed { index, tier, error })
+        }
+        // Folder-wide warming is intentionally invisible to the event/UI
+        // channel. The panic hook still records the contained panic.
+        Action::WarmDevelop(_) => None,
+    }
+}
+
+#[cfg(test)]
 fn publish(shared: &Shared, event: Event) {
     let _ = shared.events.send(event);
     notify_safely(shared.notify.as_ref());
+}
+
+fn publish_claimed(
+    shared: &Shared,
+    queue: &JobQueue,
+    id: JobId,
+    token: &Arc<CancelToken>,
+    event: Event,
+) {
+    if queue.enqueue_current_event(id, token, &shared.events, event) {
+        notify_safely(shared.notify.as_ref());
+    }
 }
 
 fn notify_safely(notify: &(dyn Fn() + Send + Sync)) {
@@ -1164,10 +1379,7 @@ fn persistence_worker(shared: &Shared) {
         // This lane is intentionally single-threaded and yields before CPU
         // work so interactive develop workers retain scheduling priority.
         std::thread::yield_now();
-        let quality = match request.id.1 {
-            Tier::Full => JPEG_QUALITY_FULL,
-            _ => JPEG_QUALITY_BROWSE,
-        };
+        let quality = jpeg_quality(request.id.1);
         let encoded = encode_jpeg(&request.pixels, quality);
         let mut persistence_error = None;
         let encode_error = encoded.as_ref().err().cloned();
@@ -1214,42 +1426,43 @@ fn persistence_worker(shared: &Shared) {
     }
 }
 
-fn run_job(shared: &Shared, id: JobId, action: Action, token: &CancelToken) -> JobCompletion {
+fn run_job(
+    shared: &Shared,
+    queue: &JobQueue,
+    id: JobId,
+    action: Action,
+    token: &Arc<CancelToken>,
+) -> JobCompletion {
     let (index, tier) = id;
+    let emit = |event| publish_claimed(shared, queue, id, token, event);
     match action {
-        Action::Metadata => run_metadata(shared, index, token),
-        Action::Thumb => run_thumb(shared, index),
-        Action::Rehydrate => run_rehydrate(shared, index, tier, token),
+        Action::Metadata => run_metadata(shared, index, token, &emit),
+        Action::Thumb => run_thumb(shared, index, &emit),
+        Action::Rehydrate => run_rehydrate(shared, index, tier, token, &emit),
         Action::Develop(quality) => {
-            let _ = run_develop(shared, index, tier, quality, token, false);
+            let _ = run_develop(shared, index, tier, quality, token, false, &emit);
         }
         Action::WarmDevelop(quality) => {
-            return run_warm_develop(shared, index, tier, quality, token);
+            return run_warm_develop(shared, index, tier, quality, token, &emit);
         }
     }
     JobCompletion::Complete
 }
 
-fn run_metadata(shared: &Shared, index: usize, token: &CancelToken) {
+fn run_metadata(shared: &Shared, index: usize, token: &CancelToken, emit: &dyn Fn(Event)) {
     if token.cancelled() {
         return;
     }
     match decode::metadata(&shared.entries[index].path) {
-        Ok(meta) if !token.cancelled() => publish(
-            shared,
-            Event::MetadataReady {
-                index,
-                meta: Box::new(meta),
-            },
-        ),
+        Ok(meta) if !token.cancelled() => emit(Event::MetadataReady {
+            index,
+            meta: Box::new(meta),
+        }),
         Ok(_) => {}
-        Err(error) if !token.cancelled() => publish(
-            shared,
-            Event::MetadataFailed {
-                index,
-                error: error.to_string(),
-            },
-        ),
+        Err(error) if !token.cancelled() => emit(Event::MetadataFailed {
+            index,
+            error: error.to_string(),
+        }),
         Err(_) => {}
     }
 }
@@ -1295,6 +1508,7 @@ fn run_warm_develop(
     tier: Tier,
     quality: Quality,
     token: &CancelToken,
+    emit: &dyn Fn(Event),
 ) -> JobCompletion {
     if token.cancelled() {
         return JobCompletion::RetryBackground;
@@ -1314,10 +1528,10 @@ fn run_warm_develop(
     {
         return JobCompletion::Complete;
     }
-    warm_job_completion(run_develop(shared, index, tier, quality, token, true))
+    warm_job_completion(run_develop(shared, index, tier, quality, token, true, emit))
 }
 
-fn run_thumb(shared: &Shared, index: usize) {
+fn run_thumb(shared: &Shared, index: usize, emit: &dyn Fn(Event)) {
     let path = &shared.entries[index].path;
     complete_thumb_attempt(
         index,
@@ -1328,7 +1542,7 @@ fn run_thumb(shared: &Shared, index: usize) {
                 .cache
                 .insert_rgba((index, Tier::Thumb), Arc::new(thumb));
         },
-        |event| publish(shared, event),
+        emit,
     );
 }
 
@@ -1377,18 +1591,16 @@ fn run_develop(
     quality: Quality,
     token: &CancelToken,
     warm_only: bool,
+    emit: &dyn Fn(Event),
 ) -> DevelopCompletion {
     let path = &shared.entries[index].path;
     let fail = |e: String| {
         if !token.cancelled() {
-            publish(
-                shared,
-                Event::ImageFailed {
-                    index,
-                    tier,
-                    error: e,
-                },
-            );
+            emit(Event::ImageFailed {
+                index,
+                tier,
+                error: e,
+            });
         }
     };
     if token.cancelled() {
@@ -1427,7 +1639,7 @@ fn run_develop(
     if !warm_only {
         shared.cache.insert_rgba((index, tier), buf.clone());
         if !token.cancelled() {
-            publish(shared, Event::ImageReady { index, tier });
+            emit(Event::ImageReady { index, tier });
         }
     }
 
@@ -1456,7 +1668,13 @@ fn run_develop(
     DevelopCompletion::Finished
 }
 
-fn run_rehydrate(shared: &Shared, index: usize, tier: Tier, token: &CancelToken) {
+fn run_rehydrate(
+    shared: &Shared,
+    index: usize,
+    tier: Tier,
+    token: &CancelToken,
+    emit: &dyn Fn(Event),
+) {
     // Ring 2 first, then ring 3 (disk). Disk bytes enter RAM only after JPEG
     // validation; a corrupt rebuildable object is evicted and falls through
     // to RAW development instead of poisoning every later request.
@@ -1466,7 +1684,7 @@ fn run_rehydrate(shared: &Shared, index: usize, tier: Tier, token: &CancelToken)
     let id = (index, tier);
     if let Some(bytes) = shared.cache.get_jpeg(id) {
         if let Ok(buf) = decode_jpeg(&bytes) {
-            return install_rehydrated(shared, index, tier, buf, token);
+            return install_rehydrated(shared, index, tier, buf, token, emit);
         }
         shared.cache.remove_jpeg(id);
     }
@@ -1482,7 +1700,7 @@ fn run_rehydrate(shared: &Shared, index: usize, tier: Tier, token: &CancelToken)
             }
             if let Ok(buf) = decode_jpeg(&bytes) {
                 shared.cache.insert_jpeg(id, Arc::new(bytes));
-                return install_rehydrated(shared, index, tier, buf, token);
+                return install_rehydrated(shared, index, tier, buf, token, emit);
             }
             if let Err(error) = disk.remove(&key) {
                 eprintln!("failed to remove corrupt disk cache object: {error}");
@@ -1490,7 +1708,7 @@ fn run_rehydrate(shared: &Shared, index: usize, tier: Tier, token: &CancelToken)
         }
     }
 
-    develop_cache_miss(shared, index, tier, token);
+    develop_cache_miss(shared, index, tier, token, emit);
 }
 
 fn install_rehydrated(
@@ -1499,19 +1717,26 @@ fn install_rehydrated(
     tier: Tier,
     buf: PixelBuf,
     token: &CancelToken,
+    emit: &dyn Fn(Event),
 ) {
     shared.cache.insert_rgba((index, tier), Arc::new(buf));
     if !token.cancelled() {
-        publish(shared, Event::ImageReady { index, tier });
+        emit(Event::ImageReady { index, tier });
     }
 }
 
-fn develop_cache_miss(shared: &Shared, index: usize, tier: Tier, token: &CancelToken) {
+fn develop_cache_miss(
+    shared: &Shared,
+    index: usize,
+    tier: Tier,
+    token: &CancelToken,
+    emit: &dyn Fn(Event),
+) {
     let quality = match tier {
         Tier::Full => Quality::Full,
         _ => Quality::Browse,
     };
-    run_develop(shared, index, tier, quality, token, false);
+    run_develop(shared, index, tier, quality, token, false, emit);
 }
 
 /// Encodes a tightly packed RGBA8 buffer as a JPEG.
@@ -1563,7 +1788,7 @@ pub fn decode_jpeg(bytes: &[u8]) -> Result<PixelBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[test]
     fn notification_callback_panic_is_contained() {
@@ -1576,6 +1801,326 @@ mod tests {
         notify_safely(&notify);
 
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn partial_engine_construction_joins_started_threads_during_unwind() {
+        let spawn_count = 1 + HEAVY_WORKERS + LIGHT_WORKERS;
+        for failure_at in 1..=spawn_count {
+            let active_threads = Arc::new(AtomicUsize::new(0));
+            let active_for_construction = active_threads.clone();
+            let (weak_shared, weak_receiver) = std::sync::mpsc::channel();
+            let construction = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let shared =
+                    persistence_shared(Vec::new(), Arc::new(RamCache::new(0, 0, 0)), None, 0);
+                weak_shared.send(Arc::downgrade(&shared)).unwrap();
+                let mut engine = Engine {
+                    shared,
+                    workers: Vec::with_capacity(HEAVY_WORKERS + LIGHT_WORKERS),
+                    persistence_worker: None,
+                };
+                let mut attempts = 0;
+
+                spawn_engine_threads(&mut engine, |name, task| {
+                    attempts += 1;
+                    if attempts == failure_at {
+                        return Err(std::io::Error::other("injected worker spawn failure"));
+                    }
+                    let active_threads = active_for_construction.clone();
+                    let (started, started_wait) = std::sync::mpsc::channel();
+                    let handle = std::thread::Builder::new().name(name).spawn(move || {
+                        active_threads.fetch_add(1, Ordering::SeqCst);
+                        started.send(()).unwrap();
+                        task();
+                        active_threads.fetch_sub(1, Ordering::SeqCst);
+                    })?;
+                    started_wait.recv().unwrap();
+                    Ok(handle)
+                })
+                .expect("injected worker spawn failure must unwind construction");
+            }));
+
+            assert!(construction.is_err(), "spawn {failure_at} must fail");
+            assert_eq!(
+                active_threads.load(Ordering::SeqCst),
+                0,
+                "spawn {failure_at} left a started worker running"
+            );
+            assert!(
+                weak_receiver.recv().unwrap().upgrade().is_none(),
+                "spawn {failure_at} left a worker retaining the engine"
+            );
+        }
+    }
+
+    #[test]
+    fn claimed_job_panic_clears_in_flight_and_the_next_job_runs() {
+        let queue = JobQueue::new();
+        queue.extend([
+            ((3, Tier::Thumb), 0, 0, Action::Metadata),
+            ((4, Tier::Thumb), 1, 0, Action::Thumb),
+        ]);
+
+        let (failed_id, failed_action, failed_token) = queue.pop().unwrap();
+        assert_eq!(
+            (failed_id, failed_action),
+            ((3, Tier::Thumb), Action::Metadata)
+        );
+        let (events, receiver) = std::sync::mpsc::channel();
+        let notifications = AtomicUsize::new(0);
+        let deferred = execute_claimed_job(
+            &queue,
+            failed_id,
+            failed_action,
+            &failed_token,
+            || panic!("deterministic decoder panic"),
+            &events,
+            || {
+                notifications.fetch_add(1, Ordering::Relaxed);
+            },
+        );
+
+        assert_eq!(deferred, None);
+        assert!(
+            !queue
+                .state
+                .lock()
+                .unwrap()
+                .in_flight
+                .contains_key(&failed_id)
+        );
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::MetadataFailed { index: 3, error })
+                if error == "worker panicked: deterministic decoder panic"
+        ));
+
+        let (next_id, next_action, next_token) = queue.pop().unwrap();
+        assert_eq!((next_id, next_action), ((4, Tier::Thumb), Action::Thumb));
+        let mut next_ran = false;
+        let deferred = execute_claimed_job(
+            &queue,
+            next_id,
+            next_action,
+            &next_token,
+            || {
+                next_ran = true;
+                JobCompletion::Complete
+            },
+            &events,
+            || panic!("a successful job must not emit a panic event"),
+        );
+        assert!(next_ran);
+        assert_eq!(deferred, None);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(queue.state.lock().unwrap().in_flight.is_empty());
+    }
+
+    #[test]
+    fn non_metadata_worker_panic_is_an_image_failure_for_the_claimed_tier() {
+        let payload = String::from("rehydrate invariant failed");
+        let event = worker_panic_event(
+            (8, Tier::Full),
+            Action::Rehydrate,
+            &payload as &(dyn std::any::Any + Send),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            event,
+            Event::ImageFailed {
+                index: 8,
+                tier: Tier::Full,
+                error,
+            } if error == "worker panicked: rehydrate invariant failed"
+        ));
+    }
+
+    #[test]
+    fn cancelled_worker_panic_does_not_publish_a_stale_failure() {
+        let queue = JobQueue::new();
+        queue.extend([((3, Tier::Thumb), 0, 0, Action::Metadata)]);
+        let (id, action, token) = queue.pop().unwrap();
+        token.cancel();
+        let (events, receiver) = std::sync::mpsc::channel();
+
+        execute_claimed_job(
+            &queue,
+            id,
+            action,
+            &token,
+            || panic!("stale decoder panic"),
+            &events,
+            || panic!("a cancelled generation must not notify"),
+        );
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(queue.state.lock().unwrap().in_flight.is_empty());
+    }
+
+    #[test]
+    fn panic_event_enqueue_precedes_reentrant_replan_notification() {
+        let queue = JobQueue::new();
+        let id = (3, Tier::Thumb);
+        queue.extend([(id, 0, 0, Action::Metadata)]);
+        let (claimed_id, action, token) = queue.pop().unwrap();
+        let (events, receiver) = std::sync::mpsc::channel();
+        let mut notified = false;
+
+        execute_claimed_job(
+            &queue,
+            claimed_id,
+            action,
+            &token,
+            || panic!("decoder panic before replan"),
+            &events,
+            || {
+                notified = true;
+                assert!(
+                    queue.state.try_lock().is_ok(),
+                    "notification ran while queue ownership was locked"
+                );
+                assert!(matches!(
+                    receiver.try_recv(),
+                    Ok(Event::MetadataFailed { index: 3, error })
+                        if error == "worker panicked: decoder panic before replan"
+                ));
+                queue.set_plan(vec![(id, 0, 0, Action::Metadata)], false);
+            },
+        );
+
+        assert!(notified);
+        let (replacement_id, replacement_action, _) = queue.pop().unwrap();
+        assert_eq!((replacement_id, replacement_action), (id, Action::Metadata));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn ordinary_event_enqueue_precedes_reentrant_replan_notification() {
+        let queue = Arc::new(JobQueue::new());
+        let id = (3, Tier::Browse);
+        queue.extend([(id, 0, 0, Action::Metadata)]);
+        let (claimed_id, _, token) = queue.pop().unwrap();
+        let (events, receiver) = std::sync::mpsc::channel();
+        let notified = Arc::new(AtomicBool::new(false));
+        let notify_unlocked = Arc::new(AtomicBool::new(false));
+        let notify_queue = queue.clone();
+        let notified_callback = notified.clone();
+        let notify_unlocked_callback = notify_unlocked.clone();
+        let shared = Shared {
+            entries: Arc::new(Vec::new()),
+            cache: Arc::new(RamCache::new(0, 0, 0)),
+            disk: None,
+            events,
+            notify: Arc::new(move || {
+                notified_callback.store(true, Ordering::SeqCst);
+                notify_unlocked_callback
+                    .store(notify_queue.state.try_lock().is_ok(), Ordering::SeqCst);
+                notify_queue.set_plan(vec![(id, 0, 0, Action::Develop(Quality::Browse))], false);
+            }),
+            heavy: JobQueue::new(),
+            light: JobQueue::new(),
+            persistence: PersistenceQueue::new(),
+            navigation: Mutex::new(NavigationOrder::default()),
+        };
+
+        publish_claimed(
+            &shared,
+            queue.as_ref(),
+            claimed_id,
+            &token,
+            Event::ImageReady {
+                index: id.0,
+                tier: id.1,
+            },
+        );
+
+        assert!(notified.load(Ordering::SeqCst));
+        assert!(notify_unlocked.load(Ordering::SeqCst));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::ImageReady {
+                index: 3,
+                tier: Tier::Browse
+            })
+        ));
+        let (replacement_id, replacement_action, replacement_token) = queue.pop().unwrap();
+        assert_eq!(
+            (replacement_id, replacement_action),
+            (id, Action::Develop(Quality::Browse))
+        );
+        queue.finish(replacement_id, &replacement_token);
+    }
+
+    #[test]
+    fn ordinary_event_publication_rejects_a_replanned_generation() {
+        let queue = JobQueue::new();
+        let id = (3, Tier::Browse);
+        queue.extend([(id, 0, 0, Action::Metadata)]);
+        let (claimed_id, _, stale_token) = queue.pop().unwrap();
+        queue.set_plan(vec![(id, 0, 0, Action::Develop(Quality::Browse))], false);
+        let (events, receiver) = std::sync::mpsc::channel();
+
+        assert!(stale_token.cancelled());
+        assert!(!queue.enqueue_current_event(
+            claimed_id,
+            &stale_token,
+            &events,
+            Event::ImageReady {
+                index: id.0,
+                tier: id.1,
+            },
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        let (replacement_id, replacement_action, replacement_token) = queue.pop().unwrap();
+        assert_eq!(
+            (replacement_id, replacement_action),
+            (id, Action::Develop(Quality::Browse))
+        );
+        assert!(queue.enqueue_current_event(
+            replacement_id,
+            &replacement_token,
+            &events,
+            Event::ImageReady {
+                index: id.0,
+                tier: id.1,
+            },
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::ImageReady {
+                index: 3,
+                tier: Tier::Browse
+            })
+        ));
+        queue.finish(replacement_id, &replacement_token);
+    }
+
+    #[test]
+    fn background_warm_panic_has_no_user_visible_event() {
+        let payload = "warm decoder panic";
+        assert!(
+            worker_panic_event(
+                (8, Tier::Browse),
+                Action::WarmDevelop(Quality::Browse),
+                &payload as &(dyn std::any::Any + Send),
+            )
+            .is_none()
+        );
     }
 
     fn patterned_buf(width: u32, height: u32) -> PixelBuf {
@@ -2406,6 +2951,7 @@ mod tests {
             Tier::Browse,
             Quality::Browse,
             &CancelToken::default(),
+            &|event| publish(&shared, event),
         );
 
         assert!(matches!(
@@ -2452,6 +2998,7 @@ mod tests {
                 Tier::Browse,
                 Quality::Browse,
                 &CancelToken::default(),
+                &|event| publish(&shared, event),
             ),
             JobCompletion::Complete
         );
@@ -2682,7 +3229,6 @@ mod tests {
             shared: shared.clone(),
             workers: Vec::new(),
             persistence_worker: Some(worker),
-            gc_worker: None,
         };
         drop(engine);
         assert_eq!(
@@ -2759,7 +3305,13 @@ mod tests {
             navigation: Mutex::new(NavigationOrder::default()),
         };
 
-        run_rehydrate(&shared, 0, Tier::Browse, &CancelToken::default());
+        run_rehydrate(
+            &shared,
+            0,
+            Tier::Browse,
+            &CancelToken::default(),
+            &|event| publish(&shared, event),
+        );
 
         assert!(!cache.has_jpeg((0, Tier::Browse)));
         assert!(!disk.has(&key));

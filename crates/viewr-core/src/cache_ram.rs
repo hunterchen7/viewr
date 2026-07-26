@@ -100,7 +100,8 @@ impl<V: Clone> ByteLru<V> {
             self.mru = prev;
         }
 
-        debug_assert_eq!(self.map.remove(key), Some(index));
+        let removed = self.map.remove(key);
+        debug_assert_eq!(removed, Some(index));
         let entry = self.entries[index]
             .take()
             .expect("LRU index must point to a resident entry");

@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError, Weak};
 use std::time::Duration;
 
 use crate::atomic_write;
@@ -36,6 +36,29 @@ pub struct DiskCache {
 
 static GC_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
 const ORPHAN_TEMP_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn ascii_hex_name(name: &std::ffi::OsStr, expected_len: usize) -> Option<&str> {
+    let name = name.to_str()?;
+    (name.len() == expected_len && name.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some(name)
+}
+
+fn is_cache_object_name(name: &std::ffi::OsStr, shard: &str) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(key) = name.strip_suffix(".jpg") else {
+        return false;
+    };
+    key.starts_with(shard)
+        && key.len() == blake3::OUT_LEN * 2
+        && key.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_viewr_temp_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.starts_with(".viewr-") && name.ends_with(".tmp"))
+}
 
 fn shared_gc_lock(root: &Path) -> Arc<Mutex<()>> {
     let identity = root.canonicalize().unwrap_or_else(|_| root.to_owned());
@@ -93,8 +116,9 @@ impl DiskCache {
         })
     }
 
-    #[cfg(test)]
-    /// Opens a cache at an explicit root for unit tests.
+    #[cfg(any(test, feature = "benchmarks"))]
+    #[doc(hidden)]
+    /// Opens a cache at an explicit root for tests and benchmarks.
     pub fn open_at(root: PathBuf) -> Self {
         std::fs::create_dir_all(&root).unwrap();
         let gc_lock = shared_gc_lock(&root);
@@ -181,10 +205,28 @@ impl DiskCache {
         self.gc(self.budget_bytes)
     }
 
+    /// Attempts one budget sweep without waiting for another sweep on this
+    /// cache root.
+    ///
+    /// Returns `None` when a sweep is already active. This is intended for
+    /// best-effort background maintenance where folder/session teardown must
+    /// not queue behind a full directory scan.
+    pub fn try_gc_to_budget(&self) -> Option<u64> {
+        let _gc_guard = match self.gc_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return None,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        Some(self.gc_without_lock(self.budget_bytes))
+    }
+
     /// Enforce the byte budget by deleting the oldest-written objects first.
     /// Cache reads do not refresh file modification times, so this is not LRU.
     /// Stale-keyed objects age out naturally.
-    /// Also sweeps `.tmp` files old enough to be abandoned. Returns bytes
+    ///
+    /// The sweep recognizes only regular `<64 hex>.jpg` objects in matching,
+    /// real `<2 hex>` shard directories and abandoned `.viewr-*.tmp` files.
+    /// Symlinks and unrelated filesystem entries are ignored. Returns bytes
     /// deleted; recent temporary files may belong to active atomic writers.
     pub fn gc(&self, budget_bytes: u64) -> u64 {
         // Engines opened for the same cache root share this lock. It prevents
@@ -194,19 +236,43 @@ impl DiskCache {
             .gc_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.gc_without_lock(budget_bytes)
+    }
+
+    fn gc_without_lock(&self, budget_bytes: u64) -> u64 {
         let mut objects: Vec<(std::path::PathBuf, std::time::SystemTime, u64)> = Vec::new();
         let mut total: u64 = 0;
         let Ok(shards) = std::fs::read_dir(&self.root) else {
             return 0;
         };
         for shard in shards.flatten() {
+            let Ok(shard_type) = shard.file_type() else {
+                continue;
+            };
+            if !shard_type.is_dir() {
+                continue;
+            }
+            let shard_name = shard.file_name();
+            let Some(shard_name) = ascii_hex_name(&shard_name, 2) else {
+                continue;
+            };
             let Ok(files) = std::fs::read_dir(shard.path()) else {
                 continue;
             };
             for file in files.flatten() {
+                let Ok(file_type) = file.file_type() else {
+                    continue;
+                };
+                if !file_type.is_file() {
+                    continue;
+                }
                 let path = file.path();
                 let Ok(md) = file.metadata() else { continue };
-                if path.extension().is_some_and(|e| e == "tmp") {
+                if !md.is_file() {
+                    continue;
+                }
+                let file_name = file.file_name();
+                if is_viewr_temp_name(&file_name) {
                     let is_stale = md
                         .modified()
                         .ok()
@@ -215,6 +281,9 @@ impl DiskCache {
                     if is_stale {
                         let _ = std::fs::remove_file(&path);
                     }
+                    continue;
+                }
+                if !is_cache_object_name(&file_name, shard_name) {
                     continue;
                 }
                 let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
@@ -292,6 +361,33 @@ mod tests {
         };
         let first = make_entry(0x80);
         let second = make_entry(0x81);
+        assert_eq!(first.path.to_string_lossy(), second.path.to_string_lossy());
+
+        assert_ne!(
+            DiskCache::key(&first, Tier::Browse),
+            DiskCache::key(&second, Tier::Browse)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn key_distinguishes_non_unicode_windows_paths_with_the_same_lossy_text() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt as _;
+
+        let make_entry = |surrogate| {
+            let mut path = "C:\\photos\\photo-".encode_utf16().collect::<Vec<_>>();
+            path.push(surrogate);
+            path.extend(".arw".encode_utf16());
+            FolderEntry {
+                path: PathBuf::from(OsString::from_wide(&path)),
+                file_name: "non-unicode.arw".into(),
+                size: 10,
+                mtime_ns: 1,
+            }
+        };
+        let first = make_entry(0xd800);
+        let second = make_entry(0xd801);
         assert_eq!(first.path.to_string_lossy(), second.path.to_string_lossy());
 
         assert_ne!(
@@ -382,19 +478,132 @@ mod tests {
             .object_path(&key)
             .unwrap()
             .with_file_name(".viewr-active.tmp");
+        let unrelated_temp = cache
+            .object_path(&key)
+            .unwrap()
+            .with_file_name("third-party.tmp");
+        let unrelated_viewr_file = cache
+            .object_path(&key)
+            .unwrap()
+            .with_file_name(".viewr-interrupted.part");
         std::fs::write(&stale, b"interrupted write").unwrap();
         std::fs::write(&recent, b"active write").unwrap();
+        std::fs::write(&unrelated_temp, b"belongs to another tool").unwrap();
+        std::fs::write(&unrelated_viewr_file, b"not an atomic-write temp").unwrap();
         let stale_file = std::fs::File::options().write(true).open(&stale).unwrap();
         stale_file
             .set_modified(
                 std::time::SystemTime::now() - ORPHAN_TEMP_MIN_AGE - Duration::from_secs(1),
             )
             .unwrap();
+        for path in [&unrelated_temp, &unrelated_viewr_file] {
+            let file = std::fs::File::options().write(true).open(path).unwrap();
+            file.set_modified(
+                std::time::SystemTime::now() - ORPHAN_TEMP_MIN_AGE - Duration::from_secs(1),
+            )
+            .unwrap();
+        }
 
         assert_eq!(cache.gc(u64::MAX), 0);
         assert!(!stale.exists());
         assert!(recent.exists());
+        assert!(unrelated_temp.exists());
+        assert!(unrelated_viewr_file.exists());
         assert_eq!(cache.get(&key).unwrap(), b"cached object");
+    }
+
+    #[test]
+    fn gc_ignores_entries_outside_the_cache_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open_at(dir.path().to_owned());
+        let key = DiskCache::key(&entry(10, 1), Tier::Browse);
+        cache.put(&key, b"cached object").unwrap();
+
+        let shard = cache
+            .object_path(&key)
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_owned();
+        let unrelated_jpeg = shard.join("notes.jpg");
+        let wrong_prefix = if &key[..2] == "ff" { "ee" } else { "ff" };
+        let misplaced_object = shard.join(format!("{wrong_prefix}{}.jpg", "0".repeat(62)));
+        let nested_file = shard.join("nested").join("keep");
+        let invalid_shard_file =
+            dir.path()
+                .join("not-a-shard")
+                .join(format!("{}{}", "a".repeat(64), ".jpg"));
+        std::fs::write(&unrelated_jpeg, b"unrelated").unwrap();
+        std::fs::write(&misplaced_object, b"wrong shard").unwrap();
+        std::fs::create_dir_all(nested_file.parent().unwrap()).unwrap();
+        std::fs::write(&nested_file, b"nested").unwrap();
+        std::fs::create_dir_all(invalid_shard_file.parent().unwrap()).unwrap();
+        std::fs::write(&invalid_shard_file, b"invalid shard").unwrap();
+
+        assert_eq!(cache.gc(0), b"cached object".len() as u64);
+        assert!(!cache.has(&key));
+        assert!(unrelated_jpeg.exists());
+        assert!(misplaced_object.exists());
+        assert!(nested_file.exists());
+        assert!(invalid_shard_file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_does_not_follow_symlinked_shards_or_objects() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open_at(dir.path().to_owned());
+
+        let outside_shard_object = outside.path().join(format!("{}.jpg", "a".repeat(64)));
+        let outside_shard_temp = outside.path().join(".viewr-abandoned.tmp");
+        std::fs::write(&outside_shard_object, b"external object").unwrap();
+        std::fs::write(&outside_shard_temp, b"external temp").unwrap();
+        let stale_temp = std::fs::File::options()
+            .write(true)
+            .open(&outside_shard_temp)
+            .unwrap();
+        stale_temp
+            .set_modified(
+                std::time::SystemTime::now() - ORPHAN_TEMP_MIN_AGE - Duration::from_secs(1),
+            )
+            .unwrap();
+        let shard_link = dir.path().join("aa");
+        symlink(outside.path(), &shard_link).unwrap();
+
+        let real_shard = dir.path().join("bb");
+        std::fs::create_dir(&real_shard).unwrap();
+        let outside_object = outside.path().join("object-sentinel");
+        std::fs::write(&outside_object, b"external target").unwrap();
+        let object_link = real_shard.join(format!("{}.jpg", "b".repeat(64)));
+        symlink(&outside_object, &object_link).unwrap();
+
+        assert_eq!(cache.gc(0), 0);
+        assert_eq!(
+            std::fs::read(&outside_shard_object).unwrap(),
+            b"external object"
+        );
+        assert_eq!(
+            std::fs::read(&outside_shard_temp).unwrap(),
+            b"external temp"
+        );
+        assert_eq!(std::fs::read(&outside_object).unwrap(), b"external target");
+        assert!(
+            shard_link
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            object_link
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
@@ -403,6 +612,11 @@ mod tests {
         let first = DiskCache::open_at(dir.path().to_owned());
         let second = DiskCache::open_at(dir.path().to_owned());
         assert!(Arc::ptr_eq(&first.gc_lock, &second.gc_lock));
+
+        let guard = first.gc_lock.lock().unwrap();
+        assert_eq!(second.try_gc_to_budget(), None);
+        drop(guard);
+        assert_eq!(second.try_gc_to_budget(), Some(0));
     }
 
     #[test]

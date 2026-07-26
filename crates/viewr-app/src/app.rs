@@ -17,15 +17,18 @@ use eframe::egui::{self, vec2};
 use viewr_core::cache_disk::DiskCache;
 use viewr_core::cache_ram::RamCache;
 use viewr_core::db::{Db, default_db_path};
-use viewr_core::folder::{FolderEntry, scan};
+use viewr_core::folder::{FolderEntry, normalize_physical_path, scan};
 use viewr_core::jobs::{Engine, Event, NavState};
-use viewr_core::library::{Library, load_ratings};
+use viewr_core::library::{
+    Library, RatingLoad, load_ratings_with_owners, rating_owner_keys, try_load_ratings_with_owners,
+};
 use viewr_core::meta::FileMeta;
 use viewr_core::types::{PixelBuf, Tier};
 
 use crate::config::{Action, Config, ScrollMode};
 use crate::filmstrip;
 use crate::loupe::{self, Zoom};
+use crate::rating_groups::{build_owner_members, install_rating_for_members};
 use crate::settings::SettingsState;
 use crate::texture_lru::ByteLru;
 
@@ -37,6 +40,18 @@ const THUMB_UPLOADS_PER_FRAME: usize = 8;
 const THUMB_REQUEST_POLL_AFTER: Duration = Duration::from_millis(16);
 const THUMB_REQUEST_STALE_AFTER: Duration = Duration::from_millis(500);
 const THUMB_FAILURE_RETRY_AFTER: Duration = Duration::from_secs(2);
+const RATING_DB_REFRESH_POLL: Duration = Duration::from_millis(50);
+const RATING_DB_REFRESH_MAX_POLL: Duration = Duration::from_secs(5);
+
+type RatingRefreshResult = std::result::Result<RatingLoad, String>;
+
+fn ram_cache_budgets(total: u64) -> (u64, u64, u64) {
+    let thumbs = THUMB_BUDGET.min(total / 2);
+    let developed = total - thumbs;
+    let rgba = developed / 3 * 2 + (developed % 3) * 2 / 3;
+    let jpeg = developed - rgba;
+    (thumbs, rgba, jpeg)
+}
 
 pub fn run(dir: &Path, select: Option<&Path>) -> Result<()> {
     let options = eframe::NativeOptions {
@@ -141,9 +156,11 @@ fn install_metadata(
     index: usize,
     meta: FileMeta,
     filter: Filter,
+    accept_rating: bool,
 ) -> bool {
     let mut filter_dirty = false;
-    if let Some(embedded) = meta.rating
+    if accept_rating
+        && let Some(embedded) = meta.rating
         && embedded > 0
         && !ratings.contains_key(&index)
     {
@@ -155,9 +172,41 @@ fn install_metadata(
     filter_dirty
 }
 
+fn merge_refreshed_ratings(
+    mut persisted: HashMap<usize, u8>,
+    metas: &HashMap<usize, FileMeta>,
+    explicit: &HashMap<usize, u8>,
+) -> HashMap<usize, u8> {
+    for (&index, meta) in metas {
+        if let Some(rating) = meta.rating
+            && rating > 0
+        {
+            persisted.entry(index).or_insert(rating.min(5) as u8);
+        }
+    }
+    persisted.extend(explicit.iter().map(|(&index, &rating)| (index, rating)));
+    persisted
+}
+
+fn rating_refresh_required(database_configured: bool) -> bool {
+    // Even a current-schema snapshot can race the persistence worker's
+    // initial recovery pass. Reconcile once after its readiness boundary so a
+    // replaced or retargeted RAW cannot leave a stale rating in this session.
+    database_configured
+}
+
+fn rating_sources_blocked(database_configured: bool, database_snapshot_available: bool) -> bool {
+    database_configured && !database_snapshot_available
+}
+
+fn next_rating_refresh_delay(delay: Duration) -> Duration {
+    delay.saturating_mul(2).min(RATING_DB_REFRESH_MAX_POLL)
+}
+
 /// Store every explicit user choice, including zero. Absence means that no
 /// higher-precedence rating source has been observed yet, so removing a zero
 /// would let a delayed embedded-metadata event resurrect the camera rating.
+#[cfg(test)]
 fn install_user_rating(ratings: &mut HashMap<usize, u8>, index: usize, rating: u8) -> u8 {
     let old_rating = ratings.get(&index).copied().unwrap_or(0);
     ratings.insert(index, rating);
@@ -173,6 +222,13 @@ struct Session {
     cache: Arc<RamCache>,
     library: Library,
     ratings: HashMap<usize, u8>,
+    explicit_ratings: HashMap<usize, u8>,
+    rating_members: Vec<Option<Arc<[usize]>>>,
+    rating_refresh_pending: bool,
+    rating_sources_blocked: bool,
+    rating_refresh_after: Option<Instant>,
+    rating_refresh_delay: Duration,
+    rating_refresh_rx: Option<Receiver<RatingRefreshResult>>,
     metas: HashMap<usize, FileMeta>,
     thumbs: ByteLru<egui::TextureHandle>,
     /// Demand requests are bounded to the current viewport and time out so a
@@ -235,22 +291,46 @@ impl App {
         if entries.is_empty() {
             return Err(anyhow!("no raw files found in {}", dir.display()));
         }
-        let start = select
-            .and_then(|f| entries.iter().position(|e| e.path == f))
+        let selected = select.map(normalize_physical_path);
+        let start = selected
+            .as_deref()
+            .and_then(|file| entries.iter().position(|entry| entry.path == file))
             .unwrap_or(0);
         let entries = Arc::new(entries);
         let ram_bytes = (self.config.ram_gb as f64 * 1e9) as u64;
-        let cache = Arc::new(RamCache::new(
-            THUMB_BUDGET,
-            ram_bytes * 2 / 3,
-            ram_bytes / 3,
-        ));
+        let (thumb_bytes, rgba_bytes, jpeg_bytes) = ram_cache_budgets(ram_bytes);
+        let cache = Arc::new(RamCache::new(thumb_bytes, rgba_bytes, jpeg_bytes));
         let disk = DiskCache::open_default((self.config.disk_gb as f64 * 1e9) as u64);
+        let rating_ctx = self.ctx.clone();
+        let library = Library::start_with_database_ready_notify(Arc::new(move || {
+            rating_ctx.request_repaint();
+        }));
         // Resolve persisted ratings before decode workers can publish embedded
-        // metadata, so startup precedence does not depend on worker timing.
-        let db = default_db_path().and_then(|p| Db::open(&p).ok());
-        let ratings = load_ratings(&entries, db.as_ref());
-        let library = Library::start();
+        // metadata. Legacy compatible schemas stay read-only here; if a
+        // migration or repair is required, the persistence worker performs it
+        // and the session refreshes this snapshot without blocking the UI.
+        let db = default_db_path()
+            .and_then(|path| Db::try_open_for_read(&path).ok())
+            .flatten();
+        let database_configured = library.database_configured();
+        let (ratings, rating_owners, database_snapshot_available) = match db.as_ref() {
+            Some(db) => match try_load_ratings_with_owners(&entries, Some(db)) {
+                Ok((ratings, owners)) => (ratings, owners, true),
+                Err(error) => {
+                    eprintln!("initial rating database read failed; scheduling retry: {error}");
+                    (HashMap::new(), rating_owner_keys(&entries), false)
+                }
+            },
+            None if database_configured => (HashMap::new(), rating_owner_keys(&entries), false),
+            None => {
+                let (ratings, owners) = load_ratings_with_owners(&entries, None);
+                (ratings, owners, false)
+            }
+        };
+        let rating_refresh_pending = rating_refresh_required(database_configured);
+        let rating_sources_blocked =
+            rating_sources_blocked(database_configured, database_snapshot_available);
+        let rating_members = build_owner_members(&rating_owners);
 
         let ctx = self.ctx.clone();
         let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
@@ -264,6 +344,13 @@ impl App {
             cache,
             library,
             ratings,
+            explicit_ratings: HashMap::new(),
+            rating_members,
+            rating_refresh_pending,
+            rating_sources_blocked,
+            rating_refresh_after: None,
+            rating_refresh_delay: RATING_DB_REFRESH_POLL,
+            rating_refresh_rx: None,
             metas: HashMap::new(),
             thumbs: ByteLru::new(THUMB_TEXTURE_BUDGET_BYTES),
             thumb_requests: HashMap::new(),
@@ -364,7 +451,7 @@ impl App {
         self.scroll_to_current = true;
         self.nav_started = Some(Instant::now());
         if let Some(s) = &self.session {
-            s.library.flush();
+            s.library.request_flush();
         }
         self.replan();
     }
@@ -374,9 +461,23 @@ impl App {
         let Some(session) = &mut self.session else {
             return;
         };
-        let old_rating = install_user_rating(&mut session.ratings, index, rating);
+        let singleton = [index];
+        let members = session.rating_members[index]
+            .as_deref()
+            .unwrap_or(&singleton);
+        let filter_changed = install_rating_for_members(
+            &mut session.ratings,
+            members,
+            rating,
+            |old_rating, new_rating| {
+                self.filter.passes(old_rating) != self.filter.passes(new_rating)
+            },
+        );
+        for &member in members {
+            session.explicit_ratings.insert(member, rating);
+        }
         session.library.set_rating(&session.entries[index], rating);
-        if self.filter.passes(old_rating) != self.filter.passes(rating) {
+        if filter_changed {
             self.filter_dirty = true;
         }
     }
@@ -388,6 +489,7 @@ impl App {
         };
         let mut replan = false;
         let mut filter_dirty = false;
+        let accept_metadata_ratings = !session.rating_sources_blocked;
         while let Ok(event) = session.events.try_recv() {
             match event {
                 Event::ThumbReady { index, meta } => {
@@ -402,6 +504,7 @@ impl App {
                         index,
                         *meta,
                         self.filter,
+                        accept_metadata_ratings,
                     );
                 }
                 Event::MetadataReady { index, meta } => {
@@ -411,6 +514,7 @@ impl App {
                         index,
                         *meta,
                         self.filter,
+                        accept_metadata_ratings,
                     );
                 }
                 Event::ImageReady { .. } => replan = true,
@@ -434,6 +538,98 @@ impl App {
         if replan {
             self.replan();
         }
+    }
+
+    fn refresh_ratings_after_database_ready(&mut self) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        if !session.rating_refresh_pending {
+            return;
+        }
+
+        if let Some(receiver) = session.rating_refresh_rx.as_ref() {
+            let result = match receiver.try_recv() {
+                Ok(result) => result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Err("rating refresh worker disconnected".to_owned())
+                }
+            };
+            let session = self.session.as_mut().expect("checked session");
+            session.rating_refresh_rx = None;
+            match result {
+                Ok((ratings, owners)) => {
+                    let ratings =
+                        merge_refreshed_ratings(ratings, &session.metas, &session.explicit_ratings);
+                    session.ratings = ratings;
+                    session.rating_members = build_owner_members(&owners);
+                    session.rating_refresh_pending = false;
+                    session.rating_sources_blocked = false;
+                    session.rating_refresh_after = None;
+                    self.filter_dirty = true;
+                }
+                Err(error) => {
+                    eprintln!("rating database refresh failed; scheduling retry: {error}");
+                    self.defer_rating_database_refresh();
+                }
+            }
+            return;
+        }
+
+        let session = self.session.as_ref().expect("checked session");
+        if !session.library.database_ready() {
+            return;
+        }
+        if session
+            .rating_refresh_after
+            .is_some_and(|retry_after| Instant::now() < retry_after)
+        {
+            return;
+        }
+        let entries = session.entries.clone();
+        let ctx = self.ctx.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        let spawn = std::thread::Builder::new()
+            .name("viewr-rating-refresh".to_owned())
+            .spawn(move || {
+                let result = (|| {
+                    let path = default_db_path()
+                        .ok_or_else(|| "configured database path is unavailable".to_owned())?;
+                    let db = Db::try_open_for_read(&path)
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| "rating database migration is not complete".to_owned())?;
+                    if !db.rating_schema_is_current() {
+                        return Err("rating database migration is not complete".to_owned());
+                    }
+                    try_load_ratings_with_owners(&entries, Some(&db))
+                        .map_err(|error| error.to_string())
+                })();
+                let _ = send.send(result);
+                ctx.request_repaint();
+            });
+        match spawn {
+            Ok(_worker) => {
+                self.session
+                    .as_mut()
+                    .expect("checked session")
+                    .rating_refresh_rx = Some(receive);
+            }
+            Err(error) => {
+                eprintln!("cannot spawn rating refresh worker; scheduling retry: {error}");
+                self.defer_rating_database_refresh();
+            }
+        }
+    }
+
+    fn defer_rating_database_refresh(&mut self) {
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        let delay = session.rating_refresh_delay;
+        session.rating_refresh_after = Some(Instant::now() + delay);
+        session.rating_refresh_delay = next_rating_refresh_delay(delay);
+        self.ctx.request_repaint_after(delay);
     }
 
     /// Upload only thumbnails demanded by the current viewport. The byte LRU
@@ -729,6 +925,7 @@ impl eframe::App for App {
         let ctx = self.ctx.clone();
         self.settings.maybe_capture(&ctx, &mut self.config);
         self.settings.show(&ctx, &mut self.config);
+        self.refresh_ratings_after_database_ready();
         self.drain_events();
         self.manage_textures();
         if self.session.is_none() {
@@ -1262,6 +1459,7 @@ mod tests {
             0,
             metadata_with_rating(Some(4)),
             filter,
+            true,
         ));
         assert_eq!(ratings.get(&0), Some(&4));
         assert_eq!(
@@ -1275,8 +1473,72 @@ mod tests {
             1,
             metadata_with_rating(Some(2)),
             filter,
+            true,
         ));
         assert_eq!(ratings.get(&1), Some(&5), "persisted rating must win");
+    }
+
+    #[test]
+    fn delayed_database_refresh_preserves_source_precedence() {
+        let persisted = HashMap::from([(0, 5), (1, 4)]);
+        let metas = HashMap::from([
+            (0, metadata_with_rating(Some(1))),
+            (2, metadata_with_rating(Some(9))),
+            (3, metadata_with_rating(Some(0))),
+        ]);
+        let explicit = HashMap::from([(1, 0), (3, 2)]);
+
+        assert_eq!(
+            merge_refreshed_ratings(persisted, &metas, &explicit),
+            HashMap::from([(0, 5), (1, 0), (2, 5), (3, 2)])
+        );
+    }
+
+    #[test]
+    fn configured_database_refreshes_until_its_snapshot_loads() {
+        assert!(rating_refresh_required(true));
+        assert!(!rating_refresh_required(false));
+        assert!(rating_sources_blocked(true, false));
+        assert!(!rating_sources_blocked(true, true));
+        assert!(!rating_sources_blocked(false, false));
+
+        assert_eq!(
+            next_rating_refresh_delay(Duration::from_millis(50)),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            next_rating_refresh_delay(Duration::from_secs(4)),
+            RATING_DB_REFRESH_MAX_POLL
+        );
+        assert_eq!(
+            next_rating_refresh_delay(RATING_DB_REFRESH_MAX_POLL),
+            RATING_DB_REFRESH_MAX_POLL
+        );
+    }
+
+    #[test]
+    fn unavailable_database_blocks_embedded_rating_but_retains_metadata() {
+        let mut ratings = HashMap::new();
+        let mut metas = HashMap::new();
+        let filter = Filter {
+            min_rating: 4,
+            unrated_only: false,
+        };
+
+        assert!(!install_metadata(
+            &mut ratings,
+            &mut metas,
+            0,
+            metadata_with_rating(Some(5)),
+            filter,
+            false,
+        ));
+        assert!(ratings.is_empty());
+        assert_eq!(
+            metas.get(&0).and_then(|meta| meta.rating),
+            Some(5),
+            "metadata remains available for reconciliation after recovery"
+        );
     }
 
     #[test]
@@ -1299,6 +1561,7 @@ mod tests {
             0,
             metadata_with_rating(Some(4)),
             filter,
+            true,
         ));
         assert_eq!(ratings.get(&0), Some(&0));
 
@@ -1309,6 +1572,7 @@ mod tests {
             0,
             metadata_with_rating(Some(3)),
             filter,
+            true,
         ));
         assert_eq!(ratings.get(&0), Some(&0));
 
@@ -1319,6 +1583,39 @@ mod tests {
             [0],
             "explicit zero still passes the unrated filter"
         );
+    }
+
+    #[test]
+    fn user_rating_updates_every_entry_with_the_same_sidecar_owner() {
+        let owner = PathBuf::from("/photos/photo.xmp");
+        let owners = vec![
+            Some(owner.clone()),
+            Some(owner),
+            Some(PathBuf::from("/photos/other.xmp")),
+            None,
+        ];
+        let mut ratings = HashMap::from([(0, 1), (1, 2), (2, 3), (3, 4)]);
+        let filter = Filter {
+            min_rating: 5,
+            unrated_only: false,
+        };
+        let members = build_owner_members(&owners);
+
+        assert!(install_rating_for_members(
+            &mut ratings,
+            members[0].as_deref().unwrap(),
+            5,
+            |old, new| filter.passes(old) != filter.passes(new)
+        ));
+        assert_eq!(ratings, HashMap::from([(0, 5), (1, 5), (2, 3), (3, 4)]));
+
+        assert!(!install_rating_for_members(
+            &mut ratings,
+            &[3],
+            4,
+            |old, new| filter.passes(old) != filter.passes(new)
+        ));
+        assert_eq!(ratings.get(&3), Some(&4));
     }
 
     #[test]
@@ -1369,6 +1666,21 @@ mod tests {
             &near,
             Zoom::Fit
         ));
+    }
+
+    #[test]
+    fn configured_ram_budget_includes_all_three_cache_rings() {
+        for total in [0, 1, 3, 1_000_000_000, 64_000_000_000, u64::MAX] {
+            let (thumbs, rgba, jpeg) = ram_cache_budgets(total);
+            assert_eq!(thumbs + rgba + jpeg, total);
+            assert!(thumbs <= THUMB_BUDGET);
+            assert!(thumbs <= total / 2);
+            assert!(rgba >= jpeg || total <= 1);
+        }
+
+        let (thumbs, rgba, jpeg) = ram_cache_budgets(1_000_000_000);
+        assert_eq!(thumbs, THUMB_BUDGET);
+        assert_eq!(rgba + jpeg, 1_000_000_000 - THUMB_BUDGET);
     }
 
     #[test]

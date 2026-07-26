@@ -89,7 +89,20 @@ including lossless compressed; DNG comes along for free.
   merge-preserving. Existing Lightroom settings and keywords are semantically
   preserved; element updates or property injection can reserialize lexical XML.
 - The local DB lives at `~/Library/Application Support/viewr/viewr.db`
-  (platform-equivalent config dir elsewhere).
+  (the platform configuration directory elsewhere). The storage location must
+  support SQLite WAL mode and local file locking. A network-backed or roaming
+  profile that declines WAL leaves rating writes queued instead of publishing
+  unjournaled XMP. On Windows, the current platform directory is Roaming
+  AppData, so managed profiles must provide WAL-capable storage there.
+- Current rating ownership resolves ordinary parent symlinks and
+  filesystem-verified case and Unicode aliases. Linux bind mounts, or unusual
+  case-folded mount spellings that canonicalize as distinct paths, cannot be
+  proven equivalent. Use one mount spelling for a photo folder.
+- Before the first 0.2.x launch, close every older Viewr process that can write
+  the same photo folders. Mixed 0.1.x/0.2.x writers are not supported: a 0.1.x
+  process can still replace an XMP file after the new database rejects its
+  obsolete journal write. Do not relaunch or downgrade to 0.1.x for folders or
+  databases already used by 0.2.x.
 - [Testing and benchmark procedures](docs/testing-and-benchmarking.md).
 - [Performance and adversarial audit](docs/performance-adversarial-pass-2026-07-21.md).
 - [Design and implementation notes](docs/m0-notes.md).

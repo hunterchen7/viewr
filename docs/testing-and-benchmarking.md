@@ -11,7 +11,7 @@ Run these commands before each commit:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --locked
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
 ```
 
 The test suite covers these areas:
@@ -20,18 +20,31 @@ The test suite covers these areas:
 - Folder scans, navigation waves, queue generations, and cancellation.
 - JPEG cache round-trips, resize geometry, rotation, and tone-curve invariants.
 - RAW crop layout, Bayer superpixels, transfer-table error, and persistence bounds.
-- XMP preservation, rating precedence, SQLite reopen behavior, and durable flushes.
+- XMP preservation, rating precedence, cross-process ownership, native paths,
+  SQLite reopen behavior, and durable flushes.
 - Configuration parsing and loupe layout mathematics.
 
-CI runs the full test suite on macOS, Windows, and Linux. Platform-independent
-formatting, Clippy, Rustdoc, benchmark compilation, and release compilation run
-once on Linux. Miri uses one pinned Linux nightly job. The independent quality,
-test, optimized-build, and Miri jobs run in parallel.
+CI runs the full test suite on macOS, Windows, and Linux. The macOS and Windows
+jobs also compile all-feature benchmark targets. Platform-independent
+formatting, Clippy, Rustdoc, optimized benchmark runtime smoke, and release
+compilation run once on Linux. Miri uses one pinned Linux nightly job. The
+independent quality, test, optimized-build, and Miri jobs run in parallel.
 
-The optimized-build job uses one release-profile Cargo invocation with
-`--bins --benches --all-features`. This builds the application and both
-benchmark harnesses with one unified dependency graph. It does not duplicate
-the three test jobs by linking unit-test harnesses again in release mode.
+Windows-specific database tests recreate ordinary drive-path rows from the
+released ownerless schemas and from the pre-v8 owner schema. They verify clean
+fallback, dirty recovery to the canonical publication owner, exact
+ordinary-to-verbatim prefix matching, mixed-history quarantine, rejection of
+drive-root-relative spellings, raw drive-case path/owner tombstones, duplicate
+component-equivalent keys, lossless non-Unicode round-tripping, and fail-closed
+malformed native-path handling.
+
+The optimized-build job builds the application and both benchmark harnesses
+with one release-profile Cargo invocation using
+`--bins --benches --all-features`. It then runs the complete workspace test
+suite in release mode and executes both Criterion harnesses in smoke-test mode.
+These checks are intentional: optimized-only parallel paths, code hidden behind
+`debug_assert!`, and benchmark runtime setup must execute in CI, not merely
+compile.
 
 CI caches downloaded Cargo registry and Git sources plus compiled dependency
 artifacts. Quality, test, optimized-build, benchmark, and Miri jobs use separate
@@ -74,18 +87,52 @@ cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked 
 
 The suite measures these workloads:
 
-- Navigation planning for 100, 1,000, and 10,000 images.
-- A pure bounded-planner proxy for navigation after persistent disk warming is
-  configured, plus the former folder-wide planner as an explicitly labeled
-  reference. These measurements exclude Engine locks, cache probes, queue
-  synchronization, and the one-time warm-order installation.
+- Navigation planning and production priority-queue synchronization for 100,
+  1,000, and 10,000 images, plus the former folder-wide planner as an
+  explicitly labeled reference. The queue benchmark excludes decoder threads
+  and filesystem cache probes.
+- Folder-open metadata queue construction for up to 100,000 entries. Queue
+  destruction is excluded from the timed interval.
+- Warm, in-memory, all-hit SQLite point lookup and complete folder-startup
+  rating hydration for up to 50,000 entries.
+- Read-write and read-only reopen of current rating databases with 1,000,
+  10,000, and 50,000 image and owner-ledger rows. These are warm filesystem
+  measurements and verify that current-schema readiness does not scale with
+  row count.
+- Read-compatible legacy folder loads against 1,000, 10,000, and 50,000
+  history rows, paired with a full-scan reference implementation. A separate
+  stress group covers zero dirty rows, dense dirty rows, and repeated clean
+  filename stems for both supported legacy schemas.
+- Cold migration of copied 1,000- and 10,000-row templates from both released
+  ownerless schemas: v0.1.0 without the journal column and v0.1.1 with sparse
+  recoverable and quarantined dirty rows. Both corpora combine existing and
+  missing RAW paths and begin in the persistent WAL mode used by those
+  releases. Separate 1,000-row all-online clean corpora measure the successful
+  owner-assignment path.
+- Cold v7-to-v8 migration of copied 1,000- and 10,000-row unresolved database
+  templates, plus a 1,000-row all-online owned template. The templates remove
+  both v8 additions (`images.owner_key_version` and
+  `rating_global_revision.ownerless_revision`) before timing. Template
+  creation and copy setup are outside the timed routine.
+- Rating journal updates against owner ledgers of up to 50,000 rows, plus
+  indexed pending-sidecar scans with zero and one dirty row.
+- Batched physical sidecar-owner discovery for up to 50,000 ordinary and
+  Unicode filenames.
 - Outward-order construction for up to 1,000,000 images.
 - Resize of a deterministic 12.2-megapixel image, plus rotation at 12.2 and
   32.7 megapixels.
-- JPEG encoding, JPEG decoding, RAM-cache hits, and eviction scaling.
+- JPEG encoding and decoding at the production Browse and Full dimensions and
+  qualities, plus RAM-cache hits and eviction scaling. Decode throughput uses
+  compressed input bytes; latency remains the primary comparison.
 - XMP parsing, XMP updates, and disk-cache key generation.
+- Warm, under-budget cache-GC scans for up to 10,000 objects.
+  This case does not sort or delete cache objects.
 - Loupe filmstrip widget scaling at 10,000 and 50,000 images.
 - Thumbnail texture-LRU maintenance for 200 touches among 773 residents.
+- Shared-owner group construction and rating installation through a prefilled
+  rating map at 1,000, 10,000, and 100,000 entries. The installation primitive
+  runs a threshold-filter transition predicate; it does not include event,
+  persistence, repaint, or full-session costs.
 
 Criterion stores reports in `target/criterion`.
 Git ignores this directory.
@@ -134,7 +181,25 @@ Use these initial review limits:
 - Do not reject a change from one hosted-runner result.
 
 The manual `Benchmarks` workflow is advisory.
-Download its Criterion artifact to inspect the complete report.
+Download its Criterion artifact to inspect the complete report. The artifact
+also contains `benchmark-metadata.json` with the commit, Cargo.lock hash, Rust
+version, OS, CPU, logical-core count, memory, Rayon setting, cache condition,
+and fixture state. Benchmark artifacts are retained for 90 days.
+CI smoke-runs every benchmark case but does not compare Criterion estimates
+with a stored numeric baseline, so performance regressions still require a
+reviewer to run and interpret a controlled before/after comparison.
+
+The released-v0.1 migration corpora sample existing RAW files at a fixed
+stride and leave the rest unresolved. The v0.1.0 corpus covers the original
+clean mirror, while v0.1.1 also exercises recovery and quarantine. This avoids
+making every large benchmark row a filesystem object. Paired 1,000-row
+all-online clean corpora measure filesystem owner discovery and successful
+ledger creation. The cold v7 suite likewise retains 1,000- and 10,000-row
+unresolved-removal cases and adds a 1,000-row online-owner rekey case.
+
+The suite also does not yet benchmark contended sidecar publication: a durable
+XMP write holds SQLite's immediate transaction, so a slow external volume can
+delay unrelated rating writers.
 
 ## Real RAW benchmarks
 
@@ -158,11 +223,13 @@ cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked 
 
 The RAW suite measures metadata-only extraction, thumbnail extraction, the
 complete `decode::load` path, and both develop qualities. The decode benchmark
-includes source construction, metadata extraction, and CFA mosaic decode; it
-does not isolate entropy decoding.
+includes source construction, metadata extraction, and CFA mosaic decode.
+It does not isolate entropy decoding.
 The develop benchmark excludes decode setup.
 The initial probe and Criterion warm-up normally make these warm operating-
 system page-cache measurements. They are not Viewr RAM- or disk-cache hits.
+When `VIEWR_BENCH_RAW` is unset, the harness prints an explicit skip message.
+Synthetic success must not be interpreted as real-camera fixture coverage.
 
 Use `viewr dev` in a new process for a cold-path inspection:
 

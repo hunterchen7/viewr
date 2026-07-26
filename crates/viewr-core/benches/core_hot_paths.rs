@@ -6,10 +6,18 @@ use std::time::Duration;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use viewr_core::cache_disk::DiskCache;
 use viewr_core::cache_ram::RamCache;
+use viewr_core::db::{
+    Db, benchmark_insert_rating, benchmark_pending_sidecars, benchmark_rating_cardinalities,
+    benchmark_rating_lookup,
+};
 use viewr_core::decode;
 use viewr_core::develop::{self, Quality};
-use viewr_core::folder::{FolderEntry, outward_order};
-use viewr_core::jobs::{decode_jpeg, encode_jpeg};
+use viewr_core::folder::{FolderEntry, benchmark_sidecar_owner_keys, outward_order};
+use viewr_core::jobs::{
+    BenchmarkMetadataQueue, BenchmarkNavigationQueue, benchmark_jpeg_quality, decode_jpeg,
+    encode_jpeg,
+};
+use viewr_core::library::{benchmark_load_ratings_legacy_full_scan, try_load_ratings_with_owners};
 use viewr_core::planning::build_plan_targets;
 use viewr_core::resize::{apply_orient, downscale_to_fit, resize_exact};
 use viewr_core::types::{Orient, PixelBuf, Tier};
@@ -77,7 +85,6 @@ fn bench_navigation_plan(c: &mut Criterion) {
     group.measurement_time(Duration::from_millis(1_500));
 
     for len in [100_usize, 1_000, 10_000] {
-        group.throughput(Throughput::Elements(len as u64));
         group.bench_with_input(BenchmarkId::new("identity", len), &len, |b, &len| {
             b.iter(|| {
                 black_box(build_plan_targets(
@@ -90,27 +97,26 @@ fn bench_navigation_plan(c: &mut Criterion) {
                 ))
             });
         });
-        // With a disk cache configured, repeated navigation still uses this
-        // bounded pure planner after the one-shot warm queue is initialized.
-        // This intentionally excludes Engine locks, cache probes, queue sync,
-        // and the first O(N) initialization; it is an asymptotic planner
-        // comparison, not an end-to-end navigation benchmark.
+
+        // This includes the production heap/index synchronization but keeps
+        // decoder threads and filesystem cache probes out of the measurement.
+        let queue = BenchmarkNavigationQueue::new(len);
+        assert!(
+            queue.navigate(len / 2) > 0,
+            "navigation benchmark must install production queue work"
+        );
+        let mut queue_current = len / 2;
         group.bench_with_input(
-            BenchmarkId::new("bounded_planner_with_disk_config", len),
+            BenchmarkId::new("production_queue_sync", len),
             &len,
             |b, &len| {
                 b.iter(|| {
-                    black_box(build_plan_targets(
-                        black_box(len),
-                        black_box(len / 2),
-                        black_box(1),
-                        black_box(false),
-                        black_box(&[]),
-                        black_box(false),
-                    ))
+                    queue_current = (queue_current + 1) % len;
+                    black_box(queue.navigate(black_box(queue_current)))
                 });
             },
         );
+
         // Retain the former O(N) planner as a reference measurement. The
         // engine no longer calls this path during navigation.
         group.bench_with_input(
@@ -148,6 +154,1182 @@ fn bench_navigation_plan(c: &mut Criterion) {
                 });
             },
         );
+    }
+
+    group.finish();
+}
+
+fn bench_metadata_queue_setup(c: &mut Criterion) {
+    let mut group = c.benchmark_group("metadata_queue_setup");
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+
+    for len in [1_000_usize, 10_000, 100_000] {
+        assert_eq!(
+            BenchmarkMetadataQueue::new(len).resident_jobs(),
+            len,
+            "metadata benchmark must retain every production queue item"
+        );
+        group.throughput(Throughput::Elements(len as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, &len| {
+            b.iter_batched(
+                || (),
+                |()| BenchmarkMetadataQueue::new(black_box(len)),
+                BatchSize::LargeInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_rating_db_lookup(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rating_db_lookup");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_secs(2));
+
+    for len in [1_000_usize, 10_000, 50_000] {
+        let db = Db::open_in_memory().expect("benchmark database opens");
+        let paths = (0..len)
+            .map(|index| PathBuf::from(format!("/benchmark/photo-{index:08}.arw")))
+            .collect::<Vec<_>>();
+        for (index, path) in paths.iter().enumerate() {
+            benchmark_insert_rating(&db, path, index as u64, index as i64, 4)
+                .expect("benchmark row inserts");
+        }
+        assert_eq!(
+            benchmark_rating_cardinalities(&db).expect("benchmark cardinalities"),
+            (len, len),
+            "lookup corpus must scale both image and owner ledgers"
+        );
+
+        group.throughput(Throughput::Elements(len as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, _| {
+            b.iter(|| {
+                assert_eq!(
+                    black_box(benchmark_rating_lookup(black_box(&db), black_box(&paths))),
+                    len
+                );
+            });
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_rating_folder_load(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rating_folder_load");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+
+    for len in [1_000_usize, 10_000, 50_000] {
+        let directory = tempfile::tempdir().expect("benchmark RAW directory");
+        let canonical =
+            std::fs::canonicalize(directory.path()).expect("benchmark directory canonicalizes");
+        let first = canonical.join("photo-00000000.ARW");
+        std::fs::write(&first, b"raw").expect("owner probe RAW placeholder");
+        let entries = (0..len)
+            .map(|index| FolderEntry {
+                path: canonical.join(format!("photo-{index:08}.ARW")),
+                file_name: format!("photo-{index:08}.ARW"),
+                size: 3,
+                mtime_ns: index as i64,
+            })
+            .collect::<Vec<_>>();
+        let db = Db::open_in_memory().expect("benchmark database opens");
+        for entry in &entries {
+            benchmark_insert_rating(&db, &entry.path, entry.size, entry.mtime_ns, 4)
+                .expect("benchmark row inserts");
+        }
+        assert_eq!(
+            benchmark_rating_cardinalities(&db).expect("benchmark cardinalities"),
+            (len, len),
+            "folder-load corpus must scale both image and owner ledgers"
+        );
+
+        group.throughput(Throughput::Elements(len as u64));
+        group.bench_with_input(BenchmarkId::new("clean_database", len), &len, |b, _| {
+            b.iter(|| {
+                let (ratings, owners) =
+                    try_load_ratings_with_owners(black_box(&entries), black_box(Some(&db)))
+                        .expect("current folder snapshot succeeds");
+                assert_eq!(ratings.len(), black_box(len));
+                assert_eq!(
+                    owners.iter().filter(|owner| owner.is_some()).count(),
+                    black_box(len)
+                );
+            });
+        });
+    }
+
+    group.finish();
+}
+
+#[derive(Clone, Copy)]
+enum LegacyRatingSchema {
+    DirtyOnly,
+    OwnerAware,
+}
+
+#[derive(Clone, Copy)]
+enum LegacyHistoryShape {
+    UniqueClean,
+    UniqueDirty,
+    RepeatedStemClean,
+}
+
+impl LegacyRatingSchema {
+    fn label(self) -> &'static str {
+        match self {
+            Self::DirtyOnly => "legacy_dirty",
+            Self::OwnerAware => "legacy_owner",
+        }
+    }
+}
+
+impl LegacyHistoryShape {
+    fn label(self) -> &'static str {
+        match self {
+            Self::UniqueClean => "zero_dirty",
+            Self::UniqueDirty => "dense_dirty",
+            Self::RepeatedStemClean => "repeated_stem_clean",
+        }
+    }
+
+    fn is_dirty(self) -> bool {
+        matches!(self, Self::UniqueDirty)
+    }
+
+    fn raw_path(self, root: &std::path::Path, index: usize) -> PathBuf {
+        match self {
+            Self::UniqueClean | Self::UniqueDirty => root.join(format!("photo-{index:08}.ARW")),
+            Self::RepeatedStemClean => root
+                .join(format!("directory-{index:08}"))
+                .join("photo-000.ARW"),
+        }
+    }
+}
+
+fn create_legacy_rating_database(
+    path: &std::path::Path,
+    rows: usize,
+    schema: LegacyRatingSchema,
+    history_shape: LegacyHistoryShape,
+    dirty: Option<(&std::path::Path, u64, i64)>,
+) {
+    let mut connection = rusqlite::Connection::open(path).expect("legacy benchmark database opens");
+    let missing_history = path
+        .parent()
+        .expect("benchmark database has a parent")
+        .join(format!(
+            "missing-history-{}-{}-{}",
+            schema.label(),
+            history_shape.label(),
+            rows
+        ));
+    assert!(
+        !missing_history.exists(),
+        "legacy history fixture must stay unresolved"
+    );
+    match schema {
+        LegacyRatingSchema::DirtyOnly => connection
+            .execute_batch(
+                "CREATE TABLE images (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .expect("legacy dirty schema initializes"),
+        LegacyRatingSchema::OwnerAware => connection
+            .execute_batch(
+                "CREATE TABLE images (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+                    sidecar_quarantined INTEGER NOT NULL DEFAULT 0,
+                    sidecar_owner,
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE viewr_schema_migrations (
+                    name TEXT PRIMARY KEY
+                ) WITHOUT ROWID;
+                INSERT INTO viewr_schema_migrations (name)
+                VALUES ('rating-generation-and-owner-v6');",
+            )
+            .expect("legacy owner schema initializes"),
+    }
+
+    let transaction = connection
+        .transaction()
+        .expect("legacy benchmark transaction begins");
+    match schema {
+        LegacyRatingSchema::DirtyOnly => {
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO images
+                        (path, size, mtime_ns, rating, sidecar_mtime_ns,
+                         sidecar_dirty, last_seen)
+                     VALUES (?1, ?2, ?3, 4, 1, ?4, 0)",
+                )
+                .expect("legacy dirty insert prepares");
+            for index in 0..rows {
+                let raw = history_shape.raw_path(&missing_history, index);
+                insert
+                    .execute(rusqlite::params![
+                        raw.to_string_lossy(),
+                        index as u64,
+                        index as i64,
+                        history_shape.is_dirty(),
+                    ])
+                    .expect("legacy dirty history row inserts");
+            }
+            drop(insert);
+            if let Some((dirty_path, dirty_size, dirty_mtime_ns)) = dirty {
+                transaction
+                    .execute(
+                        "INSERT INTO images
+                            (path, size, mtime_ns, rating, sidecar_mtime_ns,
+                             sidecar_dirty, last_seen)
+                         VALUES (?1, ?2, ?3, 5, 0, 1, 0)",
+                        rusqlite::params![
+                            dirty_path.to_string_lossy(),
+                            dirty_size,
+                            dirty_mtime_ns,
+                        ],
+                    )
+                    .expect("legacy dirty pending row inserts");
+            }
+        }
+        LegacyRatingSchema::OwnerAware => {
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO images
+                        (path, size, mtime_ns, rating, sidecar_mtime_ns,
+                         sidecar_dirty, sidecar_quarantined, sidecar_owner,
+                         revision, last_seen)
+                     VALUES (?1, ?2, ?3, 4, 1, ?4, 0, ?5, 1, 0)",
+                )
+                .expect("legacy owner insert prepares");
+            for index in 0..rows {
+                let raw = history_shape.raw_path(&missing_history, index);
+                insert
+                    .execute(rusqlite::params![
+                        raw.to_string_lossy(),
+                        index as u64,
+                        index as i64,
+                        history_shape.is_dirty(),
+                        raw.with_extension("xmp").to_string_lossy(),
+                    ])
+                    .expect("legacy owner history row inserts");
+            }
+            drop(insert);
+            if let Some((dirty_path, dirty_size, dirty_mtime_ns)) = dirty {
+                transaction
+                    .execute(
+                        "INSERT INTO images
+                            (path, size, mtime_ns, rating, sidecar_mtime_ns,
+                             sidecar_dirty, sidecar_quarantined, sidecar_owner,
+                             revision, last_seen)
+                         VALUES (?1, ?2, ?3, 5, 0, 1, 0, ?4, 1, 0)",
+                        rusqlite::params![
+                            dirty_path.to_string_lossy(),
+                            dirty_size,
+                            dirty_mtime_ns,
+                            dirty_path.with_extension("xmp").to_string_lossy(),
+                        ],
+                    )
+                    .expect("legacy owner pending row inserts");
+            }
+        }
+    }
+    transaction
+        .commit()
+        .expect("legacy benchmark transaction commits");
+    if matches!(schema, LegacyRatingSchema::OwnerAware) {
+        connection
+            .execute_batch(
+                "CREATE UNIQUE INDEX images_sidecar_owners
+                    ON images(sidecar_owner)
+                 WHERE sidecar_owner IS NOT NULL;",
+            )
+            .expect("legacy owner index initializes");
+    }
+}
+
+fn bench_legacy_rating_folder_load(c: &mut Criterion) {
+    const FOLDER_LEN: usize = 100;
+    let mut group = c.benchmark_group("rating_legacy_folder_load");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+
+    for len in [1_000_usize, 10_000, 50_000] {
+        let directory = tempfile::tempdir().expect("legacy benchmark directory");
+        let physical = directory.path().join("physical");
+        std::fs::create_dir(&physical).expect("legacy benchmark RAW directory initializes");
+        let physical =
+            std::fs::canonicalize(physical).expect("legacy benchmark directory canonicalizes");
+        let mut entries = Vec::with_capacity(FOLDER_LEN);
+        for index in 0..FOLDER_LEN {
+            let file_name = format!("photo-{index:03}.ARW");
+            let path = physical.join(&file_name);
+            std::fs::write(&path, b"raw").expect("legacy benchmark RAW placeholder");
+            let metadata = std::fs::metadata(&path).expect("legacy benchmark RAW metadata");
+            let mtime_ns = metadata
+                .modified()
+                .expect("legacy benchmark RAW mtime")
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("legacy benchmark RAW mtime after epoch")
+                .as_nanos() as i64;
+            entries.push(FolderEntry {
+                path,
+                file_name,
+                size: metadata.len(),
+                mtime_ns,
+            });
+        }
+        let dirty = &entries[0];
+        let dirty_path = dirty.path.clone();
+
+        for schema in [
+            LegacyRatingSchema::DirtyOnly,
+            LegacyRatingSchema::OwnerAware,
+        ] {
+            let database_path = directory
+                .path()
+                .join(format!("{}-{len}.db", schema.label()));
+            create_legacy_rating_database(
+                &database_path,
+                len,
+                schema,
+                LegacyHistoryShape::UniqueClean,
+                Some((&dirty_path, dirty.size, dirty.mtime_ns)),
+            );
+            let probe = Db::try_open_for_read(&database_path)
+                .expect("legacy benchmark database opens read-only")
+                .expect("legacy benchmark schema is read-compatible");
+            let (ratings, _) = try_load_ratings_with_owners(&entries, Some(&probe))
+                .expect("targeted legacy preflight succeeds");
+            assert_eq!(
+                ratings.get(&0),
+                Some(&5),
+                "the matching physical dirty row must remain authoritative"
+            );
+            let (reference_ratings, reference_owners) =
+                benchmark_load_ratings_legacy_full_scan(&entries, &probe)
+                    .expect("full legacy preflight succeeds");
+            assert_eq!(
+                ratings, reference_ratings,
+                "targeted legacy reads must preserve full-scan decisions"
+            );
+            assert_eq!(reference_owners.len(), entries.len());
+            drop(probe);
+
+            group.bench_with_input(
+                BenchmarkId::new(schema.label(), len),
+                &database_path,
+                |b, database_path| {
+                    b.iter(|| {
+                        let db = Db::try_open_for_read(black_box(database_path.as_path()))
+                            .expect("legacy benchmark database opens read-only")
+                            .expect("legacy benchmark schema is read-compatible");
+                        let (ratings, owners) =
+                            try_load_ratings_with_owners(black_box(&entries), Some(&db))
+                                .expect("targeted legacy snapshot succeeds");
+                        assert_eq!(ratings.get(&0), Some(&5));
+                        assert_eq!(owners.len(), FOLDER_LEN);
+                    });
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new(format!("{}_full_scan_reference", schema.label()), len),
+                &database_path,
+                |b, database_path| {
+                    b.iter(|| {
+                        let db = Db::try_open_for_read(black_box(database_path.as_path()))
+                            .expect("legacy benchmark database opens read-only")
+                            .expect("legacy benchmark schema is read-compatible");
+                        let (ratings, owners) =
+                            benchmark_load_ratings_legacy_full_scan(black_box(&entries), &db)
+                                .expect("full legacy snapshot succeeds");
+                        assert_eq!(ratings.get(&0), Some(&5));
+                        assert_eq!(owners.len(), FOLDER_LEN);
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+fn bench_legacy_rating_stress(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rating_legacy_stress");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+
+    for len in [1_000_usize, 10_000] {
+        let directory = tempfile::tempdir().expect("legacy stress directory");
+        let physical = directory.path().join("physical");
+        std::fs::create_dir(&physical).expect("legacy stress RAW directory initializes");
+        let path = physical.join("photo-000.ARW");
+        std::fs::write(&path, b"raw").expect("legacy stress RAW placeholder");
+        let metadata = std::fs::metadata(&path).expect("legacy stress RAW metadata");
+        let mtime_ns = metadata
+            .modified()
+            .expect("legacy stress RAW mtime")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("legacy stress RAW mtime after epoch")
+            .as_nanos() as i64;
+        let entries = vec![FolderEntry {
+            file_name: "photo-000.ARW".to_owned(),
+            path,
+            size: metadata.len(),
+            mtime_ns,
+        }];
+
+        for history_shape in [
+            LegacyHistoryShape::UniqueClean,
+            LegacyHistoryShape::UniqueDirty,
+            LegacyHistoryShape::RepeatedStemClean,
+        ] {
+            for schema in [
+                LegacyRatingSchema::DirtyOnly,
+                LegacyRatingSchema::OwnerAware,
+            ] {
+                let database_path = directory.path().join(format!(
+                    "stress-{}-{}-{len}.db",
+                    schema.label(),
+                    history_shape.label(),
+                ));
+                create_legacy_rating_database(&database_path, len, schema, history_shape, None);
+                let probe = Db::try_open_for_read(&database_path)
+                    .expect("legacy stress database opens read-only")
+                    .expect("legacy stress schema is read-compatible");
+                let targeted = try_load_ratings_with_owners(&entries, Some(&probe))
+                    .expect("targeted legacy stress snapshot succeeds");
+                let reference = benchmark_load_ratings_legacy_full_scan(&entries, &probe)
+                    .expect("full legacy stress snapshot succeeds");
+                assert_eq!(
+                    targeted, reference,
+                    "stress corpus must preserve full-scan decisions"
+                );
+                assert!(targeted.0.is_empty());
+                drop(probe);
+
+                group.bench_with_input(
+                    BenchmarkId::new(format!("{}_{}", schema.label(), history_shape.label()), len),
+                    &database_path,
+                    |b, database_path| {
+                        b.iter(|| {
+                            let db = Db::try_open_for_read(black_box(database_path.as_path()))
+                                .expect("legacy stress database opens read-only")
+                                .expect("legacy stress schema is read-compatible");
+                            let (ratings, owners) =
+                                try_load_ratings_with_owners(black_box(&entries), Some(&db))
+                                    .expect("targeted legacy stress snapshot succeeds");
+                            assert!(ratings.is_empty());
+                            assert_eq!(owners.len(), entries.len());
+                        });
+                    },
+                );
+            }
+        }
+    }
+
+    group.finish();
+}
+
+fn bench_rating_db_reopen(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rating_db_reopen");
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+
+    for len in [1_000_usize, 10_000, 50_000] {
+        let directory = tempfile::tempdir().expect("benchmark database directory");
+        let database_path = directory.path().join("viewr.db");
+        let db = Db::open(&database_path).expect("benchmark database opens");
+        for index in 0..len {
+            benchmark_insert_rating(
+                &db,
+                &PathBuf::from(format!("/benchmark/photo-{index:08}.arw")),
+                index as u64,
+                index as i64,
+                4,
+            )
+            .expect("benchmark row inserts");
+        }
+        assert_eq!(
+            benchmark_rating_cardinalities(&db).expect("benchmark cardinalities"),
+            (len, len),
+            "reopen corpus must scale both image and owner ledgers"
+        );
+        drop(db);
+
+        let probe = Db::open(&database_path).expect("populated benchmark database reopens");
+        assert!(
+            probe
+                .get_image(&format!("/benchmark/photo-{:08}.arw", len - 1))
+                .is_some(),
+            "reopen benchmark must retain its populated database"
+        );
+        drop(probe);
+
+        group.bench_with_input(
+            BenchmarkId::new("warm", len),
+            &database_path,
+            |b, database_path| {
+                b.iter(|| {
+                    black_box(
+                        Db::open(black_box(database_path.as_path()))
+                            .expect("benchmark database reopens"),
+                    )
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("read_only_current", len),
+            &database_path,
+            |b, database_path| {
+                b.iter(|| {
+                    black_box(
+                        Db::try_open_for_read(black_box(database_path.as_path()))
+                            .expect("current benchmark database opens read-only")
+                            .expect("current benchmark schema is read-compatible"),
+                    )
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+#[derive(Clone, Copy)]
+struct V01MigrationExpectations {
+    surviving_images: usize,
+    owner_ledgers: usize,
+    pending_sidecars: usize,
+    quarantined_ratings: usize,
+}
+
+#[derive(Clone, Copy)]
+enum V01Release {
+    V010,
+    V011,
+}
+
+impl V01Release {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::V010 => "v0.1.0",
+            Self::V011 => "v0.1.1",
+        }
+    }
+
+    const fn has_dirty_column(self) -> bool {
+        matches!(self, Self::V011)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum V01Corpus {
+    MixedOffline,
+    OnlineClean,
+}
+
+impl V01Corpus {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::MixedOffline => "mixed-offline",
+            Self::OnlineClean => "online-clean",
+        }
+    }
+}
+
+fn create_v01_migration_template(
+    path: &std::path::Path,
+    rows: usize,
+    release: V01Release,
+    corpus: V01Corpus,
+) -> V01MigrationExpectations {
+    const EXISTING_STRIDE: usize = 250;
+    const DIRTY_STRIDE: usize = 997;
+
+    let fixture_root = path.parent().expect("v0.1 migration template has a parent");
+    let existing_root = fixture_root.join(format!(
+        "existing-{}-{}-{rows}",
+        release.label(),
+        corpus.label()
+    ));
+    std::fs::create_dir(&existing_root).expect("v0.1 existing RAW directory initializes");
+    let existing_root =
+        std::fs::canonicalize(existing_root).expect("v0.1 existing RAW directory canonicalizes");
+    let missing_root = existing_root
+        .parent()
+        .expect("v0.1 existing RAW directory has a parent")
+        .join(format!(
+            "missing-{}-{}-{rows}",
+            release.label(),
+            corpus.label()
+        ));
+    assert!(
+        !missing_root.exists(),
+        "v0.1 missing RAW directory must stay unresolved"
+    );
+
+    let mut connection =
+        rusqlite::Connection::open(path).expect("v0.1 migration template database opens");
+    connection
+        .pragma_update(None, "journal_mode", "WAL")
+        .expect("released v0.1 template enables WAL");
+    let journal_mode = connection
+        .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+        .expect("released v0.1 template journal mode reads");
+    assert!(
+        journal_mode.eq_ignore_ascii_case("wal"),
+        "released v0.1 template must begin in persistent WAL mode"
+    );
+    connection
+        .execute_batch(match release {
+            V01Release::V010 => {
+                "CREATE TABLE images (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );"
+            }
+            V01Release::V011 => {
+                "CREATE TABLE images (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    rating INTEGER,
+                    sidecar_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                    sidecar_dirty INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0
+                );"
+            }
+        })
+        .expect("released v0.1 rating schema initializes");
+
+    let transaction = connection
+        .transaction()
+        .expect("v0.1 migration template transaction begins");
+    let mut insert = transaction
+        .prepare(match release {
+            V01Release::V010 => {
+                "INSERT INTO images
+                    (path, size, mtime_ns, rating, sidecar_mtime_ns, last_seen)
+                 VALUES (?1, ?2, ?3, 4, 1, 0)"
+            }
+            V01Release::V011 => {
+                "INSERT INTO images
+                    (path, size, mtime_ns, rating, sidecar_mtime_ns,
+                     sidecar_dirty, last_seen)
+                 VALUES (?1, ?2, ?3, 4, 1, ?4, 0)"
+            }
+        })
+        .expect("v0.1 migration template insert prepares");
+    let mut existing_dirty = 0_usize;
+    let mut missing_dirty = 0_usize;
+    let mut existing_rows = 0_usize;
+    for index in 0..rows {
+        let exists = matches!(corpus, V01Corpus::OnlineClean) || index % EXISTING_STRIDE == 0;
+        let dirty = matches!(corpus, V01Corpus::MixedOffline)
+            && release.has_dirty_column()
+            && index % DIRTY_STRIDE == 0;
+        let raw = if exists {
+            existing_rows += 1;
+            let raw = existing_root.join(format!("photo-{index:08}.ARW"));
+            std::fs::write(&raw, b"raw").expect("v0.1 existing RAW placeholder writes");
+            raw
+        } else {
+            missing_root.join(format!("photo-{index:08}.ARW"))
+        };
+        let (size, mtime_ns) = if exists {
+            let metadata = std::fs::metadata(&raw).expect("v0.1 existing RAW metadata reads");
+            let mtime_ns = metadata
+                .modified()
+                .expect("v0.1 existing RAW mtime reads")
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("v0.1 existing RAW mtime follows epoch")
+                .as_nanos() as i64;
+            (metadata.len(), mtime_ns)
+        } else {
+            (index as u64 + 1, index as i64 + 1)
+        };
+        let raw = raw.to_str().expect("v0.1 benchmark path is UTF-8");
+        match release {
+            V01Release::V010 => insert.execute(rusqlite::params![raw, size, mtime_ns]),
+            V01Release::V011 => insert.execute(rusqlite::params![raw, size, mtime_ns, dirty]),
+        }
+        .expect("v0.1 migration template row inserts");
+        if dirty {
+            if exists {
+                existing_dirty += 1;
+            } else {
+                missing_dirty += 1;
+            }
+        }
+    }
+    drop(insert);
+    transaction
+        .commit()
+        .expect("v0.1 migration template transaction commits");
+    drop(connection);
+
+    if matches!(
+        (release, corpus),
+        (V01Release::V011, V01Corpus::MixedOffline)
+    ) {
+        assert!(
+            existing_dirty > 0 && missing_dirty > 0,
+            "v0.1.1 mixed corpus must include recoverable and quarantined dirty rows"
+        );
+    }
+    V01MigrationExpectations {
+        surviving_images: rows - missing_dirty,
+        owner_ledgers: existing_rows,
+        pending_sidecars: existing_dirty,
+        quarantined_ratings: missing_dirty,
+    }
+}
+
+fn bench_rating_db_cold_released_migrations(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rating_db_cold_released_migrations");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+
+    for release in [V01Release::V010, V01Release::V011] {
+        for corpus in [V01Corpus::MixedOffline, V01Corpus::OnlineClean] {
+            let row_counts: &[usize] = match corpus {
+                V01Corpus::MixedOffline => &[1_000, 10_000],
+                V01Corpus::OnlineClean => &[1_000],
+            };
+            for &rows in row_counts {
+                let template_directory = tempfile::tempdir().expect("v0.1 template directory");
+                let template_path = template_directory.path().join(format!(
+                    "viewr-{}-{}.db",
+                    release.label(),
+                    corpus.label()
+                ));
+                let expected = create_v01_migration_template(&template_path, rows, release, corpus);
+
+                let preflight_directory = tempfile::tempdir().expect("v0.1 preflight directory");
+                let preflight_path = preflight_directory.path().join("viewr.db");
+                std::fs::copy(&template_path, &preflight_path)
+                    .expect("v0.1 migration preflight template copies");
+                let preflight =
+                    Db::open(&preflight_path).expect("v0.1 migration preflight succeeds");
+                assert_eq!(
+                    benchmark_rating_cardinalities(&preflight)
+                        .expect("v0.1 migration cardinalities read"),
+                    (expected.surviving_images, expected.owner_ledgers),
+                    "released migration must retain the expected history and unfinished work"
+                );
+                assert_eq!(
+                    preflight
+                        .pending_sidecars()
+                        .expect("v0.1 migrated pending sidecars read")
+                        .len(),
+                    expected.pending_sidecars,
+                    "released migration must retain only recoverable unfinished work"
+                );
+                drop(preflight);
+                let quarantine = rusqlite::Connection::open(&preflight_path)
+                    .expect("v0.1 migrated preflight database reopens")
+                    .query_row(
+                        "SELECT COUNT(*) FROM quarantined_legacy_ratings",
+                        [],
+                        |row| row.get::<_, usize>(0),
+                    )
+                    .expect("v0.1 migration quarantine cardinality reads");
+                assert_eq!(
+                    quarantine, expected.quarantined_ratings,
+                    "released migration must archive every unresolved unfinished row"
+                );
+
+                group.bench_with_input(
+                    BenchmarkId::new(format!("{}-{}", release.label(), corpus.label()), rows),
+                    &rows,
+                    |b, _| {
+                        b.iter_batched(
+                            || {
+                                let directory = tempfile::tempdir()
+                                    .expect("v0.1 migration iteration directory");
+                                let database_path = directory.path().join("viewr.db");
+                                std::fs::copy(&template_path, &database_path)
+                                    .expect("v0.1 migration iteration template copies");
+                                (directory, database_path)
+                            },
+                            |(directory, database_path)| {
+                                let db = Db::open(black_box(&database_path))
+                                    .expect("v0.1 migration succeeds");
+                                black_box((db, directory))
+                            },
+                            BatchSize::SmallInput,
+                        );
+                    },
+                );
+            }
+        }
+    }
+
+    group.finish();
+}
+
+#[derive(Clone, Copy)]
+enum V7Corpus {
+    Unresolved,
+    OnlineOwned,
+}
+
+impl V7Corpus {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Unresolved => "unresolved-removal",
+            Self::OnlineOwned => "online-owned",
+        }
+    }
+}
+
+fn create_v7_migration_template(path: &std::path::Path, rows: usize, corpus: V7Corpus) {
+    let db = Db::open(path).expect("migration template database opens");
+    let fixture_root = path.parent().expect("migration template has a parent");
+    let unresolved_root = fixture_root.join("unresolved-v7");
+    let mut online_root = fixture_root.join("online-v7");
+    if matches!(corpus, V7Corpus::OnlineOwned) {
+        std::fs::create_dir(&online_root).expect("online v7 fixture directory initializes");
+        online_root =
+            std::fs::canonicalize(online_root).expect("online v7 fixture directory canonicalizes");
+    } else {
+        assert!(
+            !unresolved_root.exists(),
+            "migration fixture paths must remain unresolved"
+        );
+    }
+    for index in 0..rows {
+        let raw = match corpus {
+            V7Corpus::Unresolved => unresolved_root.join(format!("photo-{index:08}.ARW")),
+            V7Corpus::OnlineOwned => {
+                let raw = online_root.join(format!("photo-{index:08}.ARW"));
+                std::fs::write(&raw, b"raw").expect("online v7 RAW placeholder writes");
+                raw
+            }
+        };
+        let (size, mtime_ns) = if matches!(corpus, V7Corpus::OnlineOwned) {
+            let metadata = std::fs::metadata(&raw).expect("online v7 RAW metadata reads");
+            let mtime_ns = metadata
+                .modified()
+                .expect("online v7 RAW mtime reads")
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("online v7 RAW mtime follows epoch")
+                .as_nanos() as i64;
+            (metadata.len(), mtime_ns)
+        } else {
+            (index as u64, index as i64)
+        };
+        benchmark_insert_rating(&db, &raw, size, mtime_ns, 4)
+            .expect("migration template row inserts");
+    }
+    drop(db);
+
+    let connection = rusqlite::Connection::open(path).expect("migration template database reopens");
+    connection
+        .execute_batch(
+            "DELETE FROM viewr_schema_migrations
+             WHERE name = 'sidecar-owner-filesystem-identity-v8';
+             DROP TRIGGER images_reject_legacy_owner_insert;
+             DROP TRIGGER images_reject_legacy_rating_update;
+             DROP TRIGGER images_reject_unowned_dirty_insert;
+             DROP TRIGGER images_reject_unowned_dirty_update;
+             ALTER TABLE images DROP COLUMN owner_key_version;
+             ALTER TABLE rating_global_revision DROP COLUMN ownerless_revision;
+             CREATE TRIGGER images_reject_unowned_dirty_insert
+             BEFORE INSERT ON images
+             WHEN NEW.sidecar_dirty = 1 AND NEW.sidecar_owner IS NULL
+             BEGIN
+                 SELECT RAISE(ABORT, 'dirty rating requires a sidecar owner');
+             END;
+             CREATE TRIGGER images_reject_unowned_dirty_update
+             BEFORE UPDATE OF sidecar_dirty, sidecar_owner ON images
+             WHEN NEW.sidecar_dirty = 1 AND NEW.sidecar_owner IS NULL
+             BEGIN
+                 SELECT RAISE(ABORT, 'dirty rating requires a sidecar owner');
+             END;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .expect("migration template is downgraded to the exact v7 column shape");
+}
+
+fn bench_rating_db_cold_v7_migration(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rating_db_cold_v7_migration");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+
+    for corpus in [V7Corpus::Unresolved, V7Corpus::OnlineOwned] {
+        let row_counts: &[usize] = match corpus {
+            V7Corpus::Unresolved => &[1_000, 10_000],
+            V7Corpus::OnlineOwned => &[1_000],
+        };
+        for &rows in row_counts {
+            let template_directory = tempfile::tempdir().expect("migration template directory");
+            let template_path = template_directory
+                .path()
+                .join(format!("viewr-v7-{}.db", corpus.label()));
+            create_v7_migration_template(&template_path, rows, corpus);
+
+            let preflight_directory = tempfile::tempdir().expect("migration preflight directory");
+            let preflight_path = preflight_directory.path().join("viewr.db");
+            std::fs::copy(&template_path, &preflight_path)
+                .expect("migration preflight template copies");
+            let preflight = Db::open(&preflight_path).expect("v7 migration preflight succeeds");
+            let expected_images = match corpus {
+                V7Corpus::Unresolved => 0,
+                V7Corpus::OnlineOwned => rows,
+            };
+            assert_eq!(
+                benchmark_rating_cardinalities(&preflight).expect("migration cardinalities"),
+                (expected_images, rows),
+                "v7 migration must preserve online rows and retain ordering tombstones"
+            );
+            drop(preflight);
+
+            group.bench_with_input(BenchmarkId::new(corpus.label(), rows), &rows, |b, _| {
+                b.iter_batched(
+                    || {
+                        let directory = tempfile::tempdir().expect("migration iteration directory");
+                        let database_path = directory.path().join("viewr.db");
+                        std::fs::copy(&template_path, &database_path)
+                            .expect("migration iteration template copies");
+                        (directory, database_path)
+                    },
+                    |(directory, database_path)| {
+                        let db =
+                            Db::open(black_box(&database_path)).expect("v7 migration succeeds");
+                        black_box((db, directory))
+                    },
+                    BatchSize::SmallInput,
+                );
+            });
+        }
+    }
+
+    group.finish();
+}
+
+fn bench_rating_db_journal(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rating_db_journal");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+
+    for len in [1_000_usize, 10_000, 50_000] {
+        let directory = tempfile::tempdir().expect("benchmark RAW directory");
+        let raw = directory.path().join("target.ARW");
+        std::fs::write(&raw, b"raw").expect("benchmark RAW placeholder");
+        let metadata = std::fs::metadata(&raw).expect("benchmark RAW metadata");
+        let mtime_ns = metadata
+            .modified()
+            .expect("benchmark RAW mtime")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("benchmark RAW mtime after epoch")
+            .as_nanos() as i64;
+        let db = Db::open_in_memory().expect("benchmark database opens");
+        for index in 0..len {
+            benchmark_insert_rating(
+                &db,
+                &PathBuf::from(format!("/benchmark/photo-{index:08}.arw")),
+                index as u64,
+                index as i64,
+                4,
+            )
+            .expect("benchmark row inserts");
+        }
+        assert_eq!(
+            benchmark_rating_cardinalities(&db).expect("benchmark cardinalities"),
+            (len, len),
+            "journal corpus must scale both image and owner ledgers"
+        );
+        db.record_rating_pending_sidecar(
+            raw.to_str().expect("benchmark path is UTF-8"),
+            metadata.len(),
+            mtime_ns,
+            3,
+        )
+        .expect("journal target prefills");
+        assert_eq!(
+            benchmark_rating_cardinalities(&db).expect("prefilled benchmark cardinalities"),
+            (len + 1, len + 1),
+            "timed journal operation must update an existing image and owner ledger"
+        );
+
+        group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, _| {
+            b.iter(|| {
+                db.record_rating_pending_sidecar(
+                    black_box(raw.to_str().expect("benchmark path is UTF-8")),
+                    black_box(metadata.len()),
+                    black_box(mtime_ns),
+                    black_box(4),
+                )
+                .expect("canonical journal update");
+            });
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_rating_db_pending_scan(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rating_db_pending_scan");
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+
+    for len in [1_000_usize, 10_000, 50_000] {
+        let db = Db::open_in_memory().expect("benchmark database opens");
+        for index in 0..len {
+            benchmark_insert_rating(
+                &db,
+                &PathBuf::from(format!("/benchmark/photo-{index:08}.arw")),
+                index as u64,
+                index as i64,
+                4,
+            )
+            .expect("benchmark row inserts");
+        }
+        assert_eq!(
+            benchmark_rating_cardinalities(&db).expect("benchmark cardinalities"),
+            (len, len),
+            "pending-scan corpus must scale both image and owner ledgers"
+        );
+
+        group.bench_with_input(BenchmarkId::new("zero_dirty", len), &len, |b, _| {
+            b.iter(|| {
+                assert_eq!(
+                    black_box(benchmark_pending_sidecars(black_box(&db)).unwrap()),
+                    0
+                );
+            });
+        });
+
+        let directory = tempfile::tempdir().expect("benchmark RAW directory");
+        let raw = directory.path().join("pending.ARW");
+        std::fs::write(&raw, b"raw").expect("benchmark RAW placeholder");
+        let metadata = std::fs::metadata(&raw).expect("benchmark RAW metadata");
+        let mtime_ns = metadata
+            .modified()
+            .expect("benchmark RAW mtime")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("benchmark RAW mtime after epoch")
+            .as_nanos() as i64;
+        db.record_rating_pending_sidecar(
+            raw.to_str().expect("benchmark path is UTF-8"),
+            metadata.len(),
+            mtime_ns,
+            5,
+        )
+        .expect("benchmark pending row inserts");
+        group.bench_with_input(BenchmarkId::new("one_dirty", len), &len, |b, _| {
+            b.iter(|| {
+                assert_eq!(
+                    black_box(benchmark_pending_sidecars(black_box(&db)).unwrap()),
+                    1
+                );
+            });
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_sidecar_owner_batch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sidecar_owner_batch");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+
+    for len in [1_000_usize, 10_000, 50_000] {
+        let directory = tempfile::tempdir().expect("benchmark RAW directory");
+        let canonical =
+            std::fs::canonicalize(directory.path()).expect("benchmark directory canonicalizes");
+        std::fs::write(canonical.join("photo-00000000.ARW"), b"raw")
+            .expect("owner probe RAW placeholder");
+        let entries = (0..len)
+            .map(|index| FolderEntry {
+                path: canonical.join(format!("photo-{index:08}.ARW")),
+                file_name: format!("photo-{index:08}.ARW"),
+                size: 3,
+                mtime_ns: 0,
+            })
+            .collect::<Vec<_>>();
+
+        group.throughput(Throughput::Elements(len as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, _| {
+            b.iter(|| {
+                assert_eq!(
+                    benchmark_sidecar_owner_keys(black_box(&entries)),
+                    black_box(len)
+                );
+            });
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_unicode_sidecar_owner_batch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sidecar_owner_unicode_batch");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+
+    for len in [1_000_usize, 10_000] {
+        let directory = tempfile::tempdir().expect("benchmark RAW directory");
+        let canonical =
+            std::fs::canonicalize(directory.path()).expect("benchmark directory canonicalizes");
+        let mut entries = Vec::with_capacity(len);
+        for index in 0..len {
+            let file_name = format!("caf\u{e9}-{index:08}.ARW");
+            let path = canonical.join(&file_name);
+            std::fs::write(&path, b"raw").expect("Unicode owner probe RAW placeholder");
+            entries.push(FolderEntry {
+                path,
+                file_name,
+                size: 3,
+                mtime_ns: 0,
+            });
+        }
+
+        group.throughput(Throughput::Elements(len as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, _| {
+            b.iter(|| {
+                assert_eq!(
+                    benchmark_sidecar_owner_keys(black_box(&entries)),
+                    black_box(len)
+                );
+            });
+        });
     }
 
     group.finish();
@@ -232,35 +1414,43 @@ fn bench_orientation(c: &mut Criterion) {
 }
 
 fn bench_jpeg(c: &mut Criterion) {
-    let photo = synthetic_photo(PHOTO_WIDTH, PHOTO_HEIGHT);
-    let decoded_bytes = photo.byte_len() as u64;
+    let cases = [
+        (
+            "browse_8mp",
+            synthetic_photo(3_504, 2_336),
+            benchmark_jpeg_quality(Tier::Browse),
+        ),
+        (
+            "full_33mp",
+            synthetic_photo(7_008, 4_672),
+            benchmark_jpeg_quality(Tier::Full),
+        ),
+    ];
 
     let mut encode_group = c.benchmark_group("jpeg_encode");
     encode_group.sample_size(10);
     encode_group.warm_up_time(Duration::from_millis(300));
     encode_group.measurement_time(Duration::from_secs(2));
-    encode_group.throughput(Throughput::Bytes(decoded_bytes));
-    for quality in [80_u8, 92] {
-        encode_group.bench_with_input(
-            BenchmarkId::from_parameter(quality),
-            &quality,
-            |b, &quality| {
-                b.iter(|| black_box(encode_jpeg(black_box(&photo), quality).unwrap()));
-            },
-        );
+    for (name, photo, quality) in &cases {
+        encode_group.throughput(Throughput::Bytes(photo.byte_len() as u64));
+        encode_group.bench_function(format!("{name}_q{quality}"), |b| {
+            b.iter(|| black_box(encode_jpeg(black_box(photo), *quality).unwrap()));
+        });
     }
     encode_group.finish();
 
-    // Encoding is deliberately outside the decode timing.
-    let encoded = encode_jpeg(&photo, 88).expect("synthetic photo must encode");
     let mut decode_group = c.benchmark_group("jpeg_decode");
     decode_group.sample_size(10);
     decode_group.warm_up_time(Duration::from_millis(300));
     decode_group.measurement_time(Duration::from_secs(2));
-    decode_group.throughput(Throughput::Bytes(decoded_bytes));
-    decode_group.bench_function("quality_88", |b| {
-        b.iter(|| black_box(decode_jpeg(black_box(encoded.as_slice())).unwrap()));
-    });
+    for (name, photo, quality) in &cases {
+        // Encoding is deliberately outside the decode timing.
+        let encoded = encode_jpeg(photo, *quality).expect("synthetic photo must encode");
+        decode_group.throughput(Throughput::Bytes(encoded.len() as u64));
+        decode_group.bench_function(format!("{name}_q{quality}"), |b| {
+            b.iter(|| black_box(decode_jpeg(black_box(encoded.as_slice())).unwrap()));
+        });
+    }
     decode_group.finish();
 }
 
@@ -307,7 +1497,10 @@ fn bench_ram_cache(c: &mut Criterion) {
     // Reuse the payload so this isolates LRU/hash-map churn rather than buffer
     // allocation. Every insert has a fresh key and evicts one resident entry.
     let churn = RamCache::new(0, rgba_bytes * 8, 0);
-    let mut next_key = 0_usize;
+    for index in 0..8 {
+        churn.insert_rgba((index, Tier::Browse), Arc::clone(&rgba));
+    }
+    let mut next_key = 8_usize;
     group.throughput(Throughput::Elements(1));
     group.bench_function("rgba_insert_with_eviction", |b| {
         b.iter(|| {
@@ -389,6 +1582,12 @@ fn realistic_xmp(element_rating: bool) -> String {
 fn bench_xmp(c: &mut Criterion) {
     let attribute_xmp = realistic_xmp(false);
     let element_xmp = realistic_xmp(true);
+    assert_eq!(parse_rating(&attribute_xmp), Some(3));
+    assert_eq!(parse_rating(&element_xmp), Some(3));
+    assert_eq!(
+        parse_rating(&update_rating_xml(&attribute_xmp, 5).unwrap()),
+        Some(5)
+    );
     let mut group = c.benchmark_group("xmp");
     group.sample_size(20);
     group.warm_up_time(Duration::from_millis(300));
@@ -454,11 +1653,44 @@ fn bench_disk_cache_key(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_disk_cache_gc_scan(c: &mut Criterion) {
+    let mut group = c.benchmark_group("disk_cache_gc_scan");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_secs(2));
+
+    for len in [1_000_usize, 10_000] {
+        let directory = tempfile::tempdir().expect("benchmark cache directory");
+        let cache = DiskCache::open_at(directory.path().to_owned());
+        for index in 0..len {
+            let entry = FolderEntry {
+                path: PathBuf::from(format!("/benchmark/photo-{index:08}.arw")),
+                file_name: format!("photo-{index:08}.arw"),
+                size: index as u64,
+                mtime_ns: index as i64,
+            };
+            cache
+                .put(&DiskCache::key(&entry, Tier::Browse), b"x")
+                .expect("benchmark cache object writes");
+        }
+
+        group.throughput(Throughput::Elements(len as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, _| {
+            b.iter(|| assert_eq!(black_box(cache.gc(black_box(u64::MAX))), 0));
+        });
+    }
+
+    group.finish();
+}
+
 /// Set VIEWR_BENCH_RAW to an ARW or DNG path to include disk decode and both
 /// development qualities. Decode happens in iter_batched's setup closure for
 /// the develop cases, so only the consuming development pipeline is timed.
 fn bench_opt_in_raw(c: &mut Criterion) {
     let Some(raw_path) = std::env::var_os("VIEWR_BENCH_RAW").map(PathBuf::from) else {
+        eprintln!(
+            "raw_opt_in skipped: set VIEWR_BENCH_RAW to an untracked ARW or DNG fixture to run it"
+        );
         return;
     };
 
@@ -531,6 +1763,18 @@ criterion_group! {
     targets =
         bench_outward_order,
         bench_navigation_plan,
+        bench_metadata_queue_setup,
+        bench_rating_db_lookup,
+        bench_rating_folder_load,
+        bench_legacy_rating_folder_load,
+        bench_legacy_rating_stress,
+        bench_rating_db_reopen,
+        bench_rating_db_cold_released_migrations,
+        bench_rating_db_cold_v7_migration,
+        bench_rating_db_journal,
+        bench_rating_db_pending_scan,
+        bench_sidecar_owner_batch,
+        bench_unicode_sidecar_owner_batch,
         bench_resize,
         bench_orientation,
         bench_jpeg,
@@ -538,6 +1782,7 @@ criterion_group! {
         bench_ram_cache_eviction_scaling,
         bench_xmp,
         bench_disk_cache_key,
+        bench_disk_cache_gc_scan,
         bench_opt_in_raw
 }
 criterion_main!(core_hot_paths);
