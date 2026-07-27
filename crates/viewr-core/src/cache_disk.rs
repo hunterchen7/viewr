@@ -20,6 +20,10 @@ use crate::types::Tier;
 /// Version 4 adds the highlight-preserving culling exposure lift.
 /// Version 5 raises cached JPEG quality to 97 with 4:4:4 chroma.
 pub const DEVELOP_VERSION: u32 = 5;
+/// Default cache JPEG quality. The default keeps the version-5 key shape so
+/// existing quality-97 objects remain reusable after quality becomes
+/// configurable.
+pub const DEFAULT_CACHE_JPEG_QUALITY: u8 = 97;
 
 #[derive(Clone)]
 /// Persistent, file-identity-keyed cache of developed JPEG renders.
@@ -135,6 +139,15 @@ impl DiskCache {
     /// nanosecond modification time, [`DEVELOP_VERSION`], and tier. It avoids
     /// lossy path conversion, but deliberately does not hash file contents.
     pub fn key(entry: &FolderEntry, tier: Tier) -> String {
+        Self::key_with_jpeg_quality(entry, tier, DEFAULT_CACHE_JPEG_QUALITY)
+    }
+
+    /// Derives a persistent object key for a selected JPEG quality.
+    ///
+    /// Non-default qualities add an encoding-profile discriminator. The
+    /// default deliberately retains the version-5 key shape so existing
+    /// quality-97 cache objects remain valid.
+    pub fn key_with_jpeg_quality(entry: &FolderEntry, tier: Tier, jpeg_quality: u8) -> String {
         let mut hasher = blake3::Hasher::new();
         hash_path_identity(&mut hasher, &entry.path);
         hasher.update(&entry.size.to_le_bytes());
@@ -145,6 +158,10 @@ impl DiskCache {
             Tier::Browse => b"b",
             Tier::Full => b"f",
         });
+        if jpeg_quality != DEFAULT_CACHE_JPEG_QUALITY {
+            hasher.update(b"jpeg-quality");
+            hasher.update(&[jpeg_quality]);
+        }
         hasher.finalize().to_hex().to_string()
     }
 
@@ -358,6 +375,25 @@ mod tests {
 
         assert_eq!(DiskCache::key(&entry, Tier::Browse), key_at_version(5));
         assert_ne!(DiskCache::key(&entry, Tier::Browse), key_at_version(4));
+    }
+
+    #[test]
+    fn selected_jpeg_quality_is_part_of_non_default_cache_identity() {
+        let entry = entry(10, 1);
+        let default = DiskCache::key(&entry, Tier::Browse);
+
+        assert_eq!(
+            default,
+            DiskCache::key_with_jpeg_quality(&entry, Tier::Browse, DEFAULT_CACHE_JPEG_QUALITY)
+        );
+        assert_ne!(
+            default,
+            DiskCache::key_with_jpeg_quality(&entry, Tier::Browse, 90)
+        );
+        assert_ne!(
+            DiskCache::key_with_jpeg_quality(&entry, Tier::Browse, 90),
+            DiskCache::key_with_jpeg_quality(&entry, Tier::Browse, 100)
+        );
     }
 
     #[cfg(unix)]
