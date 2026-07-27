@@ -469,6 +469,9 @@ Source: https://github.com/KokaKiwi/rust-hex
 hexf-parse 0.2.1
 License: CC0-1.0
 Source: https://github.com/lifthrasiir/hexf
+home 0.5.12
+License: MIT OR Apache-2.0
+Source: https://github.com/rust-lang/cargo
 iana-time-zone 0.1.65
 License: MIT OR Apache-2.0
 Source: https://github.com/strawlab/iana-time-zone
@@ -841,6 +844,9 @@ Source: https://github.com/PolyMeilex/rfd
 rle-decode-fast 1.0.3
 License: MIT OR Apache-2.0
 Source: https://github.com/WanzenBug/rle-decode-helper
+ron 0.12.2
+License: MIT OR Apache-2.0
+Source: https://github.com/ron-rs/ron
 rusqlite 0.32.1
 License: MIT
 Source: https://github.com/rusqlite/rusqlite
@@ -1015,6 +1021,9 @@ Source: https://github.com/harfbuzz/ttf-parser
 type-map 0.5.1
 License: MIT OR Apache-2.0
 Source: https://github.com/kardeiz/type-map
+typeid 1.0.3
+License: MIT OR Apache-2.0
+Source: https://github.com/dtolnay/typeid
 uds_windows 1.2.1
 License: MIT
 Source: https://github.com/haraldh/rust_uds_windows
@@ -5408,6 +5417,7 @@ Used by:
 - rayon-core 1.13.0
 - rayon 1.12.0
 - renderdoc-sys 1.1.0
+- ron 0.12.2
 - rustc-demangle 0.1.28
 - rustc-hash 1.1.0
 - rustc_version 0.4.1
@@ -6867,6 +6877,7 @@ Apache License 2.0
 
 Used by:
 - adler2 2.0.1
+- home 0.5.12
 - proc-macro-crate 3.5.0
 
                               Apache License
@@ -8799,6 +8810,7 @@ Used by:
 - thiserror 1.0.69
 - thiserror 2.0.19
 - type-map 0.5.1
+- typeid 1.0.3
 - unicode-ident 1.0.24
 - vello_common 0.0.9
 - vello_cpu 0.0.9
