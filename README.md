@@ -18,7 +18,9 @@ preview.
 Residency uses hard accounting limits and soft targets:
 
 1. **GPU textures** — Browse textures cover the current ±2 visible images.
-   Viewr uploads a Full texture only for the current zoomed image. The viewport
+   While zoomed, Viewr overlays Full-resolution 1024-pixel tiles on the current
+   image, uploading the visible region first and then expanding outward. The
+   Browse texture remains underneath until each tile is ready. The viewport
    thumbnail LRU holds at most 256 MiB of logical RGBA bytes. The backend
    allocation can differ. Each frame uploads a maximum of eight new thumbnails.
 2. **Decoded RGBA in RAM** — exact LRU with a target byte budget for instant
@@ -34,8 +36,10 @@ Residency uses hard accounting limits and soft targets:
 Both develop tiers use real RAW data. Browse uses a half-resolution superpixel
 demosaic. Full uses a full-resolution PPG demosaic. Fit mode schedules and pins
 Full renders for the current image and its immediate visible neighbors. Viewr
-does not upload the Full texture until zoom needs it. The main view can show an
-embedded thumbnail while the Browse render is not ready.
+does not upload Full pixels to the GPU until zoom needs them. Visible-region
+tiling starts after the Full CPU render completes; the underlying PPG RAW
+demosaic remains a whole-render operation. The main view can show an embedded
+thumbnail while the Browse render is not ready.
 
 The display pipeline applies the camera white balance and color matrix. It then
 applies a small exposure lift, highlight roll-off, sRGB transfer, and tone
