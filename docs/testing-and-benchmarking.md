@@ -124,8 +124,10 @@ The suite measures these workloads:
 - Resize of a deterministic 12.2-megapixel image, plus rotation at 12.2 and
   32.7 megapixels.
 - JPEG encoding and decoding at the production Browse and Full dimensions and
-  qualities, plus RAM-cache hits and eviction scaling. Decode throughput uses
-  compressed input bytes; latency remains the primary comparison.
+  quality, plus RAM-cache hits and eviction scaling. A dark-gradient regression
+  compares production quality against the legacy Full-cache setting. Decode
+  throughput uses compressed input bytes; latency remains the primary
+  comparison.
 - XMP parsing, XMP updates, and disk-cache key generation.
 - Warm, under-budget cache-GC scans for up to 10,000 objects.
   This case does not sort or delete cache objects.
@@ -147,6 +149,8 @@ See [the second performance and adversarial pass](performance-adversarial-pass-2
 for UI scaling, cold-thumbnail probes, native sampling, and Miri coverage.
 See [the progressive Full-texture experiment](progressive-full-textures-2026-07-26.md)
 for the tile-size comparison and promotion decision.
+See [the cache JPEG-quality experiment](jpeg-quality-2026-07-27.md) for the
+dark-gradient quality, storage, and latency tradeoff.
 
 ## Unsafe image-path checks
 
