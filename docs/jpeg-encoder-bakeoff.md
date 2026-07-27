@@ -9,9 +9,13 @@ It does not depend on Homebrew, a Linux package, or a Windows DLL at runtime.
 On the target Apple M5, production-shape q97 encoding is about 65% faster than
 the former `jpeg-encoder` path. A real Sony RAW comparison reduced combined
 Browse and Full JPEG time by 62.2% while producing byte-for-byte identical
-decoded RGB pixels. The selected path also used about half the peak memory and
-29% less CPU than the four-thread pure-Rust finalist for the same ten-image
-workload.
+decoded RGB pixels.
+
+`jpeg-rusturbo` automatic mode won the isolated thin-LTO microbenchmark by
+6–9%. It did not win the complete selection: the C path was slightly faster on
+the real RAW, used less than half the peak memory, used about 37% less total
+CPU, and tied automatic Rust under two-workload contention. This matters
+because persistence overlaps RAW development and adjacent-image preload work.
 
 No UI behavior or setting changed. The existing q80–q100 preference, q97
 default, 4:4:4 chroma, opaque decode, and content-dependent file sizing remain
@@ -25,6 +29,8 @@ the same.
 | `jpeg-rusturbo-t1` | Pure Rust | 0.9.2 | NEON, one thread |
 | `jpeg-rusturbo-t2` | Pure Rust | 0.9.2 | NEON, two-thread DCT stage |
 | `jpeg-rusturbo-t4` | Pure Rust | 0.9.2 | NEON, four-thread DCT stage |
+| `jpeg-rusturbo-t8` | Pure Rust | 0.9.2 | NEON, eight-thread DCT stage |
+| `jpeg-rusturbo-auto` | Pure Rust | 0.9.2 | Ambient 10-thread Rayon pool |
 | `libjpeg-turbo-rs` | Pure-Rust reimplementation | 0.7.0 | SIMD, accurate integer DCT |
 | `libjpeg-turbo-c` | Original C through `turbojpeg` 1.5.1 | 3.1.0 | NEON, accurate integer DCT |
 
@@ -78,12 +84,17 @@ Environment:
 - Rust 1.96.1, LLVM 22.1.2;
 - release/benchmark profile with thin LTO.
 
-The benchmark search was deliberately bounded to the six variants, four
+The nested workspace explicitly enables thin LTO for release and benchmark
+profiles; it does not rely on inheriting the root workspace profile. Its C
+candidate disables `pkg-config`, requires SIMD, and always builds the bundled
+3.1.0 source.
+
+The benchmark search was deliberately bounded to the eight variants, four
 qualities, four quality fixtures, and two production sizes above.
 
 ## Quality and size
 
-At the production q97 setting, all six variants produced the same size and the
+At the production q97 setting, all eight variants produced the same size and the
 same decoded quality metrics on every probe fixture:
 
 | Fixture | Bytes | RGB PSNR | Max channel error | Neighbor-delta MAE |
@@ -112,17 +123,20 @@ Criterion q97 estimates from the candidate run:
 
 | Encoder | Browse 8 MP | Full 33 MP |
 |---|---:|---:|
-| `jpeg-encoder` | 95.41 ms | 379.20 ms |
-| `jpeg-rusturbo-t1` | 40.59 ms | 161.10 ms |
-| `jpeg-rusturbo-t2` | 35.42 ms | 138.27 ms |
-| `jpeg-rusturbo-t4` | 32.33 ms | 125.55 ms |
-| `libjpeg-turbo-rs` | 35.58 ms | 142.83 ms |
-| `libjpeg-turbo-c`, new handle | 30.76 ms | 129.97 ms |
-| `libjpeg-turbo-c`, reused handle | 30.46 ms | 121.43 ms |
+| `jpeg-encoder` | 93.22 ms | 363.99 ms |
+| `jpeg-rusturbo-t1` | 39.32 ms | 160.88 ms |
+| `jpeg-rusturbo-t2` | 33.48 ms | 133.11 ms |
+| `jpeg-rusturbo-t4` | 30.16 ms | 120.06 ms |
+| `jpeg-rusturbo-t8` | 28.47 ms | 112.24 ms |
+| `jpeg-rusturbo-auto` | 28.13 ms | 109.61 ms |
+| `libjpeg-turbo-rs` | 35.09 ms | 141.98 ms |
+| `libjpeg-turbo-c`, new handle | 29.93 ms | 120.47 ms |
+| `libjpeg-turbo-c`, reused handle | 29.97 ms | noisy; see stress result |
 
-The C and four-thread Rust paths are effectively tied at q97 wall time. C was
-faster on the high-chroma fixture and at q100; four-thread Rust was faster on
-some q80 and low-entropy cases. Viewr reuses the C compressor on its
+Automatic Rust is the isolated latency winner. The reused-C Full Criterion
+sample was rejected as unstable because two severe high outliers widened its
+estimate to 128.77–189.17 ms. Five isolated ten-image processes instead gave
+stable C wall times of 1.25–1.29 seconds. Viewr reuses the C compressor on its
 single-threaded persistence lane.
 
 The post-integration production benchmark, which includes a fresh handle in
@@ -145,17 +159,41 @@ combined Browse + Full encode times:
 - selected path: 116.5 ms median (112.0–152.9 ms);
 - median reduction: 62.2%.
 
+For the final omitted-mode check, the automatic Rust integration measured
+118.8 ms median (108.2–123.7 ms). The C and automatic-Rust real-photo results
+are effectively tied; C is 2.3 ms ahead at the median.
+
+The fixture is the public Sony DSC-RX100 `DSC00838.ARW`, 21,155,328 bytes,
+downloaded from `https://raw.pixls.us/data/Sony/DSC-RX100/DSC00838.ARW`.
+Its SHA-256 is
+`579a485b5126a25cbd55cbd5dadfa7d09cf021c99cc7d4869f9e56e3f759390b`.
+The baseline was release commit `7ed6778`; each candidate used a release build.
+Runs alternated implementations to limit thermal and background-load bias:
+
+```sh
+curl -fL \
+  https://raw.pixls.us/data/Sony/DSC-RX100/DSC00838.ARW \
+  -o /tmp/DSC00838.ARW
+printf '%s  %s\n' \
+  579a485b5126a25cbd55cbd5dadfa7d09cf021c99cc7d4869f9e56e3f759390b \
+  /tmp/DSC00838.ARW | shasum -a 256 --check -
+cargo build --release --locked -p viewr
+target/release/viewr dev /tmp/DSC00838.ARW /tmp/viewr-jpeg-output
+```
+
 ## CPU, memory, and release cost
 
 Ten Full q97 encodes compared the two wall-time finalists:
 
-| Encoder | Wall | User CPU | Peak RSS | Encoded bytes |
+| Encoder | Median wall | Total CPU | Peak RSS | Encoded bytes |
 |---|---:|---:|---:|---:|
-| `jpeg-rusturbo-t4` | 1.29 s | 1.66 s | 392,085,504 | 201,570,250 |
-| bundled `libjpeg-turbo-c` | 1.27 s | 1.19 s | 209,354,752 | 201,570,250 |
+| `jpeg-rusturbo-auto` | 1.16 s | 1.95 s | 439,140,352 bytes (418.8 MiB) | 201,570,250 |
+| bundled reused `libjpeg-turbo-c` | 1.26 s | 1.23 s | 207,273,984 bytes (197.7 MiB) | 201,570,250 |
 
-The C path avoids a private Rayon pool per encode. This matters because cache
-persistence runs beside RAW development and adjacent-image preload work.
+Two simultaneous ten-image processes completed in 1.30 seconds median for
+automatic Rust and 1.29 seconds for reused C. Their combined total CPU was
+about 3.91 and 2.53 seconds respectively. C therefore gives up isolated
+microbenchmark latency without giving up contended wall time.
 
 The arm64 macOS release binary changed from 26,804,864 to 26,784,256 bytes
 (20,608 bytes smaller). `otool -L` reports no JPEG dynamic library, confirming
@@ -217,6 +255,7 @@ legacy store.
 
 ```sh
 cargo test --manifest-path tools/jpeg-bakeoff/Cargo.toml --locked
+mkdir -p target
 cargo run --release --manifest-path tools/jpeg-bakeoff/Cargo.toml --locked
 cargo bench --manifest-path tools/jpeg-bakeoff/Cargo.toml \
   --locked --bench encode -- --noplot
@@ -228,7 +267,7 @@ Resource comparison:
 
 ```sh
 /usr/bin/time -lp tools/jpeg-bakeoff/target/release/viewr-jpeg-bakeoff \
-  stress libjpeg-turbo-c 10 97
+  stress libjpeg-turbo-c-reused 10 97
 ```
 
 ## Limits and next trigger
@@ -245,5 +284,5 @@ Re-run the bake-off when one of these changes:
 - `turbojpeg-sys` bundles a newer original C source;
 - the persistence lane becomes concurrent.
 
-`jpeg-rusturbo` with four threads is the measured pure-Rust fallback if native
+`jpeg-rusturbo` automatic mode is the measured pure-Rust fallback if native
 build or safety costs later become unacceptable.

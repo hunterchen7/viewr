@@ -69,4 +69,29 @@ if ! cmp -s "$rust_copyright_source" "$rust_copyright_copy"; then
     exit 1
 fi
 
+if ! grep -Fqx \
+    "This software is based in part on the work of the Independent JPEG Group." \
+    packaging/THIRD-PARTY-NOTICES.txt ||
+    ! grep -Fqx \
+    "The TurboJPEG API and build system are available under the Modified (3-clause)" \
+    packaging/THIRD-PARTY-NOTICES.txt ||
+    ! grep -Fqx \
+    "1. Redistributions of source code must retain the above copyright notice," \
+    packaging/THIRD-PARTY-NOTICES.txt ||
+    ! grep -Fqx \
+    "2. Redistributions in binary form must reproduce the above copyright notice," \
+    packaging/THIRD-PARTY-NOTICES.txt ||
+    ! grep -Fqx \
+    "3. Neither the name of the libjpeg-turbo Project nor the names of its" \
+    packaging/THIRD-PARTY-NOTICES.txt ||
+    ! grep -Fqx \
+    'THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS",' \
+    packaging/THIRD-PARTY-NOTICES.txt ||
+    ! grep -Fqx \
+    "Bundled by: turbojpeg-sys 1.2.0" \
+    packaging/THIRD-PARTY-NOTICES.txt; then
+    echo "error: libjpeg-turbo attribution is incomplete" >&2
+    exit 1
+fi
+
 echo "Third-party license files are current and reproducible."

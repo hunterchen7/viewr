@@ -46,7 +46,8 @@ mkdir -p "$source_root/.cargo"
 git -C "$repo_root" archive HEAD | tar -xf - -C "$source_root"
 (
   cd "$source_root"
-  cargo vendor --locked --versioned-dirs vendor >.cargo/config.toml
+  printf '\n' >>.cargo/config.toml
+  cargo vendor --locked --versioned-dirs vendor >>.cargo/config.toml
 )
 
 find "$source_root" -exec touch -h -d "@$source_date_epoch" {} +

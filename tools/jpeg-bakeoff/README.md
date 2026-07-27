@@ -8,6 +8,7 @@ Run the correctness tests, quality/size probe, and Criterion benchmark:
 
 ```sh
 cargo test --manifest-path tools/jpeg-bakeoff/Cargo.toml --locked
+mkdir -p target
 cargo run --release --manifest-path tools/jpeg-bakeoff/Cargo.toml --locked \
   > target/jpeg-bakeoff.csv
 cargo bench --manifest-path tools/jpeg-bakeoff/Cargo.toml --locked --bench encode -- --noplot
@@ -23,13 +24,14 @@ for CPU and peak-memory measurement:
 
 ```sh
 /usr/bin/time -lp tools/jpeg-bakeoff/target/release/viewr-jpeg-bakeoff \
-  stress libjpeg-turbo-c 10 97
+  stress libjpeg-turbo-c-reused 10 97
 ```
 
 The fixed search budget is:
 
 - `jpeg-encoder` (current baseline)
-- `jpeg-rusturbo` with 1, 2, and 4 threads
+- `jpeg-rusturbo` with 1, 2, 4, and 8 private threads, plus its automatic
+  ambient-Rayon-pool mode
 - `libjpeg-turbo-rs`
 - original C `libjpeg-turbo` through the safe `turbojpeg` Rust API
 - quality 80, 90, 97, and 100 over photographic, dark-gradient,

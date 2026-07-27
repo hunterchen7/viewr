@@ -13,7 +13,7 @@ anyhow = "1"
 jpeg-encoder = { version = "0.6", features = ["simd"] }
 jpeg-rusturbo = "0.9.2"
 libjpeg-turbo-rs = "0.7.0"
-turbojpeg = "1.5.1"
+turbojpeg = { version = "1.5.1", default-features = false, features = ["cmake", "require-simd"] }
 zune-jpeg = "0.5"
 
 [dev-dependencies]
@@ -23,3 +23,8 @@ criterion = "0.8"
 name = "encode"
 harness = false
 
+[profile.release]
+lto = "thin"
+
+[profile.bench]
+lto = "thin"

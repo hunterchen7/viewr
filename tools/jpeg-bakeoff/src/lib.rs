@@ -15,11 +15,13 @@ pub enum Codec {
 }
 
 impl Codec {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::JpegEncoder,
         Self::JpegRusturbo { threads: 1 },
         Self::JpegRusturbo { threads: 2 },
         Self::JpegRusturbo { threads: 4 },
+        Self::JpegRusturbo { threads: 8 },
+        Self::JpegRusturbo { threads: 0 },
         Self::LibjpegTurboRs,
         Self::LibjpegTurboC,
     ];
@@ -30,6 +32,8 @@ impl Codec {
             Self::JpegRusturbo { threads: 1 } => "jpeg-rusturbo-t1",
             Self::JpegRusturbo { threads: 2 } => "jpeg-rusturbo-t2",
             Self::JpegRusturbo { threads: 4 } => "jpeg-rusturbo-t4",
+            Self::JpegRusturbo { threads: 8 } => "jpeg-rusturbo-t8",
+            Self::JpegRusturbo { threads: 0 } => "jpeg-rusturbo-auto",
             Self::JpegRusturbo { .. } => "jpeg-rusturbo-custom",
             Self::LibjpegTurboRs => "libjpeg-turbo-rs",
             Self::LibjpegTurboC => "libjpeg-turbo-c",

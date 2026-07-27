@@ -1,7 +1,9 @@
 use std::hint::black_box;
 
 use anyhow::{Context, bail};
-use viewr_jpeg_bakeoff::{Codec, QUALITIES, encode, fixtures, full_resolution_fixture, probe};
+use viewr_jpeg_bakeoff::{
+    Codec, QUALITIES, TurbojpegEncoder, encode, fixtures, full_resolution_fixture, probe,
+};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -46,23 +48,36 @@ fn stress(args: &[String]) -> anyhow::Result<()> {
     let quality: u8 = args[2].parse().context("invalid quality")?;
     let fixture = full_resolution_fixture();
     let mut total_bytes = 0_usize;
-    for _ in 0..iterations {
-        let jpeg = encode(codec, black_box(&fixture), quality)?;
-        total_bytes = total_bytes.wrapping_add(black_box(jpeg.len()));
+    if args[0] == "libjpeg-turbo-c-reused" {
+        let mut encoder = TurbojpegEncoder::new(quality)?;
+        for _ in 0..iterations {
+            let jpeg = encoder.encode(black_box(&fixture))?;
+            total_bytes = total_bytes.wrapping_add(black_box(jpeg.len()));
+        }
+    } else {
+        for _ in 0..iterations {
+            let jpeg = encode(codec, black_box(&fixture), quality)?;
+            total_bytes = total_bytes.wrapping_add(black_box(jpeg.len()));
+        }
     }
     println!(
-        "codec={codec} fixture={} iterations={iterations} quality={quality} total_bytes={total_bytes}",
-        fixture.name
+        "codec={} fixture={} iterations={iterations} quality={quality} total_bytes={total_bytes}",
+        args[0], fixture.name
     );
     Ok(())
 }
 
 fn parse_codec(name: &str) -> anyhow::Result<Codec> {
+    if name == "libjpeg-turbo-c-reused" {
+        return Ok(Codec::LibjpegTurboC);
+    }
     Codec::ALL
         .into_iter()
         .find(|codec| codec.name() == name)
         .with_context(|| {
-            let names = Codec::ALL.map(Codec::name).join(", ");
+            let mut names = Codec::ALL.map(Codec::name).to_vec();
+            names.push("libjpeg-turbo-c-reused");
+            let names = names.join(", ");
             format!("unknown codec {name:?}; expected one of {names}")
         })
 }

@@ -107,6 +107,8 @@ jobs:
         run: |
           cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- --test
           cargo bench -p viewr --features benchmarks --bench filmstrip_scaling --locked -- --test
+          cargo test --manifest-path tools/jpeg-bakeoff/Cargo.toml --locked
+          cargo bench --manifest-path tools/jpeg-bakeoff/Cargo.toml --locked --bench encode -- --test
       - name: Install pinned nightly Miri toolchain
         id: miri_toolchain
         if: ${{ !cancelled() }}

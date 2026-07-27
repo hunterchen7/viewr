@@ -12,7 +12,7 @@ concurrency:
 jobs:
   synthetic:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Linux build deps
@@ -45,9 +45,13 @@ jobs:
           bench_cores="$(nproc)"
           bench_memory="$(awk '/MemTotal/ {print $2 * 1024; exit}' /proc/meminfo)"
           bench_lock_hash="$(sha256sum Cargo.lock | awk '{print $1}')"
+          jpeg_bakeoff_lock_hash="$(
+            sha256sum tools/jpeg-bakeoff/Cargo.lock | awk '{print $1}'
+          )"
           jq -n \
             --arg commit "$bench_commit" \
             --arg cargo_lock_sha256 "$bench_lock_hash" \
+            --arg jpeg_bakeoff_lock_sha256 "$jpeg_bakeoff_lock_hash" \
             --arg rustc "$bench_rust" \
             --arg os "$bench_os" \
             --arg cpu "$bench_cpu" \
@@ -58,6 +62,7 @@ jobs:
               schema_version: 1,
               commit: $commit,
               cargo_lock_sha256: $cargo_lock_sha256,
+              jpeg_bakeoff_lock_sha256: $jpeg_bakeoff_lock_sha256,
               rustc: $rustc,
               os: $os,
               cpu: $cpu,
@@ -73,6 +78,8 @@ jobs:
         run: cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- --noplot
       - name: Run filmstrip scaling benchmarks
         run: cargo bench -p viewr --features benchmarks --bench filmstrip_scaling --locked -- --noplot
+      - name: Run JPEG codec bake-off
+        run: cargo bench --manifest-path tools/jpeg-bakeoff/Cargo.toml --locked --bench encode -- --noplot
       - name: Upload Criterion results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -80,6 +87,7 @@ jobs:
           name: criterion-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             target/criterion
+            tools/jpeg-bakeoff/target/criterion
             target/benchmark-metadata.json
           if-no-files-found: warn
           retention-days: 90
