@@ -136,8 +136,7 @@ Criterion q97 estimates from the candidate run:
 Automatic Rust is the isolated latency winner. The reused-C Full Criterion
 sample was rejected as unstable because two severe high outliers widened its
 estimate to 128.77–189.17 ms. Five isolated ten-image processes instead gave
-stable C wall times of 1.25–1.29 seconds. Viewr reuses the C compressor on its
-single-threaded persistence lane.
+stable reused-handle C wall times of 1.25–1.29 seconds.
 
 The post-integration production benchmark measured:
 
