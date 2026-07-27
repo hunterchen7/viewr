@@ -10,7 +10,6 @@ color detail.
 The promoted setting must materially reduce dark-gradient error, retain exact
 dimensions and opaque-alpha reconstruction, decode on every supported
 platform, and remain bounded by the existing RAM and 20 GiB disk-cache budgets.
-No UI behavior or controls may change.
 
 ## Quality variants
 
@@ -32,7 +31,17 @@ better.
 q95 provides only a modest gradient improvement. q98 and q100 continue to
 improve the fixture, but their storage growth is disproportionate. q97 reduces
 the gradient-error score by about 22% relative to the legacy Full setting and
-is the best measured safe balance.
+is the best measured safe default.
+
+## User-selected quality
+
+The Preferences window exposes the inclusive range q80–q100 and keeps q97 as
+the default. The setting applies when the next folder is opened so an active
+engine and its RAM cache always use one immutable encoding profile.
+
+Disk keys include every non-default quality. The q97 profile deliberately
+retains the version-5 key shape, so existing q97 objects remain reusable.
+Changing quality cannot rehydrate an object encoded at another quality.
 
 ## Production-shape cost
 
