@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use eframe::egui;
 use serde::Deserialize;
+use viewr_core::jobs::{CACHE_JPEG_QUALITY, MAX_CACHE_JPEG_QUALITY, MIN_CACHE_JPEG_QUALITY};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
@@ -111,6 +112,9 @@ pub struct Config {
     pub ram_gb: f32,
     /// Disk cache budget in GB. Applies on the next folder open.
     pub disk_gb: f32,
+    /// JPEG quality for Browse and Full cache objects. Applies on the next
+    /// folder open.
+    pub jpeg_quality: u8,
     binds: HashMap<Action, Vec<Bind>>,
 }
 
@@ -162,12 +166,14 @@ impl Default for RawUi {
 struct RawCache {
     ram_gb: f32,
     disk_gb: f32,
+    jpeg_quality: i16,
 }
 impl Default for RawCache {
     fn default() -> Self {
         Self {
             ram_gb: 4.5,
             disk_gb: 20.0,
+            jpeg_quality: i16::from(CACHE_JPEG_QUALITY),
         }
     }
 }
@@ -305,6 +311,15 @@ impl Config {
             grid_cell: finite_clamp(raw.ui.grid_cell, default_ui.grid_cell, 120.0, 400.0),
             ram_gb: finite_clamp(raw.cache.ram_gb, default_cache.ram_gb, 1.0, 20.0),
             disk_gb: finite_clamp(raw.cache.disk_gb, default_cache.disk_gb, 1.0, 500.0),
+            jpeg_quality: raw
+                .cache
+                .jpeg_quality
+                .clamp(
+                    i16::from(MIN_CACHE_JPEG_QUALITY),
+                    i16::from(MAX_CACHE_JPEG_QUALITY),
+                )
+                .try_into()
+                .expect("clamped JPEG quality fits in u8"),
             binds,
         }
     }
@@ -346,7 +361,7 @@ impl Config {
              # hand-edits are read at startup but comments are not kept.\n\n[input]\n",
         );
         out.push_str(&format!(
-            "scroll = \"{}\"\n\n[ui]\ntier_indicator = \"{}\"\nshow_loading = {}\nshow_performance = {}\nshow_exposure = {}\nfilmstrip_height = {:.0}\ngrid_cell = {:.0}\n\n[cache]\nram_gb = {:.1}\ndisk_gb = {:.1}\n\n[binds]\n",
+            "scroll = \"{}\"\n\n[ui]\ntier_indicator = \"{}\"\nshow_loading = {}\nshow_performance = {}\nshow_exposure = {}\nfilmstrip_height = {:.0}\ngrid_cell = {:.0}\n\n[cache]\nram_gb = {:.1}\ndisk_gb = {:.1}\njpeg_quality = {}\n\n[binds]\n",
             match self.scroll {
                 ScrollMode::Pan => "pan",
                 ScrollMode::Zoom => "zoom",
@@ -359,6 +374,7 @@ impl Config {
             self.grid_cell,
             self.ram_gb,
             self.disk_gb,
+            self.jpeg_quality,
         ));
         for &(name, _, action) in ACTIONS {
             let labels: Vec<String> = self
@@ -414,6 +430,9 @@ show_exposure = true
 ram_gb = 4.5
 # Disk cache budget in GB (~/Library/Caches/viewr).
 disk_gb = 20.0
+# Cache JPEG quality from 80 to 100. Higher values retain smoother gradients
+# and more detail but use more RAM, disk space, and background CPU time.
+jpeg_quality = 97
 
 [binds]
 # Each action takes a list of binds: "Key" or "Mod+Key".
@@ -479,6 +498,7 @@ mod tests {
             scroll = "zoom"
             [cache]
             ram_gb = 8.0
+            jpeg_quality = 91
             [binds]
             next = ["D"]
             "#,
@@ -487,6 +507,7 @@ mod tests {
         let cfg = Config::from_raw(raw);
         assert_eq!(cfg.scroll, ScrollMode::Zoom);
         assert!((cfg.ram_gb - 8.0).abs() < f32::EPSILON);
+        assert_eq!(cfg.jpeg_quality, 91);
         assert_eq!(cfg.tier_indicator, TierIndicator::Marks);
         assert!(cfg.show_loading);
         assert!(cfg.show_performance);
@@ -506,6 +527,7 @@ mod tests {
             [cache]
             ram_gb = -10.0
             disk_gb = -10.0
+            jpeg_quality = -10
             "#,
         )
         .unwrap();
@@ -514,6 +536,7 @@ mod tests {
         assert_eq!(cfg.grid_cell, 120.0);
         assert_eq!(cfg.ram_gb, 1.0);
         assert_eq!(cfg.disk_gb, 1.0);
+        assert_eq!(cfg.jpeg_quality, MIN_CACHE_JPEG_QUALITY);
 
         let too_high: RawConfig = toml::from_str(
             r#"
@@ -523,6 +546,7 @@ mod tests {
             [cache]
             ram_gb = 1000.0
             disk_gb = 1000.0
+            jpeg_quality = 1000
             "#,
         )
         .unwrap();
@@ -531,6 +555,7 @@ mod tests {
         assert_eq!(cfg.grid_cell, 400.0);
         assert_eq!(cfg.ram_gb, 20.0);
         assert_eq!(cfg.disk_gb, 500.0);
+        assert_eq!(cfg.jpeg_quality, MAX_CACHE_JPEG_QUALITY);
     }
 
     #[test]
@@ -623,6 +648,7 @@ mod tests {
         assert_eq!(cfg.grid_cell, 200.0);
         assert_eq!(cfg.ram_gb, 4.5);
         assert_eq!(cfg.disk_gb, 20.0);
+        assert_eq!(cfg.jpeg_quality, CACHE_JPEG_QUALITY);
     }
 
     #[test]

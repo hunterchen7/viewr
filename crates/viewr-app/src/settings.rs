@@ -1,8 +1,9 @@
 //! Preferences window: input mode, tier border, cache budgets, and
 //! click-to-capture keybind editing. Changes save to viewr.toml
-//! immediately; budget changes apply on the next folder open.
+//! immediately; cache-profile changes apply on the next folder open.
 
 use eframe::egui;
+use viewr_core::jobs::{MAX_CACHE_JPEG_QUALITY, MIN_CACHE_JPEG_QUALITY};
 
 use crate::config::{ACTIONS, Action, Bind, Config, ScrollMode, TierIndicator};
 
@@ -132,9 +133,25 @@ impl SettingsState {
                         .add(egui::Slider::new(&mut config.disk_gb, 2.0..=200.0).fixed_decimals(0))
                         .changed();
                     ui.end_row();
+                    ui.label("JPEG quality");
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(
+                                &mut config.jpeg_quality,
+                                MIN_CACHE_JPEG_QUALITY..=MAX_CACHE_JPEG_QUALITY,
+                            )
+                            .integer(),
+                        )
+                        .on_hover_text(
+                            "Higher quality preserves smoother gradients and detail but uses more RAM, disk, and background CPU time",
+                        )
+                        .changed();
+                    ui.end_row();
                 });
                 ui.label(
-                    egui::RichText::new("Budgets apply when the next folder is opened.")
+                    egui::RichText::new(
+                        "Cache budgets and JPEG quality apply when the next folder is opened.",
+                    )
                         .weak()
                         .size(11.0),
                 );
