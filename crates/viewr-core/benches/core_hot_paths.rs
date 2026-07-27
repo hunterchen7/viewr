@@ -1732,6 +1732,30 @@ fn bench_opt_in_raw(c: &mut Criterion) {
         b.iter(|| black_box(decode::metadata(black_box(raw_path.as_path())).unwrap()));
     });
 
+    for (name, scale) in [
+        (
+            "legacy_two_pass",
+            develop::benchmark_scale_cfa_legacy as fn(rawler::RawImage) -> Vec<f32>,
+        ),
+        (
+            "fused",
+            develop::benchmark_scale_cfa_fused as fn(rawler::RawImage) -> Vec<f32>,
+        ),
+    ] {
+        group.throughput(Throughput::Elements(sensor_pixels));
+        group.bench_function(format!("scale_cfa/{name}"), |b| {
+            b.iter_batched(
+                || {
+                    decode::load(&raw_path)
+                        .expect("RAW decoded during benchmark setup")
+                        .raw
+                },
+                |raw| black_box(scale(black_box(raw))),
+                BatchSize::PerIteration,
+            );
+        });
+    }
+
     for quality in [Quality::Browse, Quality::Full] {
         group.throughput(Throughput::Elements(sensor_pixels));
         group.bench_with_input(

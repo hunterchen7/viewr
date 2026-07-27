@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use rawler::cfa::PlaneColor;
 use rawler::imgop::matrix::{multiply, normalize, pseudo_inverse};
-use rawler::imgop::raw::clip_euclidean_norm_avg;
+use rawler::imgop::raw::{clip_euclidean_norm_avg, correct_blacklevel_cfa};
 use rawler::imgop::sensor::bayer::{Demosaic, ppg::PPGDemosaic, superpixel::Superpixel3Channel};
 use rawler::imgop::srgb;
 use rawler::imgop::xyz::{Illuminant, SRGB_TO_XYZ_D65};
@@ -95,7 +95,7 @@ fn sanitize_white_balance(coefficients: [f32; 4]) -> [f32; 4] {
 /// # Errors
 ///
 /// Returns [`DevelopError::Unsupported`] for non-CFA or non-RGB CFA sensors and
-/// [`DevelopError::Rawler`] when RAW normalization fails.
+/// [`DevelopError::Rawler`] when an upstream RAW operation fails.
 pub fn develop(
     raw: RawImage,
     quality: Quality,
@@ -126,17 +126,12 @@ enum RegionLayout {
 }
 
 fn develop_with_layout(
-    mut raw: RawImage,
+    raw: RawImage,
     quality: Quality,
     gamma_mode: GammaMode,
     region_layout: RegionLayout,
 ) -> Result<(PixelBuf, DevelopTimings), DevelopError> {
     let mut timings = DevelopTimings::default();
-
-    // Black/white level rescale, normalized f32 in place.
-    let t = Instant::now();
-    raw.apply_scaling()?;
-    timings.rescale = t.elapsed();
 
     let RawPhotometricInterpretation::Cfa(config) = &raw.photometric else {
         return Err(DevelopError::Unsupported("not a CFA sensor".into()));
@@ -148,14 +143,19 @@ fn develop_with_layout(
         )));
     }
 
+    // Convert and normalize integer mosaics in one traversal. rawler's
+    // RawImage::apply_scaling first writes a complete f32 copy and then
+    // revisits it for black/white correction; development consumes the raw,
+    // so the intermediate unscaled f32 frame is unnecessary.
+    let t = Instant::now();
     let width = raw.width;
     let height = raw.height;
+    let blacklevel = raw.blacklevel.as_bayer_array();
+    let whitelevel = raw.whitelevel.as_bayer_array();
     // Move the mosaic plane out instead of cloning it (~120MB at 61MP).
-    let data = match raw.data {
-        RawImageData::Float(v) => v,
-        RawImageData::Integer(v) => v.into_iter().map(f32::from).collect(),
-    };
+    let data = scale_cfa_data(raw.data, width, height, blacklevel, whitelevel);
     let mosaic = PixF32::new_with(data, width, height);
+    timings.rescale = t.elapsed();
 
     // Demosaic over the active (non-masked) sensor area.
     let t = Instant::now();
@@ -242,6 +242,114 @@ fn develop_with_layout(
         },
         timings,
     ))
+}
+
+fn scale_cfa_data(
+    data: RawImageData,
+    width: usize,
+    height: usize,
+    blacklevel: [f32; 4],
+    whitelevel: [f32; 4],
+) -> Vec<f32> {
+    let data = match data {
+        RawImageData::Float(mut data) => {
+            correct_blacklevel_cfa(&mut data, width, height, &blacklevel, &whitelevel);
+            return data;
+        }
+        RawImageData::Integer(data) => data,
+    };
+    assert_eq!(data.len(), width * height);
+    let output_len = data.len();
+    if output_len == 0 {
+        return Vec::new();
+    }
+
+    let maximum = [
+        whitelevel[0] - blacklevel[0],
+        whitelevel[1] - blacklevel[1],
+        whitelevel[2] - blacklevel[2],
+        whitelevel[3] - blacklevel[3],
+    ];
+    let scale = |value: u16, channel: usize| {
+        let value = f32::from(value) - blacklevel[channel];
+        (if value.is_sign_negative() { 0.0 } else { value }) / maximum[channel]
+    };
+
+    let mut output = Vec::<f32>::with_capacity(output_len);
+    {
+        let spare = &mut output.spare_capacity_mut()[..output_len];
+        let row_pair_samples = width * 2;
+        let paired_samples = data.len() / row_pair_samples * row_pair_samples;
+        let fill_pair = |input: &[u16], output: &mut [std::mem::MaybeUninit<f32>]| {
+            let (input_top, input_bottom) = input.split_at(width);
+            let (output_top, output_bottom) = output.split_at_mut(width);
+            for (input, output) in input_top
+                .chunks_exact(2)
+                .zip(output_top.chunks_exact_mut(2))
+            {
+                output[0].write(scale(input[0], 0));
+                output[1].write(scale(input[1], 1));
+            }
+            for (input, output) in input_bottom
+                .chunks_exact(2)
+                .zip(output_bottom.chunks_exact_mut(2))
+            {
+                output[0].write(scale(input[0], 2));
+                output[1].write(scale(input[1], 3));
+            }
+            if !width.is_multiple_of(2) {
+                output_top[width - 1].write(f32::from(input_top[width - 1]));
+                output_bottom[width - 1].write(f32::from(input_bottom[width - 1]));
+            }
+        };
+        #[cfg(not(miri))]
+        data[..paired_samples]
+            .par_chunks_exact(row_pair_samples)
+            .zip(spare[..paired_samples].par_chunks_exact_mut(row_pair_samples))
+            .for_each(|(input, output)| fill_pair(input, output));
+        #[cfg(miri)]
+        data[..paired_samples]
+            .chunks_exact(row_pair_samples)
+            .zip(spare[..paired_samples].chunks_exact_mut(row_pair_samples))
+            .for_each(|(input, output)| fill_pair(input, output));
+        data[paired_samples..]
+            .iter()
+            .zip(&mut spare[paired_samples..])
+            .for_each(|(input, output)| {
+                output.write(f32::from(*input));
+            });
+    }
+    // SAFETY: every output slot is initialized exactly once above. Full row
+    // pairs receive corrected samples (plus rawler-compatible odd-width
+    // tails), and a possible final odd row receives unscaled f32 samples to
+    // match correct_blacklevel_cfa's chunks_exact behavior.
+    unsafe { output.set_len(output_len) };
+    output
+}
+
+#[cfg(feature = "benchmarks")]
+#[doc(hidden)]
+/// Runs the production fused integer conversion and CFA normalization.
+pub fn benchmark_scale_cfa_fused(raw: RawImage) -> Vec<f32> {
+    scale_cfa_data(
+        raw.data,
+        raw.width,
+        raw.height,
+        raw.blacklevel.as_bayer_array(),
+        raw.whitelevel.as_bayer_array(),
+    )
+}
+
+#[cfg(feature = "benchmarks")]
+#[doc(hidden)]
+/// Runs rawler's former two-pass normalization as a benchmark reference.
+pub fn benchmark_scale_cfa_legacy(mut raw: RawImage) -> Vec<f32> {
+    raw.apply_scaling()
+        .expect("the decoded benchmark RAW scales");
+    match raw.data {
+        RawImageData::Float(data) => data,
+        RawImageData::Integer(_) => unreachable!("apply_scaling always produces f32 samples"),
+    }
 }
 
 fn develop_region(
@@ -485,6 +593,34 @@ mod tests {
             [1.0, 1.0, 0.0, 1.0],
         ] {
             assert_eq!(sanitize_white_balance(invalid), [1.0; 4]);
+        }
+    }
+
+    #[test]
+    fn fused_integer_cfa_scaling_matches_rawler_exactly() {
+        let blacklevel = [64.0, 72.0, 80.0, 96.0];
+        let whitelevel = [4_095.0, 4_000.0, 3_900.0, 3_800.0];
+
+        for (width, height) in [(8, 6), (7, 6), (8, 5), (7, 5)] {
+            let integer: Vec<u16> = (0..width * height)
+                .map(|index| ((index * 137 + 17) % 4_096) as u16)
+                .collect();
+            let mut expected: Vec<f32> = integer.iter().copied().map(f32::from).collect();
+            rawler::imgop::raw::correct_blacklevel_cfa(
+                &mut expected,
+                width,
+                height,
+                &blacklevel,
+                &whitelevel,
+            );
+            let actual = super::scale_cfa_data(
+                rawler::rawimage::RawImageData::Integer(integer),
+                width,
+                height,
+                blacklevel,
+                whitelevel,
+            );
+            assert_eq!(actual, expected, "{width}x{height}");
         }
     }
 
