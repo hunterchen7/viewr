@@ -10,7 +10,6 @@ color detail.
 The promoted setting must materially reduce dark-gradient error, retain exact
 dimensions and opaque-alpha reconstruction, decode on every supported
 platform, and remain bounded by the existing RAM and 20 GiB disk-cache budgets.
-No UI behavior or controls may change.
 
 ## Quality variants
 
@@ -32,7 +31,24 @@ better.
 q95 provides only a modest gradient improvement. q98 and q100 continue to
 improve the fixture, but their storage growth is disproportionate. q97 reduces
 the gradient-error score by about 22% relative to the legacy Full setting and
-is the best measured safe balance.
+is the best measured safe default.
+
+## User-selected quality
+
+The Preferences window exposes the inclusive range q80–q100 and keeps q97 as
+the default. The setting applies when the next folder is opened so an active
+engine and its RAM cache always use one immutable encoding profile.
+
+Disk keys include every quality. Cache format v6 starts with a new object
+store and removes the obsolete pre-v6 store in the background. Changing
+quality cannot rehydrate an object encoded at another quality.
+
+JPEG output size remains content-dependent; the encoder has no reliable
+single-pass target-file-size mode. The quality preference controls the
+per-image size/quality/speed tradeoff, while the RAM and disk budgets cap total
+cache residency. A target-size mode would require repeated trial encodes and
+would produce inconsistent quality across images with different noise and
+texture.
 
 ## Production-shape cost
 

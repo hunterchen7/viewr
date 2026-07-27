@@ -29,9 +29,9 @@ Residency uses hard accounting limits and soft targets:
    until Viewr removes the pins.
 3. **JPEG bytes in RAM** — memoized develops with a target byte budget. Their
    compression ratio is content-dependent; the texture-heavy benchmark is
-   about 6× smaller than RGBA. Cache JPEGs use quality 97 with 4:4:4 chroma to
-   preserve dark gradients and fine color detail. Pins have the same
-   soft-budget behavior.
+   about 6× smaller than RGBA. Cache JPEGs default to quality 97 with 4:4:4
+   chroma to preserve dark gradients and fine color detail. Quality is
+   configurable from 80 to 100. Pins have the same soft-budget behavior.
 4. **Disk** (`~/Library/Caches/viewr/`) — a target budget for developed JPEGs
    used on fast folder reopens; cache GC enforces the target rather than every
    write, and files are never written inside photo folders.
@@ -75,8 +75,10 @@ Zoom framing persists across images — cull a burst at 100% comparing
 the same detail. Viewr also restores the last window size and position.
 
 The Preferences window controls the loading message, performance details,
-exposure details, and cache indicator. The cache indicator has border, mark,
-and hidden modes. All binds and the scroll behavior are also configurable.
+exposure details, cache indicator, budgets, and cache JPEG quality. The cache
+indicator has border, mark, and hidden modes. JPEG quality changes apply when
+the next folder is opened. All binds and the scroll behavior are also
+configurable.
 Viewr stores these settings in
 `~/Library/Application Support/viewr/viewr.toml` on macOS. Viewr writes a
 documented template on the first run.

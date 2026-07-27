@@ -21,7 +21,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, TryLockError};
 use std::time::Duration;
 
-use crate::cache_disk::DiskCache;
+use crate::cache_disk::{DEFAULT_CACHE_JPEG_QUALITY, DiskCache};
 use crate::cache_ram::RamCache;
 use crate::decode;
 use crate::develop::{Quality, develop};
@@ -41,20 +41,20 @@ const LIGHT_WORKERS: usize = 2;
 /// bounded to at most two such retained frames; larger and excess requests are
 /// best-effort cache misses.
 const PERSIST_PENDING_BUDGET_BYTES: usize = 256 * 1024 * 1024;
-/// JPEG quality used by persistent Browse and Full renders.
-pub const CACHE_JPEG_QUALITY: u8 = 97;
+/// Default JPEG quality used by persistent Browse and Full renders.
+pub const CACHE_JPEG_QUALITY: u8 = DEFAULT_CACHE_JPEG_QUALITY;
+/// Lowest cache JPEG quality exposed by the application preference.
+pub const MIN_CACHE_JPEG_QUALITY: u8 = 80;
+/// Highest cache JPEG quality exposed by the application preference.
+pub const MAX_CACHE_JPEG_QUALITY: u8 = 100;
 const PERSIST_WRITE_ATTEMPTS: usize = 3;
 const PERSIST_RETRY_BASE_DELAY: Duration = Duration::from_millis(2);
 
-fn jpeg_quality(_tier: Tier) -> u8 {
-    CACHE_JPEG_QUALITY
-}
-
-/// Returns the production persistence quality for a benchmark tier.
+/// Returns the default production persistence quality for a benchmark tier.
 #[cfg(feature = "benchmarks")]
 #[doc(hidden)]
-pub fn benchmark_jpeg_quality(tier: Tier) -> u8 {
-    jpeg_quality(tier)
+pub fn benchmark_jpeg_quality(_tier: Tier) -> u8 {
+    CACHE_JPEG_QUALITY
 }
 
 #[derive(Debug)]
@@ -885,6 +885,7 @@ struct Shared {
     heavy: JobQueue,
     light: JobQueue,
     persistence: PersistenceQueue,
+    jpeg_quality: u8,
     /// Display order and its last navigation generation.
     navigation: Mutex<NavigationOrder>,
 }
@@ -994,7 +995,24 @@ impl Engine {
         disk: Option<DiskCache>,
         notify: Arc<dyn Fn() + Send + Sync>,
     ) -> (Self, Receiver<Event>) {
+        Self::new_with_jpeg_quality(entries, start, cache, disk, CACHE_JPEG_QUALITY, notify)
+    }
+
+    /// Spawns the worker pool with a selected persistent-cache JPEG quality.
+    ///
+    /// Values outside the supported application range are clamped. The
+    /// selected quality becomes part of non-default disk-cache keys, so
+    /// changing it cannot reuse bytes encoded at another quality.
+    pub fn new_with_jpeg_quality(
+        entries: Arc<Vec<FolderEntry>>,
+        start: usize,
+        cache: Arc<RamCache>,
+        disk: Option<DiskCache>,
+        jpeg_quality: u8,
+        notify: Arc<dyn Fn() + Send + Sync>,
+    ) -> (Self, Receiver<Event>) {
         let (events, rx) = std::sync::mpsc::channel();
+        let jpeg_quality = jpeg_quality.clamp(MIN_CACHE_JPEG_QUALITY, MAX_CACHE_JPEG_QUALITY);
         // Construct the owner before spawning. If any later spawn panics via
         // `expect`, `Engine::drop` closes both queues and joins every handle
         // already installed by `spawn_engine_threads`.
@@ -1008,6 +1026,7 @@ impl Engine {
                 heavy: JobQueue::new(),
                 light: JobQueue::new(),
                 persistence: PersistenceQueue::new(),
+                jpeg_quality,
                 navigation: Mutex::new(NavigationOrder::default()),
             }),
             workers: Vec::with_capacity(HEAVY_WORKERS + LIGHT_WORKERS),
@@ -1378,14 +1397,18 @@ fn persistence_worker(shared: &Shared) {
         // This lane is intentionally single-threaded and yields before CPU
         // work so interactive develop workers retain scheduling priority.
         std::thread::yield_now();
-        let quality = jpeg_quality(request.id.1);
+        let quality = shared.jpeg_quality;
         let encoded = encode_jpeg(&request.pixels, quality);
         let mut persistence_error = None;
         let encode_error = encoded.as_ref().err().cloned();
         if let Ok(bytes) = &encoded
             && let Some(disk) = &shared.disk
         {
-            let key = DiskCache::key(&shared.entries[request.id.0], request.id.1);
+            let key = DiskCache::key_with_jpeg_quality(
+                &shared.entries[request.id.0],
+                request.id.1,
+                quality,
+            );
             if let Err(error) = retry_persistence_write(
                 PERSIST_WRITE_ATTEMPTS,
                 || disk.put(&key, bytes),
@@ -1518,7 +1541,11 @@ fn run_warm_develop(
     let Some(disk) = &shared.disk else {
         return JobCompletion::Complete;
     };
-    if disk.has(&DiskCache::key(&shared.entries[index], tier)) {
+    if disk.has(&DiskCache::key_with_jpeg_quality(
+        &shared.entries[index],
+        tier,
+        shared.jpeg_quality,
+    )) {
         return JobCompletion::Complete;
     }
     if shared
@@ -1692,7 +1719,8 @@ fn run_rehydrate(
         return;
     }
     if let Some(disk) = &shared.disk {
-        let key = DiskCache::key(&shared.entries[index], tier);
+        let key =
+            DiskCache::key_with_jpeg_quality(&shared.entries[index], tier, shared.jpeg_quality);
         if let Some(bytes) = disk.get(&key) {
             if token.cancelled() {
                 return;
@@ -2032,6 +2060,7 @@ mod tests {
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             persistence: PersistenceQueue::new(),
+            jpeg_quality: CACHE_JPEG_QUALITY,
             navigation: Mutex::new(NavigationOrder::default()),
         };
 
@@ -2170,6 +2199,22 @@ mod tests {
         disk: Option<DiskCache>,
         pending_budget_bytes: usize,
     ) -> Arc<Shared> {
+        persistence_shared_with_quality(
+            entries,
+            cache,
+            disk,
+            pending_budget_bytes,
+            CACHE_JPEG_QUALITY,
+        )
+    }
+
+    fn persistence_shared_with_quality(
+        entries: Vec<FolderEntry>,
+        cache: Arc<RamCache>,
+        disk: Option<DiskCache>,
+        pending_budget_bytes: usize,
+        jpeg_quality: u8,
+    ) -> Arc<Shared> {
         let (events, _receiver) = std::sync::mpsc::channel();
         Arc::new(Shared {
             entries: Arc::new(entries),
@@ -2180,6 +2225,7 @@ mod tests {
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             persistence: PersistenceQueue::with_budget(pending_budget_bytes),
+            jpeg_quality,
             navigation: Mutex::new(NavigationOrder::default()),
         })
     }
@@ -2940,6 +2986,7 @@ mod tests {
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             persistence: PersistenceQueue::new(),
+            jpeg_quality: CACHE_JPEG_QUALITY,
             navigation: Mutex::new(NavigationOrder::default()),
         };
 
@@ -3281,6 +3328,49 @@ mod tests {
     }
 
     #[test]
+    fn non_default_quality_persists_and_rehydrates_only_its_cache_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = DiskCache::open_at(dir.path().join("cache"));
+        let entries = vec![entry(dir.path().join("quality-90.arw"), 100)];
+        let default_key = DiskCache::key(&entries[0], Tier::Browse);
+        let selected_key = DiskCache::key_with_jpeg_quality(&entries[0], Tier::Browse, 90);
+        let cache = Arc::new(RamCache::new(0, 0, 1024 * 1024));
+        let shared = persistence_shared_with_quality(
+            entries,
+            cache.clone(),
+            Some(disk.clone()),
+            1024 * 1024,
+            90,
+        );
+
+        assert_eq!(
+            shared.persistence.try_enqueue(persistence_request(
+                (0, Tier::Browse),
+                Arc::new(patterned_buf(64, 48)),
+                false,
+            )),
+            PersistenceEnqueue::Queued
+        );
+        let worker_shared = shared.clone();
+        let worker = std::thread::spawn(move || persistence_worker(&worker_shared));
+        shared.persistence.close();
+        worker.join().unwrap();
+
+        assert!(!disk.has(&default_key));
+        assert!(disk.has(&selected_key));
+        assert!(!cache.has_jpeg((0, Tier::Browse)));
+
+        run_rehydrate(
+            &shared,
+            0,
+            Tier::Browse,
+            &CancelToken::default(),
+            &|event| publish(&shared, event),
+        );
+        assert!(cache.has_jpeg((0, Tier::Browse)));
+    }
+
+    #[test]
     fn corrupt_cached_jpeg_is_evicted_before_raw_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let raw_entry = entry(dir.path().join("missing.arw"), 100);
@@ -3300,6 +3390,7 @@ mod tests {
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             persistence: PersistenceQueue::new(),
+            jpeg_quality: CACHE_JPEG_QUALITY,
             navigation: Mutex::new(NavigationOrder::default()),
         };
 
@@ -3390,10 +3481,9 @@ mod tests {
                 .sum::<u64>()
         };
 
-        assert_eq!(jpeg_quality(Tier::Browse), 97);
-        assert_eq!(jpeg_quality(Tier::Full), 97);
+        assert_eq!(CACHE_JPEG_QUALITY, 97);
         let legacy_error = squared_error(90);
-        let production_error = squared_error(jpeg_quality(Tier::Full));
+        let production_error = squared_error(CACHE_JPEG_QUALITY);
         assert!(
             production_error * 4 < legacy_error * 3,
             "q97 error {production_error} was not at least 25% below q90 error {legacy_error}"

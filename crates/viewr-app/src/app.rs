@@ -349,7 +349,14 @@ impl App {
 
         let ctx = self.ctx.clone();
         let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
-        let (engine, events) = Engine::new(entries.clone(), start, cache.clone(), disk, notify);
+        let (engine, events) = Engine::new_with_jpeg_quality(
+            entries.clone(),
+            start,
+            cache.clone(),
+            disk,
+            self.config.jpeg_quality,
+            notify,
+        );
 
         self.session = Some(Session {
             dir: dir.to_owned(),
