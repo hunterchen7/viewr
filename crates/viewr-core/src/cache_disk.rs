@@ -17,9 +17,8 @@ use crate::types::Tier;
 
 /// Bump when the develop pipeline's output changes; invalidates every
 /// cached render for free.
-/// Version 3 invalidated renders after the crop, gamma, and RGBA-packing
-/// pipeline was streamlined.
-pub const DEVELOP_VERSION: u32 = 3;
+/// Version 4 adds the highlight-preserving culling exposure lift.
+pub const DEVELOP_VERSION: u32 = 4;
 
 #[derive(Clone)]
 /// Persistent, file-identity-keyed cache of developed JPEG renders.
