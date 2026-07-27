@@ -50,7 +50,12 @@ git -C "$repo_root" archive HEAD | tar -xf - -C "$source_root"
   cargo vendor --locked --versioned-dirs vendor >>.cargo/config.toml
 )
 
-find "$source_root" -exec touch -h -d "@$source_date_epoch" {} +
+if touch -h -d "@$source_date_epoch" "$source_root" 2>/dev/null; then
+  find "$source_root" -exec touch -h -d "@$source_date_epoch" {} +
+else
+  source_date_stamp="$(date -r "$source_date_epoch" '+%Y%m%d%H%M.%S')"
+  find "$source_root" -exec touch -h -t "$source_date_stamp" {} +
+fi
 
 archive="$output_dir/viewr-$version-source.tar.gz"
 tar \
