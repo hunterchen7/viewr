@@ -60,15 +60,18 @@ jobs:
           esac
 
           cargo update --workspace
+          cargo update \
+            --manifest-path tools/jpeg-bakeoff/Cargo.toml \
+            -p viewr-core
 
-          if git diff --quiet -- Cargo.lock; then
+          if git diff --quiet -- Cargo.lock tools/jpeg-bakeoff/Cargo.lock; then
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.lock
-          git commit -m "chore: sync Cargo.lock for release"
+          git add Cargo.lock tools/jpeg-bakeoff/Cargo.lock
+          git commit -m "chore: sync release lockfiles"
           git push origin "HEAD:refs/heads/$RELEASE_BRANCH"
       - name: Run CI for release pull request
         if: ${{ steps.release.outputs.prs_created == 'true' }}
