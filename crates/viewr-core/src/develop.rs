@@ -606,6 +606,7 @@ mod tests {
                 .map(|index| ((index * 137 + 17) % 4_096) as u16)
                 .collect();
             let mut expected: Vec<f32> = integer.iter().copied().map(f32::from).collect();
+            #[cfg(not(miri))]
             rawler::imgop::raw::correct_blacklevel_cfa(
                 &mut expected,
                 width,
@@ -613,6 +614,21 @@ mod tests {
                 &blacklevel,
                 &whitelevel,
             );
+            #[cfg(miri)]
+            for lines in expected.chunks_exact_mut(width * 2) {
+                for (index, value) in lines.iter_mut().enumerate() {
+                    let channel = usize::from(index >= width) * 2 + index % width % 2;
+                    if !width.is_multiple_of(2) && index % width == width - 1 {
+                        continue;
+                    }
+                    let corrected = *value - blacklevel[channel];
+                    *value = (if corrected.is_sign_negative() {
+                        0.0
+                    } else {
+                        corrected
+                    }) / (whitelevel[channel] - blacklevel[channel]);
+                }
+            }
             let actual = super::scale_cfa_data(
                 rawler::rawimage::RawImageData::Integer(integer),
                 width,
