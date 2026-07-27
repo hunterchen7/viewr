@@ -43,6 +43,13 @@ Disk keys include every non-default quality. The q97 profile deliberately
 retains the version-5 key shape, so existing q97 objects remain reusable.
 Changing quality cannot rehydrate an object encoded at another quality.
 
+JPEG output size remains content-dependent; the encoder has no reliable
+single-pass target-file-size mode. The quality preference controls the
+per-image size/quality/speed tradeoff, while the RAM and disk budgets cap total
+cache residency. A target-size mode would require repeated trial encodes and
+would produce inconsistent quality across images with different noise and
+texture.
+
 ## Production-shape cost
 
 The existing Criterion suite measures the promoted q97 setting on

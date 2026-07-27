@@ -150,6 +150,13 @@ impl SettingsState {
                 });
                 ui.label(
                     egui::RichText::new(
+                        "80 is smaller/faster · 97 is the default · 100 retains the most detail.",
+                    )
+                    .weak()
+                    .size(11.0),
+                );
+                ui.label(
+                    egui::RichText::new(
                         "Cache budgets and JPEG quality apply when the next folder is opened.",
                     )
                         .weak()
