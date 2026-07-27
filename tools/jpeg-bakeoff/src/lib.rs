@@ -242,16 +242,7 @@ pub fn encode(codec: Codec, fixture: &Fixture, quality: u8) -> Result<Vec<u8>> {
                 .context("jpeg-encoder failed")?;
             Ok(output)
         }
-        Codec::JpegRusturbo { threads } => {
-            let mut output = Vec::new();
-            let mut encoder = jpeg_rusturbo::JpegEncoder::new_with_quality(&mut output, quality);
-            encoder.set_subsampling(jpeg_rusturbo::ChromaSubsampling::Yuv444);
-            encoder.set_threads(threads);
-            encoder
-                .encode_rgba(&fixture.rgba, fixture.width, fixture.height)
-                .context("jpeg-rusturbo failed")?;
-            Ok(output)
-        }
+        Codec::JpegRusturbo { threads } => encode_rusturbo(fixture, quality, threads),
         Codec::LibjpegTurboRs => libjpeg_turbo_rs::compress(
             &fixture.rgba,
             fixture.width as usize,
@@ -265,6 +256,51 @@ pub fn encode(codec: Codec, fixture: &Fixture, quality: u8) -> Result<Vec<u8>> {
             let mut encoder = TurbojpegEncoder::new(quality)?;
             encoder.encode(fixture)
         }
+    }
+}
+
+fn encode_rusturbo(fixture: &Fixture, quality: u8, threads: u32) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut encoder = jpeg_rusturbo::JpegEncoder::new_with_quality(&mut output, quality);
+    encoder.set_subsampling(jpeg_rusturbo::ChromaSubsampling::Yuv444);
+    encoder.set_threads(threads);
+    encoder
+        .encode_rgba(&fixture.rgba, fixture.width, fixture.height)
+        .context("jpeg-rusturbo failed")?;
+    drop(encoder);
+    Ok(output)
+}
+
+/// Reusable dedicated Rayon pool that mirrors Viewr's background JPEG lane.
+pub struct DedicatedRusturboEncoder {
+    pool: rayon::ThreadPool,
+    quality: u8,
+}
+
+impl DedicatedRusturboEncoder {
+    pub fn new(workers: usize, quality: u8) -> Result<Self> {
+        if workers == 0 {
+            bail!("dedicated JPEG pool must have at least one worker");
+        }
+        if !(1..=100).contains(&quality) {
+            bail!("quality must be in 1..=100");
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .thread_name(|index| format!("jpeg-bakeoff-dedicated-{index}"))
+            .build()
+            .context("dedicated JPEG pool setup failed")?;
+        Ok(Self { pool, quality })
+    }
+
+    pub fn workers(&self) -> usize {
+        self.pool.current_num_threads()
+    }
+
+    pub fn encode(&self, fixture: &Fixture) -> Result<Vec<u8>> {
+        validate_input(fixture, self.quality)?;
+        self.pool
+            .install(|| encode_rusturbo(fixture, self.quality, 0))
     }
 }
 
@@ -547,5 +583,23 @@ mod tests {
         let fixture = synthetic_photo("small", 8, 8);
         assert!(probe(Codec::LibjpegTurboC, &fixture, 0, 1).is_err());
         assert!(probe(Codec::LibjpegTurboC, &fixture, 101, 1).is_err());
+    }
+
+    #[test]
+    fn dedicated_rusturbo_pool_matches_automatic_output() {
+        let fixture = synthetic_photo("small", 127, 93);
+        let dedicated = DedicatedRusturboEncoder::new(2, 97).unwrap();
+        assert_eq!(dedicated.workers(), 2);
+        assert_eq!(
+            dedicated.encode(&fixture).unwrap(),
+            encode(Codec::JpegRusturbo { threads: 0 }, &fixture, 97).unwrap()
+        );
+    }
+
+    #[test]
+    fn dedicated_rusturbo_pool_rejects_invalid_configuration() {
+        assert!(DedicatedRusturboEncoder::new(0, 97).is_err());
+        assert!(DedicatedRusturboEncoder::new(2, 0).is_err());
+        assert!(DedicatedRusturboEncoder::new(2, 101).is_err());
     }
 }

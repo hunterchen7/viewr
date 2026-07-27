@@ -47,7 +47,7 @@ pub const CACHE_JPEG_QUALITY: u8 = DEFAULT_CACHE_JPEG_QUALITY;
 pub const MIN_CACHE_JPEG_QUALITY: u8 = 80;
 /// Highest cache JPEG quality exposed by the application preference.
 pub const MAX_CACHE_JPEG_QUALITY: u8 = 100;
-const MAX_JPEG_WORKERS: usize = 4;
+const MAX_JPEG_WORKERS: usize = 10;
 const PERSIST_WRITE_ATTEMPTS: usize = 3;
 const PERSIST_RETRY_BASE_DELAY: Duration = Duration::from_millis(2);
 
@@ -1792,7 +1792,7 @@ fn jpeg_pool() -> Result<&'static rayon::ThreadPool, String> {
     let available = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1);
-    let workers = available.div_ceil(2).clamp(1, MAX_JPEG_WORKERS);
+    let workers = available.clamp(1, MAX_JPEG_WORKERS);
     let candidate = rayon::ThreadPoolBuilder::new()
         .num_threads(workers)
         .thread_name(|index| format!("viewr-jpeg-{index}"))
@@ -3652,10 +3652,10 @@ mod tests {
         let pool = jpeg_pool().unwrap();
         assert!(pool.current_num_threads() <= MAX_JPEG_WORKERS);
         assert!(pool.current_num_threads() >= 1);
-        let global_threads = rayon::current_num_threads();
-        if global_threads > MAX_JPEG_WORKERS {
-            assert_ne!(pool.current_num_threads(), global_threads);
-        }
+        let thread_name = pool
+            .install(|| std::thread::current().name().map(str::to_owned))
+            .expect("the dedicated JPEG worker has a name");
+        assert!(thread_name.starts_with("viewr-jpeg-"));
     }
 
     #[test]

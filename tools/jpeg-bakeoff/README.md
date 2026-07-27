@@ -1,6 +1,6 @@
 # Viewr JPEG encoder bake-off
 
-This nested workspace compares Viewr's current encoder with three replacement
+This nested workspace compares Viewr's former encoder with three replacement
 families without adding the losing candidates to the release dependency graph.
 Every case supplies RGBA pixels directly and requires baseline 4:4:4 output.
 The original C candidate requires CMake; x86 hosts also require NASM for SIMD.
@@ -28,9 +28,40 @@ for CPU and peak-memory measurement:
   stress libjpeg-turbo-c-reused 10 97
 ```
 
+The selected Rust encoder can also be tested in a reusable dedicated Rayon
+pool. The contention command prints every raw sample and a median summary. If
+`VIEWR_BENCH_RAW` is set, it decodes the RAW once, builds the JPEG input from a
+Full development outside the timed region, and overlaps each background encode
+with another Full development of that RAW. Without the variable, it falls back
+to overlapping the synthetic 33 MP encode with a 90-degree orientation:
+
+```sh
+cargo build --release --manifest-path tools/jpeg-bakeoff/Cargo.toml --locked
+
+for workers in 4 8 10 10 4 8 8 10 4 4 10 8 8 4 10; do
+  VIEWR_BENCH_RAW=/tmp/DSC00838.ARW \
+    tools/jpeg-bakeoff/target/release/viewr-jpeg-bakeoff \
+    dedicated-contention "$workers" 9 97
+done
+
+for workers in 4 8 10; do
+  for run in 1 2 3 4 5; do
+    /usr/bin/time -lp \
+      tools/jpeg-bakeoff/target/release/viewr-jpeg-bakeoff \
+      dedicated-stress "$workers" 10 97
+  done
+done
+```
+
+Fixture decoding, input cloning, fixture development, warmup, pool creation,
+and worker creation are outside recorded intervals. The background thread and
+its dedicated pool are reused for all samples. Foreground development uses
+Viewr's normal global Rayon pool, matching the scheduling interaction that the
+dedicated encoder pool is intended to isolate.
+
 The fixed search budget is:
 
-- `jpeg-encoder` (current baseline)
+- `jpeg-encoder` (former baseline)
 - `jpeg-rusturbo` with 1, 2, 4, and 8 private threads, plus its automatic
   ambient-Rayon-pool mode
 - `libjpeg-turbo-rs`
