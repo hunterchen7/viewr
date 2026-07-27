@@ -226,6 +226,9 @@ Safety validation:
   Invalid-input, round-trip, and reused-handle tests completed without a
   sanitizer finding during evaluation.
 - Miri passed the pure-Rust input-validation test.
+- A full automatic-thread encoder run under Miri stopped in
+  `crossbeam-epoch`'s pointer-tagging implementation; this is not counted as
+  either a pass or a finding in Viewr or `jpeg-rusturbo`.
 - Viewr's validation is intentionally stricter than the selected encoder's
   image-layout preconditions.
 
