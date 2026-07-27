@@ -20,7 +20,7 @@ use crate::types::Tier;
 /// Version 4 adds the highlight-preserving culling exposure lift.
 /// Version 5 raises cached JPEG quality to 97 with 4:4:4 chroma.
 /// Version 6 includes the selected JPEG quality in every cache key.
-/// Version 7 switches cached renders to libjpeg-turbo.
+/// Version 7 switches cached renders to jpeg-rusturbo.
 pub const DEVELOP_VERSION: u32 = 7;
 /// Default cache JPEG quality.
 pub const DEFAULT_CACHE_JPEG_QUALITY: u8 = 97;

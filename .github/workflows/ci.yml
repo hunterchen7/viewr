@@ -126,6 +126,11 @@ jobs:
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/viewr-miri-target
         run: cargo +nightly-2026-07-21 miri test -p viewr-core --lib develop::tests::superpixel_output_initialization_is_valid_under_miri --locked
+      - name: Check JPEG input validation with Miri
+        if: ${{ !cancelled() && steps.miri_toolchain.outcome == 'success' }}
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/viewr-miri-target
+        run: cargo +nightly-2026-07-21 miri test -p viewr-core --lib jobs::tests::jpeg_input_validation_is_independent_of_the_encoding_pool --locked
 
   macos-compatibility:
     name: Compatibility (macOS latest)

@@ -18,7 +18,7 @@
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, TryLockError};
 use std::time::Duration;
 
 use crate::cache_disk::{DEFAULT_CACHE_JPEG_QUALITY, DiskCache};
@@ -47,6 +47,7 @@ pub const CACHE_JPEG_QUALITY: u8 = DEFAULT_CACHE_JPEG_QUALITY;
 pub const MIN_CACHE_JPEG_QUALITY: u8 = 80;
 /// Highest cache JPEG quality exposed by the application preference.
 pub const MAX_CACHE_JPEG_QUALITY: u8 = 100;
+const MAX_JPEG_WORKERS: usize = 4;
 const PERSIST_WRITE_ATTEMPTS: usize = 3;
 const PERSIST_RETRY_BASE_DELAY: Duration = Duration::from_millis(2);
 
@@ -1769,8 +1770,9 @@ fn develop_cache_miss(
 /// Encodes a tightly packed RGBA8 buffer as a JPEG.
 ///
 /// `quality` is passed directly to jpeg-rusturbo. Chroma is always encoded at
-/// full 4:4:4 resolution and the output discards alpha. Encoding uses the
-/// ambient Rayon pool, which is sized for the current computer.
+/// full 4:4:4 resolution and the output discards alpha. Encoding uses a
+/// dedicated bounded Rayon pool so cache persistence cannot occupy the
+/// foreground RAW-development pool.
 ///
 /// # Errors
 ///
@@ -1779,6 +1781,30 @@ fn develop_cache_miss(
 /// dimensions, or JPEG encoding fails.
 pub fn encode_jpeg(buf: &PixelBuf, quality: u8) -> Result<Vec<u8>, String> {
     validate_jpeg_input(buf, quality)?;
+    jpeg_pool()?.install(|| encode_jpeg_on_current_pool(buf, quality))
+}
+
+fn jpeg_pool() -> Result<&'static rayon::ThreadPool, String> {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    if let Some(pool) = POOL.get() {
+        return Ok(pool);
+    }
+    let available = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    let workers = available.div_ceil(2).clamp(1, MAX_JPEG_WORKERS);
+    let candidate = rayon::ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .thread_name(|index| format!("viewr-jpeg-{index}"))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let _ = POOL.set(candidate);
+    Ok(POOL
+        .get()
+        .expect("the JPEG pool was installed by this or a racing caller"))
+}
+
+fn encode_jpeg_on_current_pool(buf: &PixelBuf, quality: u8) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
     let mut encoder = jpeg_rusturbo::JpegEncoder::new_with_quality(&mut output, quality);
     encoder.set_subsampling(jpeg_rusturbo::ChromaSubsampling::Yuv444);
@@ -3607,7 +3633,7 @@ mod tests {
     }
 
     #[test]
-    fn jpeg_input_validation_is_independent_of_the_native_codec() {
+    fn jpeg_input_validation_is_independent_of_the_encoding_pool() {
         let valid = patterned_buf(8, 6);
         assert_eq!(validate_jpeg_input(&valid, 97), Ok((8, 6, 32)));
 
@@ -3619,6 +3645,17 @@ mod tests {
         assert!(validate_jpeg_input(&malformed, 97).is_err());
         assert!(validate_jpeg_input(&valid, 0).is_err());
         assert!(validate_jpeg_input(&valid, 101).is_err());
+    }
+
+    #[test]
+    fn jpeg_pool_is_bounded_and_separate_from_the_global_pool() {
+        let pool = jpeg_pool().unwrap();
+        assert!(pool.current_num_threads() <= MAX_JPEG_WORKERS);
+        assert!(pool.current_num_threads() >= 1);
+        let global_threads = rayon::current_num_threads();
+        if global_threads > MAX_JPEG_WORKERS {
+            assert_ne!(pool.current_num_threads(), global_threads);
+        }
     }
 
     #[test]

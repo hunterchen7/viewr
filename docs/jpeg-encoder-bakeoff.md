@@ -2,21 +2,20 @@
 
 ## Decision
 
-Viewr now uses pure-Rust `jpeg-rusturbo` in automatic mode, which uses the
-ambient Rayon pool sized for the current computer. The app has no new native
-library, FFI, or runtime dependency.
+Viewr now uses pure-Rust `jpeg-rusturbo` on a reusable dedicated pool capped at
+four workers. This keeps persistence out of the foreground RAW-development
+pool. The app has no new native library, FFI, or runtime dependency.
 
-On the target Apple M5, production-shape q97 encoding is about 70% faster than
+On the target Apple M5, production-shape q97 encoding is about 69% faster than
 the former `jpeg-encoder` path. A real Sony RAW comparison reduced combined
-Browse and Full JPEG time by 61.4% while producing byte-for-byte identical
+Browse and Full JPEG time by 60.0% while producing byte-for-byte identical
 decoded RGB pixels.
 
 `jpeg-rusturbo` automatic mode won the isolated thin-LTO microbenchmark by
-6–9%. Original C was effectively tied on the real RAW and used less than half
-the peak memory and about 37% less total CPU. The selection follows the stated
-goal of maximum isolated encode speed on this machine; C remains the measured
-resource-efficiency alternative if memory or shared-CPU pressure becomes the
-priority.
+6–9%. The app uses a bounded pool instead: it gives up a small amount of
+isolated throughput so background persistence cannot submit work to the
+foreground Rayon pool. Original C remains the measured low-CPU, low-memory
+alternative.
 
 No UI behavior or setting changed. The existing q80–q100 preference, q97
 default, 4:4:4 chroma, opaque decode, and content-dependent file sizing remain
@@ -142,8 +141,8 @@ The post-integration production benchmark measured:
 
 | Work | Before | After | Change |
 |---|---:|---:|---:|
-| Browse 8 MP encode | 95.41 ms | 27.73 ms | −70.9% |
-| Full 33 MP encode | 379.20 ms | 112.99 ms | −70.2% |
+| Browse 8 MP encode | 95.41 ms | 29.54 ms | −69.0% |
+| Full 33 MP encode | 379.20 ms | 119.16 ms | −68.6% |
 | Browse decode | 46.63 ms | 46.52 ms | effectively unchanged |
 | Full decode | 185.62 ms | 183.75 ms | effectively unchanged |
 
@@ -154,12 +153,13 @@ Five alternating runs of the real Sony RAW diagnostic command gave these
 combined Browse + Full encode times:
 
 - former path: 308.0 ms median (297.1–320.8 ms);
-- selected path: 118.8 ms median (108.2–123.7 ms);
-- median reduction: 61.4%.
+- selected bounded-pool path: 123.1 ms median (121.9–156.2 ms);
+- median reduction: 60.0%.
 
-The C integration measured 116.5 ms median (112.0–152.9 ms). The C and
-automatic-Rust real-photo results are effectively tied; C is 2.3 ms ahead at
-the median while automatic Rust wins both fixed production sizes.
+The automatic-Rust integration measured 118.8 ms median (108.2–123.7 ms), and
+the C integration measured 116.5 ms median (112.0–152.9 ms). Those alternatives
+are slightly faster on this serial diagnostic; the selected path deliberately
+bounds background parallelism to protect foreground scheduling.
 
 The fixture is the public Sony DSC-RX100 `DSC00838.ARW`, 21,155,328 bytes,
 downloaded from `https://raw.pixls.us/data/Sony/DSC-RX100/DSC00838.ARW`.
@@ -194,8 +194,8 @@ about 3.91 and 2.53 seconds respectively. This is a process-level saturation
 probe, not a model of Viewr's same-process Rayon scheduling, and it was not
 used to claim production contention behavior.
 
-The arm64 macOS release binary changed from 26,804,864 to 26,700,400 bytes
-(104,464 bytes smaller). `otool -L` reports no JPEG dynamic library.
+The arm64 macOS release binary changed from 26,804,864 to 26,721,632 bytes
+(83,232 bytes smaller). `otool -L` reports no JPEG dynamic library.
 
 The installed system `libjpeg-turbo` 3.1.4.1 completed the same stress workload
 in 1.35 s wall, 1.20 s user CPU, and 208,486,400 bytes peak RSS. This single
@@ -204,12 +204,12 @@ dependency.
 
 ## Architecture and safety
 
-The app contains no handwritten `unsafe` and the selected encoder is pure
-Rust. Each encode configures 4:4:4 and automatic parallelism locally; the
-persistence lane remains single-request-at-a-time while its DCT stage can use
-the ambient Rayon pool.
+The JPEG integration adds no handwritten `unsafe` or FFI and the selected
+encoder is pure Rust. Each encode configures 4:4:4 and automatic parallelism
+inside a reusable dedicated pool capped at four workers. The persistence lane
+remains single-request-at-a-time.
 
-Before the wrapper sees an image pointer, Viewr checks:
+Before the encoder sees a pixel slice, Viewr checks:
 
 - quality is in 1–100;
 - dimensions are non-zero and fit the JPEG 16-bit format limit;
@@ -229,7 +229,7 @@ Safety validation:
   `crossbeam-epoch`'s pointer-tagging implementation; this is not counted as
   either a pass or a finding in Viewr or `jpeg-rusturbo`.
 - Viewr's validation is intentionally stricter than the selected encoder's
-  image-layout preconditions.
+  pixel-layout preconditions.
 
 Build and release behavior:
 
