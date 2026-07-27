@@ -12,11 +12,11 @@ the former `jpeg-encoder` path. A real Sony RAW comparison reduced combined
 Browse and Full JPEG time by 57.6% while producing byte-for-byte identical
 decoded RGB pixels.
 
-`jpeg-rusturbo` automatic mode won the isolated thin-LTO microbenchmark by
-6–9%. The app uses a bounded pool instead so background persistence cannot
-submit work to the foreground Rayon pool. The selected ten-worker bound won the
-replicated same-process completion benchmark. Original C remains the measured
-low-CPU, low-memory alternative.
+`jpeg-rusturbo` automatic mode remained the isolated thin-LTO winner, narrowly
+ahead of the bounded ten-worker path. The app uses a dedicated pool so
+background persistence cannot submit work to the foreground Rayon pool. The
+selected ten-worker bound won the replicated same-process completion
+benchmark. Original C remains the measured low-CPU, low-memory alternative.
 
 No UI behavior or setting changed. The existing q80–q100 preference, q97
 default, 4:4:4 chroma, opaque decode, and content-dependent file sizing remain
