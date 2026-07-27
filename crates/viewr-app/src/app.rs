@@ -27,7 +27,8 @@ use viewr_core::types::{PixelBuf, Tier};
 
 use crate::config::{Action, Config, ScrollMode, TierIndicator};
 use crate::filmstrip;
-use crate::loupe::{self, Zoom};
+use crate::loupe::{self, LoupeResponse, Zoom};
+use crate::progressive_texture::{self, TileCoord};
 use crate::rating_groups::{build_owner_members, install_rating_for_members};
 use crate::settings::SettingsState;
 use crate::texture_lru::ByteLru;
@@ -37,6 +38,8 @@ const THUMB_BUDGET: u64 = 384 * 1024 * 1024;
 /// allocation can be slightly higher, but remains proportional to this cap.
 const THUMB_TEXTURE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const THUMB_UPLOADS_PER_FRAME: usize = 8;
+const VISIBLE_FULL_TILE_UPLOADS_PER_FRAME: usize = 4;
+const BACKGROUND_FULL_TILE_UPLOADS_PER_FRAME: usize = 1;
 const THUMB_REQUEST_POLL_AFTER: Duration = Duration::from_millis(16);
 const THUMB_REQUEST_STALE_AFTER: Duration = Duration::from_millis(500);
 const THUMB_FAILURE_RETRY_AFTER: Duration = Duration::from_secs(2);
@@ -148,26 +151,13 @@ fn visible_position(visible: &[usize], current: usize) -> usize {
     }
 }
 
-fn full_texture_work_enabled(zoom: Zoom) -> bool {
-    !matches!(zoom, Zoom::Fit)
+fn current_texture_candidates(current: usize) -> [(usize, Tier); 1] {
+    [(current, Tier::Browse)]
 }
 
-fn current_texture_candidates(current: usize, zoom: Zoom) -> impl Iterator<Item = (usize, Tier)> {
-    let include_full = full_texture_work_enabled(zoom);
-    [(current, Tier::Browse), (current, Tier::Full)]
-        .into_iter()
-        .filter(move |(_, tier)| include_full || *tier != Tier::Full)
-}
-
-fn main_texture_should_be_kept(
-    index: usize,
-    tier: Tier,
-    current: usize,
-    near: &[usize],
-    zoom: Zoom,
-) -> bool {
+fn main_texture_should_be_kept(index: usize, tier: Tier, near: &[usize]) -> bool {
     match tier {
-        Tier::Full => full_texture_work_enabled(zoom) && index == current,
+        Tier::Full => false,
         _ => near.contains(&index),
     }
 }
@@ -258,6 +248,9 @@ struct Session {
     thumb_requests: HashMap<usize, Instant>,
     thumb_retry_after: HashMap<usize, Instant>,
     textures: HashMap<(usize, Tier), egui::TextureHandle>,
+    /// Full-resolution texture tiles exist only for the current zoomed image.
+    /// Browse stays underneath them so incomplete regions remain usable.
+    full_tiles: HashMap<(usize, TileCoord), egui::TextureHandle>,
 }
 
 pub struct App {
@@ -378,6 +371,7 @@ impl App {
             thumb_requests: HashMap::new(),
             thumb_retry_after: HashMap::new(),
             textures: HashMap::new(),
+            full_tiles: HashMap::new(),
         });
         self.current = start;
         self.direction = 1;
@@ -754,8 +748,8 @@ impl App {
         }
     }
 
-    /// Upload policy: current Browse first, current Full only while zoomed,
-    /// then one neighbor Browse per frame. Prune outside the keep window.
+    /// Upload policy for untiled textures: current Browse first, then one
+    /// neighbor Browse per frame. Full is uploaded progressively in loupe mode.
     fn manage_textures(&mut self) {
         let ctx = self.ctx.clone();
         let current = self.current;
@@ -775,7 +769,10 @@ impl App {
         };
         session
             .textures
-            .retain(|(i, tier), _| main_texture_should_be_kept(*i, *tier, current, &near, zoom));
+            .retain(|(i, tier), _| main_texture_should_be_kept(*i, *tier, &near));
+        session
+            .full_tiles
+            .retain(|(index, _), _| *index == current && !matches!(zoom, Zoom::Fit));
 
         let mut upload = |key: (usize, Tier), budget: &mut i32| {
             if *budget <= 0 || session.textures.contains_key(&key) {
@@ -792,13 +789,102 @@ impl App {
             }
         };
         let mut budget = 2;
-        for key in current_texture_candidates(current, zoom) {
+        for key in current_texture_candidates(current) {
             upload(key, &mut budget);
         }
         let mut neighbor_budget = 1;
         for &i in near.iter().filter(|&&i| i != current) {
             upload((i, Tier::Browse), &mut neighbor_budget);
         }
+    }
+
+    /// Upload Full-resolution tiles under the current zoom rectangle first and
+    /// paint them over the Browse stand-in. Once the visible rectangle is
+    /// complete, one tile per frame expands the Full texture outward.
+    fn progressive_full_overlay(&mut self, ui: &egui::Ui, response: &LoupeResponse) -> bool {
+        if matches!(self.zoom, Zoom::Fit) {
+            return false;
+        }
+        let current = self.current;
+        let ctx = self.ctx.clone();
+        let Some(buf) = self
+            .session
+            .as_ref()
+            .and_then(|session| session.cache.get_rgba((current, Tier::Full)))
+        else {
+            return false;
+        };
+        let order = progressive_texture::priority_order(buf.width, buf.height, response.visible_uv);
+        let visible_count = progressive_texture::visible_prefix_len(
+            buf.width,
+            buf.height,
+            response.visible_uv,
+            &order,
+        );
+        let Some(session) = &mut self.session else {
+            return false;
+        };
+        let missing_visible = order[..visible_count]
+            .iter()
+            .filter(|&&tile| !session.full_tiles.contains_key(&(current, tile)))
+            .count();
+        let upload_budget = if missing_visible > 0 {
+            VISIBLE_FULL_TILE_UPLOADS_PER_FRAME
+        } else {
+            BACKGROUND_FULL_TILE_UPLOADS_PER_FRAME
+        };
+        let mut uploaded = 0;
+        let mut invalid_storage = false;
+        for &tile in &order {
+            if uploaded >= upload_budget {
+                break;
+            }
+            let key = (current, tile);
+            if session.full_tiles.contains_key(&key) {
+                continue;
+            }
+            let Some(image) = progressive_texture::color_image(&buf, tile) else {
+                invalid_storage = true;
+                break;
+            };
+            let texture = ctx.load_texture(
+                format!("img{current}-Full-{}-{}", tile.col, tile.row),
+                image,
+                egui::TextureOptions::LINEAR,
+            );
+            session.full_tiles.insert(key, texture);
+            uploaded += 1;
+        }
+
+        let painter = ui.painter().with_clip_rect(response.viewport_rect);
+        for &tile in &order[..visible_count] {
+            let Some(texture) = session.full_tiles.get(&(current, tile)) else {
+                continue;
+            };
+            let Some(geometry) = progressive_texture::paint_geometry(
+                buf.width,
+                buf.height,
+                tile,
+                response.visible_uv,
+                response.image_draw_rect,
+            ) else {
+                continue;
+            };
+            painter.image(
+                texture.id(),
+                geometry.screen,
+                geometry.texture_uv,
+                egui::Color32::WHITE,
+            );
+        }
+
+        let visible_complete = order[..visible_count]
+            .iter()
+            .all(|&tile| session.full_tiles.contains_key(&(current, tile)));
+        if !invalid_storage && session.full_tiles.len() < order.len() {
+            ctx.request_repaint();
+        }
+        visible_complete
     }
 
     fn handle_keys(&mut self, loupe_rect: egui::Rect, img_size: Option<egui::Vec2>) {
@@ -1351,15 +1437,20 @@ impl App {
         // the retained framing (blurry→sharp in place, no flash-to-fit).
         let loupe_rect = ui.available_rect_before_wrap();
         let mut img_size = None;
+        let full_logical = self.session.as_ref().and_then(|session| {
+            session
+                .cache
+                .get_rgba((self.current, Tier::Full))
+                .map(|buf| vec2(buf.width as f32, buf.height as f32))
+        });
         let best = self.session.as_ref().and_then(|s| {
-            s.textures
-                .get(&(self.current, Tier::Full))
-                .map(|t| (Tier::Full, t.clone(), t.size_vec2()))
-                .or_else(|| {
-                    s.textures
-                        .get(&(self.current, Tier::Browse))
-                        .map(|t| (Tier::Browse, t.clone(), t.size_vec2() * 2.0))
-                })
+            s.textures.get(&(self.current, Tier::Browse)).map(|t| {
+                (
+                    Tier::Browse,
+                    t.clone(),
+                    full_logical.unwrap_or_else(|| t.size_vec2() * 2.0),
+                )
+            })
         });
         let mut standin = false; // zoomed onto a lower tier than Full
         match best {
@@ -1369,9 +1460,12 @@ impl App {
                 if let Some(t0) = self.nav_started.take() {
                     self.status = Status::Performance(format!("{tier:?} in {:.0?}", t0.elapsed()));
                 }
-                standin = tier != Tier::Full && !matches!(self.zoom, Zoom::Fit);
                 let scroll_zooms = self.config.scroll == ScrollMode::Zoom;
                 let response = loupe::show(ui, &tex, logical, &mut self.zoom, scroll_zooms);
+                standin = tier != Tier::Full && !matches!(self.zoom, Zoom::Fit);
+                if standin && self.progressive_full_overlay(ui, &response) {
+                    standin = false;
+                }
                 if let Some(pos) = response.double_clicked_at {
                     loupe::toggle_100(&mut self.zoom, loupe_rect, logical, pos);
                     self.replan();
@@ -1387,9 +1481,12 @@ impl App {
                     // size keeps the framing; fall back to fit otherwise.
                     let logical = self.last_logical.unwrap_or_else(|| tex.size_vec2());
                     img_size = Some(logical);
-                    standin = !matches!(self.zoom, Zoom::Fit);
                     let scroll_zooms = self.config.scroll == ScrollMode::Zoom;
-                    loupe::show(ui, &tex, logical, &mut self.zoom, scroll_zooms);
+                    let response = loupe::show(ui, &tex, logical, &mut self.zoom, scroll_zooms);
+                    standin = !matches!(self.zoom, Zoom::Fit);
+                    if standin && self.progressive_full_overlay(ui, &response) {
+                        standin = false;
+                    }
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.spinner();
@@ -1743,43 +1840,13 @@ mod tests {
     }
 
     #[test]
-    fn fit_texture_policy_omits_full_while_zoomed_preserves_current_full() {
+    fn untiled_texture_policy_keeps_browse_and_delegates_full_to_tiles() {
         let near = [6, 7, 8];
-        assert_eq!(
-            current_texture_candidates(7, Zoom::Fit).collect::<Vec<_>>(),
-            [(7, Tier::Browse)]
-        );
-        assert!(!main_texture_should_be_kept(
-            7,
-            Tier::Full,
-            7,
-            &near,
-            Zoom::Fit
-        ));
-
-        let zoomed = Zoom::Anchored {
-            scale: 1.0,
-            center: vec2(0.5, 0.5),
-        };
-        assert_eq!(
-            current_texture_candidates(7, zoomed).collect::<Vec<_>>(),
-            [(7, Tier::Browse), (7, Tier::Full)]
-        );
-        assert!(main_texture_should_be_kept(7, Tier::Full, 7, &near, zoomed));
-        assert!(!main_texture_should_be_kept(
-            8,
-            Tier::Full,
-            7,
-            &near,
-            zoomed
-        ));
-        assert!(main_texture_should_be_kept(
-            8,
-            Tier::Browse,
-            7,
-            &near,
-            Zoom::Fit
-        ));
+        assert_eq!(current_texture_candidates(7), [(7, Tier::Browse)]);
+        assert!(!main_texture_should_be_kept(7, Tier::Full, &near));
+        assert!(!main_texture_should_be_kept(8, Tier::Full, &near));
+        assert!(main_texture_should_be_kept(8, Tier::Browse, &near));
+        assert!(!main_texture_should_be_kept(9, Tier::Browse, &near));
     }
 
     #[test]

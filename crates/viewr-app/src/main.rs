@@ -12,6 +12,7 @@ mod color;
 mod config;
 mod filmstrip;
 mod loupe;
+mod progressive_texture;
 mod rating_groups;
 mod settings;
 mod texture_lru;
