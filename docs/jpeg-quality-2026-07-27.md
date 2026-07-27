@@ -39,9 +39,9 @@ The Preferences window exposes the inclusive range q80–q100 and keeps q97 as
 the default. The setting applies when the next folder is opened so an active
 engine and its RAM cache always use one immutable encoding profile.
 
-Disk keys include every non-default quality. The q97 profile deliberately
-retains the version-5 key shape, so existing q97 objects remain reusable.
-Changing quality cannot rehydrate an object encoded at another quality.
+Disk keys include every quality. Cache format v6 starts with a new object
+store and removes the obsolete pre-v6 store in the background. Changing
+quality cannot rehydrate an object encoded at another quality.
 
 JPEG output size remains content-dependent; the encoder has no reliable
 single-pass target-file-size mode. The quality preference controls the

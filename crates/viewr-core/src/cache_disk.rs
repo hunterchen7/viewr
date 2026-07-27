@@ -1,7 +1,7 @@
 //! Ring 3: persistent disk cache of developed JPEGs.
 //!
 //! Lives OUTSIDE any photo folder (never pollutes synced libraries):
-//! `~/Library/Caches/viewr/objects/xx/<blake3>.jpg`. Keyed by
+//! `~/Library/Caches/viewr/objects-v6/xx/<blake3>.jpg`. Keyed by
 //! (path, size, mtime, DEVELOP_VERSION, tier) so edited files and
 //! pipeline changes self-invalidate — stale objects simply never hit
 //! and become eligible for budget GC later.
@@ -19,12 +19,12 @@ use crate::types::Tier;
 /// cached render for free.
 /// Version 4 adds the highlight-preserving culling exposure lift.
 /// Version 5 raises cached JPEG quality to 97 with 4:4:4 chroma.
-pub const DEVELOP_VERSION: u32 = 5;
-const VERSION_5_BASE_JPEG_QUALITY: u8 = 97;
-/// Default cache JPEG quality. The default keeps the version-5 key shape so
-/// existing quality-97 objects remain reusable after quality becomes
-/// configurable.
-pub const DEFAULT_CACHE_JPEG_QUALITY: u8 = VERSION_5_BASE_JPEG_QUALITY;
+/// Version 6 includes the selected JPEG quality in every cache key.
+pub const DEVELOP_VERSION: u32 = 6;
+/// Default cache JPEG quality.
+pub const DEFAULT_CACHE_JPEG_QUALITY: u8 = 97;
+const CACHE_OBJECT_DIR: &str = "objects-v6";
+const LEGACY_CACHE_OBJECT_DIR: &str = "objects";
 
 #[derive(Clone)]
 /// Persistent, file-identity-keyed cache of developed JPEG renders.
@@ -40,6 +40,7 @@ pub struct DiskCache {
 }
 
 static GC_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+static LEGACY_CACHE_CLEANUP_STARTED: OnceLock<()> = OnceLock::new();
 const ORPHAN_TEMP_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 fn ascii_hex_name(name: &std::ffi::OsStr, expected_len: usize) -> Option<&str> {
@@ -80,6 +81,38 @@ fn shared_gc_lock(root: &Path) -> Arc<Mutex<()>> {
     lock
 }
 
+fn remove_legacy_cache_root(root: &Path) -> std::io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(());
+    }
+    std::fs::remove_dir_all(root)
+}
+
+fn schedule_legacy_cache_cleanup(cache_base: &Path) {
+    if LEGACY_CACHE_CLEANUP_STARTED.set(()).is_err() {
+        return;
+    }
+    let legacy_root = cache_base.join(LEGACY_CACHE_OBJECT_DIR);
+    if let Err(error) = std::thread::Builder::new()
+        .name("viewr-legacy-cache-cleanup".into())
+        .spawn(move || {
+            if let Err(error) = remove_legacy_cache_root(&legacy_root) {
+                eprintln!(
+                    "failed to remove legacy cache {}: {error}",
+                    legacy_root.display()
+                );
+            }
+        })
+    {
+        eprintln!("failed to spawn legacy cache cleanup: {error}");
+    }
+}
+
 fn hash_path_identity(hasher: &mut blake3::Hasher, path: &Path) {
     #[cfg(unix)]
     {
@@ -104,15 +137,18 @@ fn hash_path_identity(hasher: &mut blake3::Hasher, path: &Path) {
 }
 
 impl DiskCache {
-    /// Opens the platform-default `viewr/objects` cache directory.
+    /// Opens the platform-default `viewr/objects-v6` cache directory.
     ///
     /// Returns `None` when the platform has no cache directory or the cache
     /// root cannot be created. The budget is enforced only when
-    /// [`gc_to_budget`](Self::gc_to_budget) is called; opening is otherwise
-    /// non-destructive.
+    /// [`gc_to_budget`](Self::gc_to_budget) is called. The first open in a
+    /// process also removes the obsolete pre-v6 object store in the
+    /// background.
     pub fn open_default(budget_bytes: u64) -> Option<Self> {
-        let root = dirs::cache_dir()?.join("viewr").join("objects");
+        let cache_base = dirs::cache_dir()?.join("viewr");
+        let root = cache_base.join(CACHE_OBJECT_DIR);
         std::fs::create_dir_all(&root).ok()?;
+        schedule_legacy_cache_cleanup(&cache_base);
         let gc_lock = shared_gc_lock(&root);
         Some(Self {
             root,
@@ -145,9 +181,7 @@ impl DiskCache {
 
     /// Derives a persistent object key for a selected JPEG quality.
     ///
-    /// Non-default qualities add an encoding-profile discriminator. The
-    /// default deliberately retains the version-5 key shape so existing
-    /// quality-97 cache objects remain valid.
+    /// Every quality has an explicit encoding-profile discriminator.
     pub fn key_with_jpeg_quality(entry: &FolderEntry, tier: Tier, jpeg_quality: u8) -> String {
         let mut hasher = blake3::Hasher::new();
         hash_path_identity(&mut hasher, &entry.path);
@@ -159,10 +193,8 @@ impl DiskCache {
             Tier::Browse => b"b",
             Tier::Full => b"f",
         });
-        if jpeg_quality != VERSION_5_BASE_JPEG_QUALITY {
-            hasher.update(b"jpeg-quality");
-            hasher.update(&[jpeg_quality]);
-        }
+        hasher.update(b"jpeg-quality");
+        hasher.update(&[jpeg_quality]);
         hasher.finalize().to_hex().to_string()
     }
 
@@ -362,20 +394,20 @@ mod tests {
     }
 
     #[test]
-    fn quality_upgrade_cannot_reuse_version_4_cache_objects() {
+    fn configurable_quality_cannot_reuse_pre_v6_cache_objects() {
         let entry = entry(10, 1);
-        let key_at_version = |version: u32| {
-            let mut hasher = blake3::Hasher::new();
-            hash_path_identity(&mut hasher, &entry.path);
-            hasher.update(&entry.size.to_le_bytes());
-            hasher.update(&entry.mtime_ns.to_le_bytes());
-            hasher.update(&version.to_le_bytes());
-            hasher.update(b"b");
-            hasher.finalize().to_hex().to_string()
-        };
+        let mut version_5 = blake3::Hasher::new();
+        hash_path_identity(&mut version_5, &entry.path);
+        version_5.update(&entry.size.to_le_bytes());
+        version_5.update(&entry.mtime_ns.to_le_bytes());
+        version_5.update(&5_u32.to_le_bytes());
+        version_5.update(b"b");
 
-        assert_eq!(DiskCache::key(&entry, Tier::Browse), key_at_version(5));
-        assert_ne!(DiskCache::key(&entry, Tier::Browse), key_at_version(4));
+        assert_eq!(DEVELOP_VERSION, 6);
+        assert_ne!(
+            DiskCache::key(&entry, Tier::Browse),
+            version_5.finalize().to_hex().to_string()
+        );
     }
 
     #[test]
@@ -395,6 +427,35 @@ mod tests {
             DiskCache::key_with_jpeg_quality(&entry, Tier::Browse, 90),
             DiskCache::key_with_jpeg_quality(&entry, Tier::Browse, 100)
         );
+    }
+
+    #[test]
+    fn legacy_cache_cleanup_removes_only_a_real_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join(LEGACY_CACHE_OBJECT_DIR);
+        std::fs::create_dir_all(legacy.join("aa")).unwrap();
+        std::fs::write(legacy.join("aa").join("old.jpg"), b"old").unwrap();
+
+        remove_legacy_cache_root(&legacy).unwrap();
+        assert!(!legacy.exists());
+        remove_legacy_cache_root(&legacy).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_cache_cleanup_does_not_follow_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep.jpg"), b"keep").unwrap();
+        let legacy = dir.path().join(LEGACY_CACHE_OBJECT_DIR);
+        symlink(&target, &legacy).unwrap();
+
+        remove_legacy_cache_root(&legacy).unwrap();
+        assert!(legacy.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(target.join("keep.jpg")).unwrap(), b"keep");
     }
 
     #[cfg(unix)]
@@ -460,6 +521,8 @@ mod tests {
         legacy.update(&entry.mtime_ns.to_le_bytes());
         legacy.update(&DEVELOP_VERSION.to_le_bytes());
         legacy.update(b"b");
+        legacy.update(b"jpeg-quality");
+        legacy.update(&[DEFAULT_CACHE_JPEG_QUALITY]);
 
         assert_eq!(
             DiskCache::key(&entry, Tier::Browse),
