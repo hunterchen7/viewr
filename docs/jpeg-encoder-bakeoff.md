@@ -200,10 +200,13 @@ Build and release behavior:
 
 - `pkg-config` is disabled for the production dependency;
 - bundled source and SIMD are required;
+- native macOS objects inherit the app's pinned 11.0 deployment target;
 - Linux CI declares CMake and NASM explicitly;
 - macOS, Windows, and Linux release jobs build the same locked dependency;
 - the generated third-party license inventory includes `turbojpeg`,
-  `turbojpeg-sys`, CMake, and their transitive crates.
+  `turbojpeg-sys`, CMake, and their transitive crates;
+- the shipped third-party notice separately includes the attribution and
+  Modified BSD text required by the bundled C project.
 
 The codec switch advances the disk object store to `objects-v7`. Existing
 `objects-v6` bytes cannot hide the new performance, and obsolete stores are

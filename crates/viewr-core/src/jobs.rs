@@ -1832,7 +1832,10 @@ fn encode_persistence_jpeg(
     buf: &PixelBuf,
     quality: u8,
 ) -> Result<Vec<u8>, String> {
-    if encoder.is_none() {
+    if encoder
+        .as_ref()
+        .is_none_or(|encoder| encoder.quality != quality)
+    {
         *encoder = Some(CacheJpegEncoder::new(quality)?);
     }
     let encoded = encoder
@@ -3658,5 +3661,9 @@ mod tests {
 
         assert_eq!(first, recovered);
         assert!(encoder.is_some());
+
+        let changed_quality = encode_persistence_jpeg(&mut encoder, &valid, 90).unwrap();
+        assert_eq!(changed_quality, encode_jpeg(&valid, 90).unwrap());
+        assert_ne!(changed_quality, first);
     }
 }
