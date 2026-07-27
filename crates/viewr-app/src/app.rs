@@ -921,9 +921,10 @@ impl App {
 
     /// Cache-tier stroke color for a thumbnail when the border mode is active.
     fn tier_stroke(&self, session: &Session, index: usize) -> Option<egui::Color32> {
-        (self.config.tier_indicator == TierIndicator::Border)
-            .then(|| Self::cache_state(session, index).map(cache_state_color))
-            .flatten()
+        if self.config.tier_indicator != TierIndicator::Border {
+            return None;
+        }
+        Self::cache_state(session, index).map(cache_state_stroke_color)
     }
 
     /// Delivery-style cache state shown below thumbnails in the subtle mode.
@@ -979,7 +980,22 @@ fn cache_state_color(state: CacheState) -> egui::Color32 {
     }
 }
 
+fn cache_state_stroke_color(state: CacheState) -> egui::Color32 {
+    match state {
+        CacheState::Full => egui::Color32::from_rgba_unmultiplied(70, 200, 110, 150),
+        CacheState::Browse => egui::Color32::from_rgba_unmultiplied(240, 180, 60, 150),
+        CacheState::Compressed => egui::Color32::from_rgba_unmultiplied(90, 140, 240, 110),
+    }
+}
+
 impl eframe::App for App {
+    fn persist_egui_memory(&self) -> bool {
+        // NativeOptions persists the root window. App preferences and panel
+        // sizes use viewr.toml; transient widget state must not reopen dialogs
+        // or restore stale scroll positions in a different folder.
+        false
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = self.ctx.clone();
         self.settings.maybe_capture(&ctx, &mut self.config);
