@@ -4,7 +4,7 @@
 
 use eframe::egui;
 
-use crate::config::{ACTIONS, Action, Bind, Config, ScrollMode};
+use crate::config::{ACTIONS, Action, Bind, Config, ScrollMode, TierIndicator};
 
 #[derive(Default)]
 pub struct SettingsState {
@@ -71,10 +71,37 @@ impl SettingsState {
                 ui.add_space(8.0);
 
                 ui.heading("Display");
+                ui.horizontal(|ui| {
+                    ui.label("Cache indicator:");
+                    changed |= ui
+                        .radio_value(&mut config.tier_indicator, TierIndicator::Marks, "marks")
+                        .on_hover_text(
+                            "Delivery-style marks below thumbnails: green full, amber browse, blue cached",
+                        )
+                        .changed();
+                    changed |= ui
+                        .radio_value(&mut config.tier_indicator, TierIndicator::Border, "border")
+                        .changed();
+                    changed |= ui
+                        .radio_value(&mut config.tier_indicator, TierIndicator::Hidden, "hidden")
+                        .changed();
+                });
                 changed |= ui
                     .checkbox(
-                        &mut config.tier_border,
-                        "Cache-tier border on thumbnails (green full · amber browse · blue warm)",
+                        &mut config.show_loading,
+                        "Loading message while the current zoom view waits for full resolution",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut config.show_performance,
+                        "Performance details (load time and cache sizes)",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut config.show_exposure,
+                        "Exposure details in the toolbar",
                     )
                     .changed();
                 ui.horizontal(|ui| {

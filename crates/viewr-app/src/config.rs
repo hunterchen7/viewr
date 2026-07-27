@@ -36,6 +36,28 @@ pub enum ScrollMode {
     Zoom,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TierIndicator {
+    /// Colored outline around a thumbnail.
+    Border,
+    /// Compact delivery-style marks below a thumbnail.
+    #[default]
+    Marks,
+    /// Do not show cache-tier state.
+    Hidden,
+}
+
+impl TierIndicator {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Border => "border",
+            Self::Marks => "marks",
+            Self::Hidden => "hidden",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bind {
     pub key: egui::Key,
@@ -75,7 +97,10 @@ impl Bind {
 
 pub struct Config {
     pub scroll: ScrollMode,
-    pub tier_border: bool,
+    pub tier_indicator: TierIndicator,
+    pub show_loading: bool,
+    pub show_performance: bool,
+    pub show_exposure: bool,
     /// Filmstrip panel height in px (drag the divider to change).
     pub filmstrip_height: f32,
     /// Grid cell width in px.
@@ -107,14 +132,25 @@ struct RawInput {
 #[derive(Deserialize)]
 #[serde(default)]
 struct RawUi {
-    tier_border: bool,
+    /// New three-state preference. `None` permits migration from the old
+    /// `tier_border` boolean.
+    tier_indicator: Option<TierIndicator>,
+    /// Compatibility with configurations written before tier marks existed.
+    tier_border: Option<bool>,
+    show_loading: bool,
+    show_performance: bool,
+    show_exposure: bool,
     filmstrip_height: f32,
     grid_cell: f32,
 }
 impl Default for RawUi {
     fn default() -> Self {
         Self {
-            tier_border: true,
+            tier_indicator: None,
+            tier_border: None,
+            show_loading: true,
+            show_performance: true,
+            show_exposure: true,
             filmstrip_height: 112.0,
             grid_cell: 200.0,
         }
@@ -250,9 +286,16 @@ impl Config {
                 .collect();
             binds.insert(action, parsed);
         }
+        let tier_indicator = raw.ui.tier_indicator.unwrap_or(match raw.ui.tier_border {
+            Some(false) => TierIndicator::Hidden,
+            Some(true) | None => TierIndicator::Marks,
+        });
         Self {
             scroll: raw.input.scroll,
-            tier_border: raw.ui.tier_border,
+            tier_indicator,
+            show_loading: raw.ui.show_loading,
+            show_performance: raw.ui.show_performance,
+            show_exposure: raw.ui.show_exposure,
             filmstrip_height: finite_clamp(
                 raw.ui.filmstrip_height,
                 default_ui.filmstrip_height,
@@ -303,12 +346,15 @@ impl Config {
              # hand-edits are read at startup but comments are not kept.\n\n[input]\n",
         );
         out.push_str(&format!(
-            "scroll = \"{}\"\n\n[ui]\ntier_border = {}\nfilmstrip_height = {:.0}\ngrid_cell = {:.0}\n\n[cache]\nram_gb = {:.1}\ndisk_gb = {:.1}\n\n[binds]\n",
+            "scroll = \"{}\"\n\n[ui]\ntier_indicator = \"{}\"\nshow_loading = {}\nshow_performance = {}\nshow_exposure = {}\nfilmstrip_height = {:.0}\ngrid_cell = {:.0}\n\n[cache]\nram_gb = {:.1}\ndisk_gb = {:.1}\n\n[binds]\n",
             match self.scroll {
                 ScrollMode::Pan => "pan",
                 ScrollMode::Zoom => "zoom",
             },
-            self.tier_border,
+            self.tier_indicator.as_str(),
+            self.show_loading,
+            self.show_performance,
+            self.show_exposure,
             self.filmstrip_height,
             self.grid_cell,
             self.ram_gb,
@@ -352,9 +398,16 @@ const TEMPLATE: &str = r#"# viewr configuration.
 scroll = "pan"
 
 [ui]
-# Subtle border on the main image showing which cache tier is displayed:
-# green = full res, amber = browse (half-res), red = thumbnail stand-in.
-tier_border = true
+# Cache state below each thumbnail: "marks", "border", or "hidden".
+# Marks use green double checks for full resolution, amber single checks for
+# browse resolution, and a blue dot for compressed cache data.
+tier_indicator = "marks"
+# Show the current-image message while zoom waits for full resolution.
+show_loading = true
+# Show load time and RAM/JPEG cache usage in the toolbar.
+show_performance = true
+# Show ISO, shutter, aperture, and focal length in the toolbar.
+show_exposure = true
 
 [cache]
 # Total RAM cache budget in GB, including thumbnails.
@@ -434,7 +487,10 @@ mod tests {
         let cfg = Config::from_raw(raw);
         assert_eq!(cfg.scroll, ScrollMode::Zoom);
         assert!((cfg.ram_gb - 8.0).abs() < f32::EPSILON);
-        assert!(cfg.tier_border); // untouched default
+        assert_eq!(cfg.tier_indicator, TierIndicator::Marks);
+        assert!(cfg.show_loading);
+        assert!(cfg.show_performance);
+        assert!(cfg.show_exposure);
         assert_eq!(cfg.binds[&Action::Next].len(), 1);
         assert_eq!(cfg.binds[&Action::Next][0].key, egui::Key::D);
         assert_eq!(cfg.binds[&Action::Prev][0].key, egui::Key::ArrowLeft);
@@ -559,11 +615,54 @@ mod tests {
         let cfg = Config::from_raw(raw);
 
         assert_eq!(cfg.scroll, ScrollMode::Pan);
-        assert!(cfg.tier_border);
+        assert_eq!(cfg.tier_indicator, TierIndicator::Marks);
+        assert!(cfg.show_loading);
+        assert!(cfg.show_performance);
+        assert!(cfg.show_exposure);
         assert_eq!(cfg.filmstrip_height, 112.0);
         assert_eq!(cfg.grid_cell, 200.0);
         assert_eq!(cfg.ram_gb, 4.5);
         assert_eq!(cfg.disk_gb, 20.0);
+    }
+
+    #[test]
+    fn legacy_tier_border_migrates_to_marks_or_hidden() {
+        let enabled: RawConfig = toml::from_str(
+            r#"
+            [ui]
+            tier_border = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            Config::from_raw(enabled).tier_indicator,
+            TierIndicator::Marks
+        );
+
+        let disabled: RawConfig = toml::from_str(
+            r#"
+            [ui]
+            tier_border = false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            Config::from_raw(disabled).tier_indicator,
+            TierIndicator::Hidden
+        );
+
+        let explicit: RawConfig = toml::from_str(
+            r#"
+            [ui]
+            tier_indicator = "border"
+            tier_border = false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            Config::from_raw(explicit).tier_indicator,
+            TierIndicator::Border
+        );
     }
 
     #[test]

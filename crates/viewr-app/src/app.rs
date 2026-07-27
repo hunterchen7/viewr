@@ -25,7 +25,7 @@ use viewr_core::library::{
 use viewr_core::meta::FileMeta;
 use viewr_core::types::{PixelBuf, Tier};
 
-use crate::config::{Action, Config, ScrollMode};
+use crate::config::{Action, Config, ScrollMode, TierIndicator};
 use crate::filmstrip;
 use crate::loupe::{self, Zoom};
 use crate::rating_groups::{build_owner_members, install_rating_for_members};
@@ -54,10 +54,7 @@ fn ram_cache_budgets(total: u64) -> (u64, u64, u64) {
 }
 
 pub fn run(dir: &Path, select: Option<&Path>) -> Result<()> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1500.0, 950.0]),
-        ..Default::default()
-    };
+    let options = native_options();
     let dir = dir.to_owned();
     let select = select.map(Path::to_owned);
     eframe::run_native(
@@ -74,10 +71,35 @@ pub fn run(dir: &Path, select: Option<&Path>) -> Result<()> {
     .map_err(|e| anyhow!("eframe: {e}"))
 }
 
+fn native_options() -> eframe::NativeOptions {
+    eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_app_id("viewr")
+            .with_inner_size([1500.0, 950.0]),
+        persist_window: true,
+        ..Default::default()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Loupe,
     Grid,
+}
+
+#[derive(Default)]
+enum Status {
+    #[default]
+    Empty,
+    Performance(String),
+    Error(String),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CacheState {
+    Full,
+    Browse,
+    Compressed,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -259,7 +281,7 @@ pub struct App {
     /// Last known full-res logical size; carries the zoom framing onto
     /// thumb placeholders before the new image's develop lands.
     last_logical: Option<egui::Vec2>,
-    status: String,
+    status: Status,
     scroll_to_current: bool,
 }
 
@@ -281,7 +303,7 @@ impl App {
             show_metadata: false,
             nav_started: None,
             last_logical: None,
-            status: String::new(),
+            status: Status::Empty,
             scroll_to_current: true,
         }
     }
@@ -378,7 +400,7 @@ impl App {
         if let Some(dir) = dialog.pick_folder()
             && let Err(e) = self.open_folder(&dir, None)
         {
-            self.status = format!("open failed: {e}");
+            self.status = Status::Error(format!("open failed: {e}"));
         }
     }
 
@@ -524,7 +546,7 @@ impl App {
                             .thumb_retry_after
                             .insert(index, Instant::now() + THUMB_FAILURE_RETRY_AFTER);
                     } else if index == current && tier != Tier::Thumb {
-                        self.status = format!("error: {error}");
+                        self.status = Status::Error(format!("error: {error}"));
                     } else {
                         eprintln!("job failed {index}/{tier:?}: {error}");
                     }
@@ -884,22 +906,51 @@ impl App {
         }
     }
 
-    /// Cache-tier stroke color for a thumbnail: green = full-res in RAM,
-    /// amber = browse in RAM, dim blue = warm (JPEG ring, instant
-    /// rehydrate), none = cold.
-    fn tier_stroke(&self, session: &Session, index: usize) -> Option<egui::Color32> {
-        if !self.config.tier_border {
-            return None;
-        }
+    fn cache_state(session: &Session, index: usize) -> Option<CacheState> {
         let cache = &session.cache;
         if cache.has_rgba((index, Tier::Full)) {
-            Some(egui::Color32::from_rgba_unmultiplied(70, 200, 110, 150))
+            Some(CacheState::Full)
         } else if cache.has_rgba((index, Tier::Browse)) {
-            Some(egui::Color32::from_rgba_unmultiplied(240, 180, 60, 150))
+            Some(CacheState::Browse)
         } else if cache.has_jpeg((index, Tier::Browse)) || cache.has_jpeg((index, Tier::Full)) {
-            Some(egui::Color32::from_rgba_unmultiplied(90, 140, 240, 110))
+            Some(CacheState::Compressed)
         } else {
             None
+        }
+    }
+
+    /// Cache-tier stroke color for a thumbnail when the border mode is active.
+    fn tier_stroke(&self, session: &Session, index: usize) -> Option<egui::Color32> {
+        (self.config.tier_indicator == TierIndicator::Border)
+            .then(|| Self::cache_state(session, index).map(cache_state_color))
+            .flatten()
+    }
+
+    /// Delivery-style cache state shown below thumbnails in the subtle mode.
+    fn tier_mark(
+        &self,
+        session: &Session,
+        index: usize,
+    ) -> Option<(&'static str, egui::Color32, &'static str)> {
+        if self.config.tier_indicator != TierIndicator::Marks {
+            return None;
+        }
+        match Self::cache_state(session, index)? {
+            CacheState::Full => Some((
+                "✓✓",
+                cache_state_color(CacheState::Full),
+                "Full resolution ready",
+            )),
+            CacheState::Browse => Some((
+                "✓",
+                cache_state_color(CacheState::Browse),
+                "Browse resolution ready",
+            )),
+            CacheState::Compressed => Some((
+                "•",
+                cache_state_color(CacheState::Compressed),
+                "Compressed render cached",
+            )),
         }
     }
 
@@ -918,6 +969,14 @@ impl App {
 
 fn stars(rating: u8) -> String {
     (0..5).map(|i| if i < rating { '★' } else { '☆' }).collect()
+}
+
+fn cache_state_color(state: CacheState) -> egui::Color32 {
+    match state {
+        CacheState::Full => egui::Color32::from_rgb(70, 200, 110),
+        CacheState::Browse => egui::Color32::from_rgb(240, 180, 60),
+        CacheState::Compressed => egui::Color32::from_rgb(90, 140, 240),
+    }
 }
 
 impl eframe::App for App {
@@ -1014,10 +1073,11 @@ impl App {
                     });
                 ui.separator();
 
-                if let Some(meta) = self
-                    .session
-                    .as_ref()
-                    .and_then(|s| s.metas.get(&self.current))
+                if self.config.show_exposure
+                    && let Some(meta) = self
+                        .session
+                        .as_ref()
+                        .and_then(|s| s.metas.get(&self.current))
                 {
                     let mut parts: Vec<String> = Vec::new();
                     if let Some(iso) = meta.iso {
@@ -1042,17 +1102,27 @@ impl App {
                     {
                         self.settings.open = !self.settings.open;
                     }
-                    if let Some(s) = &self.session {
+                    if self.config.show_performance
+                        && let Some(s) = &self.session
+                    {
                         let st = s.cache.stats();
                         ui.label(
                             egui::RichText::new(format!(
-                                "{}  |  rgba {}M  jpeg {}M",
-                                self.status,
+                                "rgba {}M  jpeg {}M",
                                 st.rgba_bytes / (1024 * 1024),
                                 st.jpeg_bytes / (1024 * 1024),
                             ))
                             .weak(),
                         );
+                    }
+                    match &self.status {
+                        Status::Performance(message) if self.config.show_performance => {
+                            ui.label(egui::RichText::new(message).weak());
+                        }
+                        Status::Error(message) => {
+                            ui.label(egui::RichText::new(message).color(egui::Color32::LIGHT_RED));
+                        }
+                        Status::Empty | Status::Performance(_) => {}
                     }
                 });
             });
@@ -1212,15 +1282,27 @@ impl App {
                                                     egui::StrokeKind::Outside,
                                                 );
                                             }
-                                            if rating > 0 {
-                                                column_ui.label(
-                                                    egui::RichText::new(
-                                                        "★".repeat(rating as usize),
+                                            column_ui.horizontal_centered(|ui| {
+                                                if rating > 0 {
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            "★".repeat(rating as usize),
+                                                        )
+                                                        .size(10.0)
+                                                        .color(egui::Color32::GOLD),
+                                                    );
+                                                }
+                                                if let Some((mark, color, help)) =
+                                                    self.tier_mark(session, i)
+                                                {
+                                                    ui.label(
+                                                        egui::RichText::new(mark)
+                                                            .size(10.0)
+                                                            .color(color),
                                                     )
-                                                    .size(10.0)
-                                                    .color(egui::Color32::GOLD),
-                                                );
-                                            }
+                                                    .on_hover_text(help);
+                                                }
+                                            });
                                             if response.clicked() {
                                                 clicked = Some(i);
                                             }
@@ -1269,7 +1351,7 @@ impl App {
                 img_size = Some(logical);
                 self.last_logical = Some(logical);
                 if let Some(t0) = self.nav_started.take() {
-                    self.status = format!("{tier:?} in {:.0?}", t0.elapsed());
+                    self.status = Status::Performance(format!("{tier:?} in {:.0?}", t0.elapsed()));
                 }
                 standin = tier != Tier::Full && !matches!(self.zoom, Zoom::Fit);
                 let scroll_zooms = self.config.scroll == ScrollMode::Zoom;
@@ -1302,7 +1384,7 @@ impl App {
 
         // Never let a low-res stand-in masquerade as full res while
         // judging focus: badge until the Full texture takes over.
-        if standin {
+        if standin && self.config.show_loading {
             egui::Area::new(egui::Id::new("standin-badge"))
                 .fixed_pos(loupe_rect.center_top() + egui::vec2(-70.0, 10.0))
                 .show(&self.ctx.clone(), |ui| {
@@ -1391,15 +1473,23 @@ impl App {
                                             egui::StrokeKind::Outside,
                                         );
                                     }
-                                    ui.label(
-                                        egui::RichText::new(if rating > 0 {
-                                            "★".repeat(rating as usize)
-                                        } else {
-                                            String::new()
-                                        })
-                                        .size(11.0)
-                                        .color(egui::Color32::GOLD),
-                                    );
+                                    ui.horizontal_centered(|ui| {
+                                        if rating > 0 {
+                                            ui.label(
+                                                egui::RichText::new("★".repeat(rating as usize))
+                                                    .size(11.0)
+                                                    .color(egui::Color32::GOLD),
+                                            );
+                                        }
+                                        if let Some((mark, color, help)) =
+                                            self.tier_mark(session, i)
+                                        {
+                                            ui.label(
+                                                egui::RichText::new(mark).size(11.0).color(color),
+                                            )
+                                            .on_hover_text(help);
+                                        }
+                                    });
                                     if response.clicked() {
                                         clicked = Some(i);
                                     }
@@ -1435,6 +1525,14 @@ fn to_color_image(buf: &PixelBuf) -> egui::ColorImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_window_uses_stable_persistent_geometry() {
+        let options = native_options();
+        assert!(options.persist_window);
+        assert_eq!(options.viewport.app_id.as_deref(), Some("viewr"));
+        assert_eq!(options.viewport.inner_size, Some(vec2(1500.0, 950.0)));
+    }
 
     fn metadata_with_rating(rating: Option<u32>) -> FileMeta {
         FileMeta {
