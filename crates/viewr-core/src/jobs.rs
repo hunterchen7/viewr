@@ -41,16 +41,13 @@ const LIGHT_WORKERS: usize = 2;
 /// bounded to at most two such retained frames; larger and excess requests are
 /// best-effort cache misses.
 const PERSIST_PENDING_BUDGET_BYTES: usize = 256 * 1024 * 1024;
-const JPEG_QUALITY_BROWSE: u8 = 87;
-const JPEG_QUALITY_FULL: u8 = 90;
+/// JPEG quality used by persistent Browse and Full renders.
+pub const CACHE_JPEG_QUALITY: u8 = 97;
 const PERSIST_WRITE_ATTEMPTS: usize = 3;
 const PERSIST_RETRY_BASE_DELAY: Duration = Duration::from_millis(2);
 
-fn jpeg_quality(tier: Tier) -> u8 {
-    match tier {
-        Tier::Full => JPEG_QUALITY_FULL,
-        Tier::Thumb | Tier::Browse => JPEG_QUALITY_BROWSE,
-    }
+fn jpeg_quality(_tier: Tier) -> u8 {
+    CACHE_JPEG_QUALITY
 }
 
 /// Returns the production persistence quality for a benchmark tier.
@@ -1743,7 +1740,8 @@ fn develop_cache_miss(
 
 /// Encodes a tightly packed RGBA8 buffer as a JPEG.
 ///
-/// `quality` is passed directly to `jpeg-encoder`. The output discards alpha.
+/// `quality` is passed directly to `jpeg-encoder`. Chroma is always encoded at
+/// full 4:4:4 resolution and the output discards alpha.
 ///
 /// # Errors
 ///
@@ -1751,7 +1749,8 @@ fn develop_cache_miss(
 /// is inconsistent with the dimensions, or JPEG encoding fails.
 pub fn encode_jpeg(buf: &PixelBuf, quality: u8) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
-    let encoder = jpeg_encoder::Encoder::new(&mut out, quality);
+    let mut encoder = jpeg_encoder::Encoder::new(&mut out, quality);
+    encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1);
     encoder
         .encode(
             &buf.rgba,
@@ -3352,6 +3351,52 @@ mod tests {
             total_error / channel_count < 5,
             "mean channel error was {}",
             total_error / channel_count
+        );
+    }
+
+    #[test]
+    fn production_jpeg_quality_preserves_dark_gradients_better_than_legacy_full() {
+        let width = 640_u32;
+        let height = 384_u32;
+        let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+        for y in 0..height {
+            for x in 0..width {
+                let base = 6 + ((x + y) * 58 / (width + height));
+                let hash = x.wrapping_mul(0x9e37_79b9) ^ y.wrapping_mul(0x85eb_ca6b);
+                let noise = ((hash ^ (hash >> 13)) % 5) as i16 - 2;
+                let value = (base as i16 + noise).clamp(0, 255) as u8;
+                rgba.extend_from_slice(&[value, value, value, 255]);
+            }
+        }
+        let source = PixelBuf {
+            width,
+            height,
+            rgba,
+        };
+        let squared_error = |quality| {
+            let encoded = encode_jpeg(&source, quality).expect("gradient must encode");
+            let decoded = decode_jpeg(&encoded).expect("gradient must decode");
+            source
+                .rgba
+                .chunks_exact(4)
+                .zip(decoded.rgba.chunks_exact(4))
+                .map(|(expected, actual)| {
+                    (0..3)
+                        .map(|channel| {
+                            u64::from(expected[channel].abs_diff(actual[channel])).pow(2)
+                        })
+                        .sum::<u64>()
+                })
+                .sum::<u64>()
+        };
+
+        assert_eq!(jpeg_quality(Tier::Browse), 97);
+        assert_eq!(jpeg_quality(Tier::Full), 97);
+        let legacy_error = squared_error(90);
+        let production_error = squared_error(jpeg_quality(Tier::Full));
+        assert!(
+            production_error * 4 < legacy_error * 3,
+            "q97 error {production_error} was not at least 25% below q90 error {legacy_error}"
         );
     }
 

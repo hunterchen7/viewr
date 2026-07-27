@@ -27,8 +27,11 @@ Residency uses hard accounting limits and soft targets:
    display. Viewr preloads and pins Full renders for the current image and its
    immediate visible neighbors. Pinned images can keep a ring above its target
    until Viewr removes the pins.
-3. **JPEG bytes in RAM** — memoized develops with a target byte budget, ~20×
-   smaller and cheap to re-inflate. Pins have the same soft-budget behavior.
+3. **JPEG bytes in RAM** — memoized develops with a target byte budget. Their
+   compression ratio is content-dependent; the texture-heavy benchmark is
+   about 6× smaller than RGBA. Cache JPEGs use quality 97 with 4:4:4 chroma to
+   preserve dark gradients and fine color detail. Pins have the same
+   soft-budget behavior.
 4. **Disk** (`~/Library/Caches/viewr/`) — a target budget for developed JPEGs
    used on fast folder reopens; cache GC enforces the target rather than every
    write, and files are never written inside photo folders.

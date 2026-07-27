@@ -18,7 +18,8 @@ use crate::types::Tier;
 /// Bump when the develop pipeline's output changes; invalidates every
 /// cached render for free.
 /// Version 4 adds the highlight-preserving culling exposure lift.
-pub const DEVELOP_VERSION: u32 = 4;
+/// Version 5 raises cached JPEG quality to 97 with 4:4:4 chroma.
+pub const DEVELOP_VERSION: u32 = 5;
 
 #[derive(Clone)]
 /// Persistent, file-identity-keyed cache of developed JPEG renders.
@@ -340,6 +341,23 @@ mod tests {
         assert_ne!(a, DiskCache::key(&entry(10, 2), Tier::Browse));
         assert_ne!(a, DiskCache::key(&entry(10, 1), Tier::Full));
         assert_eq!(a, DiskCache::key(&entry(10, 1), Tier::Browse));
+    }
+
+    #[test]
+    fn quality_upgrade_cannot_reuse_version_4_cache_objects() {
+        let entry = entry(10, 1);
+        let key_at_version = |version: u32| {
+            let mut hasher = blake3::Hasher::new();
+            hash_path_identity(&mut hasher, &entry.path);
+            hasher.update(&entry.size.to_le_bytes());
+            hasher.update(&entry.mtime_ns.to_le_bytes());
+            hasher.update(&version.to_le_bytes());
+            hasher.update(b"b");
+            hasher.finalize().to_hex().to_string()
+        };
+
+        assert_eq!(DiskCache::key(&entry, Tier::Browse), key_at_version(5));
+        assert_ne!(DiskCache::key(&entry, Tier::Browse), key_at_version(4));
     }
 
     #[cfg(unix)]
