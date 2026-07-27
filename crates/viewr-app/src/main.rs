@@ -169,8 +169,8 @@ fn spike(input: &Path, out_dir: &Path) -> Result<()> {
     let stem = input.file_stem().unwrap_or_default().to_string_lossy();
     let browse_path = out_dir.join(format!("{stem}.browse.jpg"));
     let full_path = out_dir.join(format!("{stem}.full.jpg"));
-    write_jpeg(&browse_path, &browse, 87)?;
-    write_jpeg(&full_path, &full, 90)?;
+    write_jpeg(&browse_path, &browse, viewr_core::jobs::CACHE_JPEG_QUALITY)?;
+    write_jpeg(&full_path, &full, viewr_core::jobs::CACHE_JPEG_QUALITY)?;
     let t_encode = t.elapsed();
 
     println!("  open+parse    {:>8.1?}", decoded.t_open);
@@ -196,7 +196,8 @@ fn spike(input: &Path, out_dir: &Path) -> Result<()> {
 }
 
 fn write_jpeg(path: &Path, buf: &viewr_core::types::PixelBuf, quality: u8) -> Result<()> {
-    let encoder = jpeg_encoder::Encoder::new_file(path, quality)?;
+    let mut encoder = jpeg_encoder::Encoder::new_file(path, quality)?;
+    encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1);
     encoder.encode(
         &buf.rgba,
         u16::try_from(buf.width).context("width exceeds JPEG limit")?,

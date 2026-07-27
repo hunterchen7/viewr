@@ -18,7 +18,8 @@ use crate::types::Tier;
 /// Bump when the develop pipeline's output changes; invalidates every
 /// cached render for free.
 /// Version 4 adds the highlight-preserving culling exposure lift.
-pub const DEVELOP_VERSION: u32 = 4;
+/// Version 5 raises cached JPEG quality to 97 with 4:4:4 chroma.
+pub const DEVELOP_VERSION: u32 = 5;
 
 #[derive(Clone)]
 /// Persistent, file-identity-keyed cache of developed JPEG renders.
