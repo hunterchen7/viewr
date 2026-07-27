@@ -1,7 +1,7 @@
 //! Ring 3: persistent disk cache of developed JPEGs.
 //!
 //! Lives OUTSIDE any photo folder (never pollutes synced libraries):
-//! `~/Library/Caches/viewr/objects-v6/xx/<blake3>.jpg`. Keyed by
+//! `~/Library/Caches/viewr/objects-v7/xx/<blake3>.jpg`. Keyed by
 //! (path, size, mtime, DEVELOP_VERSION, tier) so edited files and
 //! pipeline changes self-invalidate — stale objects simply never hit
 //! and become eligible for budget GC later.
@@ -20,11 +20,12 @@ use crate::types::Tier;
 /// Version 4 adds the highlight-preserving culling exposure lift.
 /// Version 5 raises cached JPEG quality to 97 with 4:4:4 chroma.
 /// Version 6 includes the selected JPEG quality in every cache key.
-pub const DEVELOP_VERSION: u32 = 6;
+/// Version 7 switches cached renders to libjpeg-turbo.
+pub const DEVELOP_VERSION: u32 = 7;
 /// Default cache JPEG quality.
 pub const DEFAULT_CACHE_JPEG_QUALITY: u8 = 97;
-const CACHE_OBJECT_DIR: &str = "objects-v6";
-const LEGACY_CACHE_OBJECT_DIR: &str = "objects";
+const CACHE_OBJECT_DIR: &str = "objects-v7";
+const LEGACY_CACHE_OBJECT_DIRS: &[&str] = &["objects", "objects-v6"];
 
 #[derive(Clone)]
 /// Persistent, file-identity-keyed cache of developed JPEG renders.
@@ -97,15 +98,20 @@ fn schedule_legacy_cache_cleanup(cache_base: &Path) {
     if LEGACY_CACHE_CLEANUP_STARTED.set(()).is_err() {
         return;
     }
-    let legacy_root = cache_base.join(LEGACY_CACHE_OBJECT_DIR);
+    let legacy_roots: Vec<_> = LEGACY_CACHE_OBJECT_DIRS
+        .iter()
+        .map(|directory| cache_base.join(directory))
+        .collect();
     if let Err(error) = std::thread::Builder::new()
         .name("viewr-legacy-cache-cleanup".into())
         .spawn(move || {
-            if let Err(error) = remove_legacy_cache_root(&legacy_root) {
-                eprintln!(
-                    "failed to remove legacy cache {}: {error}",
-                    legacy_root.display()
-                );
+            for legacy_root in legacy_roots {
+                if let Err(error) = remove_legacy_cache_root(&legacy_root) {
+                    eprintln!(
+                        "failed to remove legacy cache {}: {error}",
+                        legacy_root.display()
+                    );
+                }
             }
         })
     {
@@ -137,12 +143,12 @@ fn hash_path_identity(hasher: &mut blake3::Hasher, path: &Path) {
 }
 
 impl DiskCache {
-    /// Opens the platform-default `viewr/objects-v6` cache directory.
+    /// Opens the platform-default `viewr/objects-v7` cache directory.
     ///
     /// Returns `None` when the platform has no cache directory or the cache
     /// root cannot be created. The budget is enforced only when
     /// [`gc_to_budget`](Self::gc_to_budget) is called. The first open in a
-    /// process also removes the obsolete pre-v6 object store in the
+    /// process also removes obsolete pre-v7 object stores in the
     /// background.
     pub fn open_default(budget_bytes: u64) -> Option<Self> {
         let cache_base = dirs::cache_dir()?.join("viewr");
@@ -394,19 +400,21 @@ mod tests {
     }
 
     #[test]
-    fn configurable_quality_cannot_reuse_pre_v6_cache_objects() {
+    fn codec_change_cannot_reuse_pre_v7_cache_objects() {
         let entry = entry(10, 1);
-        let mut version_5 = blake3::Hasher::new();
-        hash_path_identity(&mut version_5, &entry.path);
-        version_5.update(&entry.size.to_le_bytes());
-        version_5.update(&entry.mtime_ns.to_le_bytes());
-        version_5.update(&5_u32.to_le_bytes());
-        version_5.update(b"b");
+        let mut version_6 = blake3::Hasher::new();
+        hash_path_identity(&mut version_6, &entry.path);
+        version_6.update(&entry.size.to_le_bytes());
+        version_6.update(&entry.mtime_ns.to_le_bytes());
+        version_6.update(&6_u32.to_le_bytes());
+        version_6.update(b"b");
+        version_6.update(b"jpeg-quality");
+        version_6.update(&[DEFAULT_CACHE_JPEG_QUALITY]);
 
-        assert_eq!(DEVELOP_VERSION, 6);
+        assert_eq!(DEVELOP_VERSION, 7);
         assert_ne!(
             DiskCache::key(&entry, Tier::Browse),
-            version_5.finalize().to_hex().to_string()
+            version_6.finalize().to_hex().to_string()
         );
     }
 
@@ -432,13 +440,15 @@ mod tests {
     #[test]
     fn legacy_cache_cleanup_removes_only_a_real_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let legacy = dir.path().join(LEGACY_CACHE_OBJECT_DIR);
-        std::fs::create_dir_all(legacy.join("aa")).unwrap();
-        std::fs::write(legacy.join("aa").join("old.jpg"), b"old").unwrap();
+        for directory in LEGACY_CACHE_OBJECT_DIRS {
+            let legacy = dir.path().join(directory);
+            std::fs::create_dir_all(legacy.join("aa")).unwrap();
+            std::fs::write(legacy.join("aa").join("old.jpg"), b"old").unwrap();
 
-        remove_legacy_cache_root(&legacy).unwrap();
-        assert!(!legacy.exists());
-        remove_legacy_cache_root(&legacy).unwrap();
+            remove_legacy_cache_root(&legacy).unwrap();
+            assert!(!legacy.exists());
+            remove_legacy_cache_root(&legacy).unwrap();
+        }
     }
 
     #[cfg(unix)]
@@ -450,7 +460,7 @@ mod tests {
         let target = dir.path().join("target");
         std::fs::create_dir(&target).unwrap();
         std::fs::write(target.join("keep.jpg"), b"keep").unwrap();
-        let legacy = dir.path().join(LEGACY_CACHE_OBJECT_DIR);
+        let legacy = dir.path().join(LEGACY_CACHE_OBJECT_DIRS[0]);
         symlink(&target, &legacy).unwrap();
 
         remove_legacy_cache_root(&legacy).unwrap();

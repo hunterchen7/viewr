@@ -1393,12 +1393,16 @@ fn persistence_retry_backoff(retry: usize) {
 }
 
 fn persistence_worker(shared: &Shared) {
+    let quality = shared.jpeg_quality;
+    let mut encoder = CacheJpegEncoder::new(quality);
     while let Some(request) = shared.persistence.pop() {
         // This lane is intentionally single-threaded and yields before CPU
         // work so interactive develop workers retain scheduling priority.
         std::thread::yield_now();
-        let quality = shared.jpeg_quality;
-        let encoded = encode_jpeg(&request.pixels, quality);
+        let encoded = match &mut encoder {
+            Ok(encoder) => encoder.encode(&request.pixels),
+            Err(error) => Err(error.clone()),
+        };
         let mut persistence_error = None;
         let encode_error = encoded.as_ref().err().cloned();
         if let Ok(bytes) = &encoded
@@ -1768,26 +1772,92 @@ fn develop_cache_miss(
 
 /// Encodes a tightly packed RGBA8 buffer as a JPEG.
 ///
-/// `quality` is passed directly to `jpeg-encoder`. Chroma is always encoded at
-/// full 4:4:4 resolution and the output discards alpha.
+/// `quality` is passed directly to libjpeg-turbo. Chroma is always encoded at
+/// full 4:4:4 resolution and the output discards alpha. The app's persistence
+/// worker reuses [`CacheJpegEncoder`] so its native compressor allocation is
+/// not repeated for every cached image.
 ///
 /// # Errors
 ///
-/// Returns a string error if either dimension exceeds `u16`, the RGBA storage
-/// is inconsistent with the dimensions, or JPEG encoding fails.
+/// Returns a string error if quality is outside 1–100, either dimension is zero
+/// or exceeds the JPEG format limit, the RGBA storage is inconsistent with the
+/// dimensions, or JPEG encoding fails.
 pub fn encode_jpeg(buf: &PixelBuf, quality: u8) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
-    let mut encoder = jpeg_encoder::Encoder::new(&mut out, quality);
-    encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1);
-    encoder
-        .encode(
-            &buf.rgba,
-            u16::try_from(buf.width).map_err(|e| e.to_string())?,
-            u16::try_from(buf.height).map_err(|e| e.to_string())?,
-            jpeg_encoder::ColorType::Rgba,
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(out)
+    CacheJpegEncoder::new(quality)?.encode(buf)
+}
+
+/// Reusable 4:4:4 libjpeg-turbo encoder for the cache persistence lane.
+///
+/// The safe Rust wrapper owns the native compressor handle. Viewr contains no
+/// handwritten `unsafe` or raw pointer manipulation at the FFI boundary.
+pub struct CacheJpegEncoder {
+    compressor: turbojpeg::Compressor,
+    quality: u8,
+}
+
+impl CacheJpegEncoder {
+    /// Creates an encoder for one fixed JPEG quality.
+    pub fn new(quality: u8) -> Result<Self, String> {
+        if !(1..=100).contains(&quality) {
+            return Err(format!("JPEG quality {quality} is outside 1..=100"));
+        }
+        let mut compressor = turbojpeg::Compressor::new().map_err(|error| error.to_string())?;
+        compressor
+            .set_quality(i32::from(quality))
+            .map_err(|error| error.to_string())?;
+        compressor
+            .set_subsamp(turbojpeg::Subsamp::None)
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            compressor,
+            quality,
+        })
+    }
+
+    /// Encodes one tightly packed RGBA8 image, discarding alpha.
+    pub fn encode(&mut self, buf: &PixelBuf) -> Result<Vec<u8>, String> {
+        let (width, height, pitch) = validate_jpeg_input(buf, self.quality)?;
+        self.compressor
+            .compress_to_vec(turbojpeg::Image {
+                pixels: buf.rgba.as_slice(),
+                width,
+                pitch,
+                height,
+                format: turbojpeg::PixelFormat::RGBA,
+            })
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn validate_jpeg_input(buf: &PixelBuf, quality: u8) -> Result<(usize, usize, usize), String> {
+    if !(1..=100).contains(&quality) {
+        return Err(format!("JPEG quality {quality} is outside 1..=100"));
+    }
+    let width = usize::from(
+        u16::try_from(buf.width).map_err(|_| format!("JPEG width {} exceeds 65535", buf.width))?,
+    );
+    let height = usize::from(
+        u16::try_from(buf.height)
+            .map_err(|_| format!("JPEG height {} exceeds 65535", buf.height))?,
+    );
+    if width == 0 || height == 0 {
+        return Err("JPEG dimensions must be non-zero".into());
+    }
+    let pitch = width
+        .checked_mul(4)
+        .ok_or_else(|| "JPEG row byte count overflowed".to_string())?;
+    let expected_len = pitch
+        .checked_mul(height)
+        .ok_or_else(|| "JPEG buffer byte count overflowed".to_string())?;
+    if buf.rgba.len() != expected_len {
+        return Err(format!(
+            "RGBA storage has {} bytes; expected {expected_len} for {}x{}",
+            buf.rgba.len(),
+            buf.width,
+            buf.height
+        ));
+    }
+    Ok((width, height, pitch))
 }
 
 /// Decodes JPEG bytes into a tightly packed RGBA8 buffer.
@@ -3419,6 +3489,8 @@ mod tests {
         let source = patterned_buf(96, 64);
         let encoded = encode_jpeg(&source, 90).unwrap();
         assert!(!encoded.is_empty());
+        let header = turbojpeg::read_header(&encoded).unwrap();
+        assert_eq!(header.subsamp, turbojpeg::Subsamp::None);
         let decoded = decode_jpeg(&encoded).unwrap();
         assert_eq!(
             (decoded.width, decoded.height),
@@ -3493,6 +3565,15 @@ mod tests {
     #[test]
     fn jpeg_codec_rejects_invalid_inputs() {
         assert!(decode_jpeg(b"not a jpeg").is_err());
+        let valid = patterned_buf(8, 8);
+        assert!(encode_jpeg(&valid, 0).is_err());
+        assert!(encode_jpeg(&valid, 101).is_err());
+        let zero_width = PixelBuf {
+            width: 0,
+            height: 1,
+            rgba: Vec::new(),
+        };
+        assert!(encode_jpeg(&zero_width, 90).is_err());
         let malformed = PixelBuf {
             width: 2,
             height: 2,
@@ -3505,5 +3586,24 @@ mod tests {
             rgba: Vec::new(),
         };
         assert!(encode_jpeg(&too_wide, 90).is_err());
+    }
+
+    #[test]
+    fn reusable_jpeg_encoder_does_not_leak_state_between_images() {
+        let first = patterned_buf(96, 64);
+        let second = patterned_buf(127, 93);
+        let mut encoder = CacheJpegEncoder::new(97).unwrap();
+
+        let reused_first = encoder.encode(&first).unwrap();
+        let reused_second = encoder.encode(&second).unwrap();
+
+        assert_eq!(reused_first, encode_jpeg(&first, 97).unwrap());
+        assert_eq!(reused_second, encode_jpeg(&second, 97).unwrap());
+        assert_eq!(
+            decode_jpeg(&reused_second)
+                .map(|decoded| (decoded.width, decoded.height))
+                .unwrap(),
+            (second.width, second.height)
+        );
     }
 }

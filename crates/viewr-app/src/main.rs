@@ -196,15 +196,9 @@ fn spike(input: &Path, out_dir: &Path) -> Result<()> {
 }
 
 fn write_jpeg(path: &Path, buf: &viewr_core::types::PixelBuf, quality: u8) -> Result<()> {
-    let mut encoder = jpeg_encoder::Encoder::new_file(path, quality)?;
-    encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1);
-    encoder.encode(
-        &buf.rgba,
-        u16::try_from(buf.width).context("width exceeds JPEG limit")?,
-        u16::try_from(buf.height).context("height exceeds JPEG limit")?,
-        jpeg_encoder::ColorType::Rgba,
-    )?;
-    Ok(())
+    let encoded = viewr_core::jobs::encode_jpeg(buf, quality).map_err(anyhow::Error::msg)?;
+    std::fs::write(path, encoded)
+        .with_context(|| format!("failed to write diagnostic JPEG {}", path.display()))
 }
 
 #[cfg(test)]
