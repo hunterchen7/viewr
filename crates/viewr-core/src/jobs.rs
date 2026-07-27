@@ -118,6 +118,9 @@ pub struct NavState {
     /// other values to `1`.
     pub direction: i8,
     /// Whether the current view needs Full-tier renders.
+    ///
+    /// Full resolution is always preloaded for the current and adjacent
+    /// images; this flag raises the current Full render's priority.
     pub zoomed: bool,
 }
 
@@ -935,12 +938,7 @@ fn spawn_engine_threads(
     Ok(())
 }
 
-fn navigation_pins(
-    len: usize,
-    current: usize,
-    include_full: bool,
-    sequence: &[usize],
-) -> Vec<JobId> {
+fn navigation_pins(len: usize, current: usize, sequence: &[usize]) -> Vec<JobId> {
     if len == 0 {
         return Vec::new();
     }
@@ -964,12 +962,13 @@ fn navigation_pins(
         }
         indices
     };
-    let mut pins = Vec::with_capacity(indices.len() * (2 + usize::from(include_full)));
+    let mut pins = Vec::with_capacity(indices.len() * 3);
     for index in indices {
-        pins.extend([(index, Tier::Thumb), (index, Tier::Browse)]);
-        if include_full {
-            pins.push((index, Tier::Full));
-        }
+        pins.extend([
+            (index, Tier::Thumb),
+            (index, Tier::Browse),
+            (index, Tier::Full),
+        ]);
     }
     pins
 }
@@ -1054,10 +1053,10 @@ impl Engine {
     /// Recomputes and synchronizes the heavy plan for a navigation state.
     ///
     /// Call this after navigation or zoom changes and after image completion
-    /// events. Obsolete jobs are cooperatively cancelled. Fit mode omits and
-    /// unpins Full-tier work; zoom mode requests Full for the current and near
-    /// entries. The first call with a disk cache also installs the one-shot
-    /// folder-wide Browse warm lane.
+    /// events. Obsolete jobs are cooperatively cancelled. Current and immediate
+    /// visible neighbors are always requested and pinned at Full resolution;
+    /// zoom mode raises the current Full job's priority. The first call with a
+    /// disk cache also installs the one-shot folder-wide Browse warm lane.
     pub fn navigate(&self, nav: NavState) {
         let len = self.shared.entries.len();
         if len == 0 {
@@ -1076,7 +1075,7 @@ impl Engine {
             let mut navigation = self.shared.navigation.lock().unwrap();
             let navigation_changed = navigation.update_navigation(nav);
             (
-                navigation_pins(len, current, nav.zoomed, &navigation.indices),
+                navigation_pins(len, current, &navigation.indices),
                 build_plan_targets(
                     len,
                     current,
@@ -1088,8 +1087,8 @@ impl Engine {
                 navigation_changed,
             )
         };
-        // Full buffers are useful only while inspecting at zoom. Filtered
-        // navigation pins visible neighbors rather than unrelated raw indices.
+        // Filtered navigation pins visible neighbors rather than unrelated raw
+        // indices. Full buffers stay ready across fit/zoom transitions.
         cache.set_pins(pins);
         let mut plan: Vec<(JobId, u8, u32, Action)> = Vec::with_capacity(targets.len());
         for target in targets {
@@ -1233,7 +1232,10 @@ impl BenchmarkNavigationQueue {
                     (target.index, target.tier),
                     target.class,
                     target.effective_distance,
-                    Action::Develop(Quality::Browse),
+                    Action::Develop(match target.tier {
+                        Tier::Full => Quality::Full,
+                        Tier::Thumb | Tier::Browse => Quality::Browse,
+                    }),
                 )
             })
             .collect();
@@ -2290,13 +2292,10 @@ mod tests {
     }
 
     #[test]
-    fn fit_pins_skip_full_while_zoomed_pins_preserve_the_near_window() {
-        let fit = navigation_pins(5, 2, false, &[]);
-        assert_eq!(fit.len(), 6);
-        assert!(fit.iter().all(|(_, tier)| *tier != Tier::Full));
-
-        let zoomed = navigation_pins(5, 2, true, &[]);
-        let full: Vec<_> = zoomed
+    fn navigation_pins_preserve_full_for_current_and_near_window() {
+        let pins = navigation_pins(5, 2, &[]);
+        assert_eq!(pins.len(), 9);
+        let full: Vec<_> = pins
             .iter()
             .filter(|(_, tier)| *tier == Tier::Full)
             .copied()
@@ -2306,7 +2305,7 @@ mod tests {
 
     #[test]
     fn filtered_pins_follow_visible_neighbors() {
-        let pins = navigation_pins(10, 4, false, &[1, 4, 8]);
+        let pins = navigation_pins(10, 4, &[1, 4, 8]);
         let browse: Vec<_> = pins
             .iter()
             .filter(|(_, tier)| *tier == Tier::Browse)

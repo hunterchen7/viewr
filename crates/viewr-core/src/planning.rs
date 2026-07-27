@@ -4,9 +4,9 @@
 use crate::types::Tier;
 
 const BROWSE_WINDOW: u32 = 24;
-const FULL_WINDOW: u32 = 2;
+const FULL_NEIGHBOR_WINDOW: u32 = 1;
 const INTERACTIVE_TARGET_CAPACITY: usize =
-    2 + BROWSE_WINDOW as usize + (BROWSE_WINDOW / 3) as usize + FULL_WINDOW as usize;
+    2 + BROWSE_WINDOW as usize + (BROWSE_WINDOW / 3) as usize + FULL_NEIGHBOR_WINDOW as usize * 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Purpose of a planned render target.
@@ -55,9 +55,12 @@ pub struct PlanTarget {
 /// origin; out-of-range sequence entries are ignored. Callers should normally
 /// supply unique valid indices.
 ///
-/// When `zoomed` is false, no Full targets are emitted. Without warm targets,
-/// allocation is bounded by the interactive windows, although locating the
-/// current item in a filtered sequence is linear in the sequence length.
+/// Full targets always include the current item and its immediate visible
+/// neighbors so zoom can use native-resolution pixels without starting new
+/// work. `zoomed` raises the current Full target to the highest priority.
+/// Without warm targets, allocation is bounded by the interactive windows,
+/// although locating the current item in a filtered sequence is linear in the
+/// sequence length.
 pub fn build_plan_targets(
     len: usize,
     current: usize,
@@ -87,9 +90,7 @@ pub fn build_plan_targets(
         };
 
         display(current, Tier::Browse, 0, 0);
-        if zoomed {
-            display(current, Tier::Full, 0, 0);
-        }
+        display(current, Tier::Full, u8::from(!zoomed), 0);
 
         let current_position = if sequence.is_empty() {
             current
@@ -110,11 +111,9 @@ pub fn build_plan_targets(
             } else {
                 distance.saturating_mul(3)
             };
-            if effective_distance <= FULL_WINDOW {
+            if distance <= FULL_NEIGHBOR_WINDOW {
                 display(index, Tier::Browse, 2, effective_distance);
-                if zoomed {
-                    display(index, Tier::Full, 3, effective_distance);
-                }
+                display(index, Tier::Full, 3, effective_distance);
             } else if effective_distance <= BROWSE_WINDOW {
                 display(index, Tier::Browse, 4, effective_distance);
             }
@@ -200,9 +199,7 @@ mod tests {
                 });
             };
             display(current, Tier::Browse, 0, 0);
-            if zoomed {
-                display(current, Tier::Full, 0, 0);
-            }
+            display(current, Tier::Full, u8::from(!zoomed), 0);
 
             let current_position = if sequence.is_empty() {
                 current
@@ -227,11 +224,9 @@ mod tests {
                 } else {
                     distance.saturating_mul(3)
                 };
-                if effective_distance <= FULL_WINDOW {
+                if distance <= FULL_NEIGHBOR_WINDOW {
                     display(index, Tier::Browse, 2, effective_distance);
-                    if zoomed {
-                        display(index, Tier::Full, 3, effective_distance);
-                    }
+                    display(index, Tier::Full, 3, effective_distance);
                 } else if effective_distance <= BROWSE_WINDOW {
                     display(index, Tier::Browse, 4, effective_distance);
                 }
@@ -319,24 +314,24 @@ mod tests {
     }
 
     #[test]
-    fn fit_omits_full_while_zoomed_prioritizes_it_and_clamps_index() {
+    fn fit_preloads_full_while_zoom_prioritizes_it_and_clamps_index() {
         let fit = build_plan_targets(5, usize::MAX, 1, false, &[], false);
         assert_eq!(target(&fit, 4, Tier::Browse, PlanKind::Display).class, 0);
-        assert!(fit.iter().all(|target| target.tier != Tier::Full));
+        assert_eq!(target(&fit, 4, Tier::Full, PlanKind::Display).class, 1);
 
         let zoomed = build_plan_targets(5, 4, 1, true, &[], false);
         assert_eq!(target(&zoomed, 4, Tier::Full, PlanKind::Display).class, 0);
     }
 
     #[test]
-    fn fit_wave_has_no_full_work_but_zoomed_wave_preserves_prefetch() {
+    fn fit_and_zoomed_waves_preload_current_and_both_immediate_neighbors() {
         let fit = build_plan_targets(100, 50, 1, false, &[], true);
-        assert_eq!(
-            fit.iter()
-                .filter(|target| target.tier == Tier::Full)
-                .count(),
-            0
-        );
+        let fit_full: Vec<_> = fit
+            .iter()
+            .filter(|target| target.tier == Tier::Full)
+            .map(|target| (target.index, target.class, target.effective_distance))
+            .collect();
+        assert_eq!(fit_full, [(50, 1, 0), (49, 3, 3), (51, 3, 1)]);
 
         let zoomed = build_plan_targets(100, 50, 1, true, &[], true);
         let full: Vec<_> = zoomed
@@ -344,7 +339,7 @@ mod tests {
             .filter(|target| target.tier == Tier::Full)
             .map(|target| (target.index, target.class, target.effective_distance))
             .collect();
-        assert_eq!(full, [(50, 0, 0), (51, 3, 1), (52, 3, 2)]);
+        assert_eq!(full, [(50, 0, 0), (49, 3, 3), (51, 3, 1)]);
     }
 
     #[test]
@@ -355,17 +350,21 @@ mod tests {
             1
         );
         assert_eq!(
-            target(&forward, 6, Tier::Full, PlanKind::Display).effective_distance,
+            target(&forward, 6, Tier::Browse, PlanKind::Display).effective_distance,
             2
+        );
+        assert!(
+            forward
+                .iter()
+                .all(|target| !(target.index == 6 && target.tier == Tier::Full))
         );
         assert_eq!(
             target(&forward, 3, Tier::Browse, PlanKind::Display).effective_distance,
             3
         );
-        assert!(
-            forward
-                .iter()
-                .all(|target| !(target.index == 3 && target.tier == Tier::Full))
+        assert_eq!(
+            target(&forward, 3, Tier::Full, PlanKind::Display).effective_distance,
+            3
         );
 
         let backward = build_plan_targets(10, 4, -1, true, &[], false);
