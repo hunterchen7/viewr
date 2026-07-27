@@ -393,10 +393,12 @@ fn superpixel_demosaic(
     Color2D::new_with(output, out_width, out_height)
 }
 
-/// Fixed "camera-standard-ish" base tone curve: a mild S in display
-/// space (smoothstep blend) so renders match the punch of camera JPEGs
-/// instead of looking flat. No editing UI — it's a culler; the constant
-/// is versioned by `cache_disk::DEVELOP_VERSION`.
+/// Fixed "camera-standard-ish" rendering: a highlight-preserving exposure
+/// lift followed by a mild display-space S curve. RAW values otherwise look
+/// darker and flatter than the camera JPEG used for normal culling. There is
+/// no editing UI; these constants are versioned by
+/// `cache_disk::DEVELOP_VERSION`.
+const CULLING_EXPOSURE_GAIN: f32 = 1.3;
 const TONE_STRENGTH: f32 = 0.35;
 
 // Development ends in an 8-bit buffer, so evaluating three `powf` calls for
@@ -410,7 +412,7 @@ static GAMMA_TONE_LUT: OnceLock<Box<[u8; GAMMA_LUT_LEN]>> = OnceLock::new();
 
 #[inline]
 fn analytical_gamma_tone_pack(v: f32) -> u8 {
-    let gamma = srgb::srgb_apply_gamma(v);
+    let gamma = srgb::srgb_apply_gamma(exposure_rolloff(v));
     (base_curve(gamma.clamp(0.0, 1.0)) * 255.0 + 0.5) as u8
 }
 
@@ -431,6 +433,12 @@ fn gamma_tone_pack(v: f32, table: &[u8; GAMMA_LUT_LEN]) -> u8 {
 }
 
 #[inline]
+fn exposure_rolloff(v: f32) -> f32 {
+    let v = v.clamp(0.0, 1.0);
+    CULLING_EXPOSURE_GAIN * v / (1.0 + (CULLING_EXPOSURE_GAIN - 1.0) * v)
+}
+
+#[inline]
 fn base_curve(v: f32) -> f32 {
     let s = v * v * (3.0 - 2.0 * v); // smoothstep
     v + TONE_STRENGTH * (s - v)
@@ -439,7 +447,7 @@ fn base_curve(v: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DevelopTimings, analytical_gamma_tone_pack, base_curve, gamma_tone_pack,
+        DevelopTimings, analytical_gamma_tone_pack, base_curve, exposure_rolloff, gamma_tone_pack,
         sanitize_white_balance, total, usable_color_matrix,
     };
     use rawler::CFA;
@@ -492,6 +500,31 @@ mod tests {
             let v = base_curve(i as f32 / 100.0);
             assert!(v >= prev);
             prev = v;
+        }
+    }
+
+    #[test]
+    fn exposure_lift_brightens_midtones_and_preserves_highlights() {
+        assert_eq!(exposure_rolloff(0.0), 0.0);
+        assert_eq!(exposure_rolloff(1.0), 1.0);
+
+        let middle_gray = exposure_rolloff(0.18);
+        assert!(middle_gray > 0.18);
+        assert!(middle_gray < 0.18 * super::CULLING_EXPOSURE_GAIN);
+        let effective_ev = (middle_gray / 0.18).log2();
+        assert!(
+            (0.3..=0.4).contains(&effective_ev),
+            "unexpected middle-gray lift: {effective_ev} EV"
+        );
+
+        let highlight = exposure_rolloff(0.9);
+        assert!((0.9..1.0).contains(&highlight));
+
+        let mut previous = 0.0;
+        for step in 1..=10_000 {
+            let output = exposure_rolloff(step as f32 / 10_000.0);
+            assert!(output >= previous);
+            previous = output;
         }
     }
 

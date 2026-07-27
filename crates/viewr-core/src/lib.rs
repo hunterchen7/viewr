@@ -31,8 +31,13 @@
 //!         && target.tier == Tier::Browse
 //!         && target.kind == PlanKind::Display
 //! }));
-//! // Fit mode does not spend CPU or memory on full-resolution development.
-//! assert!(targets.iter().all(|target| target.tier != Tier::Full));
+//! // Fit mode preloads Full for the current image and its immediate neighbors.
+//! let full_indices: Vec<_> = targets
+//!     .iter()
+//!     .filter(|target| target.tier == Tier::Full)
+//!     .map(|target| target.index)
+//!     .collect();
+//! assert_eq!(full_indices, [50, 49, 51]);
 //! ```
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]

@@ -18,7 +18,7 @@ thiserror = "2"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 fast_image_resize = "6"
 anyhow = "1"
-eframe = "0.35"
+eframe = { version = "0.35", features = ["persistence"] }
 rfd = "0.15"
 objc2 = "0.6"
 raw-window-handle = "0.6"

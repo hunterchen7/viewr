@@ -17,23 +17,29 @@ preview.
 
 Residency uses hard accounting limits and soft targets:
 
-1. **GPU textures** — Browse for the current ±2 visible images, Full only for
-   the current zoomed image, plus viewport thumbnails in an LRU accounting for
-   at most 256 MiB of logical RGBA bytes (actual backend allocation can differ;
-   at most eight new thumbnails upload per frame).
+1. **GPU textures** — Browse textures cover the current ±2 visible images.
+   Viewr uploads a Full texture only for the current zoomed image. The viewport
+   thumbnail LRU holds at most 256 MiB of logical RGBA bytes. The backend
+   allocation can differ. Each frame uploads a maximum of eight new thumbnails.
 2. **Decoded RGBA in RAM** — exact LRU with a target byte budget for instant
-   display. Pinned current and nearby images can keep a ring above its target
-   until they are unpinned.
+   display. Viewr preloads and pins Full renders for the current image and its
+   immediate visible neighbors. Pinned images can keep a ring above its target
+   until Viewr removes the pins.
 3. **JPEG bytes in RAM** — memoized develops with a target byte budget, ~20×
    smaller and cheap to re-inflate. Pins have the same soft-budget behavior.
 4. **Disk** (`~/Library/Caches/viewr/`) — a target budget for developed JPEGs
    used on fast folder reopens; cache GC enforces the target rather than every
    write, and files are never written inside photo folders.
 
-Both develop tiers use real RAW data: half-res superpixel for browsing and
-full-res PPG demosaic for 100% zoom. Fit mode does not schedule, pin, or upload
-Full renders. The main view can show its demanded embedded thumbnail while a
-RAW-derived Browse render is still in flight.
+Both develop tiers use real RAW data. Browse uses a half-resolution superpixel
+demosaic. Full uses a full-resolution PPG demosaic. Fit mode schedules and pins
+Full renders for the current image and its immediate visible neighbors. Viewr
+does not upload the Full texture until zoom needs it. The main view can show an
+embedded thumbnail while the Browse render is not ready.
+
+The display pipeline applies the camera white balance and color matrix. It then
+applies a small exposure lift, highlight roll-off, sRGB transfer, and tone
+curve. This pipeline gives a useful culling image without changing the RAW file.
 
 ## Usage
 
@@ -55,12 +61,18 @@ viewr dev <file.arw> [out]     decode one file, print per-stage timings
 | I | metadata panel |
 | F | fullscreen |
 | Cmd+O | open folder |
+| Cmd+, | preferences |
 | ★ buttons in top bar | filter ≥N stars / unrated |
 
 Zoom framing persists across images — cull a burst at 100% comparing
-the same detail. All binds and the scroll behavior are configurable in
-`~/Library/Application Support/viewr/viewr.toml` (a documented template
-is written on first run).
+the same detail. Viewr also restores the last window size and position.
+
+The Preferences window controls the loading message, performance details,
+exposure details, and cache indicator. The cache indicator has border, mark,
+and hidden modes. All binds and the scroll behavior are also configurable.
+Viewr stores these settings in
+`~/Library/Application Support/viewr/viewr.toml` on macOS. Viewr writes a
+documented template on the first run.
 
 ## Install
 
