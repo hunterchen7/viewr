@@ -46,7 +46,11 @@ mkdir -p "$source_root/.cargo"
 git -C "$repo_root" archive HEAD | tar -xf - -C "$source_root"
 (
   cd "$source_root"
-  cargo vendor --locked --versioned-dirs vendor >.cargo/config.toml
+  cargo vendor \
+    --locked \
+    --versioned-dirs \
+    --sync tools/jpeg-bakeoff/Cargo.toml \
+    vendor >.cargo/config.toml
 )
 
 if touch -h -d "@$source_date_epoch" "$source_root" 2>/dev/null; then

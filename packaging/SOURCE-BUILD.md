@@ -33,3 +33,23 @@ without network access.
 The project README lists the required Linux packages, including
 `build-essential` and `pkg-config`. The macOS build requires Xcode
 command-line tools. The Windows build requires the MSVC build tools.
+
+## Reproduce the JPEG bake-off
+
+The archive also vendors the independent JPEG benchmark workspace. CMake is
+required for its original-C candidate. NASM is also required on x86 hosts.
+Source-only benchmark dependencies keep their license files beside their
+vendored source. The generated third-party inventory describes the shipped
+Viewr binary dependency graph, not these experimental candidates.
+
+```sh
+cargo test \
+  --manifest-path tools/jpeg-bakeoff/Cargo.toml \
+  --locked \
+  --offline
+cargo bench \
+  --manifest-path tools/jpeg-bakeoff/Cargo.toml \
+  --locked \
+  --offline \
+  --bench encode -- --noplot
+```
