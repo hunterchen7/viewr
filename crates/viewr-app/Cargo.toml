@@ -17,7 +17,6 @@ path = "src/main.rs"
 viewr-core.workspace = true
 anyhow.workspace = true
 eframe.workspace = true
-jpeg-encoder.workspace = true
 rfd.workspace = true
 serde.workspace = true
 toml.workspace = true

@@ -30,9 +30,6 @@ ignore-transitive-dependencies = false
 [epaint_default_fonts]
 accepted = ["OFL-1.1", "Ubuntu-font-1.0"]
 
-[jpeg-encoder]
-accepted = ["IJG"]
-
 [option-ext]
 accepted = ["MPL-2.0"]
 

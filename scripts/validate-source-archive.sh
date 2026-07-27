@@ -37,7 +37,13 @@ required=(
   "$top_level/Cargo.toml"
   "$top_level/packaging/SOURCE-BUILD.md"
   "$top_level/scripts/prepare-local-rawler.sh"
+  "$top_level/tools/jpeg-bakeoff/Cargo.lock"
+  "$top_level/tools/jpeg-bakeoff/Cargo.toml"
+  "$top_level/vendor/jpeg-encoder-0.6.1/LICENSE-APACHE"
+  "$top_level/vendor/jpeg-encoder-0.6.1/LICENSE-MIT"
   "$top_level/vendor/rawler-0.7.2/LICENSE"
+  "$top_level/vendor/turbojpeg-sys-1.2.0/libjpeg-turbo/LICENSE.md"
+  "$top_level/vendor/turbojpeg-sys-1.2.0/libjpeg-turbo/README.ijg"
 )
 archive_listing="$(tar -tzf "$archive")"
 duplicate_paths="$(
@@ -112,6 +118,15 @@ fi
 (
   cd "$source_root"
   cargo metadata --locked --offline --format-version 1 >/dev/null
+  cargo metadata \
+    --manifest-path tools/jpeg-bakeoff/Cargo.toml \
+    --locked \
+    --offline \
+    --format-version 1 >/dev/null
+  cargo test \
+    --manifest-path tools/jpeg-bakeoff/Cargo.toml \
+    --locked \
+    --offline
   scripts/prepare-local-rawler.sh
   if [[ -e local/rawler-0.7.2/.cargo-checksum.json ]]; then
     echo "editable rawler copy retained its vendor checksum file" >&2

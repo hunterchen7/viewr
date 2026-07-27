@@ -18,7 +18,7 @@
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, TryLockError};
 use std::time::Duration;
 
 use crate::cache_disk::{DEFAULT_CACHE_JPEG_QUALITY, DiskCache};
@@ -47,6 +47,7 @@ pub const CACHE_JPEG_QUALITY: u8 = DEFAULT_CACHE_JPEG_QUALITY;
 pub const MIN_CACHE_JPEG_QUALITY: u8 = 80;
 /// Highest cache JPEG quality exposed by the application preference.
 pub const MAX_CACHE_JPEG_QUALITY: u8 = 100;
+const MAX_JPEG_WORKERS: usize = 10;
 const PERSIST_WRITE_ATTEMPTS: usize = 3;
 const PERSIST_RETRY_BASE_DELAY: Duration = Duration::from_millis(2);
 
@@ -1393,11 +1394,11 @@ fn persistence_retry_backoff(retry: usize) {
 }
 
 fn persistence_worker(shared: &Shared) {
+    let quality = shared.jpeg_quality;
     while let Some(request) = shared.persistence.pop() {
         // This lane is intentionally single-threaded and yields before CPU
         // work so interactive develop workers retain scheduling priority.
         std::thread::yield_now();
-        let quality = shared.jpeg_quality;
         let encoded = encode_jpeg(&request.pixels, quality);
         let mut persistence_error = None;
         let encode_error = encoded.as_ref().err().cloned();
@@ -1768,26 +1769,82 @@ fn develop_cache_miss(
 
 /// Encodes a tightly packed RGBA8 buffer as a JPEG.
 ///
-/// `quality` is passed directly to `jpeg-encoder`. Chroma is always encoded at
-/// full 4:4:4 resolution and the output discards alpha.
+/// `quality` is passed directly to jpeg-rusturbo. Chroma is always encoded at
+/// full 4:4:4 resolution and the output discards alpha. Encoding uses a
+/// dedicated bounded Rayon pool so cache persistence cannot occupy the
+/// foreground RAW-development pool.
 ///
 /// # Errors
 ///
-/// Returns a string error if either dimension exceeds `u16`, the RGBA storage
-/// is inconsistent with the dimensions, or JPEG encoding fails.
+/// Returns a string error if quality is outside 1–100, either dimension is zero
+/// or exceeds the JPEG format limit, the RGBA storage is inconsistent with the
+/// dimensions, or JPEG encoding fails.
 pub fn encode_jpeg(buf: &PixelBuf, quality: u8) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
-    let mut encoder = jpeg_encoder::Encoder::new(&mut out, quality);
-    encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1);
+    validate_jpeg_input(buf, quality)?;
+    jpeg_pool()?.install(|| encode_jpeg_on_current_pool(buf, quality))
+}
+
+fn jpeg_pool() -> Result<&'static rayon::ThreadPool, String> {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    if let Some(pool) = POOL.get() {
+        return Ok(pool);
+    }
+    let available = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    let workers = available.clamp(1, MAX_JPEG_WORKERS);
+    let candidate = rayon::ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .thread_name(|index| format!("viewr-jpeg-{index}"))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let _ = POOL.set(candidate);
+    Ok(POOL
+        .get()
+        .expect("the JPEG pool was installed by this or a racing caller"))
+}
+
+fn encode_jpeg_on_current_pool(buf: &PixelBuf, quality: u8) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    let mut encoder = jpeg_rusturbo::JpegEncoder::new_with_quality(&mut output, quality);
+    encoder.set_subsampling(jpeg_rusturbo::ChromaSubsampling::Yuv444);
+    encoder.set_threads(0);
     encoder
-        .encode(
-            &buf.rgba,
-            u16::try_from(buf.width).map_err(|e| e.to_string())?,
-            u16::try_from(buf.height).map_err(|e| e.to_string())?,
-            jpeg_encoder::ColorType::Rgba,
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(out)
+        .encode_rgba(&buf.rgba, buf.width, buf.height)
+        .map_err(|error| error.to_string())?;
+    drop(encoder);
+    Ok(output)
+}
+
+fn validate_jpeg_input(buf: &PixelBuf, quality: u8) -> Result<(usize, usize, usize), String> {
+    if !(1..=100).contains(&quality) {
+        return Err(format!("JPEG quality {quality} is outside 1..=100"));
+    }
+    let width = usize::from(
+        u16::try_from(buf.width).map_err(|_| format!("JPEG width {} exceeds 65535", buf.width))?,
+    );
+    let height = usize::from(
+        u16::try_from(buf.height)
+            .map_err(|_| format!("JPEG height {} exceeds 65535", buf.height))?,
+    );
+    if width == 0 || height == 0 {
+        return Err("JPEG dimensions must be non-zero".into());
+    }
+    let pitch = width
+        .checked_mul(4)
+        .ok_or_else(|| "JPEG row byte count overflowed".to_string())?;
+    let expected_len = pitch
+        .checked_mul(height)
+        .ok_or_else(|| "JPEG buffer byte count overflowed".to_string())?;
+    if buf.rgba.len() != expected_len {
+        return Err(format!(
+            "RGBA storage has {} bytes; expected {expected_len} for {}x{}",
+            buf.rgba.len(),
+            buf.width,
+            buf.height
+        ));
+    }
+    Ok((width, height, pitch))
 }
 
 /// Decodes JPEG bytes into a tightly packed RGBA8 buffer.
@@ -2170,6 +2227,64 @@ mod tests {
             height,
             rgba,
         }
+    }
+
+    fn jpeg_has_444_sampling(bytes: &[u8]) -> bool {
+        let Some([0xff, 0xd8]) = bytes.get(..2) else {
+            return false;
+        };
+        let mut offset = 2;
+        while offset + 4 <= bytes.len() {
+            if bytes[offset] != 0xff {
+                return false;
+            }
+            while offset < bytes.len() && bytes[offset] == 0xff {
+                offset += 1;
+            }
+            let Some(&marker) = bytes.get(offset) else {
+                return false;
+            };
+            offset += 1;
+            if marker == 0xd9 || marker == 0xda {
+                return false;
+            }
+            if marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+                continue;
+            }
+            let Some(length_bytes) = bytes.get(offset..offset + 2) else {
+                return false;
+            };
+            let length = usize::from(u16::from_be_bytes([length_bytes[0], length_bytes[1]]));
+            if length < 2 || offset + length > bytes.len() {
+                return false;
+            }
+            if matches!(
+                marker,
+                0xc0 | 0xc1
+                    | 0xc2
+                    | 0xc3
+                    | 0xc5
+                    | 0xc6
+                    | 0xc7
+                    | 0xc9
+                    | 0xca
+                    | 0xcb
+                    | 0xcd
+                    | 0xce
+                    | 0xcf
+            ) {
+                let segment = &bytes[offset + 2..offset + length];
+                if segment.len() < 9 {
+                    return false;
+                }
+                let components = usize::from(segment[5]);
+                return components == 3
+                    && segment.len() >= 6 + components * 3
+                    && (0..components).all(|component| segment[7 + component * 3] == 0x11);
+            }
+            offset += length;
+        }
+        false
     }
 
     fn job(id: JobId, class: u8, dist: u32) -> (JobId, u8, u32, Action) {
@@ -3419,6 +3534,7 @@ mod tests {
         let source = patterned_buf(96, 64);
         let encoded = encode_jpeg(&source, 90).unwrap();
         assert!(!encoded.is_empty());
+        assert!(jpeg_has_444_sampling(&encoded));
         let decoded = decode_jpeg(&encoded).unwrap();
         assert_eq!(
             (decoded.width, decoded.height),
@@ -3493,6 +3609,15 @@ mod tests {
     #[test]
     fn jpeg_codec_rejects_invalid_inputs() {
         assert!(decode_jpeg(b"not a jpeg").is_err());
+        let valid = patterned_buf(8, 8);
+        assert!(encode_jpeg(&valid, 0).is_err());
+        assert!(encode_jpeg(&valid, 101).is_err());
+        let zero_width = PixelBuf {
+            width: 0,
+            height: 1,
+            rgba: Vec::new(),
+        };
+        assert!(encode_jpeg(&zero_width, 90).is_err());
         let malformed = PixelBuf {
             width: 2,
             height: 2,
@@ -3505,5 +3630,68 @@ mod tests {
             rgba: Vec::new(),
         };
         assert!(encode_jpeg(&too_wide, 90).is_err());
+    }
+
+    #[test]
+    fn jpeg_input_validation_is_independent_of_the_encoding_pool() {
+        let valid = patterned_buf(8, 6);
+        assert_eq!(validate_jpeg_input(&valid, 97), Ok((8, 6, 32)));
+
+        let malformed = PixelBuf {
+            width: 8,
+            height: 6,
+            rgba: vec![0; 8 * 6 * 4 - 1],
+        };
+        assert!(validate_jpeg_input(&malformed, 97).is_err());
+        assert!(validate_jpeg_input(&valid, 0).is_err());
+        assert!(validate_jpeg_input(&valid, 101).is_err());
+    }
+
+    #[test]
+    fn jpeg_pool_is_bounded_and_separate_from_the_global_pool() {
+        let pool = jpeg_pool().unwrap();
+        assert!(pool.current_num_threads() <= MAX_JPEG_WORKERS);
+        assert!(pool.current_num_threads() >= 1);
+        let thread_name = pool
+            .install(|| std::thread::current().name().map(str::to_owned))
+            .expect("the dedicated JPEG worker has a name");
+        assert!(thread_name.starts_with("viewr-jpeg-"));
+    }
+
+    #[test]
+    fn jpeg_encoder_does_not_leak_state_between_images() {
+        let first = patterned_buf(96, 64);
+        let second = patterned_buf(127, 93);
+
+        let encoded_first = encode_jpeg(&first, 97).unwrap();
+        let encoded_second = encode_jpeg(&second, 97).unwrap();
+
+        assert_eq!(encoded_first, encode_jpeg(&first, 97).unwrap());
+        assert_eq!(encoded_second, encode_jpeg(&second, 97).unwrap());
+        assert_eq!(
+            decode_jpeg(&encoded_second)
+                .map(|decoded| (decoded.width, decoded.height))
+                .unwrap(),
+            (second.width, second.height)
+        );
+    }
+
+    #[test]
+    fn jpeg_encoder_recovers_after_a_bad_request_and_quality_change() {
+        let valid = patterned_buf(96, 64);
+        let malformed = PixelBuf {
+            width: 96,
+            height: 64,
+            rgba: vec![0; 17],
+        };
+        let first = encode_jpeg(&valid, 97).unwrap();
+        assert!(encode_jpeg(&malformed, 97).is_err());
+        let recovered = encode_jpeg(&valid, 97).unwrap();
+
+        assert_eq!(first, recovered);
+
+        let changed_quality = encode_jpeg(&valid, 90).unwrap();
+        assert_eq!(changed_quality, encode_jpeg(&valid, 90).unwrap());
+        assert_ne!(changed_quality, first);
     }
 }

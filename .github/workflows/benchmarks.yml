@@ -12,13 +12,20 @@ concurrency:
 jobs:
   synthetic:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Linux build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
+          sudo apt-get install -y \
+            cmake \
+            libgtk-3-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            nasm
       - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -38,9 +45,13 @@ jobs:
           bench_cores="$(nproc)"
           bench_memory="$(awk '/MemTotal/ {print $2 * 1024; exit}' /proc/meminfo)"
           bench_lock_hash="$(sha256sum Cargo.lock | awk '{print $1}')"
+          jpeg_bakeoff_lock_hash="$(
+            sha256sum tools/jpeg-bakeoff/Cargo.lock | awk '{print $1}'
+          )"
           jq -n \
             --arg commit "$bench_commit" \
             --arg cargo_lock_sha256 "$bench_lock_hash" \
+            --arg jpeg_bakeoff_lock_sha256 "$jpeg_bakeoff_lock_hash" \
             --arg rustc "$bench_rust" \
             --arg os "$bench_os" \
             --arg cpu "$bench_cpu" \
@@ -51,6 +62,7 @@ jobs:
               schema_version: 1,
               commit: $commit,
               cargo_lock_sha256: $cargo_lock_sha256,
+              jpeg_bakeoff_lock_sha256: $jpeg_bakeoff_lock_sha256,
               rustc: $rustc,
               os: $os,
               cpu: $cpu,
@@ -66,6 +78,8 @@ jobs:
         run: cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- --noplot
       - name: Run filmstrip scaling benchmarks
         run: cargo bench -p viewr --features benchmarks --bench filmstrip_scaling --locked -- --noplot
+      - name: Run JPEG codec bake-off
+        run: cargo bench --manifest-path tools/jpeg-bakeoff/Cargo.toml --locked --bench encode -- --noplot
       - name: Upload Criterion results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -73,6 +87,7 @@ jobs:
           name: criterion-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             target/criterion
+            tools/jpeg-bakeoff/target/criterion
             target/benchmark-metadata.json
           if-no-files-found: warn
           retention-days: 90

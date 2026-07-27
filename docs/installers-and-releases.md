@@ -229,9 +229,12 @@ scripts/validate-source-archive.sh dist/viewr-*-source.tar.gz
 The source archive contains the repository files and versioned, vendored Rust
 dependencies. CI requires two source-package builds to be byte-identical. The
 validator rejects duplicate, noncanonical, linked, and special members. It
-checks offline Cargo metadata, the exact rawler license, and an offline release
-link after it prepares and edits a local rawler replacement. See
-`packaging/SOURCE-BUILD.md` inside the archive.
+checks offline Cargo metadata for both the app and JPEG benchmark workspaces,
+the source-only codec license files, the benchmark tests, the exact rawler
+license, and an offline release link after it prepares and edits a local rawler
+replacement. The generated third-party inventory covers the shipped app
+dependency graph; experimental benchmark crates retain licenses alongside
+their vendored source. See `packaging/SOURCE-BUILD.md` inside the archive.
 
 ## License inventories
 

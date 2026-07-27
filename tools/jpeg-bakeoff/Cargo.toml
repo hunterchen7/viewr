@@ -1,0 +1,32 @@
+[package]
+name = "viewr-jpeg-bakeoff"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+
+# Keep experimental codecs out of Viewr's release dependency graph.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+jpeg-encoder = { version = "0.6", features = ["simd"] }
+jpeg-rusturbo = "0.9.2"
+libjpeg-turbo-rs = "0.7.0"
+rayon = "1"
+turbojpeg = { version = "1.5.1", default-features = false, features = ["cmake", "require-simd"] }
+viewr-core = { path = "../../crates/viewr-core" }
+zune-jpeg = "0.5"
+
+[dev-dependencies]
+criterion = "0.8"
+
+[[bench]]
+name = "encode"
+harness = false
+
+[profile.release]
+lto = "thin"
+
+[profile.bench]
+lto = "thin"
