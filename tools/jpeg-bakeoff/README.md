@@ -3,6 +3,7 @@
 This nested workspace compares Viewr's current encoder with three replacement
 families without adding the losing candidates to the release dependency graph.
 Every case supplies RGBA pixels directly and requires baseline 4:4:4 output.
+The original C candidate requires CMake; x86 hosts also require NASM for SIMD.
 
 Run the correctness tests, quality/size probe, and Criterion benchmark:
 

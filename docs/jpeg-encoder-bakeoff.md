@@ -2,20 +2,21 @@
 
 ## Decision
 
-Viewr now uses original C `libjpeg-turbo` through the safe `turbojpeg` Rust
-API. The C source is bundled, built with SIMD required, and statically linked.
-It does not depend on Homebrew, a Linux package, or a Windows DLL at runtime.
+Viewr now uses pure-Rust `jpeg-rusturbo` in automatic mode, which uses the
+ambient Rayon pool sized for the current computer. The app has no new native
+library, FFI, or runtime dependency.
 
-On the target Apple M5, production-shape q97 encoding is about 65% faster than
+On the target Apple M5, production-shape q97 encoding is about 70% faster than
 the former `jpeg-encoder` path. A real Sony RAW comparison reduced combined
-Browse and Full JPEG time by 62.2% while producing byte-for-byte identical
+Browse and Full JPEG time by 61.4% while producing byte-for-byte identical
 decoded RGB pixels.
 
 `jpeg-rusturbo` automatic mode won the isolated thin-LTO microbenchmark by
-6–9%. It did not win the complete selection: the C path was slightly faster on
-the real RAW, used less than half the peak memory, used about 37% less total
-CPU, and tied automatic Rust under two-workload contention. This matters
-because persistence overlaps RAW development and adjacent-image preload work.
+6–9%. Original C was effectively tied on the real RAW and used less than half
+the peak memory and about 37% less total CPU. The selection follows the stated
+goal of maximum isolated encode speed on this machine; C remains the measured
+resource-efficiency alternative if memory or shared-CPU pressure becomes the
+priority.
 
 No UI behavior or setting changed. The existing q80–q100 preference, q97
 default, 4:4:4 chroma, opaque decode, and content-dependent file sizing remain
@@ -34,10 +35,9 @@ the same.
 | `libjpeg-turbo-rs` | Pure-Rust reimplementation | 0.7.0 | SIMD, accurate integer DCT |
 | `libjpeg-turbo-c` | Original C through `turbojpeg` 1.5.1 | 3.1.0 | NEON, accurate integer DCT |
 
-The C source version is the copy bundled by `turbojpeg-sys` 1.2.0. The locally
-installed C 3.1.4.1 library was measured separately and did not outperform the
-bundled build. The bundled source was selected for deterministic releases and
-cross-platform installer builds.
+The C source version is the copy bundled by `turbojpeg-sys` 1.2.0 in the
+experimental workspace. The locally installed C 3.1.4.1 library was measured
+separately and did not outperform that bundled build.
 
 Upstream references:
 
@@ -139,29 +139,28 @@ estimate to 128.77–189.17 ms. Five isolated ten-image processes instead gave
 stable C wall times of 1.25–1.29 seconds. Viewr reuses the C compressor on its
 single-threaded persistence lane.
 
-The post-integration production benchmark, which includes a fresh handle in
-the public stateless helper, measured:
+The post-integration production benchmark measured:
 
 | Work | Before | After | Change |
 |---|---:|---:|---:|
-| Browse 8 MP encode | 95.41 ms | 32.39 ms | −66.1% |
-| Full 33 MP encode | 379.20 ms | 134.25 ms | −64.6% |
-| Browse decode | 46.63 ms | 43.24 ms | −7.3% |
-| Full decode | 185.62 ms | 174.33 ms | −6.1% |
+| Browse 8 MP encode | 95.41 ms | 27.73 ms | −70.9% |
+| Full 33 MP encode | 379.20 ms | 112.99 ms | −70.2% |
+| Browse decode | 46.63 ms | 46.52 ms | effectively unchanged |
+| Full decode | 185.62 ms | 183.75 ms | effectively unchanged |
 
-The decode improvement is a secondary observation: the decoder did not change,
-and different JPEG marker layout can affect its setup cost.
+The decoder did not change. Decode differences are measurement noise and are
+not credited to the encoder change.
 
 Five alternating runs of the real Sony RAW diagnostic command gave these
 combined Browse + Full encode times:
 
 - former path: 308.0 ms median (297.1–320.8 ms);
-- selected path: 116.5 ms median (112.0–152.9 ms);
-- median reduction: 62.2%.
+- selected path: 118.8 ms median (108.2–123.7 ms);
+- median reduction: 61.4%.
 
-For the final omitted-mode check, the automatic Rust integration measured
-118.8 ms median (108.2–123.7 ms). The C and automatic-Rust real-photo results
-are effectively tied; C is 2.3 ms ahead at the median.
+The C integration measured 116.5 ms median (112.0–152.9 ms). The C and
+automatic-Rust real-photo results are effectively tied; C is 2.3 ms ahead at
+the median while automatic Rust wins both fixed production sizes.
 
 The fixture is the public Sony DSC-RX100 `DSC00838.ARW`, 21,155,328 bytes,
 downloaded from `https://raw.pixls.us/data/Sony/DSC-RX100/DSC00838.ARW`.
@@ -192,12 +191,12 @@ Ten Full q97 encodes compared the two wall-time finalists:
 
 Two simultaneous ten-image processes completed in 1.30 seconds median for
 automatic Rust and 1.29 seconds for reused C. Their combined total CPU was
-about 3.91 and 2.53 seconds respectively. C therefore gives up isolated
-microbenchmark latency without giving up contended wall time.
+about 3.91 and 2.53 seconds respectively. This is a process-level saturation
+probe, not a model of Viewr's same-process Rayon scheduling, and it was not
+used to claim production contention behavior.
 
-The arm64 macOS release binary changed from 26,804,864 to 26,784,256 bytes
-(20,608 bytes smaller). `otool -L` reports no JPEG dynamic library, confirming
-that the selected C library is statically linked.
+The arm64 macOS release binary changed from 26,804,864 to 26,700,400 bytes
+(104,464 bytes smaller). `otool -L` reports no JPEG dynamic library.
 
 The installed system `libjpeg-turbo` 3.1.4.1 completed the same stress workload
 in 1.35 s wall, 1.20 s user CPU, and 208,486,400 bytes peak RSS. This single
@@ -206,9 +205,10 @@ dependency.
 
 ## Architecture and safety
 
-The app contains no handwritten `unsafe` and does not call raw C symbols.
-`CacheJpegEncoder` owns the safe wrapper handle and stays on the one
-persistence thread. It is not exposed as public API.
+The app contains no handwritten `unsafe` and the selected encoder is pure
+Rust. Each encode configures 4:4:4 and automatic parallelism locally; the
+persistence lane remains single-request-at-a-time while its DCT stage can use
+the ambient Rayon pool.
 
 Before the wrapper sees an image pointer, Viewr checks:
 
@@ -217,34 +217,26 @@ Before the wrapper sees an image pointer, Viewr checks:
 - row-stride and total-size arithmetic cannot overflow;
 - RGBA storage length exactly matches width × height × 4.
 
-The persistence worker lazily creates and reuses one compressor. Any native
-encode error drops the handle, so one failed request cannot poison every later
-cache write. Tests cover cross-decode, explicit 4:4:4, invalid input, quality
-bounds, repeated handle use, state isolation between dimensions, and recovery
-after a bad request.
+Tests cover cross-decode, explicit 4:4:4, invalid input, quality bounds, state
+isolation between dimensions, and recovery after a bad request.
 
 Safety validation:
 
-- The vendored C source was compiled with Apple Clang 17 AddressSanitizer.
+- The losing C candidate was compiled with Apple Clang 17 AddressSanitizer.
   Invalid-input, round-trip, and reused-handle tests completed without a
-  sanitizer finding.
-- Miri passed the pure-Rust pre-FFI validation test.
-- Miri cannot execute external C and therefore is not evidence about
-  `libjpeg-turbo` internals.
-- The Rust wrapper's native boundary was reviewed. Viewr's validation is
-  intentionally stricter than its assertion-based image-layout preconditions.
+  sanitizer finding during evaluation.
+- Miri passed the pure-Rust input-validation test.
+- Viewr's validation is intentionally stricter than the selected encoder's
+  image-layout preconditions.
 
 Build and release behavior:
 
-- `pkg-config` is disabled for the production dependency;
-- bundled source and SIMD are required;
-- native macOS objects inherit the app's pinned 11.0 deployment target;
-- Linux CI declares CMake and NASM explicitly;
-- macOS, Windows, and Linux release jobs build the same locked dependency;
-- the generated third-party license inventory includes `turbojpeg`,
-  `turbojpeg-sys`, CMake, and their transitive crates;
-- the shipped third-party notice separately includes the attribution and
-  Modified BSD text required by the bundled C project.
+- macOS, Windows, and Linux release jobs build the same locked pure-Rust
+  dependency;
+- the app's release graph contains no `turbojpeg` or `turbojpeg-sys`;
+- the nested experimental workspace disables `pkg-config` and requires the
+  bundled C SIMD build so its C comparison stays reproducible;
+- Linux benchmark CI declares CMake and NASM for that experimental candidate.
 
 The codec switch advances the disk object store to `objects-v7`. Existing
 `objects-v6` bytes cannot hide the new performance, and obsolete stores are
@@ -270,6 +262,18 @@ Resource comparison:
   stress libjpeg-turbo-c-reused 10 97
 ```
 
+The resource numbers used five fresh processes per finalist:
+
+```sh
+for codec in jpeg-rusturbo-auto libjpeg-turbo-c-reused; do
+  for run in 1 2 3 4 5; do
+    /usr/bin/time -lp \
+      tools/jpeg-bakeoff/target/release/viewr-jpeg-bakeoff \
+      stress "$codec" 10 97
+  done
+done
+```
+
 ## Limits and next trigger
 
 Synthetic data cannot represent every camera, noise profile, or cache-quality
@@ -281,8 +285,8 @@ Re-run the bake-off when one of these changes:
 - the target computer architecture;
 - the default cache quality or chroma policy;
 - a candidate's SIMD implementation;
-- `turbojpeg-sys` bundles a newer original C source;
+- `jpeg-rusturbo` changes its automatic scheduling or SIMD implementation;
 - the persistence lane becomes concurrent.
 
-`jpeg-rusturbo` automatic mode is the measured pure-Rust fallback if native
-build or safety costs later become unacceptable.
+Bundled original C is the measured low-CPU, low-memory fallback if automatic
+parallelism becomes harmful to the rest of the viewer.

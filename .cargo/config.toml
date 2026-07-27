@@ -1,5 +1,0 @@
-[env]
-# Rust's arm64 Apple target defaults to macOS 11, but native CMake
-# dependencies do not inherit that target automatically. Keep every native
-# object compatible with the minimum version declared by the app and installer.
-MACOSX_DEPLOYMENT_TARGET = { value = "11.0", force = true }

@@ -38,8 +38,6 @@ required=(
   "$top_level/packaging/SOURCE-BUILD.md"
   "$top_level/scripts/prepare-local-rawler.sh"
   "$top_level/vendor/rawler-0.7.2/LICENSE"
-  "$top_level/vendor/turbojpeg-sys-1.2.0/libjpeg-turbo/LICENSE.md"
-  "$top_level/vendor/turbojpeg-sys-1.2.0/libjpeg-turbo/README.ijg"
 )
 archive_listing="$(tar -tzf "$archive")"
 duplicate_paths="$(
@@ -102,13 +100,6 @@ source_root="$work_dir/$top_level"
 
 if grep -Fq "$work_dir" "$source_root/.cargo/config.toml"; then
   echo "vendored Cargo configuration contains an absolute staging path" >&2
-  exit 1
-fi
-if ! grep -Fqx '[env]' "$source_root/.cargo/config.toml" ||
-  ! grep -Fqx \
-    'MACOSX_DEPLOYMENT_TARGET = { value = "11.0", force = true }' \
-    "$source_root/.cargo/config.toml"; then
-  echo "vendored Cargo configuration lost the macOS deployment target" >&2
   exit 1
 fi
 if [[ "$(

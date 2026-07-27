@@ -144,7 +144,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             binutils \
-            cmake \
             desktop-file-utils \
             dpkg-dev \
             jq \
@@ -155,7 +154,6 @@ jobs:
             libxkbcommon-dev \
             libvulkan1 \
             lintian \
-            nasm \
             shared-mime-info \
             xdg-utils
       - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
@@ -275,14 +273,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
-            cmake \
             jq \
             libgtk-3-dev \
             libxcb-render0-dev \
             libxcb-shape0-dev \
             libxcb-xfixes0-dev \
             libxkbcommon-dev \
-            nasm \
             pkg-config
       - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
       - name: Install license inventory tool

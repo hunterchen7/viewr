@@ -31,6 +31,5 @@ vendor checksum file, adds an exact local Cargo patch, and updates `Cargo.lock`
 without network access.
 
 The project README lists the required Linux packages, including
-`build-essential`, CMake, NASM, and `pkg-config`. The macOS build requires
-Xcode command-line tools and CMake. The Windows build requires the MSVC build
-tools, CMake, and NASM. NASM is required for the x86 JPEG SIMD path.
+`build-essential` and `pkg-config`. The macOS build requires Xcode
+command-line tools. The Windows build requires the MSVC build tools.

@@ -1394,12 +1394,11 @@ fn persistence_retry_backoff(retry: usize) {
 
 fn persistence_worker(shared: &Shared) {
     let quality = shared.jpeg_quality;
-    let mut encoder = None;
     while let Some(request) = shared.persistence.pop() {
         // This lane is intentionally single-threaded and yields before CPU
         // work so interactive develop workers retain scheduling priority.
         std::thread::yield_now();
-        let encoded = encode_persistence_jpeg(&mut encoder, &request.pixels, quality);
+        let encoded = encode_jpeg(&request.pixels, quality);
         let mut persistence_error = None;
         let encode_error = encoded.as_ref().err().cloned();
         if let Ok(bytes) = &encoded
@@ -1769,10 +1768,9 @@ fn develop_cache_miss(
 
 /// Encodes a tightly packed RGBA8 buffer as a JPEG.
 ///
-/// `quality` is passed directly to libjpeg-turbo. Chroma is always encoded at
-/// full 4:4:4 resolution and the output discards alpha. The app's persistence
-/// worker reuses `CacheJpegEncoder` so its native compressor allocation is
-/// not repeated for every cached image.
+/// `quality` is passed directly to jpeg-rusturbo. Chroma is always encoded at
+/// full 4:4:4 resolution and the output discards alpha. Encoding uses the
+/// ambient Rayon pool, which is sized for the current computer.
 ///
 /// # Errors
 ///
@@ -1781,73 +1779,15 @@ fn develop_cache_miss(
 /// dimensions, or JPEG encoding fails.
 pub fn encode_jpeg(buf: &PixelBuf, quality: u8) -> Result<Vec<u8>, String> {
     validate_jpeg_input(buf, quality)?;
-    CacheJpegEncoder::new(quality)?.encode(buf)
-}
-
-/// Reusable 4:4:4 libjpeg-turbo encoder for the cache persistence lane.
-///
-/// The safe Rust wrapper owns the native compressor handle. Viewr contains no
-/// handwritten `unsafe` or raw pointer manipulation at the FFI boundary.
-struct CacheJpegEncoder {
-    compressor: turbojpeg::Compressor,
-    quality: u8,
-}
-
-impl CacheJpegEncoder {
-    /// Creates an encoder for one fixed JPEG quality.
-    fn new(quality: u8) -> Result<Self, String> {
-        if !(1..=100).contains(&quality) {
-            return Err(format!("JPEG quality {quality} is outside 1..=100"));
-        }
-        let mut compressor = turbojpeg::Compressor::new().map_err(|error| error.to_string())?;
-        compressor
-            .set_quality(i32::from(quality))
-            .map_err(|error| error.to_string())?;
-        compressor
-            .set_subsamp(turbojpeg::Subsamp::None)
-            .map_err(|error| error.to_string())?;
-        Ok(Self {
-            compressor,
-            quality,
-        })
-    }
-
-    /// Encodes one tightly packed RGBA8 image, discarding alpha.
-    fn encode(&mut self, buf: &PixelBuf) -> Result<Vec<u8>, String> {
-        let (width, height, pitch) = validate_jpeg_input(buf, self.quality)?;
-        self.compressor
-            .compress_to_vec(turbojpeg::Image {
-                pixels: buf.rgba.as_slice(),
-                width,
-                pitch,
-                height,
-                format: turbojpeg::PixelFormat::RGBA,
-            })
-            .map_err(|error| error.to_string())
-    }
-}
-
-fn encode_persistence_jpeg(
-    encoder: &mut Option<CacheJpegEncoder>,
-    buf: &PixelBuf,
-    quality: u8,
-) -> Result<Vec<u8>, String> {
-    if encoder
-        .as_ref()
-        .is_none_or(|encoder| encoder.quality != quality)
-    {
-        *encoder = Some(CacheJpegEncoder::new(quality)?);
-    }
-    let encoded = encoder
-        .as_mut()
-        .expect("encoder was initialized above")
-        .encode(buf);
-    if encoded.is_err() {
-        // A native-code failure may leave the compressor state unusable. Drop
-        // it so one bad request cannot poison every later persistence job.
-        *encoder = None;
-    }
-    encoded
+    let mut output = Vec::new();
+    let mut encoder = jpeg_rusturbo::JpegEncoder::new_with_quality(&mut output, quality);
+    encoder.set_subsampling(jpeg_rusturbo::ChromaSubsampling::Yuv444);
+    encoder.set_threads(0);
+    encoder
+        .encode_rgba(&buf.rgba, buf.width, buf.height)
+        .map_err(|error| error.to_string())?;
+    drop(encoder);
+    Ok(output)
 }
 
 fn validate_jpeg_input(buf: &PixelBuf, quality: u8) -> Result<(usize, usize, usize), String> {
@@ -2261,6 +2201,64 @@ mod tests {
             height,
             rgba,
         }
+    }
+
+    fn jpeg_has_444_sampling(bytes: &[u8]) -> bool {
+        let Some([0xff, 0xd8]) = bytes.get(..2) else {
+            return false;
+        };
+        let mut offset = 2;
+        while offset + 4 <= bytes.len() {
+            if bytes[offset] != 0xff {
+                return false;
+            }
+            while offset < bytes.len() && bytes[offset] == 0xff {
+                offset += 1;
+            }
+            let Some(&marker) = bytes.get(offset) else {
+                return false;
+            };
+            offset += 1;
+            if marker == 0xd9 || marker == 0xda {
+                return false;
+            }
+            if marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+                continue;
+            }
+            let Some(length_bytes) = bytes.get(offset..offset + 2) else {
+                return false;
+            };
+            let length = usize::from(u16::from_be_bytes([length_bytes[0], length_bytes[1]]));
+            if length < 2 || offset + length > bytes.len() {
+                return false;
+            }
+            if matches!(
+                marker,
+                0xc0 | 0xc1
+                    | 0xc2
+                    | 0xc3
+                    | 0xc5
+                    | 0xc6
+                    | 0xc7
+                    | 0xc9
+                    | 0xca
+                    | 0xcb
+                    | 0xcd
+                    | 0xce
+                    | 0xcf
+            ) {
+                let segment = &bytes[offset + 2..offset + length];
+                if segment.len() < 9 {
+                    return false;
+                }
+                let components = usize::from(segment[5]);
+                return components == 3
+                    && segment.len() >= 6 + components * 3
+                    && (0..components).all(|component| segment[7 + component * 3] == 0x11);
+            }
+            offset += length;
+        }
+        false
     }
 
     fn job(id: JobId, class: u8, dist: u32) -> (JobId, u8, u32, Action) {
@@ -3510,8 +3508,7 @@ mod tests {
         let source = patterned_buf(96, 64);
         let encoded = encode_jpeg(&source, 90).unwrap();
         assert!(!encoded.is_empty());
-        let header = turbojpeg::read_header(&encoded).unwrap();
-        assert_eq!(header.subsamp, turbojpeg::Subsamp::None);
+        assert!(jpeg_has_444_sampling(&encoded));
         let decoded = decode_jpeg(&encoded).unwrap();
         assert_eq!(
             (decoded.width, decoded.height),
@@ -3625,18 +3622,17 @@ mod tests {
     }
 
     #[test]
-    fn reusable_jpeg_encoder_does_not_leak_state_between_images() {
+    fn jpeg_encoder_does_not_leak_state_between_images() {
         let first = patterned_buf(96, 64);
         let second = patterned_buf(127, 93);
-        let mut encoder = CacheJpegEncoder::new(97).unwrap();
 
-        let reused_first = encoder.encode(&first).unwrap();
-        let reused_second = encoder.encode(&second).unwrap();
+        let encoded_first = encode_jpeg(&first, 97).unwrap();
+        let encoded_second = encode_jpeg(&second, 97).unwrap();
 
-        assert_eq!(reused_first, encode_jpeg(&first, 97).unwrap());
-        assert_eq!(reused_second, encode_jpeg(&second, 97).unwrap());
+        assert_eq!(encoded_first, encode_jpeg(&first, 97).unwrap());
+        assert_eq!(encoded_second, encode_jpeg(&second, 97).unwrap());
         assert_eq!(
-            decode_jpeg(&reused_second)
+            decode_jpeg(&encoded_second)
                 .map(|decoded| (decoded.width, decoded.height))
                 .unwrap(),
             (second.width, second.height)
@@ -3644,25 +3640,20 @@ mod tests {
     }
 
     #[test]
-    fn persistence_encoder_recovers_after_a_bad_request() {
+    fn jpeg_encoder_recovers_after_a_bad_request_and_quality_change() {
         let valid = patterned_buf(96, 64);
         let malformed = PixelBuf {
             width: 96,
             height: 64,
             rgba: vec![0; 17],
         };
-        let mut encoder = None;
-
-        let first = encode_persistence_jpeg(&mut encoder, &valid, 97).unwrap();
-        assert!(encoder.is_some());
-        assert!(encode_persistence_jpeg(&mut encoder, &malformed, 97).is_err());
-        assert!(encoder.is_none());
-        let recovered = encode_persistence_jpeg(&mut encoder, &valid, 97).unwrap();
+        let first = encode_jpeg(&valid, 97).unwrap();
+        assert!(encode_jpeg(&malformed, 97).is_err());
+        let recovered = encode_jpeg(&valid, 97).unwrap();
 
         assert_eq!(first, recovered);
-        assert!(encoder.is_some());
 
-        let changed_quality = encode_persistence_jpeg(&mut encoder, &valid, 90).unwrap();
+        let changed_quality = encode_jpeg(&valid, 90).unwrap();
         assert_eq!(changed_quality, encode_jpeg(&valid, 90).unwrap());
         assert_ne!(changed_quality, first);
     }

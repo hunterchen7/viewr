@@ -112,11 +112,9 @@ cargo doc --workspace --no-deps  # API and architecture contracts
 ```
 
 Rust 1.96 is pinned; the application stack uses egui/wgpu → Metal on macOS,
-DX12/Vulkan on Windows, and Vulkan on Linux. The bundled SQLite and
-libjpeg-turbo libraries are native C. CMake is required on every platform;
-x86 Linux and Windows builds also require NASM for the mandatory JPEG SIMD
-path. CI builds and tests all three platforms.
-Linux builds need `build-essential cmake nasm pkg-config libgtk-3-dev
+DX12/Vulkan on Windows, and Vulkan on Linux. The bundled SQLite library is
+native C. CI builds and tests all three platforms.
+Linux builds need `build-essential pkg-config libgtk-3-dev
 libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
 libxkbcommon-dev`. RAW decoding by
 [rawler](https://github.com/dnglab/dnglab) — Sony ARW first-class
