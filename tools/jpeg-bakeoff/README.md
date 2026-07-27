@@ -17,6 +17,14 @@ The probe cross-decodes every output through Viewr's `zune-jpeg` decoder. It
 reports output size, median wall time, RGB PSNR, maximum channel error, and
 neighbor-delta error. The last metric is sensitive to damaged smooth gradients
 and visible contouring. Criterion is the authoritative latency measurement.
+The benchmark separately measures a reused C compressor handle to expose any
+per-call FFI setup cost. A fixed full-resolution stress workload is available
+for CPU and peak-memory measurement:
+
+```sh
+/usr/bin/time -lp tools/jpeg-bakeoff/target/release/viewr-jpeg-bakeoff \
+  stress libjpeg-turbo-c 10 97
+```
 
 The fixed search budget is:
 

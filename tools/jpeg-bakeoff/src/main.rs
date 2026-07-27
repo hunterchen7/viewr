@@ -1,7 +1,13 @@
-use anyhow::Result;
-use viewr_jpeg_bakeoff::{Codec, QUALITIES, fixtures, probe};
+use std::hint::black_box;
 
-fn main() -> Result<()> {
+use anyhow::{Context, bail};
+use viewr_jpeg_bakeoff::{Codec, QUALITIES, encode, fixtures, full_resolution_fixture, probe};
+
+fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "stress") {
+        return stress(&args[1..]);
+    }
     println!(
         "codec,fixture,width,height,quality,bytes,median_ms,megapixels_per_second,psnr_rgb,max_abs_rgb,neighbor_delta_mae,sampling"
     );
@@ -29,4 +35,34 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn stress(args: &[String]) -> anyhow::Result<()> {
+    if args.len() != 3 {
+        bail!("usage: viewr-jpeg-bakeoff stress CODEC ITERATIONS QUALITY");
+    }
+    let codec = parse_codec(&args[0])?;
+    let iterations: usize = args[1].parse().context("invalid iteration count")?;
+    let quality: u8 = args[2].parse().context("invalid quality")?;
+    let fixture = full_resolution_fixture();
+    let mut total_bytes = 0_usize;
+    for _ in 0..iterations {
+        let jpeg = encode(codec, black_box(&fixture), quality)?;
+        total_bytes = total_bytes.wrapping_add(black_box(jpeg.len()));
+    }
+    println!(
+        "codec={codec} fixture={} iterations={iterations} quality={quality} total_bytes={total_bytes}",
+        fixture.name
+    );
+    Ok(())
+}
+
+fn parse_codec(name: &str) -> anyhow::Result<Codec> {
+    Codec::ALL
+        .into_iter()
+        .find(|codec| codec.name() == name)
+        .with_context(|| {
+            let names = Codec::ALL.map(Codec::name).join(", ");
+            format!("unknown codec {name:?}; expected one of {names}")
+        })
 }

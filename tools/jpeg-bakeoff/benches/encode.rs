@@ -2,7 +2,9 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use viewr_jpeg_bakeoff::{Codec, encode, full_resolution_fixture, synthetic_photo};
+use viewr_jpeg_bakeoff::{
+    Codec, TurbojpegEncoder, encode, full_resolution_fixture, synthetic_photo,
+};
 
 fn bench_encode(c: &mut Criterion) {
     let fixtures = [
@@ -23,6 +25,10 @@ fn bench_encode(c: &mut Criterion) {
                 });
             });
         }
+        let mut reused_c_encoder = TurbojpegEncoder::new(97).unwrap();
+        group.bench_function(format!("{}/libjpeg-turbo-c-reused", fixture.name), |b| {
+            b.iter(|| black_box(reused_c_encoder.encode(black_box(fixture)).unwrap()));
+        });
     }
     group.finish();
 }

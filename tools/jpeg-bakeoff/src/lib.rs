@@ -258,24 +258,47 @@ pub fn encode(codec: Codec, fixture: &Fixture, quality: u8) -> Result<Vec<u8>> {
         )
         .context("libjpeg-turbo-rs failed"),
         Codec::LibjpegTurboC => {
-            let mut compressor =
-                turbojpeg::Compressor::new().context("libjpeg-turbo compressor setup failed")?;
-            compressor
-                .set_quality(i32::from(quality))
-                .context("libjpeg-turbo quality setup failed")?;
-            compressor
-                .set_subsamp(turbojpeg::Subsamp::None)
-                .context("libjpeg-turbo subsampling setup failed")?;
-            compressor
-                .compress_to_vec(turbojpeg::Image {
-                    pixels: fixture.rgba.as_slice(),
-                    width: fixture.width as usize,
-                    pitch: fixture.width as usize * 4,
-                    height: fixture.height as usize,
-                    format: turbojpeg::PixelFormat::RGBA,
-                })
-                .context("libjpeg-turbo failed")
+            let mut encoder = TurbojpegEncoder::new(quality)?;
+            encoder.encode(fixture)
         }
+    }
+}
+
+pub struct TurbojpegEncoder {
+    compressor: turbojpeg::Compressor,
+    quality: u8,
+}
+
+impl TurbojpegEncoder {
+    pub fn new(quality: u8) -> Result<Self> {
+        if !(1..=100).contains(&quality) {
+            bail!("quality must be in 1..=100");
+        }
+        let mut compressor =
+            turbojpeg::Compressor::new().context("libjpeg-turbo compressor setup failed")?;
+        compressor
+            .set_quality(i32::from(quality))
+            .context("libjpeg-turbo quality setup failed")?;
+        compressor
+            .set_subsamp(turbojpeg::Subsamp::None)
+            .context("libjpeg-turbo subsampling setup failed")?;
+        Ok(Self {
+            compressor,
+            quality,
+        })
+    }
+
+    pub fn encode(&mut self, fixture: &Fixture) -> Result<Vec<u8>> {
+        validate_input(fixture, self.quality)?;
+        self.compressor
+            .compress_to_vec(turbojpeg::Image {
+                pixels: fixture.rgba.as_slice(),
+                width: fixture.width as usize,
+                pitch: fixture.width as usize * 4,
+                height: fixture.height as usize,
+                format: turbojpeg::PixelFormat::RGBA,
+            })
+            .context("libjpeg-turbo failed")
     }
 }
 
