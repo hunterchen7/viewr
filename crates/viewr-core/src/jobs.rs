@@ -1394,15 +1394,12 @@ fn persistence_retry_backoff(retry: usize) {
 
 fn persistence_worker(shared: &Shared) {
     let quality = shared.jpeg_quality;
-    let mut encoder = CacheJpegEncoder::new(quality);
+    let mut encoder = None;
     while let Some(request) = shared.persistence.pop() {
         // This lane is intentionally single-threaded and yields before CPU
         // work so interactive develop workers retain scheduling priority.
         std::thread::yield_now();
-        let encoded = match &mut encoder {
-            Ok(encoder) => encoder.encode(&request.pixels),
-            Err(error) => Err(error.clone()),
-        };
+        let encoded = encode_persistence_jpeg(&mut encoder, &request.pixels, quality);
         let mut persistence_error = None;
         let encode_error = encoded.as_ref().err().cloned();
         if let Ok(bytes) = &encoded
@@ -1774,7 +1771,7 @@ fn develop_cache_miss(
 ///
 /// `quality` is passed directly to libjpeg-turbo. Chroma is always encoded at
 /// full 4:4:4 resolution and the output discards alpha. The app's persistence
-/// worker reuses [`CacheJpegEncoder`] so its native compressor allocation is
+/// worker reuses `CacheJpegEncoder` so its native compressor allocation is
 /// not repeated for every cached image.
 ///
 /// # Errors
@@ -1783,6 +1780,7 @@ fn develop_cache_miss(
 /// or exceeds the JPEG format limit, the RGBA storage is inconsistent with the
 /// dimensions, or JPEG encoding fails.
 pub fn encode_jpeg(buf: &PixelBuf, quality: u8) -> Result<Vec<u8>, String> {
+    validate_jpeg_input(buf, quality)?;
     CacheJpegEncoder::new(quality)?.encode(buf)
 }
 
@@ -1790,14 +1788,14 @@ pub fn encode_jpeg(buf: &PixelBuf, quality: u8) -> Result<Vec<u8>, String> {
 ///
 /// The safe Rust wrapper owns the native compressor handle. Viewr contains no
 /// handwritten `unsafe` or raw pointer manipulation at the FFI boundary.
-pub struct CacheJpegEncoder {
+struct CacheJpegEncoder {
     compressor: turbojpeg::Compressor,
     quality: u8,
 }
 
 impl CacheJpegEncoder {
     /// Creates an encoder for one fixed JPEG quality.
-    pub fn new(quality: u8) -> Result<Self, String> {
+    fn new(quality: u8) -> Result<Self, String> {
         if !(1..=100).contains(&quality) {
             return Err(format!("JPEG quality {quality} is outside 1..=100"));
         }
@@ -1815,7 +1813,7 @@ impl CacheJpegEncoder {
     }
 
     /// Encodes one tightly packed RGBA8 image, discarding alpha.
-    pub fn encode(&mut self, buf: &PixelBuf) -> Result<Vec<u8>, String> {
+    fn encode(&mut self, buf: &PixelBuf) -> Result<Vec<u8>, String> {
         let (width, height, pitch) = validate_jpeg_input(buf, self.quality)?;
         self.compressor
             .compress_to_vec(turbojpeg::Image {
@@ -1827,6 +1825,26 @@ impl CacheJpegEncoder {
             })
             .map_err(|error| error.to_string())
     }
+}
+
+fn encode_persistence_jpeg(
+    encoder: &mut Option<CacheJpegEncoder>,
+    buf: &PixelBuf,
+    quality: u8,
+) -> Result<Vec<u8>, String> {
+    if encoder.is_none() {
+        *encoder = Some(CacheJpegEncoder::new(quality)?);
+    }
+    let encoded = encoder
+        .as_mut()
+        .expect("encoder was initialized above")
+        .encode(buf);
+    if encoded.is_err() {
+        // A native-code failure may leave the compressor state unusable. Drop
+        // it so one bad request cannot poison every later persistence job.
+        *encoder = None;
+    }
+    encoded
 }
 
 fn validate_jpeg_input(buf: &PixelBuf, quality: u8) -> Result<(usize, usize, usize), String> {
@@ -3589,6 +3607,21 @@ mod tests {
     }
 
     #[test]
+    fn jpeg_input_validation_is_independent_of_the_native_codec() {
+        let valid = patterned_buf(8, 6);
+        assert_eq!(validate_jpeg_input(&valid, 97), Ok((8, 6, 32)));
+
+        let malformed = PixelBuf {
+            width: 8,
+            height: 6,
+            rgba: vec![0; 8 * 6 * 4 - 1],
+        };
+        assert!(validate_jpeg_input(&malformed, 97).is_err());
+        assert!(validate_jpeg_input(&valid, 0).is_err());
+        assert!(validate_jpeg_input(&valid, 101).is_err());
+    }
+
+    #[test]
     fn reusable_jpeg_encoder_does_not_leak_state_between_images() {
         let first = patterned_buf(96, 64);
         let second = patterned_buf(127, 93);
@@ -3605,5 +3638,25 @@ mod tests {
                 .unwrap(),
             (second.width, second.height)
         );
+    }
+
+    #[test]
+    fn persistence_encoder_recovers_after_a_bad_request() {
+        let valid = patterned_buf(96, 64);
+        let malformed = PixelBuf {
+            width: 96,
+            height: 64,
+            rgba: vec![0; 17],
+        };
+        let mut encoder = None;
+
+        let first = encode_persistence_jpeg(&mut encoder, &valid, 97).unwrap();
+        assert!(encoder.is_some());
+        assert!(encode_persistence_jpeg(&mut encoder, &malformed, 97).is_err());
+        assert!(encoder.is_none());
+        let recovered = encode_persistence_jpeg(&mut encoder, &valid, 97).unwrap();
+
+        assert_eq!(first, recovered);
+        assert!(encoder.is_some());
     }
 }
