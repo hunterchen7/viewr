@@ -130,6 +130,9 @@ The suite measures these workloads:
 - Warm, under-budget cache-GC scans for up to 10,000 objects.
   This case does not sort or delete cache objects.
 - Loupe filmstrip widget scaling at 10,000 and 50,000 images.
+- Full-resolution texture conversion for a 24-megapixel image, compared with
+  visible-region-first conversion at 512-, 1024-, and 2048-pixel tile sizes.
+  This measures CPU image preparation, not backend GPU transfer time.
 - Thumbnail texture-LRU maintenance for 200 touches among 773 residents.
 - Shared-owner group construction and rating installation through a prefilled
   rating map at 1,000, 10,000, and 100,000 entries. The installation primitive
@@ -142,6 +145,8 @@ See [the first reference run](benchmark-baseline-2026-07-21.md).
 See [the optimization campaign](performance-optimization-2026-07-21.md) for the current results and tradeoffs.
 See [the second performance and adversarial pass](performance-adversarial-pass-2026-07-21.md)
 for UI scaling, cold-thumbnail probes, native sampling, and Miri coverage.
+See [the progressive Full-texture experiment](progressive-full-textures-2026-07-26.md)
+for the tile-size comparison and promotion decision.
 
 ## Unsafe image-path checks
 
