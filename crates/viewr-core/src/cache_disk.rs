@@ -20,10 +20,11 @@ use crate::types::Tier;
 /// Version 4 adds the highlight-preserving culling exposure lift.
 /// Version 5 raises cached JPEG quality to 97 with 4:4:4 chroma.
 pub const DEVELOP_VERSION: u32 = 5;
+const VERSION_5_BASE_JPEG_QUALITY: u8 = 97;
 /// Default cache JPEG quality. The default keeps the version-5 key shape so
 /// existing quality-97 objects remain reusable after quality becomes
 /// configurable.
-pub const DEFAULT_CACHE_JPEG_QUALITY: u8 = 97;
+pub const DEFAULT_CACHE_JPEG_QUALITY: u8 = VERSION_5_BASE_JPEG_QUALITY;
 
 #[derive(Clone)]
 /// Persistent, file-identity-keyed cache of developed JPEG renders.
@@ -158,7 +159,7 @@ impl DiskCache {
             Tier::Browse => b"b",
             Tier::Full => b"f",
         });
-        if jpeg_quality != DEFAULT_CACHE_JPEG_QUALITY {
+        if jpeg_quality != VERSION_5_BASE_JPEG_QUALITY {
             hasher.update(b"jpeg-quality");
             hasher.update(&[jpeg_quality]);
         }
