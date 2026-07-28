@@ -20,7 +20,9 @@ comparison, not a text comparison.
 An automatic check starts four seconds after the viewer opens. Viewr limits
 automatic checks to one check each day. A file lock applies this limit to all
 open Viewr processes. Use **Preferences > Updates > Check now** for a manual
-check.
+check. The automatic-check preference is also shared by all open processes.
+When one process disables the checks, another process checks the preference
+again before it makes a network request.
 
 The update dialog shows the bounded release text as plain text. The dialog has
 these actions:
@@ -61,11 +63,20 @@ The updater applies the same checks. It also applies these controls:
 - It writes the package to a same-directory temporary file.
 - It calculates SHA-256 while it writes the package.
 - It publishes the file only after the size and digest match.
-- It calculates SHA-256 again before it opens an installer.
+- It adds macOS quarantine data or Windows Internet-zone data.
+- It calculates SHA-256 and checks the download metadata again on a background
+  thread before it opens an installer.
 
 Viewr stores update state in the Viewr configuration directory. Viewr stores
 downloads and cross-process lock files in the Viewr cache directory. The updater
-rejects a symbolic-link state file, lock file, directory, or package target.
+rejects a symbolic-link state file, lock file, directory, or package target. On
+Unix systems, the updater uses owner-only permissions for its state, lock, and
+download paths.
+
+Only one Viewr process can download an update at one time. When that process
+starts a download, it removes temporary files that an interrupted process left
+behind. It also removes completed version directories that are more than seven
+days old. It keeps the directory for the requested version.
 
 CAUTION: The preview installers do not have Apple or Microsoft platform
 signatures. An untrusted installer can change the system. Confirm the repository
@@ -81,8 +92,8 @@ the operating-system installer.
 Viewr opens the package with the applicable operating-system command:
 
 - macOS: `/usr/bin/open PACKAGE.pkg`.
-- Windows: `msiexec.exe /i PACKAGE.msi`.
-- Linux: `xdg-open PACKAGE.deb`.
+- Windows: the `msiexec.exe` in the Windows system directory.
+- Linux: `/usr/bin/xdg-open PACKAGE.deb`.
 
 The operating system controls permission prompts and installation. Viewr cannot
 reliably detect completion for all three package types. Thus, Viewr does not

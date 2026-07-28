@@ -284,7 +284,7 @@ impl App {
     fn empty(cc: &eframe::CreationContext<'_>) -> Self {
         let ctx = cc.egui_ctx.clone();
         let config = Config::load();
-        let updates = UpdateManager::new(ctx.clone(), config.check_updates_automatically);
+        let updates = UpdateManager::new(ctx.clone());
         Self {
             ctx,
             config,
@@ -901,8 +901,8 @@ impl App {
     }
 
     fn handle_keys(&mut self, loupe_rect: egui::Rect, img_size: Option<egui::Vec2>) {
-        if self.settings.capturing() {
-            return; // keystrokes are being captured as new binds
+        if self.settings.capturing() || self.updates.blocks_app_input() {
+            return; // a modal owns this frame's keystrokes
         }
         let ctx = self.ctx.clone();
         struct Keys {
@@ -1098,13 +1098,19 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = self.ctx.clone();
         self.updates.poll();
-        self.settings.maybe_capture(&ctx, &mut self.config);
+        if self.settings.open {
+            self.updates.refresh_automatic_preference();
+        }
+        if !self.updates.blocks_app_input() {
+            self.settings.maybe_capture(&ctx, &mut self.config);
+        }
         let update_status = self.updates.status_text();
         let update_actions = self.settings.show(
             &ctx,
             &mut self.config,
             &update_status,
             self.updates.has_status_details(),
+            self.updates.automatic_checks_enabled(),
         );
         if update_actions.check_for_updates {
             self.updates.check_now();
@@ -1112,8 +1118,8 @@ impl eframe::App for App {
         if update_actions.show_update_status {
             self.updates.open_status();
         }
-        if update_actions.automatic_updates_enabled {
-            self.updates.schedule_automatic_check();
+        if let Some(enabled) = update_actions.automatic_updates_changed {
+            self.updates.set_automatic_checks(enabled);
         }
         self.updates.show();
         self.refresh_ratings_after_database_ready();

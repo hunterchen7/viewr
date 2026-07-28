@@ -116,8 +116,6 @@ pub struct Config {
     /// JPEG quality for Browse and Full cache objects. Applies on the next
     /// folder open.
     pub jpeg_quality: u8,
-    /// Check GitHub Releases for a newer stable version after startup.
-    pub check_updates_automatically: bool,
     binds: HashMap<Action, Vec<Bind>>,
 }
 
@@ -127,7 +125,6 @@ struct RawConfig {
     input: RawInput,
     ui: RawUi,
     cache: RawCache,
-    updates: RawUpdates,
     binds: HashMap<String, Vec<String>>,
 }
 
@@ -178,20 +175,6 @@ impl Default for RawCache {
             ram_gb: 4.5,
             disk_gb: 20.0,
             jpeg_quality: i16::from(CACHE_JPEG_QUALITY),
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(default)]
-struct RawUpdates {
-    check_automatically: bool,
-}
-
-impl Default for RawUpdates {
-    fn default() -> Self {
-        Self {
-            check_automatically: true,
         }
     }
 }
@@ -340,7 +323,6 @@ impl Config {
                 )
                 .try_into()
                 .expect("clamped JPEG quality fits in u8"),
-            check_updates_automatically: raw.updates.check_automatically,
             binds,
         }
     }
@@ -389,7 +371,7 @@ impl Config {
              # hand-edits are read at startup but comments are not kept.\n\n[input]\n",
         );
         out.push_str(&format!(
-            "scroll = \"{}\"\n\n[ui]\ntier_indicator = \"{}\"\nshow_loading = {}\nshow_performance = {}\nshow_exposure = {}\nfilmstrip_height = {:.0}\ngrid_cell = {:.0}\n\n[cache]\nram_gb = {:.1}\ndisk_gb = {:.1}\njpeg_quality = {}\n\n[updates]\ncheck_automatically = {}\n\n[binds]\n",
+            "scroll = \"{}\"\n\n[ui]\ntier_indicator = \"{}\"\nshow_loading = {}\nshow_performance = {}\nshow_exposure = {}\nfilmstrip_height = {:.0}\ngrid_cell = {:.0}\n\n[cache]\nram_gb = {:.1}\ndisk_gb = {:.1}\njpeg_quality = {}\n\n[binds]\n",
             match self.scroll {
                 ScrollMode::Pan => "pan",
                 ScrollMode::Zoom => "zoom",
@@ -403,7 +385,6 @@ impl Config {
             self.ram_gb,
             self.disk_gb,
             self.jpeg_quality,
-            self.check_updates_automatically,
         ));
         for &(name, _, action) in ACTIONS {
             let labels: Vec<String> = self
@@ -507,10 +488,6 @@ disk_gb = 20.0
 # Cache JPEG quality from 80 to 100. Higher values retain smoother gradients
 # and more detail but use more RAM, disk space, and background CPU time.
 jpeg_quality = 97
-
-[updates]
-# Check once per day for the newest stable GitHub release.
-check_automatically = true
 
 [binds]
 # Each action takes a list of binds: "Key" or "Mod+Key".
@@ -727,18 +704,6 @@ mod tests {
         assert_eq!(cfg.ram_gb, 4.5);
         assert_eq!(cfg.disk_gb, 20.0);
         assert_eq!(cfg.jpeg_quality, CACHE_JPEG_QUALITY);
-        assert!(cfg.check_updates_automatically);
-    }
-
-    #[test]
-    fn update_check_preference_round_trips_through_generated_config() {
-        let mut cfg = Config::from_raw(RawConfig::default());
-        cfg.check_updates_automatically = false;
-
-        let reparsed: RawConfig = toml::from_str(&cfg.serialized()).unwrap();
-        let reparsed = Config::from_raw(reparsed);
-
-        assert!(!reparsed.check_updates_automatically);
     }
 
     #[test]

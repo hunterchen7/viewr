@@ -22,7 +22,10 @@ eframe = { version = "0.35", features = ["persistence"] }
 rfd = "0.15"
 objc2 = "0.6"
 raw-window-handle = "0.6"
-windows-sys = { version = "0.61", features = ["Win32_UI_Shell"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_System_SystemInformation",
+    "Win32_UI_Shell",
+] }
 jpeg-rusturbo = "0.9.2"
 zune-jpeg = "0.5"
 rusqlite = { version = "0.32", features = ["bundled"] }

@@ -6,7 +6,7 @@
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,13 +24,17 @@ const RELEASE_API_URL: &str = "https://api.github.com/repos/hunterchen7/viewr/re
 const GITHUB_API_VERSION: &str = "2026-03-10";
 const USER_AGENT: &str = concat!("viewr/", env!("CARGO_PKG_VERSION"), " updater");
 const MAX_RELEASE_JSON_BYTES: usize = 1024 * 1024;
-const MAX_RELEASE_NOTES_BYTES: usize = 256 * 1024;
+const MAX_RELEASE_NOTES_BYTES: usize = 64 * 1024;
 const MAX_RELEASE_ASSETS: usize = 128;
 const MAX_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 5;
+const MAX_DOWNLOAD_DURATION: Duration = Duration::from_secs(20 * 60);
 const AUTO_CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
 const MANUAL_CHECK_INTERVAL_SECS: u64 = 5;
 const MAX_UPDATE_STATE_BYTES: u64 = 4096;
+const UPDATE_CACHE_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+#[cfg(target_os = "macos")]
+static QUARANTINE_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Error)]
 pub(crate) enum UpdateError {
@@ -161,8 +165,16 @@ fn native_install_path(target_os: &str, executable: &Path) -> bool {
         "windows" => {
             let normalized = executable.to_string_lossy().replace('/', "\\");
             let normalized = normalized.to_ascii_lowercase();
-            normalized.ends_with("\\program files\\viewr\\viewr.exe")
-                || normalized.ends_with("\\program files (x86)\\viewr\\viewr.exe")
+            let normalized = normalized.strip_prefix(r"\\?\").unwrap_or(&normalized);
+            let Some(relative) = normalized.get(2..) else {
+                return false;
+            };
+            normalized.as_bytes()[0].is_ascii_alphabetic()
+                && normalized.as_bytes()[1] == b':'
+                && matches!(
+                    relative,
+                    r"\program files\viewr\viewr.exe" | r"\program files (x86)\viewr\viewr.exe"
+                )
         }
         _ => false,
     }
@@ -186,8 +198,17 @@ struct GithubAsset {
 }
 
 pub(crate) fn current_version() -> Version {
-    Version::parse(env!("CARGO_PKG_VERSION"))
-        .expect("the workspace package version must be valid stable SemVer")
+    let raw = current_version_text();
+    let version = Version::parse(raw).expect("the workspace package version must be valid SemVer");
+    assert!(
+        version.pre.is_empty() && version.build.is_empty() && version.to_string() == raw,
+        "the workspace package version must be canonical stable SemVer"
+    );
+    version
+}
+
+fn current_version_text() -> &'static str {
+    env!("CARGO_PKG_VERSION")
 }
 
 fn parse_stable_tag(tag: &str) -> Result<Version, UpdateError> {
@@ -397,11 +418,14 @@ impl HttpClient {
         let mut url = Url::parse(raw_url)
             .map_err(|_| UpdateError::InvalidRelease("the update URL is not valid".into()))?;
         validate_request_url(&url, purpose)?;
+        let started = Instant::now();
         for redirect_count in 0..=MAX_REDIRECTS {
+            if started.elapsed() > timeout {
+                return Err(UpdateError::Network("the update request timed out".into()));
+            }
             let response = self
                 .agent
                 .get(url.as_str())
-                .timeout(timeout)
                 .set("Accept-Encoding", "identity")
                 .set(
                     "Accept",
@@ -416,28 +440,34 @@ impl HttpClient {
             match response.status() {
                 200 => return Ok(response),
                 301 | 302 | 303 | 307 | 308 => {
-                    if redirect_count == MAX_REDIRECTS {
-                        return Err(UpdateError::Network(
-                            "the update download redirected too many times".into(),
-                        ));
-                    }
-                    let location = response.header("Location").ok_or_else(|| {
-                        UpdateError::Network(
-                            "the update download redirected without a location".into(),
-                        )
-                    })?;
-                    url = url.join(location).map_err(|_| {
-                        UpdateError::Network(
-                            "the update download returned an invalid redirect".into(),
-                        )
-                    })?;
-                    validate_request_url(&url, purpose)?;
+                    url = redirect_url(&url, response.header("Location"), redirect_count, purpose)?;
                 }
                 status => return Err(UpdateError::HttpStatus(status)),
             }
         }
         unreachable!("the redirect loop returns at its configured bound")
     }
+}
+
+fn redirect_url(
+    current: &Url,
+    location: Option<&str>,
+    redirect_count: usize,
+    purpose: RequestPurpose,
+) -> Result<Url, UpdateError> {
+    if redirect_count == MAX_REDIRECTS {
+        return Err(UpdateError::Network(
+            "the update download redirected too many times".into(),
+        ));
+    }
+    let location = location.ok_or_else(|| {
+        UpdateError::Network("the update download redirected without a location".into())
+    })?;
+    let next = current.join(location).map_err(|_| {
+        UpdateError::Network("the update download returned an invalid redirect".into())
+    })?;
+    validate_request_url(&next, purpose)?;
+    Ok(next)
 }
 
 fn map_ureq_error(error: ureq::Error) -> UpdateError {
@@ -477,13 +507,21 @@ fn validate_request_url(url: &Url, purpose: RequestPurpose) -> Result<(), Update
 }
 
 fn read_bounded(mut reader: impl io::Read, maximum: usize) -> Result<Vec<u8>, UpdateError> {
+    let started = Instant::now();
     let mut bytes = Vec::with_capacity(maximum.min(64 * 1024));
-    reader
-        .by_ref()
-        .take(maximum as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > maximum {
-        return Err(UpdateError::BodyTooLarge(maximum));
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        if started.elapsed() > Duration::from_secs(20) {
+            return Err(UpdateError::Network("the update response timed out".into()));
+        }
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(count) > maximum {
+            return Err(UpdateError::BodyTooLarge(maximum));
+        }
+        bytes.extend_from_slice(&buffer[..count]);
     }
     Ok(bytes)
 }
@@ -510,6 +548,7 @@ pub(crate) fn check_latest_release() -> Result<CheckOutcome, UpdateError> {
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct PersistedUpdateState {
+    automatic_checks_enabled: Option<bool>,
     skipped_version: Option<String>,
     last_automatic_attempt_unix: Option<u64>,
     last_manual_attempt_unix: Option<u64>,
@@ -587,10 +626,20 @@ impl UpdateStore {
             Err(error) => return Err(error.into()),
         };
         if metadata.len() > MAX_UPDATE_STATE_BYTES {
-            return Ok(PersistedUpdateState::default());
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "update state exceeds its size limit",
+            )
+            .into());
         }
         let text = std::fs::read_to_string(&self.state_path)?;
-        Ok(toml::from_str(&text).unwrap_or_default())
+        toml::from_str(&text).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("update state is not valid TOML: {error}"),
+            )
+            .into()
+        })
     }
 
     fn write_state_unlocked(&self, state: &PersistedUpdateState) -> Result<(), UpdateError> {
@@ -599,7 +648,10 @@ impl UpdateStore {
             .as_deref()
             .and_then(valid_stored_version);
         let mut output =
-            String::from("# Internal Viewr update state. Preferences are in viewr.toml.\n");
+            String::from("# Viewr update preferences and cross-process coordination state.\n");
+        if let Some(enabled) = state.automatic_checks_enabled {
+            output.push_str(&format!("automatic_checks_enabled = {enabled}\n"));
+        }
         if let Some(skipped) = skipped {
             output.push_str(&format!("skipped_version = \"{skipped}\"\n"));
         }
@@ -614,12 +666,42 @@ impl UpdateStore {
     }
 
     pub(crate) fn skipped_version(&self) -> Result<Option<Version>, UpdateError> {
-        self.with_state(|state| {
-            state
-                .skipped_version
-                .as_deref()
-                .and_then(valid_stored_version)
-        })
+        Ok(self
+            .read_state_unlocked()?
+            .skipped_version
+            .as_deref()
+            .and_then(valid_stored_version))
+    }
+
+    fn automatic_checks_enabled(&self) -> Result<bool, UpdateError> {
+        // State publication is an atomic same-directory rename, so a reader
+        // sees either the previous complete file or the next complete file.
+        // Do not wait on the writer lock from the UI thread.
+        Ok(self
+            .read_state_unlocked()?
+            .automatic_checks_enabled
+            .unwrap_or(true))
+    }
+
+    fn set_automatic_checks_enabled(&self, enabled: bool) -> Result<(), UpdateError> {
+        ensure_private_directory(
+            self.state_lock_path
+                .parent()
+                .expect("state lock has a parent"),
+        )?;
+        let lock = open_lock_file(&self.state_lock_path)?;
+        lock.lock()?;
+        let mut state = match self.read_state_unlocked() {
+            Ok(state) => state,
+            Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::InvalidData => {
+                PersistedUpdateState::default()
+            }
+            Err(error) => return Err(error),
+        };
+        state.automatic_checks_enabled = Some(enabled);
+        self.write_state_unlocked(&state)?;
+        lock.unlock()?;
+        Ok(())
     }
 
     pub(crate) fn skip(&self, version: &Version) -> Result<(), UpdateError> {
@@ -629,8 +711,18 @@ impl UpdateStore {
         })
     }
 
-    pub(crate) fn clear_obsolete_skip(&self, running: &Version) -> Result<(), UpdateError> {
-        self.with_state(|state| {
+    fn initialize(&self, running: &Version) -> Result<bool, UpdateError> {
+        ensure_private_directory(
+            self.state_lock_path
+                .parent()
+                .expect("state lock has a parent"),
+        )?;
+        let lock = open_lock_file(&self.state_lock_path)?;
+        lock.lock()?;
+        let mut state = self.read_state_unlocked()?;
+        let enabled = state.automatic_checks_enabled.unwrap_or(true);
+        let original_skip = state.skipped_version.clone();
+        {
             let clear = state
                 .skipped_version
                 .as_deref()
@@ -644,7 +736,12 @@ impl UpdateStore {
             {
                 state.skipped_version = None;
             }
-        })
+        }
+        if state.skipped_version != original_skip {
+            self.write_state_unlocked(&state)?;
+        }
+        lock.unlock()?;
+        Ok(enabled)
     }
 
     pub(crate) fn claim_check(
@@ -665,9 +762,18 @@ impl UpdateStore {
         }
 
         let claimed = self.with_state(|state| {
+            if source == CheckSource::Automatic && state.automatic_checks_enabled == Some(false) {
+                return false;
+            }
             let previous = match source {
                 CheckSource::Automatic => state.last_automatic_attempt_unix,
-                CheckSource::Manual => state.last_manual_attempt_unix,
+                CheckSource::Manual => match (
+                    state.last_automatic_attempt_unix,
+                    state.last_manual_attempt_unix,
+                ) {
+                    (Some(automatic), Some(manual)) => Some(automatic.max(manual)),
+                    (automatic, manual) => automatic.or(manual),
+                },
             };
             let minimum_age = match source {
                 CheckSource::Automatic => AUTO_CHECK_INTERVAL_SECS,
@@ -690,10 +796,9 @@ impl UpdateStore {
         }
     }
 
-    fn claim_download(&self, asset: &ReleaseAsset) -> Result<File, UpdateError> {
+    fn claim_download(&self) -> Result<File, UpdateError> {
         ensure_private_directory(&self.operation_directory)?;
-        let lock_name = format!("download-{}.lock", asset.name);
-        let lock = open_lock_file(&self.operation_directory.join(lock_name))?;
+        let lock = open_lock_file(&self.operation_directory.join("download.lock"))?;
         match lock.try_lock() {
             Ok(()) => Ok(lock),
             Err(std::fs::TryLockError::WouldBlock) => {
@@ -708,6 +813,44 @@ impl UpdateStore {
             .join(release.version.to_string())
             .join(asset.name)
     }
+}
+
+fn prune_update_cache(
+    download_directory: &Path,
+    keep_directory: &Path,
+    obsolete_before: SystemTime,
+) -> io::Result<()> {
+    let entries = match std::fs::read_dir(download_directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let version_path = entry.path();
+        let metadata = version_path.symlink_metadata()?;
+        if !metadata.is_dir() {
+            continue;
+        }
+        let obsolete = metadata
+            .modified()
+            .is_ok_and(|modified| modified <= obsolete_before);
+        for candidate in std::fs::read_dir(&version_path)? {
+            let candidate = candidate?;
+            let name = candidate.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(".viewr-download-") && name.ends_with(".tmp") {
+                let metadata = candidate.path().symlink_metadata()?;
+                if metadata.is_file() || metadata.file_type().is_symlink() {
+                    std::fs::remove_file(candidate.path())?;
+                }
+            }
+        }
+        if version_path != keep_directory && obsolete {
+            std::fs::remove_dir_all(version_path)?;
+        }
+    }
+    Ok(())
 }
 
 fn valid_stored_version(value: &str) -> Option<Version> {
@@ -739,12 +882,18 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
             "update lock cannot be a symbolic link",
         ));
     }
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(path)
+        .open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
 }
 
 fn ensure_private_directory(path: &Path) -> io::Result<()> {
@@ -766,6 +915,11 @@ fn ensure_private_directory(path: &Path) -> io::Result<()> {
             std::fs::create_dir_all(path)?;
         }
         Err(error) => return Err(error),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
 }
@@ -801,6 +955,13 @@ fn replace_file_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
     temporary.write_all(bytes)?;
     if let Some(permissions) = permissions {
         temporary.as_file().set_permissions(permissions)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
     temporary.as_file().sync_all()?;
     temporary.persist(path).map_err(|error| error.error)?;
@@ -843,19 +1004,175 @@ fn verify_file(path: &Path, asset: &ReleaseAsset) -> Result<(), UpdateError> {
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn quarantine_value(timestamp: u64, event_id: &str) -> String {
+    format!("0083;{timestamp:x};Viewr;{event_id}")
+}
+
+#[cfg(target_os = "macos")]
+fn quarantine_event_id(path: &Path, asset: &ReleaseAsset) -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = QUARANTINE_EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut hasher = Sha256::new();
+    hasher.update(timestamp.to_le_bytes());
+    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(sequence.to_le_bytes());
+    hasher.update(path.as_os_str().as_encoded_bytes());
+    hasher.update(asset.url.as_bytes());
+    let digest = hasher.finalize();
+    let mut id: [u8; 16] = digest[..16]
+        .try_into()
+        .expect("a SHA-256 digest contains 16 bytes");
+    id[6] = (id[6] & 0x0f) | 0x40;
+    id[8] = (id[8] & 0x3f) | 0x80;
+    format!(
+        "{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        id[0],
+        id[1],
+        id[2],
+        id[3],
+        id[4],
+        id[5],
+        id[6],
+        id[7],
+        id[8],
+        id[9],
+        id[10],
+        id[11],
+        id[12],
+        id[13],
+        id[14],
+        id[15]
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn valid_quarantine_event_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && [8, 13, 18, 23]
+            .into_iter()
+            .all(|index| bytes[index] == b'-')
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
+        && bytes[14] == b'4'
+        && matches!(bytes[19].to_ascii_uppercase(), b'8' | b'9' | b'A' | b'B')
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn zone_identifier(source_url: &str) -> String {
+    format!("[ZoneTransfer]\r\nZoneId=3\r\nHostUrl={source_url}\r\n")
+}
+
+#[cfg(target_os = "windows")]
+fn zone_identifier_path(path: &Path) -> PathBuf {
+    let mut stream = path.as_os_str().to_owned();
+    stream.push(":Zone.Identifier");
+    PathBuf::from(stream)
+}
+
+fn apply_download_provenance(path: &Path, asset: &ReleaseAsset) -> Result<(), UpdateError> {
+    #[cfg(target_os = "macos")]
+    {
+        let value = quarantine_value(unix_time(), &quarantine_event_id(path, asset));
+        let output = Command::new("/usr/bin/xattr")
+            .args(["-w", "com.apple.quarantine", &value])
+            .arg(path)
+            .output()?;
+        if !output.status.success() {
+            return Err(UpdateError::Io(io::Error::other(format!(
+                "could not apply macOS download quarantine: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))));
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut marker = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(zone_identifier_path(path))?;
+        marker.write_all(zone_identifier(&asset.url).as_bytes())?;
+        marker.sync_all()?;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (path, asset);
+    }
+    Ok(())
+}
+
+fn verify_download_provenance(path: &Path, _asset: &ReleaseAsset) -> Result<(), UpdateError> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("/usr/bin/xattr")
+            .args(["-p", "com.apple.quarantine"])
+            .arg(path)
+            .output()?;
+        if !output.status.success() {
+            return Err(UpdateError::InvalidRelease(
+                "the cached update is missing macOS download quarantine".into(),
+            ));
+        }
+        let value = String::from_utf8_lossy(&output.stdout);
+        let fields: Vec<&str> = value.trim_end().splitn(4, ';').collect();
+        if fields.len() != 4
+            || fields[0] != "0083"
+            || fields[2] != "Viewr"
+            || !valid_quarantine_event_id(fields[3])
+        {
+            return Err(UpdateError::InvalidRelease(
+                "the cached update has invalid macOS download quarantine".into(),
+            ));
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let marker = std::fs::read_to_string(zone_identifier_path(path))?;
+        if marker != zone_identifier(&_asset.url) {
+            return Err(UpdateError::InvalidRelease(
+                "the cached update has invalid Windows Internet-zone metadata".into(),
+            ));
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (path, _asset);
+    }
+    Ok(())
+}
+
+fn prepare_download_for_handoff(path: &Path, asset: &ReleaseAsset) -> Result<(), UpdateError> {
+    verify_file(path, asset)?;
+    apply_download_provenance(path, asset)?;
+    verify_download_provenance(path, asset)
+}
+
 pub(crate) fn download_release(
     release: &Release,
     asset: &ReleaseAsset,
     store: &UpdateStore,
     progress: &AtomicU64,
 ) -> Result<PathBuf, UpdateError> {
-    let _download_lock = store.claim_download(asset)?;
+    let _download_lock = store.claim_download()?;
     let destination = store.destination(release, asset);
     let directory = destination
         .parent()
         .expect("download destination has a parent");
     ensure_private_directory(&store.download_directory)?;
     ensure_private_directory(directory)?;
+    let obsolete_before = SystemTime::now()
+        .checked_sub(UPDATE_CACHE_RETENTION)
+        .unwrap_or(UNIX_EPOCH);
+    if let Err(error) = prune_update_cache(&store.download_directory, directory, obsolete_before) {
+        eprintln!("could not prune the update cache: {error}");
+    }
 
     match destination.symlink_metadata() {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
@@ -864,8 +1181,16 @@ pub(crate) fn download_release(
             ));
         }
         Ok(_) if verify_file(&destination, asset).is_ok() => {
-            progress.store(asset.size, Ordering::Relaxed);
-            return Ok(destination);
+            match prepare_download_for_handoff(&destination, asset) {
+                Ok(()) => {
+                    progress.store(asset.size, Ordering::Relaxed);
+                    return Ok(destination);
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(&destination);
+                    return Err(error);
+                }
+            }
         }
         Ok(_) => std::fs::remove_file(&destination)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -876,7 +1201,7 @@ pub(crate) fn download_release(
     let response = client.get(
         &asset.url,
         RequestPurpose::ReleaseAsset,
-        Duration::from_secs(20 * 60),
+        MAX_DOWNLOAD_DURATION,
     )?;
     if let Some(length) = response.header("Content-Length") {
         let length = length.parse::<u64>().map_err(|_| {
@@ -909,7 +1234,11 @@ fn persist_download_stream(
     let mut hasher = Sha256::new();
     let mut received = 0u64;
     let mut buffer = [0u8; 64 * 1024];
+    let started = Instant::now();
     loop {
+        if started.elapsed() > MAX_DOWNLOAD_DURATION {
+            return Err(UpdateError::Network("the update download timed out".into()));
+        }
         let count = reader.read(&mut buffer)?;
         if count == 0 {
             break;
@@ -950,13 +1279,20 @@ fn persist_download_stream(
     temporary
         .persist(destination)
         .map_err(|error| error.error)?;
-    sync_parent(directory)?;
-    verify_file(destination, asset)?;
+    let finalized = sync_parent(directory)
+        .map_err(UpdateError::from)
+        .and_then(|()| prepare_download_for_handoff(destination, asset));
+    if let Err(error) = finalized {
+        let _ = std::fs::remove_file(destination);
+        let _ = sync_parent(directory);
+        return Err(error);
+    }
     Ok(())
 }
 
 pub(crate) fn verify_before_open(path: &Path, asset: &ReleaseAsset) -> Result<(), UpdateError> {
-    verify_file(path, asset)
+    verify_file(path, asset)?;
+    verify_download_provenance(path, asset)
 }
 
 #[derive(Clone, Debug)]
@@ -986,6 +1322,11 @@ enum UpdateState {
         asset: ReleaseAsset,
         path: PathBuf,
     },
+    VerifyingInstaller {
+        id: u64,
+        release: Release,
+        path: PathBuf,
+    },
     InstallerOpened {
         release: Release,
         path: PathBuf,
@@ -1012,7 +1353,7 @@ struct DownloadRetry {
 enum WorkerEvent {
     CheckFinished {
         id: u64,
-        source: CheckSource,
+        claimed_source: CheckSource,
         result: Result<Option<CheckOutcome>, UpdateError>,
     },
     DownloadFinished {
@@ -1020,6 +1361,13 @@ enum WorkerEvent {
         release: Release,
         asset: ReleaseAsset,
         result: Result<PathBuf, UpdateError>,
+    },
+    InstallerVerified {
+        id: u64,
+        release: Release,
+        asset: ReleaseAsset,
+        path: PathBuf,
+        result: Result<(), UpdateError>,
     },
 }
 
@@ -1029,40 +1377,106 @@ struct CommandSpec {
     arguments: Vec<OsString>,
 }
 
-fn installer_command(target_os: &str, path: &Path) -> Option<CommandSpec> {
+fn installer_command_for(
+    target_os: &str,
+    path: &Path,
+    windows_system_directory: Option<&Path>,
+) -> Option<CommandSpec> {
     match target_os {
         "macos" => Some(CommandSpec {
             program: "/usr/bin/open".into(),
             arguments: vec![path.as_os_str().to_owned()],
         }),
         "windows" => Some(CommandSpec {
-            program: "msiexec.exe".into(),
+            program: windows_system_directory?
+                .join("msiexec.exe")
+                .into_os_string(),
             arguments: vec!["/i".into(), path.as_os_str().to_owned()],
         }),
         "linux" => Some(CommandSpec {
-            program: "xdg-open".into(),
+            program: "/usr/bin/xdg-open".into(),
             arguments: vec![path.as_os_str().to_owned()],
         }),
         _ => None,
     }
 }
 
-fn reveal_command(target_os: &str, path: &Path) -> Option<CommandSpec> {
+fn reveal_command_for(
+    target_os: &str,
+    path: &Path,
+    windows_directory: Option<&Path>,
+) -> Option<CommandSpec> {
     match target_os {
         "macos" => Some(CommandSpec {
             program: "/usr/bin/open".into(),
             arguments: vec!["-R".into(), path.as_os_str().to_owned()],
         }),
         "windows" => Some(CommandSpec {
-            program: "explorer.exe".into(),
+            program: windows_directory?.join("explorer.exe").into_os_string(),
             arguments: vec![format!("/select,{}", path.display()).into()],
         }),
         "linux" => Some(CommandSpec {
-            program: "xdg-open".into(),
+            program: "/usr/bin/xdg-open".into(),
             arguments: vec![path.parent()?.as_os_str().to_owned()],
         }),
         _ => None,
     }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_known_directory(
+    getter: unsafe extern "system" fn(*mut u16, u32) -> u32,
+) -> io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt as _;
+
+    let mut buffer = vec![0u16; 260];
+    loop {
+        // SAFETY: `buffer` is writable for the advertised length. The Win32
+        // functions write at most that many UTF-16 code units and return the
+        // required length when the buffer is too small.
+        let length = unsafe { getter(buffer.as_mut_ptr(), buffer.len() as u32) };
+        if length == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let length = length as usize;
+        if length < buffer.len() {
+            return Ok(PathBuf::from(OsString::from_wide(&buffer[..length])));
+        }
+        buffer.resize(length.saturating_add(1), 0);
+    }
+}
+
+fn installer_command(path: &Path) -> Result<CommandSpec, UpdateError> {
+    #[cfg(target_os = "windows")]
+    let windows_system_directory = Some(windows_known_directory(
+        windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW,
+    )?);
+    #[cfg(not(target_os = "windows"))]
+    let windows_system_directory: Option<PathBuf> = None;
+
+    installer_command_for(
+        std::env::consts::OS,
+        path,
+        windows_system_directory.as_deref(),
+    )
+    .ok_or_else(|| {
+        UpdateError::InvalidRelease("opening installers is unsupported on this platform".into())
+    })
+}
+
+fn reveal_command(path: &Path) -> Result<CommandSpec, UpdateError> {
+    #[cfg(target_os = "windows")]
+    let windows_directory = Some(windows_known_directory(
+        windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW,
+    )?);
+    #[cfg(not(target_os = "windows"))]
+    let windows_directory: Option<PathBuf> = None;
+
+    reveal_command_for(std::env::consts::OS, path, windows_directory.as_deref()).ok_or_else(|| {
+        UpdateError::InvalidRelease(
+            "showing downloaded files is unsupported on this platform".into(),
+        )
+    })
 }
 
 fn spawn_command(spec: &CommandSpec) -> io::Result<()> {
@@ -1090,22 +1504,31 @@ pub(crate) struct UpdateManager {
     sender: mpsc::Sender<WorkerEvent>,
     receiver: mpsc::Receiver<WorkerEvent>,
     next_id: u64,
+    automatic_checks_enabled: bool,
     automatic_due_at: Option<Instant>,
+    preference_refresh_due_at: Instant,
     dialog_open: bool,
 }
 
 impl UpdateManager {
-    pub(crate) fn new(ctx: egui::Context, check_automatically: bool) -> Self {
+    pub(crate) fn new(ctx: egui::Context) -> Self {
+        Self::with_store(ctx, UpdateStore::from_system())
+    }
+
+    fn with_store(ctx: egui::Context, store_result: Result<UpdateStore, UpdateError>) -> Self {
         let (sender, receiver) = mpsc::channel();
-        let (store, store_error) = match UpdateStore::from_system() {
-            Ok(store) => {
-                if let Err(error) = store.clear_obsolete_skip(&current_version()) {
-                    eprintln!("could not normalize update state: {error}");
-                }
-                (Some(store), None)
-            }
-            Err(error) => (None, Some(error.to_string())),
+        let (store, store_error, automatic_checks_enabled) = match store_result {
+            Ok(store) => match store.initialize(&current_version()) {
+                Ok(enabled) => (Some(store), None, enabled),
+                Err(error) => (Some(store), Some(error.to_string()), false),
+            },
+            Err(error) => (None, Some(error.to_string()), false),
         };
+        let automatic_due_at =
+            automatic_checks_enabled.then(|| Instant::now() + Duration::from_secs(4));
+        if let Some(deadline) = automatic_due_at {
+            ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
+        }
         Self {
             ctx,
             state: UpdateState::Idle,
@@ -1114,19 +1537,23 @@ impl UpdateManager {
             sender,
             receiver,
             next_id: 1,
-            automatic_due_at: check_automatically.then(|| Instant::now() + Duration::from_secs(4)),
+            automatic_checks_enabled,
+            automatic_due_at,
+            preference_refresh_due_at: Instant::now(),
             dialog_open: false,
         }
     }
 
     pub(crate) fn poll(&mut self) {
-        if self
-            .automatic_due_at
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            self.automatic_due_at = None;
-            if matches!(self.state, UpdateState::Idle) {
-                self.start_check(CheckSource::Automatic);
+        if let Some(deadline) = self.automatic_due_at {
+            let now = Instant::now();
+            if now >= deadline {
+                self.automatic_due_at = None;
+                if matches!(self.state, UpdateState::Idle) {
+                    self.start_check(CheckSource::Automatic);
+                }
+            } else {
+                self.ctx.request_repaint_after(deadline.duration_since(now));
             }
         }
         while let Ok(event) = self.receiver.try_recv() {
@@ -1137,14 +1564,88 @@ impl UpdateManager {
         }
     }
 
-    pub(crate) fn schedule_automatic_check(&mut self) {
-        if matches!(self.state, UpdateState::Idle) {
-            self.automatic_due_at = Some(Instant::now() + Duration::from_secs(1));
+    pub(crate) fn set_automatic_checks(&mut self, enabled: bool) {
+        let result = self
+            .store
+            .as_ref()
+            .ok_or_else(|| {
+                self.store_error
+                    .clone()
+                    .unwrap_or_else(|| "update storage is unavailable".into())
+            })
+            .and_then(|store| {
+                store
+                    .set_automatic_checks_enabled(enabled)
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(message) = result {
+            self.state = UpdateState::Failed {
+                message,
+                retry: Retry::None,
+            };
+            self.dialog_open = true;
+            return;
+        }
+        self.automatic_checks_enabled = enabled;
+        self.store_error = None;
+        if enabled && matches!(self.state, UpdateState::Idle) {
+            let delay = Duration::from_secs(1);
+            self.automatic_due_at = Some(Instant::now() + delay);
+            self.ctx.request_repaint_after(delay);
+        } else if !enabled {
+            self.automatic_due_at = None;
+        }
+    }
+
+    pub(crate) fn automatic_checks_enabled(&self) -> bool {
+        self.automatic_checks_enabled
+    }
+
+    pub(crate) fn refresh_automatic_preference(&mut self) {
+        let now = Instant::now();
+        if now < self.preference_refresh_due_at {
+            self.ctx
+                .request_repaint_after(self.preference_refresh_due_at.duration_since(now));
+            return;
+        }
+        self.preference_refresh_due_at = now + Duration::from_millis(250);
+        self.ctx.request_repaint_after(Duration::from_millis(250));
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        match store.automatic_checks_enabled() {
+            Ok(enabled) if enabled != self.automatic_checks_enabled => {
+                self.store_error = None;
+                self.automatic_checks_enabled = enabled;
+                if enabled && matches!(self.state, UpdateState::Idle) {
+                    let delay = Duration::from_secs(1);
+                    self.automatic_due_at = Some(now + delay);
+                    self.ctx.request_repaint_after(delay);
+                } else if !enabled {
+                    self.automatic_due_at = None;
+                }
+            }
+            Ok(_) => {
+                self.store_error = None;
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if self.store_error.as_deref() != Some(&message) {
+                    eprintln!("could not refresh update preference: {message}");
+                }
+                self.store_error = Some(message);
+                self.automatic_checks_enabled = false;
+                self.automatic_due_at = None;
+            }
         }
     }
 
     pub(crate) fn check_now(&mut self) {
         self.dialog_open = true;
+        if let UpdateState::Checking { source, .. } = &mut self.state {
+            *source = CheckSource::Manual;
+            return;
+        }
         self.start_check(CheckSource::Manual);
     }
 
@@ -1164,6 +1665,7 @@ impl UpdateManager {
                 | UpdateState::Deferred { .. }
                 | UpdateState::Downloading { .. }
                 | UpdateState::Ready { .. }
+                | UpdateState::VerifyingInstaller { .. }
                 | UpdateState::InstallerOpened { .. }
         )
     }
@@ -1172,9 +1674,15 @@ impl UpdateManager {
         !matches!(self.state, UpdateState::Idle)
     }
 
+    pub(crate) fn blocks_app_input(&self) -> bool {
+        self.dialog_open
+    }
+
     pub(crate) fn status_text(&self) -> String {
         match &self.state {
-            UpdateState::Idle => format!("Viewr {} is installed", current_version()),
+            UpdateState::Idle => {
+                format!("Viewr {} is installed", current_version_text())
+            }
             UpdateState::Checking { .. } => "Checking for updates…".into(),
             UpdateState::UpToDate { latest } => {
                 format!("Viewr is up to date ({latest})")
@@ -1191,6 +1699,9 @@ impl UpdateManager {
             ),
             UpdateState::Ready { release, .. } => {
                 format!("Viewr {} is ready", release.version)
+            }
+            UpdateState::VerifyingInstaller { release, .. } => {
+                format!("Verifying Viewr {} installer", release.version)
             }
             UpdateState::InstallerOpened { release, .. } => {
                 format!("Viewr {} installer opened", release.version)
@@ -1210,7 +1721,9 @@ impl UpdateManager {
     fn start_check(&mut self, source: CheckSource) {
         if matches!(
             self.state,
-            UpdateState::Checking { .. } | UpdateState::Downloading { .. }
+            UpdateState::Checking { .. }
+                | UpdateState::Downloading { .. }
+                | UpdateState::VerifyingInstaller { .. }
         ) {
             return;
         }
@@ -1242,7 +1755,11 @@ impl UpdateManager {
                     Ok(None) => Ok(None),
                     Err(error) => Err(error),
                 };
-                let _ = sender.send(WorkerEvent::CheckFinished { id, source, result });
+                let _ = sender.send(WorkerEvent::CheckFinished {
+                    id,
+                    claimed_source: source,
+                    result,
+                });
                 ctx.request_repaint();
             });
         if let Err(error) = spawn {
@@ -1297,21 +1814,63 @@ impl UpdateManager {
         }
     }
 
+    fn start_installer_verification(
+        &mut self,
+        release: Release,
+        asset: ReleaseAsset,
+        path: PathBuf,
+    ) {
+        let id = self.next_request_id();
+        self.state = UpdateState::VerifyingInstaller {
+            id,
+            release: release.clone(),
+            path: path.clone(),
+        };
+        self.dialog_open = true;
+        let sender = self.sender.clone();
+        let ctx = self.ctx.clone();
+        let worker_release = release.clone();
+        let worker_asset = asset.clone();
+        let worker_path = path.clone();
+        let spawn = std::thread::Builder::new()
+            .name("viewr-update-verify".into())
+            .spawn(move || {
+                let result = verify_before_open(&worker_path, &worker_asset);
+                let _ = sender.send(WorkerEvent::InstallerVerified {
+                    id,
+                    release: worker_release,
+                    asset: worker_asset,
+                    path: worker_path,
+                    result,
+                });
+                ctx.request_repaint();
+            });
+        if let Err(error) = spawn {
+            self.state = UpdateState::Failed {
+                message: format!("could not start installer verification: {error}"),
+                retry: Retry::Download(Box::new(DownloadRetry { release, asset })),
+            };
+        }
+    }
+
     fn handle_event(&mut self, event: WorkerEvent) {
         match event {
-            WorkerEvent::CheckFinished { id, source, result } => {
-                if !matches!(
-                    self.state,
-                    UpdateState::Checking {
-                        id: active,
-                        ..
-                    } if active == id
-                ) {
-                    return;
-                }
+            WorkerEvent::CheckFinished {
+                id,
+                claimed_source,
+                result,
+            } => {
+                let source = match &self.state {
+                    UpdateState::Checking { id: active, source } if *active == id => *source,
+                    _ => return,
+                };
                 match result {
                     Ok(None) => {
-                        if source == CheckSource::Manual {
+                        if source == CheckSource::Manual && claimed_source == CheckSource::Automatic
+                        {
+                            self.state = UpdateState::Idle;
+                            self.start_check(CheckSource::Manual);
+                        } else if source == CheckSource::Manual {
                             self.state = UpdateState::Failed {
                                 message: "Another update check ran moments ago. Try again in a few seconds.".into(),
                                 retry: Retry::Check,
@@ -1389,6 +1948,38 @@ impl UpdateManager {
                 }
                 self.dialog_open = true;
             }
+            WorkerEvent::InstallerVerified {
+                id,
+                release,
+                asset,
+                path,
+                result,
+            } => {
+                if !matches!(
+                    self.state,
+                    UpdateState::VerifyingInstaller {
+                        id: active,
+                        ..
+                    } if active == id
+                ) {
+                    return;
+                }
+                let result = result
+                    .and_then(|()| installer_command(&path))
+                    .and_then(|spec| spawn_command(&spec).map_err(UpdateError::from));
+                match result {
+                    Ok(()) => {
+                        self.state = UpdateState::InstallerOpened { release, path };
+                    }
+                    Err(error) => {
+                        self.state = UpdateState::Failed {
+                            message: error.to_string(),
+                            retry: Retry::Download(Box::new(DownloadRetry { release, asset })),
+                        };
+                    }
+                }
+                self.dialog_open = true;
+            }
         }
     }
 
@@ -1434,7 +2025,7 @@ impl UpdateManager {
                 ui.heading("Viewr is up to date");
                 ui.label(format!(
                     "You are running {}. The latest stable release is {latest}.",
-                    current_version()
+                    current_version_text()
                 ));
                 ui.add_space(12.0);
                 if ui.button("Close").clicked() {
@@ -1447,7 +2038,7 @@ impl UpdateManager {
                 ui.heading(format!("Viewr {} is available", release.version));
                 ui.label(format!(
                     "You are currently running Viewr {}.",
-                    current_version()
+                    current_version_text()
                 ));
                 ui.add_space(8.0);
                 ui.label(egui::RichText::new("What’s new").strong());
@@ -1555,6 +2146,14 @@ impl UpdateManager {
                         .size(10.0),
                 );
                 action
+            }
+            UpdateState::VerifyingInstaller { .. } => {
+                ui.heading("Verifying installer");
+                ui.spinner();
+                ui.label(
+                    "Viewr is checking the downloaded file again before it asks the operating system to open it.",
+                );
+                UpdateAction::None
             }
             UpdateState::InstallerOpened { release, path } => {
                 ui.heading("Installer opened");
@@ -1697,11 +2296,8 @@ impl UpdateManager {
                 let Some(path) = path_in_state(&self.state) else {
                     return;
                 };
-                let result = reveal_command(std::env::consts::OS, &path)
-                    .ok_or_else(|| {
-                        io::Error::other("showing downloaded files is unsupported on this platform")
-                    })
-                    .and_then(|spec| spawn_command(&spec));
+                let result = reveal_command(&path)
+                    .and_then(|spec| spawn_command(&spec).map_err(UpdateError::from));
                 if let Err(error) = result {
                     self.state = UpdateState::Failed {
                         message: format!("could not show the update file: {error}"),
@@ -1720,25 +2316,7 @@ impl UpdateManager {
                 }) else {
                     return;
                 };
-                let result = verify_before_open(&path, &asset).and_then(|()| {
-                    let spec = installer_command(std::env::consts::OS, &path).ok_or_else(|| {
-                        UpdateError::InvalidRelease(
-                            "opening installers is unsupported on this platform".into(),
-                        )
-                    })?;
-                    spawn_command(&spec).map_err(UpdateError::from)
-                });
-                match result {
-                    Ok(()) => {
-                        self.state = UpdateState::InstallerOpened { release, path };
-                    }
-                    Err(error) => {
-                        self.state = UpdateState::Failed {
-                            message: error.to_string(),
-                            retry: Retry::Download(Box::new(DownloadRetry { release, asset })),
-                        };
-                    }
-                }
+                self.start_installer_verification(release, asset, path);
             }
             UpdateAction::Quit => {
                 self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1753,6 +2331,7 @@ fn release_in_state(state: &UpdateState) -> Option<&Release> {
         | UpdateState::Deferred { release }
         | UpdateState::Downloading { release, .. }
         | UpdateState::Ready { release, .. }
+        | UpdateState::VerifyingInstaller { release, .. }
         | UpdateState::InstallerOpened { release, .. } => Some(release),
         UpdateState::Idle
         | UpdateState::Checking { .. }
@@ -1763,9 +2342,9 @@ fn release_in_state(state: &UpdateState) -> Option<&Release> {
 
 fn path_in_state(state: &UpdateState) -> Option<PathBuf> {
     match state {
-        UpdateState::Ready { path, .. } | UpdateState::InstallerOpened { path, .. } => {
-            Some(path.clone())
-        }
+        UpdateState::Ready { path, .. }
+        | UpdateState::VerifyingInstaller { path, .. }
+        | UpdateState::InstallerOpened { path, .. } => Some(path.clone()),
         _ => None,
     }
 }
@@ -1811,6 +2390,17 @@ mod tests {
 
     fn digest(byte: u8) -> String {
         format!("sha256:{}", format!("{byte:02x}").repeat(32))
+    }
+
+    fn digest_for(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+
+        let digest = Sha256::digest(bytes);
+        let mut output = String::from("sha256:");
+        for byte in digest {
+            write!(&mut output, "{byte:02x}").unwrap();
+        }
+        output
     }
 
     fn release_json(tag: &str, name: &str, size: u64, digest: Option<String>) -> Vec<u8> {
@@ -1870,9 +2460,17 @@ mod tests {
             "windows",
             Path::new(r"C:\Program Files\Viewr\viewr.exe")
         ));
+        assert!(native_install_path(
+            "windows",
+            Path::new(r"\\?\C:\Program Files\Viewr\viewr.exe")
+        ));
         assert!(!native_install_path(
             "windows",
             Path::new(r"C:\Downloads\Viewr\viewr.exe")
+        ));
+        assert!(!native_install_path(
+            "windows",
+            Path::new(r"C:\Downloads\Program Files\Viewr\viewr.exe")
         ));
         assert!(native_install_path("linux", Path::new("/usr/bin/viewr")));
         assert!(!native_install_path(
@@ -1899,6 +2497,29 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(outcome, CheckOutcome::Current(_)));
+    }
+
+    #[test]
+    fn available_release_uses_only_the_canonical_asset_contract() {
+        let bytes = release_json("v0.2.0", "viewr-linux-x64.deb", 42, Some(digest(0xab)));
+        let CheckOutcome::Available(release) = parse_release(
+            &bytes,
+            &Version::parse("0.1.0").unwrap(),
+            Some(("viewr-linux-x64.deb", PackageKind::Installer)),
+        )
+        .unwrap() else {
+            panic!("expected an available release");
+        };
+        let Delivery::Download(asset) = release.delivery else {
+            panic!("expected a downloadable asset");
+        };
+        assert_eq!(asset.name, "viewr-linux-x64.deb");
+        assert_eq!(
+            asset.url,
+            "https://github.com/hunterchen7/viewr/releases/download/v0.2.0/viewr-linux-x64.deb"
+        );
+        assert_eq!(asset.sha256, [0xab; 32]);
+        assert_eq!(asset.kind, PackageKind::Installer);
     }
 
     #[test]
@@ -2022,9 +2643,72 @@ mod tests {
     }
 
     #[test]
+    fn redirects_remain_https_and_inside_the_purpose_allowlist() {
+        let asset_url =
+            Url::parse("https://github.com/hunterchen7/viewr/releases/download/v0.2.0/update.pkg")
+                .unwrap();
+        assert_eq!(
+            redirect_url(
+                &asset_url,
+                Some("https://release-assets.githubusercontent.com/token"),
+                0,
+                RequestPurpose::ReleaseAsset,
+            )
+            .unwrap()
+            .host_str(),
+            Some("release-assets.githubusercontent.com")
+        );
+        assert!(
+            redirect_url(
+                &asset_url,
+                Some("http://release-assets.githubusercontent.com/token"),
+                0,
+                RequestPurpose::ReleaseAsset,
+            )
+            .is_err()
+        );
+        assert!(
+            redirect_url(
+                &asset_url,
+                Some("https://example.com/token"),
+                0,
+                RequestPurpose::ReleaseAsset,
+            )
+            .is_err()
+        );
+        assert!(redirect_url(&asset_url, None, 0, RequestPurpose::ReleaseAsset).is_err());
+        assert!(
+            redirect_url(
+                &asset_url,
+                Some("/another"),
+                MAX_REDIRECTS,
+                RequestPurpose::ReleaseAsset,
+            )
+            .is_err()
+        );
+
+        let api_url = Url::parse(RELEASE_API_URL).unwrap();
+        assert!(
+            redirect_url(
+                &api_url,
+                Some("https://github.com/hunterchen7/viewr/releases/latest"),
+                0,
+                RequestPurpose::ReleaseApi,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn bounded_reader_rejects_one_extra_byte() {
         assert_eq!(read_bounded(&b"abcd"[..], 4).unwrap(), b"abcd");
         assert!(read_bounded(&b"abcde"[..], 4).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires the public GitHub API"]
+    fn live_release_endpoint_satisfies_the_update_contract() {
+        check_latest_release().unwrap();
     }
 
     #[test]
@@ -2039,11 +2723,9 @@ mod tests {
         store.skip(&skipped).unwrap();
         assert_eq!(store.skipped_version().unwrap(), Some(skipped.clone()));
 
-        store
-            .clear_obsolete_skip(&Version::parse("0.1.9").unwrap())
-            .unwrap();
+        store.initialize(&Version::parse("0.1.9").unwrap()).unwrap();
         assert_eq!(store.skipped_version().unwrap(), Some(skipped.clone()));
-        store.clear_obsolete_skip(&skipped).unwrap();
+        store.initialize(&skipped).unwrap();
         assert_eq!(store.skipped_version().unwrap(), None);
 
         assert!(check_due(None, 100, 10));
@@ -2081,28 +2763,206 @@ mod tests {
             store
                 .claim_check(CheckSource::Manual, 100)
                 .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .claim_check(CheckSource::Manual, 100 + MANUAL_CHECK_INTERVAL_SECS,)
+                .unwrap()
                 .is_some()
         );
     }
 
     #[test]
+    fn automatic_opt_out_is_authoritative_across_existing_processes() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config");
+        let cache = directory.path().join("cache");
+        let first = UpdateStore::new(config.clone(), cache.clone()).unwrap();
+        let sibling = UpdateStore::new(config, cache).unwrap();
+
+        assert!(first.automatic_checks_enabled().unwrap());
+        first.set_automatic_checks_enabled(false).unwrap();
+        assert!(!sibling.automatic_checks_enabled().unwrap());
+        assert!(
+            sibling
+                .claim_check(CheckSource::Automatic, 100)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            sibling
+                .claim_check(CheckSource::Manual, 100)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn corrupt_existing_update_state_fails_closed_for_automatic_network_access() {
+        let cases = [
+            b"automatic_checks_enabled = maybe".to_vec(),
+            vec![b'x'; MAX_UPDATE_STATE_BYTES as usize + 1],
+        ];
+        for contents in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let store = UpdateStore::new(
+                directory.path().join("config"),
+                directory.path().join("cache"),
+            )
+            .unwrap();
+            std::fs::write(&store.state_path, &contents).unwrap();
+
+            assert!(store.automatic_checks_enabled().is_err());
+            let mut manager = UpdateManager::with_store(egui::Context::default(), Ok(store));
+            assert!(!manager.automatic_checks_enabled());
+            assert!(manager.automatic_due_at.is_none());
+            manager.set_automatic_checks(true);
+            assert!(manager.automatic_checks_enabled());
+            assert!(manager.store_error.is_none());
+        }
+    }
+
+    #[test]
+    fn manager_schedules_and_cancels_automatic_checks_with_the_persisted_setting() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = UpdateStore::new(
+            directory.path().join("config"),
+            directory.path().join("cache"),
+        )
+        .unwrap();
+        let mut manager = UpdateManager::with_store(egui::Context::default(), Ok(store.clone()));
+        let mut sibling = UpdateManager::with_store(egui::Context::default(), Ok(store.clone()));
+        assert!(manager.automatic_checks_enabled());
+        assert!(sibling.automatic_checks_enabled());
+        assert!(manager.automatic_due_at.is_some());
+
+        manager.set_automatic_checks(false);
+        assert!(!manager.automatic_checks_enabled());
+        assert!(manager.automatic_due_at.is_none());
+
+        sibling.preference_refresh_due_at = Instant::now();
+        sibling.refresh_automatic_preference();
+        assert!(!sibling.automatic_checks_enabled());
+        assert!(sibling.automatic_due_at.is_none());
+
+        let restarted = UpdateManager::with_store(egui::Context::default(), Ok(store));
+        assert!(!restarted.automatic_checks_enabled());
+        assert!(restarted.automatic_due_at.is_none());
+    }
+
+    #[test]
+    fn manual_check_promotes_an_in_flight_automatic_check() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = UpdateStore::new(
+            directory.path().join("config"),
+            directory.path().join("cache"),
+        )
+        .unwrap();
+        let mut manager = UpdateManager::with_store(egui::Context::default(), Ok(store));
+        manager.state = UpdateState::Checking {
+            id: 9,
+            source: CheckSource::Automatic,
+        };
+
+        manager.check_now();
+
+        assert!(manager.dialog_open);
+        assert!(matches!(
+            manager.state,
+            UpdateState::Checking {
+                id: 9,
+                source: CheckSource::Manual
+            }
+        ));
+    }
+
+    #[test]
+    fn promoted_manual_check_retries_when_the_automatic_claim_was_suppressed() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = UpdateStore::new(
+            directory.path().join("config"),
+            directory.path().join("cache"),
+        )
+        .unwrap();
+        drop(
+            store
+                .claim_check(CheckSource::Manual, unix_time())
+                .unwrap()
+                .unwrap(),
+        );
+        let mut manager = UpdateManager::with_store(egui::Context::default(), Ok(store));
+        manager.state = UpdateState::Checking {
+            id: 9,
+            source: CheckSource::Manual,
+        };
+
+        manager.handle_event(WorkerEvent::CheckFinished {
+            id: 9,
+            claimed_source: CheckSource::Automatic,
+            result: Ok(None),
+        });
+
+        assert!(matches!(
+            manager.state,
+            UpdateState::Checking {
+                id,
+                source: CheckSource::Manual
+            } if id != 9
+        ));
+    }
+
+    #[test]
     fn installer_and_reveal_commands_preserve_paths_as_single_arguments() {
         let path = Path::new("/tmp/update with spaces;$(nope).pkg");
-        let mac = installer_command("macos", path).unwrap();
+        let mac = installer_command_for("macos", path, None).unwrap();
         assert_eq!(mac.program, OsString::from("/usr/bin/open"));
         assert_eq!(mac.arguments, vec![path.as_os_str().to_owned()]);
 
-        let windows = installer_command("windows", Path::new(r"C:\update a.msi")).unwrap();
-        assert_eq!(windows.program, OsString::from("msiexec.exe"));
+        let system = Path::new(r"C:\Windows\System32");
+        let windows =
+            installer_command_for("windows", Path::new(r"C:\update a.msi"), Some(system)).unwrap();
+        assert_eq!(windows.program, system.join("msiexec.exe").into_os_string());
         assert_eq!(
             windows.arguments,
             vec![OsString::from("/i"), OsString::from(r"C:\update a.msi")]
         );
 
-        let linux = reveal_command("linux", Path::new("/tmp/version/update.deb")).unwrap();
-        assert_eq!(linux.program, OsString::from("xdg-open"));
+        let windows = reveal_command_for(
+            "windows",
+            Path::new(r"C:\update a.msi"),
+            Some(Path::new(r"C:\Windows")),
+        )
+        .unwrap();
+        assert_eq!(
+            windows.program,
+            Path::new(r"C:\Windows")
+                .join("explorer.exe")
+                .into_os_string()
+        );
+
+        let linux =
+            reveal_command_for("linux", Path::new("/tmp/version/update.deb"), None).unwrap();
+        assert_eq!(linux.program, OsString::from("/usr/bin/xdg-open"));
         assert_eq!(linux.arguments, vec![OsString::from("/tmp/version")]);
-        assert!(installer_command("freebsd", path).is_none());
+        assert!(installer_command_for("freebsd", path, None).is_none());
+        assert!(installer_command_for("windows", path, None).is_none());
+    }
+
+    #[test]
+    fn provenance_records_the_download_source_without_shell_interpolation() {
+        let url = "https://github.com/hunterchen7/viewr/releases/download/v0.2.0/viewr.pkg?x=1&y=2";
+        let event_id = "550E8400-E29B-41D4-A716-446655440000";
+        assert_eq!(
+            quarantine_value(0x1234, event_id),
+            format!("0083;1234;Viewr;{event_id}")
+        );
+        assert!(valid_quarantine_event_id(event_id));
+        assert!(!valid_quarantine_event_id(url));
+        assert_eq!(
+            zone_identifier(url),
+            format!("[ZoneTransfer]\r\nZoneId=3\r\nHostUrl={url}\r\n")
+        );
     }
 
     #[test]
@@ -2160,6 +3020,129 @@ mod tests {
         }
     }
 
+    #[test]
+    fn local_release_to_verified_handoff_flow_is_end_to_end() {
+        let bytes = b"a complete release package";
+        let platform = platform_assets(std::env::consts::OS, std::env::consts::ARCH)
+            .expect("CI runs on a supported release target");
+        let json = release_json(
+            "v9.8.7",
+            platform.portable,
+            bytes.len() as u64,
+            Some(digest_for(bytes)),
+        );
+        let CheckOutcome::Available(release) = parse_release(
+            &json,
+            &Version::parse("1.0.0").unwrap(),
+            Some((platform.portable, PackageKind::Portable)),
+        )
+        .unwrap() else {
+            panic!("expected a newer release");
+        };
+        let Delivery::Download(asset) = &release.delivery else {
+            panic!("expected the exact platform asset");
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let store = UpdateStore::new(
+            directory.path().join("config"),
+            directory.path().join("cache"),
+        )
+        .unwrap();
+        let destination = store.destination(&release, asset);
+        ensure_private_directory(destination.parent().unwrap()).unwrap();
+
+        persist_download_stream(&bytes[..], &destination, asset, &AtomicU64::new(0)).unwrap();
+
+        verify_before_open(&destination, asset).unwrap();
+        assert_eq!(std::fs::read(destination).unwrap(), bytes);
+    }
+
+    #[test]
+    fn pre_open_verification_rejects_same_size_tampering() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("viewr-update.pkg");
+        let original = b"verified update";
+        let asset = ReleaseAsset {
+            name: "viewr-macos-arm64.pkg",
+            url:
+                "https://github.com/hunterchen7/viewr/releases/download/v0.2.0/viewr-macos-arm64.pkg"
+                    .into(),
+            size: original.len() as u64,
+            sha256: Sha256::digest(original).into(),
+            kind: PackageKind::Installer,
+        };
+        std::fs::write(&path, original).unwrap();
+        apply_download_provenance(&path, &asset).unwrap();
+        std::fs::write(&path, b"tampered update").unwrap();
+
+        assert!(verify_before_open(&path, &asset).is_err());
+    }
+
+    #[test]
+    fn stale_installer_verification_cannot_open_an_installer() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = UpdateStore::new(
+            directory.path().join("config"),
+            directory.path().join("cache"),
+        )
+        .unwrap();
+        let mut manager = UpdateManager::with_store(egui::Context::default(), Ok(store));
+        let asset = ReleaseAsset {
+            name: "viewr-macos-arm64.pkg",
+            url:
+                "https://github.com/hunterchen7/viewr/releases/download/v0.2.0/viewr-macos-arm64.pkg"
+                    .into(),
+            size: 1,
+            sha256: [0; 32],
+            kind: PackageKind::Installer,
+        };
+        let release = Release {
+            version: Version::parse("0.2.0").unwrap(),
+            notes: String::new(),
+            delivery: Delivery::Download(asset.clone()),
+        };
+        manager.state = UpdateState::VerifyingInstaller {
+            id: 7,
+            release: release.clone(),
+            path: PathBuf::from("/tmp/update.pkg"),
+        };
+        manager.handle_event(WorkerEvent::InstallerVerified {
+            id: 6,
+            release,
+            asset,
+            path: PathBuf::from("/tmp/update.pkg"),
+            result: Ok(()),
+        });
+        assert!(matches!(
+            manager.state,
+            UpdateState::VerifyingInstaller { id: 7, .. }
+        ));
+    }
+
+    #[test]
+    fn cache_pruning_removes_orphan_temps_and_obsolete_versions() {
+        let directory = tempfile::tempdir().unwrap();
+        let downloads = directory.path().join("downloads");
+        let keep = downloads.join("0.3.0");
+        let obsolete = downloads.join("0.2.0");
+        std::fs::create_dir_all(&keep).unwrap();
+        std::fs::create_dir_all(&obsolete).unwrap();
+        std::fs::write(keep.join(".viewr-download-one.tmp"), b"partial").unwrap();
+        std::fs::write(keep.join("viewr.pkg"), b"current").unwrap();
+        std::fs::write(obsolete.join("viewr.pkg"), b"old").unwrap();
+
+        prune_update_cache(
+            &downloads,
+            &keep,
+            SystemTime::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+
+        assert!(keep.join("viewr.pkg").is_file());
+        assert!(!keep.join(".viewr-download-one.tmp").exists());
+        assert!(!obsolete.exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn update_state_refuses_symbolic_link_targets() {
@@ -2177,6 +3160,45 @@ mod tests {
 
         assert!(store.skip(&Version::parse("0.2.0").unwrap()).is_err());
         assert_eq!(std::fs::read(target).unwrap(), b"untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn updater_storage_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = UpdateStore::new(
+            directory.path().join("config"),
+            directory.path().join("cache"),
+        )
+        .unwrap();
+        store.skip(&Version::parse("0.2.0").unwrap()).unwrap();
+        let check_lock = store
+            .claim_check(CheckSource::Manual, 100)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            store
+                .state_path
+                .parent()
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            store.state_path.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            check_lock.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

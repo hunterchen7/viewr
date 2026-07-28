@@ -1,6 +1,6 @@
-//! Preferences window: input mode, tier border, cache budgets, and
-//! click-to-capture keybind editing. Changes save to viewr.toml
-//! immediately; cache-profile changes apply on the next folder open.
+//! Preferences window: input mode, display, cache, updates, and keybinds.
+//! Viewer preferences save to viewr.toml; updater actions are returned to its
+//! cross-process store. Cache-profile changes apply on the next folder open.
 
 use eframe::egui;
 use viewr_core::jobs::{MAX_CACHE_JPEG_QUALITY, MIN_CACHE_JPEG_QUALITY};
@@ -11,7 +11,7 @@ use crate::config::{ACTIONS, Action, Bind, Config, ScrollMode, TierIndicator};
 pub struct SettingsActions {
     pub check_for_updates: bool,
     pub show_update_status: bool,
-    pub automatic_updates_enabled: bool,
+    pub automatic_updates_changed: Option<bool>,
 }
 
 #[derive(Default)]
@@ -56,6 +56,7 @@ impl SettingsState {
         config: &mut Config,
         update_status: &str,
         update_details_available: bool,
+        automatic_updates_enabled: bool,
     ) -> SettingsActions {
         let mut actions = SettingsActions::default();
         if !self.open {
@@ -180,15 +181,17 @@ impl SettingsState {
 
                 ui.heading("Updates");
                 ui.label(update_status);
+                let mut automatic_updates_enabled = automatic_updates_enabled;
                 let automatic_changed = ui
                     .checkbox(
-                        &mut config.check_updates_automatically,
+                        &mut automatic_updates_enabled,
                         "Check automatically for stable releases",
                     )
                     .changed();
-                changed |= automatic_changed;
-                actions.automatic_updates_enabled |=
-                    automatic_changed && config.check_updates_automatically;
+                if automatic_changed {
+                    actions.automatic_updates_changed =
+                        Some(automatic_updates_enabled);
+                }
                 ui.horizontal(|ui| {
                     if ui.button("Check now").clicked() {
                         actions.check_for_updates = true;
