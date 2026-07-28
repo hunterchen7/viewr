@@ -17,6 +17,7 @@ image.workspace = true
 fast_image_resize.workspace = true
 jpeg-rusturbo.workspace = true
 zune-jpeg.workspace = true
+memchr.workspace = true
 rusqlite.workspace = true
 blake3.workspace = true
 quick-xml.workspace = true

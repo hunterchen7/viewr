@@ -97,9 +97,9 @@ jobs:
             --test-threads=1 2>&1 |
             tee "$test_log"
           if ! grep -Fq \
-            "test result: ok. 3 passed; 0 failed; 0 ignored;" \
+            "test result: ok. 4 passed; 0 failed; 0 ignored;" \
             "$test_log"; then
-            echo "::error::Expected exactly three pinned real-RAW tests to pass."
+            echo "::error::Expected exactly four pinned real-RAW tests to pass."
             exit 1
           fi
       - name: Smoke-test optimized benchmark harnesses
