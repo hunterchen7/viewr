@@ -483,6 +483,34 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the pinned public-domain Sony RAW fixture or VIEWR_TEST_RAW"]
+    fn real_sony_raw_cache_objects_decode_identically_in_parallel() {
+        let path = std::env::var_os("VIEWR_TEST_RAW")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../testdata/real-raw-corpus/HCA04875.ARW")
+            });
+
+        for quality in [crate::develop::Quality::Browse, crate::develop::Quality::Full] {
+            let raw = crate::decode::load(&path).expect("fixture decodes").raw;
+            let (developed, _) =
+                crate::develop::develop(raw, quality).expect("fixture develop succeeds");
+            let encoded = encode_jpeg(&developed, crate::cache_disk::DEFAULT_CACHE_JPEG_QUALITY)
+                .expect("cache-quality encode succeeds");
+            let parallel =
+                try_decode(&encoded).expect("real cache objects qualify for the parallel path");
+            let serial = serial_reference(&encoded);
+            assert_eq!(
+                (parallel.width, parallel.height),
+                (serial.width, serial.height),
+                "{quality:?} dimensions"
+            );
+            assert_eq!(parallel.rgba, serial.rgba, "{quality:?} pixels");
+        }
+    }
+
+    #[test]
     fn chunking_covers_every_row_without_empty_chunks() {
         for row_count in [2usize, 3, 9, 64, 583] {
             let rows: Vec<_> = (0..row_count)
