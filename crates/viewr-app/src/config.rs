@@ -6,6 +6,7 @@
 //! Preferences window edits this in memory and saves a regenerated file.
 
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use eframe::egui;
@@ -261,7 +262,9 @@ impl Config {
                     .map_err(|e| eprintln!("viewr.toml: {e}; using defaults"))
                     .ok(),
                 Err(_) => {
-                    let _ = std::fs::write(&p, TEMPLATE);
+                    if let Err(error) = replace_file_durable(&p, TEMPLATE.as_bytes()) {
+                        eprintln!("failed to create {}: {error}", p.display());
+                    }
                     None
                 }
             })
@@ -356,6 +359,13 @@ impl Config {
     /// comments are replaced — the file is round-tripped by the app.)
     pub fn save(&self) {
         let Some(path) = config_path() else { return };
+        let out = self.serialized();
+        if let Err(error) = replace_file_durable(&path, out.as_bytes()) {
+            eprintln!("failed to save {}: {error}", path.display());
+        }
+    }
+
+    fn serialized(&self) -> String {
         let mut out = String::from(
             "# viewr configuration. Managed by the Preferences window;\n\
              # hand-edits are read at startup but comments are not kept.\n\n[input]\n",
@@ -384,9 +394,7 @@ impl Config {
                 .collect();
             out.push_str(&format!("{name} = [{}]\n", labels.join(", ")));
         }
-        if let Err(e) = std::fs::write(&path, out) {
-            eprintln!("failed to save {}: {e}", path.display());
-        }
+        out
     }
 }
 
@@ -402,6 +410,53 @@ fn config_path() -> Option<PathBuf> {
     let dir = dirs::config_dir()?.join("viewr");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join("viewr.toml"))
+}
+
+fn replace_file_durable(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "configuration path has no parent directory",
+        )
+    })?;
+    let permissions = match path.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to replace a symbolic-link configuration file",
+            ));
+        }
+        Ok(metadata) if metadata.is_file() => Some(metadata.permissions()),
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "configuration path is not a regular file",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".viewr-config-")
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    temporary.write_all(bytes)?;
+    if let Some(permissions) = permissions {
+        temporary.as_file().set_permissions(permissions)?;
+    }
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    sync_parent(parent)
+}
+
+#[cfg(unix)]
+fn sync_parent(parent: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_parent: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 const TEMPLATE: &str = r#"# viewr configuration.
@@ -649,6 +704,34 @@ mod tests {
         assert_eq!(cfg.ram_gb, 4.5);
         assert_eq!(cfg.disk_gb, 20.0);
         assert_eq!(cfg.jpeg_quality, CACHE_JPEG_QUALITY);
+    }
+
+    #[test]
+    fn durable_config_replacement_publishes_complete_contents() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("viewr.toml");
+
+        replace_file_durable(&path, b"first").unwrap();
+        replace_file_durable(&path, b"replacement").unwrap();
+
+        assert_eq!(std::fs::read(path).unwrap(), b"replacement");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_config_replacement_refuses_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.toml");
+        let link = directory.path().join("viewr.toml");
+        std::fs::write(&target, b"untouched").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let error = replace_file_durable(&link, b"replacement").unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read(target).unwrap(), b"untouched");
     }
 
     #[test]

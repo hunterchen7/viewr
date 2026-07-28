@@ -22,7 +22,10 @@ eframe = { version = "0.35", features = ["persistence"] }
 rfd = "0.15"
 objc2 = "0.6"
 raw-window-handle = "0.6"
-windows-sys = { version = "0.61", features = ["Win32_UI_Shell"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_System_SystemInformation",
+    "Win32_UI_Shell",
+] }
 jpeg-rusturbo = "0.9.2"
 zune-jpeg = "0.5"
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -32,8 +35,13 @@ dirs = "5"
 icu_casemap = "2.2"
 icu_normalizer = "2.2"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+semver = "1"
+sha2 = "0.10"
 toml = "0.8"
 tempfile = "3.27"
+ureq = { version = "2.12.1", default-features = false, features = ["tls"] }
+url = "2"
 criterion = { version = "0.8", features = ["html_reports"] }
 
 [profile.release]

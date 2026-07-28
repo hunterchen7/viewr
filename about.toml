@@ -8,6 +8,10 @@ accepted = [
     "BSD-3-Clause",
     "BSL-1.0",
     "CC0-1.0",
+    # Mozilla CA root data shipped by webpki-roots. Section 2.1 requires the
+    # agreement text to accompany redistributed data; cargo-about includes it
+    # in the generated installer inventory.
+    "CDLA-Permissive-2.0",
     "ISC",
     "Unicode-3.0",
     "Zlib",
