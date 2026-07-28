@@ -55,7 +55,7 @@ carry markers and become splittable as the cache naturally rewrites.
 | Operation | Before | After | Change |
 | --- | ---: | ---: | ---: |
 | Decode Browse, 8 MP, q97 | 44.1 ms | 9.2 ms | 79% faster |
-| Decode Full, 33 MP, q97 | 171.8 ms | 37.7 ms | 78% faster |
+| Decode Full, 33 MP, q97 | 171.8 ms | 38.3 ms | 78% faster |
 | Encode Browse, 8 MP, q97 | 27.6 ms | 27.7 ms | no significant change |
 | Encode Full, 33 MP, q97 | 111.4 ms | 110.8 ms | no significant change |
 | Browse object size | 5,078,270 B | 5,078,337 B | +0.001% |
@@ -90,10 +90,11 @@ would not.
 
 The first implementation created exactly one chunk per worker. Entropy
 density varies between MCU rows, so the join waited on the densest chunk:
-33 MP decoded in 41.9 ms and 8 MP in 11.1 ms. Six chunks per worker let work
-stealing absorb the imbalance and reached 37.7 ms and 9.2 ms. Three chunks
-per worker measured between the two. The knob stops mattering beyond about
-six; per-chunk header decode limits further subdivision.
+33 MP decoded in 41.9 ms and 8 MP in 11.1 ms. Finer chunks let work stealing
+absorb the imbalance. Three chunks per worker measured 37.7 ms and 10.9 ms;
+six measured 38.3 ms and 9.2 ms, with overlapping 33 MP intervals. Six is
+the production value for its clearly better 8 MP result. Per-chunk header
+decode limits further subdivision.
 
 ### Vertically subsampled streams
 

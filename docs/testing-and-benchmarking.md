@@ -127,7 +127,9 @@ The suite measures these workloads:
   quality, plus RAM-cache hits and eviction scaling. A dark-gradient regression
   compares production quality against the legacy Full-cache setting. Decode
   throughput uses compressed input bytes; latency remains the primary
-  comparison.
+  comparison. The `jpeg_decode_serial` and `jpeg_encode_plain` groups keep the
+  whole-buffer serial decode and the markerless encode measurable beside the
+  production restart-marker split.
 - XMP parsing, XMP updates, and disk-cache key generation.
 - Warm, under-budget cache-GC scans for up to 10,000 objects.
   This case does not sort or delete cache objects.
@@ -151,6 +153,8 @@ See [the progressive Full-texture experiment](progressive-full-textures-2026-07-
 for the tile-size comparison and promotion decision.
 See [the cache JPEG-quality experiment](jpeg-quality-2026-07-27.md) for the
 dark-gradient quality, storage, and latency tradeoff.
+See [the parallel cache-decode experiment](jpeg-parallel-decode-2026-07-28.md)
+for the restart-marker split decode and its rejected variants.
 
 ## Unsafe image-path checks
 
