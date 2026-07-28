@@ -223,7 +223,8 @@ CI downloads the public-domain Sony DSC-RX100 `DSC00838.ARW` fixture from
 `579a485b5126a25cbd55cbd5dadfa7d09cf021c99cc7d4869f9e56e3f759390b`
 before use. The focused ignored tests cover raw-pixel decode, embedded
 thumbnail and metadata consistency, analytical-versus-table transfer output,
-and copied-versus-strided crop output. The pinned fixture gives the decoder
+copied-versus-strided crop output, and exact parallel-versus-serial decode of
+real cache JPEGs. The pinned fixture gives the decoder
 and develop pipeline one real-camera compatibility gate without storing a
 20 MB binary in Git.
 
