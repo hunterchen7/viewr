@@ -43,6 +43,7 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 mod atomic_write;
+mod jpeg_restart;
 
 pub mod cache_disk;
 pub mod cache_ram;

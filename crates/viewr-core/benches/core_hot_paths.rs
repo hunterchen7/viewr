@@ -14,8 +14,8 @@ use viewr_core::decode;
 use viewr_core::develop::{self, Quality};
 use viewr_core::folder::{FolderEntry, benchmark_sidecar_owner_keys, outward_order};
 use viewr_core::jobs::{
-    BenchmarkMetadataQueue, BenchmarkNavigationQueue, benchmark_jpeg_quality, decode_jpeg,
-    encode_jpeg,
+    BenchmarkMetadataQueue, BenchmarkNavigationQueue, benchmark_decode_jpeg_serial,
+    benchmark_jpeg_quality, decode_jpeg, encode_jpeg,
 };
 use viewr_core::library::{benchmark_load_ratings_legacy_full_scan, try_load_ratings_with_owners};
 use viewr_core::planning::build_plan_targets;
@@ -1452,6 +1452,23 @@ fn bench_jpeg(c: &mut Criterion) {
         });
     }
     decode_group.finish();
+
+    // The whole-buffer serial decode stays measurable so the restart-marker
+    // split remains independently comparable on any host.
+    let mut serial_group = c.benchmark_group("jpeg_decode_serial");
+    serial_group.sample_size(10);
+    serial_group.warm_up_time(Duration::from_millis(300));
+    serial_group.measurement_time(Duration::from_secs(2));
+    for (name, photo, quality) in &cases {
+        let encoded = encode_jpeg(photo, *quality).expect("synthetic photo must encode");
+        serial_group.throughput(Throughput::Bytes(encoded.len() as u64));
+        serial_group.bench_function(format!("{name}_q{quality}"), |b| {
+            b.iter(|| {
+                black_box(benchmark_decode_jpeg_serial(black_box(encoded.as_slice())).unwrap())
+            });
+        });
+    }
+    serial_group.finish();
 }
 
 fn bench_ram_cache(c: &mut Criterion) {

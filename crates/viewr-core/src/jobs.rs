@@ -1809,6 +1809,12 @@ fn encode_jpeg_on_current_pool(buf: &PixelBuf, quality: u8) -> Result<Vec<u8>, S
     let mut encoder = jpeg_rusturbo::JpegEncoder::new_with_quality(&mut output, quality);
     encoder.set_subsampling(jpeg_rusturbo::ChromaSubsampling::Yuv444);
     encoder.set_threads(0);
+    // One restart interval per 4:4:4 MCU row (8 pixel rows) resets the DC
+    // predictors at every row boundary, which lets decode_jpeg split the scan
+    // across workers. The output stays a standard baseline JPEG; decoders
+    // without that split read it unchanged. Width is validated to 65535 or
+    // less, so the per-row MCU count always fits the u16 DRI field.
+    encoder.set_restart_interval(buf.width.div_ceil(8) as u16);
     encoder
         .encode_rgba(&buf.rgba, buf.width, buf.height)
         .map_err(|error| error.to_string())?;
@@ -1849,11 +1855,22 @@ fn validate_jpeg_input(buf: &PixelBuf, quality: u8) -> Result<(usize, usize, usi
 
 /// Decodes JPEG bytes into a tightly packed RGBA8 buffer.
 ///
+/// Viewr's own cache objects carry row-aligned restart markers, so large
+/// streams normally decode on multiple workers; every other stream — and any
+/// stream the splitter refuses — uses the whole-buffer serial decoder.
+///
 /// # Errors
 ///
 /// Returns a human-readable string for malformed or unsupported JPEG data, or
 /// when the decoder does not report dimensions.
 pub fn decode_jpeg(bytes: &[u8]) -> Result<PixelBuf, String> {
+    if let Some(buf) = crate::jpeg_restart::try_decode(bytes) {
+        return Ok(buf);
+    }
+    decode_jpeg_serial(bytes)
+}
+
+fn decode_jpeg_serial(bytes: &[u8]) -> Result<PixelBuf, String> {
     use zune_jpeg::JpegDecoder;
     use zune_jpeg::zune_core::colorspace::ColorSpace;
     use zune_jpeg::zune_core::options::DecoderOptions;
@@ -1869,6 +1886,13 @@ pub fn decode_jpeg(bytes: &[u8]) -> Result<PixelBuf, String> {
         height: h as u32,
         rgba: pixels,
     })
+}
+
+#[cfg(feature = "benchmarks")]
+#[doc(hidden)]
+/// Runs the whole-buffer serial JPEG decode as a benchmark reference.
+pub fn benchmark_decode_jpeg_serial(bytes: &[u8]) -> Result<PixelBuf, String> {
+    decode_jpeg_serial(bytes)
 }
 
 #[cfg(test)]
