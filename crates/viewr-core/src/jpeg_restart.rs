@@ -27,6 +27,9 @@ use crate::types::PixelBuf;
 /// marker scanning and chunk assembly are not worth scheduling.
 const MIN_PARALLEL_SCAN_BYTES: usize = 256 * 1024;
 
+/// Decode chunks scheduled per available worker.
+const CHUNKS_PER_WORKER: usize = 6;
+
 struct ScanLayout {
     width: usize,
     height: usize,
@@ -257,7 +260,11 @@ pub(crate) fn try_decode(bytes: &[u8]) -> Option<PixelBuf> {
     let row_bytes = layout.width.checked_mul(4)?;
     let total_len = row_bytes.checked_mul(layout.height)?;
 
-    let chunks = chunk_rows(&layout.rows, threads);
+    // Several chunks per worker: entropy density varies between MCU rows, so
+    // exactly one chunk per worker leaves the join waiting on the densest
+    // chunk. Finer chunks let work stealing absorb the imbalance; per-chunk
+    // header decode stays cheap relative to the chunk body.
+    let chunks = chunk_rows(&layout.rows, threads * CHUNKS_PER_WORKER);
     if chunks.len() < 2 {
         return None;
     }

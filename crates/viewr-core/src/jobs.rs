@@ -1895,6 +1895,24 @@ pub fn benchmark_decode_jpeg_serial(bytes: &[u8]) -> Result<PixelBuf, String> {
     decode_jpeg_serial(bytes)
 }
 
+#[cfg(feature = "benchmarks")]
+#[doc(hidden)]
+/// Encodes without restart markers as a size and speed benchmark reference.
+pub fn benchmark_encode_jpeg_plain(buf: &PixelBuf, quality: u8) -> Result<Vec<u8>, String> {
+    validate_jpeg_input(buf, quality)?;
+    jpeg_pool()?.install(|| {
+        let mut output = Vec::new();
+        let mut encoder = jpeg_rusturbo::JpegEncoder::new_with_quality(&mut output, quality);
+        encoder.set_subsampling(jpeg_rusturbo::ChromaSubsampling::Yuv444);
+        encoder.set_threads(0);
+        encoder
+            .encode_rgba(&buf.rgba, buf.width, buf.height)
+            .map_err(|error| error.to_string())?;
+        drop(encoder);
+        Ok(output)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

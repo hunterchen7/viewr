@@ -15,7 +15,7 @@ use viewr_core::develop::{self, Quality};
 use viewr_core::folder::{FolderEntry, benchmark_sidecar_owner_keys, outward_order};
 use viewr_core::jobs::{
     BenchmarkMetadataQueue, BenchmarkNavigationQueue, benchmark_decode_jpeg_serial,
-    benchmark_jpeg_quality, decode_jpeg, encode_jpeg,
+    benchmark_encode_jpeg_plain, benchmark_jpeg_quality, decode_jpeg, encode_jpeg,
 };
 use viewr_core::library::{benchmark_load_ratings_legacy_full_scan, try_load_ratings_with_owners};
 use viewr_core::planning::build_plan_targets;
@@ -1438,6 +1438,20 @@ fn bench_jpeg(c: &mut Criterion) {
         });
     }
     encode_group.finish();
+
+    // The former markerless encode stays measurable so the restart-marker
+    // cost remains independently comparable on any host.
+    let mut plain_group = c.benchmark_group("jpeg_encode_plain");
+    plain_group.sample_size(10);
+    plain_group.warm_up_time(Duration::from_millis(300));
+    plain_group.measurement_time(Duration::from_secs(2));
+    for (name, photo, quality) in &cases {
+        plain_group.throughput(Throughput::Bytes(photo.byte_len() as u64));
+        plain_group.bench_function(format!("{name}_q{quality}"), |b| {
+            b.iter(|| black_box(benchmark_encode_jpeg_plain(black_box(photo), *quality).unwrap()));
+        });
+    }
+    plain_group.finish();
 
     let mut decode_group = c.benchmark_group("jpeg_decode");
     decode_group.sample_size(10);
