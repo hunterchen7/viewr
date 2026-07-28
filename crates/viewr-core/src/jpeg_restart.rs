@@ -492,7 +492,10 @@ mod tests {
                     .join("../../testdata/real-raw-corpus/HCA04875.ARW")
             });
 
-        for quality in [crate::develop::Quality::Browse, crate::develop::Quality::Full] {
+        for quality in [
+            crate::develop::Quality::Browse,
+            crate::develop::Quality::Full,
+        ] {
             let raw = crate::decode::load(&path).expect("fixture decodes").raw;
             let (developed, _) =
                 crate::develop::develop(raw, quality).expect("fixture develop succeeds");
