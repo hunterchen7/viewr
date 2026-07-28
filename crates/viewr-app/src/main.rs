@@ -31,6 +31,7 @@ enum Command {
     NotifyFileAssociations,
     PickFolder,
     PrintUsage,
+    PrintVersion,
 }
 
 fn main() -> Result<()> {
@@ -41,6 +42,7 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> Result<Command> {
     let args: Vec<OsString> = args.into_iter().collect();
     match args.as_slice() {
         [] => Ok(Command::PrintUsage),
+        [flag] if flag == "--version" || flag == "-V" => Ok(Command::PrintVersion),
         [flag] if flag == "--notify-file-associations" => Ok(Command::NotifyFileAssociations),
         [flag] if flag == "--pick-folder" => Ok(Command::PickFolder),
         [command, input] if command == "dev" => Ok(Command::Develop {
@@ -59,6 +61,9 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> Result<Command> {
         }
         [flag, ..] if flag == "--notify-file-associations" => {
             bail!("usage: viewr --notify-file-associations");
+        }
+        [flag, ..] if flag == "--version" || flag == "-V" => {
+            bail!("usage: viewr --version");
         }
         [path] => Ok(Command::Browse(PathBuf::from(path))),
         _ => bail!("usage: viewr <folder|file.arw>"),
@@ -90,6 +95,10 @@ fn run(command: Command) -> Result<()> {
             eprintln!("usage: viewr <folder|file.arw>     browse raws");
             eprintln!("       viewr --pick-folder          choose a folder");
             eprintln!("       viewr dev <file.arw> [out]  decode spike with timings");
+            Ok(())
+        }
+        Command::PrintVersion => {
+            println!("viewr {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
     }
@@ -229,6 +238,14 @@ mod tests {
                 .to_string()
                 .contains("usage")
         );
+    }
+
+    #[test]
+    fn parses_version_commands() {
+        assert_eq!(parse(&["--version"]).unwrap(), Command::PrintVersion);
+        assert_eq!(parse(&["-V"]).unwrap(), Command::PrintVersion);
+        assert!(parse(&["--version", "extra"]).is_err());
+        assert!(parse(&["-V", "extra"]).is_err());
     }
 
     #[test]

@@ -6,6 +6,7 @@
 //! Preferences window edits this in memory and saves a regenerated file.
 
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use eframe::egui;
@@ -115,6 +116,8 @@ pub struct Config {
     /// JPEG quality for Browse and Full cache objects. Applies on the next
     /// folder open.
     pub jpeg_quality: u8,
+    /// Check GitHub Releases for a newer stable version after startup.
+    pub check_updates_automatically: bool,
     binds: HashMap<Action, Vec<Bind>>,
 }
 
@@ -124,6 +127,7 @@ struct RawConfig {
     input: RawInput,
     ui: RawUi,
     cache: RawCache,
+    updates: RawUpdates,
     binds: HashMap<String, Vec<String>>,
 }
 
@@ -174,6 +178,20 @@ impl Default for RawCache {
             ram_gb: 4.5,
             disk_gb: 20.0,
             jpeg_quality: i16::from(CACHE_JPEG_QUALITY),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct RawUpdates {
+    check_automatically: bool,
+}
+
+impl Default for RawUpdates {
+    fn default() -> Self {
+        Self {
+            check_automatically: true,
         }
     }
 }
@@ -261,7 +279,9 @@ impl Config {
                     .map_err(|e| eprintln!("viewr.toml: {e}; using defaults"))
                     .ok(),
                 Err(_) => {
-                    let _ = std::fs::write(&p, TEMPLATE);
+                    if let Err(error) = replace_file_durable(&p, TEMPLATE.as_bytes()) {
+                        eprintln!("failed to create {}: {error}", p.display());
+                    }
                     None
                 }
             })
@@ -320,6 +340,7 @@ impl Config {
                 )
                 .try_into()
                 .expect("clamped JPEG quality fits in u8"),
+            check_updates_automatically: raw.updates.check_automatically,
             binds,
         }
     }
@@ -356,12 +377,19 @@ impl Config {
     /// comments are replaced — the file is round-tripped by the app.)
     pub fn save(&self) {
         let Some(path) = config_path() else { return };
+        let out = self.serialized();
+        if let Err(error) = replace_file_durable(&path, out.as_bytes()) {
+            eprintln!("failed to save {}: {error}", path.display());
+        }
+    }
+
+    fn serialized(&self) -> String {
         let mut out = String::from(
             "# viewr configuration. Managed by the Preferences window;\n\
              # hand-edits are read at startup but comments are not kept.\n\n[input]\n",
         );
         out.push_str(&format!(
-            "scroll = \"{}\"\n\n[ui]\ntier_indicator = \"{}\"\nshow_loading = {}\nshow_performance = {}\nshow_exposure = {}\nfilmstrip_height = {:.0}\ngrid_cell = {:.0}\n\n[cache]\nram_gb = {:.1}\ndisk_gb = {:.1}\njpeg_quality = {}\n\n[binds]\n",
+            "scroll = \"{}\"\n\n[ui]\ntier_indicator = \"{}\"\nshow_loading = {}\nshow_performance = {}\nshow_exposure = {}\nfilmstrip_height = {:.0}\ngrid_cell = {:.0}\n\n[cache]\nram_gb = {:.1}\ndisk_gb = {:.1}\njpeg_quality = {}\n\n[updates]\ncheck_automatically = {}\n\n[binds]\n",
             match self.scroll {
                 ScrollMode::Pan => "pan",
                 ScrollMode::Zoom => "zoom",
@@ -375,6 +403,7 @@ impl Config {
             self.ram_gb,
             self.disk_gb,
             self.jpeg_quality,
+            self.check_updates_automatically,
         ));
         for &(name, _, action) in ACTIONS {
             let labels: Vec<String> = self
@@ -384,9 +413,7 @@ impl Config {
                 .collect();
             out.push_str(&format!("{name} = [{}]\n", labels.join(", ")));
         }
-        if let Err(e) = std::fs::write(&path, out) {
-            eprintln!("failed to save {}: {e}", path.display());
-        }
+        out
     }
 }
 
@@ -402,6 +429,53 @@ fn config_path() -> Option<PathBuf> {
     let dir = dirs::config_dir()?.join("viewr");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join("viewr.toml"))
+}
+
+fn replace_file_durable(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "configuration path has no parent directory",
+        )
+    })?;
+    let permissions = match path.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to replace a symbolic-link configuration file",
+            ));
+        }
+        Ok(metadata) if metadata.is_file() => Some(metadata.permissions()),
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "configuration path is not a regular file",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".viewr-config-")
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    temporary.write_all(bytes)?;
+    if let Some(permissions) = permissions {
+        temporary.as_file().set_permissions(permissions)?;
+    }
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    sync_parent(parent)
+}
+
+#[cfg(unix)]
+fn sync_parent(parent: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_parent: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 const TEMPLATE: &str = r#"# viewr configuration.
@@ -433,6 +507,10 @@ disk_gb = 20.0
 # Cache JPEG quality from 80 to 100. Higher values retain smoother gradients
 # and more detail but use more RAM, disk space, and background CPU time.
 jpeg_quality = 97
+
+[updates]
+# Check once per day for the newest stable GitHub release.
+check_automatically = true
 
 [binds]
 # Each action takes a list of binds: "Key" or "Mod+Key".
@@ -649,6 +727,46 @@ mod tests {
         assert_eq!(cfg.ram_gb, 4.5);
         assert_eq!(cfg.disk_gb, 20.0);
         assert_eq!(cfg.jpeg_quality, CACHE_JPEG_QUALITY);
+        assert!(cfg.check_updates_automatically);
+    }
+
+    #[test]
+    fn update_check_preference_round_trips_through_generated_config() {
+        let mut cfg = Config::from_raw(RawConfig::default());
+        cfg.check_updates_automatically = false;
+
+        let reparsed: RawConfig = toml::from_str(&cfg.serialized()).unwrap();
+        let reparsed = Config::from_raw(reparsed);
+
+        assert!(!reparsed.check_updates_automatically);
+    }
+
+    #[test]
+    fn durable_config_replacement_publishes_complete_contents() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("viewr.toml");
+
+        replace_file_durable(&path, b"first").unwrap();
+        replace_file_durable(&path, b"replacement").unwrap();
+
+        assert_eq!(std::fs::read(path).unwrap(), b"replacement");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_config_replacement_refuses_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.toml");
+        let link = directory.path().join("viewr.toml");
+        std::fs::write(&target, b"untouched").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let error = replace_file_durable(&link, b"replacement").unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read(target).unwrap(), b"untouched");
     }
 
     #[test]

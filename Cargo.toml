@@ -32,8 +32,13 @@ dirs = "5"
 icu_casemap = "2.2"
 icu_normalizer = "2.2"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+semver = "1"
+sha2 = "0.10"
 toml = "0.8"
 tempfile = "3.27"
+ureq = { version = "2.12.1", default-features = false, features = ["tls"] }
+url = "2"
 criterion = { version = "0.8", features = ["html_reports"] }
 
 [profile.release]
