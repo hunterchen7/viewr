@@ -8,6 +8,90 @@ Viewr supplies one native installer for each release platform.
 | Windows 10 or later, x64 | `viewr-windows-x64.msi` | `viewr-windows-x64.zip` |
 | Ubuntu 22.04+ or Debian 12+, x64 | `viewr-linux-x64.deb` | `viewr-linux-x64.tar.gz` |
 
+## In-app updates
+
+Viewr checks the latest stable GitHub release. The Cargo package version is the
+installed version. The release tag supplies the available version.
+
+Viewr accepts only a canonical `vMAJOR.MINOR.PATCH` tag. Viewr does not accept a
+draft release, a prerelease, or a build suffix. Viewr uses a semantic-version
+comparison, not a text comparison.
+
+An automatic check starts four seconds after the viewer opens. Viewr limits
+automatic checks to one check each day. A file lock applies this limit to all
+open Viewr processes. Use **Preferences > Updates > Check now** for a manual
+check.
+
+The update dialog shows the bounded release text as plain text. The dialog has
+these actions:
+
+- **Download now** downloads the applicable package.
+- **Later** closes the dialog for the current process.
+- **Skip this version** stores the exact available version.
+- **View release** opens the fixed GitHub release page.
+
+A skipped version stays hidden during automatic checks. A later version appears
+normally. A manual check can show a skipped version again.
+
+### Package selection
+
+Viewr selects an installer only when the current executable has a native
+installer path:
+
+- macOS: `/Applications/Viewr.app/Contents/MacOS/viewr-bin`.
+- Windows: `Program Files\Viewr\viewr.exe`.
+- Linux: `/usr/bin/viewr`.
+
+For another executable path, Viewr selects the portable archive. Viewr downloads
+the archive but does not replace the current executable.
+
+The package names are a fixed application contract. The updater does not use a
+file name from an HTTP header. The updater constructs the download URL from the
+validated version and one of these fixed names.
+
+### Download validation
+
+The release workflow checks each remote asset before it publishes the release.
+The workflow checks the asset state, byte size, and GitHub SHA-256 digest.
+
+The updater applies the same checks. It also applies these controls:
+
+- It permits HTTPS requests to known GitHub hosts only.
+- It limits redirects, response sizes, asset counts, and request time.
+- It writes the package to a same-directory temporary file.
+- It calculates SHA-256 while it writes the package.
+- It publishes the file only after the size and digest match.
+- It calculates SHA-256 again before it opens an installer.
+
+Viewr stores update state in the Viewr configuration directory. Viewr stores
+downloads and cross-process lock files in the Viewr cache directory. The updater
+rejects a symbolic-link state file, lock file, directory, or package target.
+
+CAUTION: The preview installers do not have Apple or Microsoft platform
+signatures. An untrusted installer can change the system. Confirm the repository
+and the operating-system prompt before you continue.
+
+The GitHub digest detects a changed or incomplete download. The digest and the
+package use the same GitHub release trust boundary. Thus, the digest is not a
+publisher signature. The updater always requires a user action before it opens
+the operating-system installer.
+
+### Installer handoff
+
+Viewr opens the package with the applicable operating-system command:
+
+- macOS: `/usr/bin/open PACKAGE.pkg`.
+- Windows: `msiexec.exe /i PACKAGE.msi`.
+- Linux: `xdg-open PACKAGE.deb`.
+
+The operating system controls permission prompts and installation. Viewr cannot
+reliably detect completion for all three package types. Thus, Viewr does not
+claim that it can install and restart automatically.
+
+After the installer opens, close all Viewr windows. Complete the installation.
+Then open Viewr again. A normal Viewr close lets rating and cache workers finish
+their shutdown work.
+
 Each installer registers Viewr as an available Sony ARW viewer. No installer
 overwrites an explicit user choice for the default viewer.
 
@@ -271,6 +355,10 @@ the checksum manifest, and uploads all files in one release command. A
 per-tag concurrency lock prevents two publication attempts from interleaving.
 The workflow publishes the draft only after the final remote verification
 passes. Every external GitHub Action is pinned to a reviewed commit.
+
+The in-app updater uses the asset state, size, and digest from the GitHub release
+API. Thus, the publication job must continue to reject a missing digest. A
+change to a platform package name also requires a matching application change.
 
 To retry a failed draft release, dispatch the workflow at the release tag:
 

@@ -103,6 +103,13 @@ Apple Developer ID or Windows Authenticode signatures. macOS Gatekeeper or
 Windows SmartScreen can show a security prompt. Verify the downloaded artifact
 with its GitHub provenance attestation and `SHA256SUMS` before installation.
 
+Viewr checks stable GitHub releases from **Preferences > Updates**. It shows the
+release notes and supports **Download now**, **Later**, and **Skip this
+version**. Viewr verifies the exact package size and GitHub SHA-256 digest before
+it makes a download available. Installed copies open the native installer.
+Portable copies download the matching archive. The installer handoff requires
+user confirmation because the current preview packages are not platform-signed.
+
 To build from source, run:
 
 ```
