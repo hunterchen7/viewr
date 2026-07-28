@@ -32,6 +32,7 @@ use crate::progressive_texture::{self, TileCoord};
 use crate::rating_groups::{build_owner_members, install_rating_for_members};
 use crate::settings::SettingsState;
 use crate::texture_lru::ByteLru;
+use crate::update::UpdateManager;
 
 const THUMB_BUDGET: u64 = 384 * 1024 * 1024;
 /// Logical RGBA bytes retained by thumbnail texture handles. Actual backend
@@ -257,6 +258,7 @@ pub struct App {
     ctx: egui::Context,
     config: Config,
     settings: SettingsState,
+    updates: UpdateManager,
     session: Option<Session>,
 
     current: usize,
@@ -280,10 +282,14 @@ pub struct App {
 
 impl App {
     fn empty(cc: &eframe::CreationContext<'_>) -> Self {
+        let ctx = cc.egui_ctx.clone();
+        let config = Config::load();
+        let updates = UpdateManager::new(ctx.clone(), config.check_updates_automatically);
         Self {
-            ctx: cc.egui_ctx.clone(),
-            config: Config::load(),
+            ctx,
+            config,
             settings: SettingsState::default(),
+            updates,
             session: None,
             current: 0,
             direction: 1,
@@ -1091,8 +1097,25 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = self.ctx.clone();
+        self.updates.poll();
         self.settings.maybe_capture(&ctx, &mut self.config);
-        self.settings.show(&ctx, &mut self.config);
+        let update_status = self.updates.status_text();
+        let update_actions = self.settings.show(
+            &ctx,
+            &mut self.config,
+            &update_status,
+            self.updates.has_status_details(),
+        );
+        if update_actions.check_for_updates {
+            self.updates.check_now();
+        }
+        if update_actions.show_update_status {
+            self.updates.open_status();
+        }
+        if update_actions.automatic_updates_enabled {
+            self.updates.schedule_automatic_check();
+        }
+        self.updates.show();
         self.refresh_ratings_after_database_ready();
         self.drain_events();
         self.manage_textures();
@@ -1210,6 +1233,14 @@ impl App {
                         .clicked()
                     {
                         self.settings.open = !self.settings.open;
+                    }
+                    if self.updates.has_available_update()
+                        && ui
+                            .button("⬇")
+                            .on_hover_text("Viewr update available")
+                            .clicked()
+                    {
+                        self.updates.open_status();
                     }
                     if self.config.show_performance
                         && let Some(s) = &self.session

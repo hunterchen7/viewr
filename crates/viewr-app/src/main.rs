@@ -16,6 +16,7 @@ mod progressive_texture;
 mod rating_groups;
 mod settings;
 mod texture_lru;
+mod update;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

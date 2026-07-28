@@ -8,6 +8,13 @@ use viewr_core::jobs::{MAX_CACHE_JPEG_QUALITY, MIN_CACHE_JPEG_QUALITY};
 use crate::config::{ACTIONS, Action, Bind, Config, ScrollMode, TierIndicator};
 
 #[derive(Default)]
+pub struct SettingsActions {
+    pub check_for_updates: bool,
+    pub show_update_status: bool,
+    pub automatic_updates_enabled: bool,
+}
+
+#[derive(Default)]
 pub struct SettingsState {
     pub open: bool,
     /// Action currently waiting for a key capture.
@@ -43,10 +50,17 @@ impl SettingsState {
         }
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, config: &mut Config) {
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        config: &mut Config,
+        update_status: &str,
+        update_details_available: bool,
+    ) -> SettingsActions {
+        let mut actions = SettingsActions::default();
         if !self.open {
             self.listening = None;
-            return;
+            return actions;
         }
         let mut open = self.open;
         let mut changed = false;
@@ -164,6 +178,36 @@ impl SettingsState {
                 );
                 ui.add_space(8.0);
 
+                ui.heading("Updates");
+                ui.label(update_status);
+                let automatic_changed = ui
+                    .checkbox(
+                        &mut config.check_updates_automatically,
+                        "Check automatically for stable releases",
+                    )
+                    .changed();
+                changed |= automatic_changed;
+                actions.automatic_updates_enabled |=
+                    automatic_changed && config.check_updates_automatically;
+                ui.horizontal(|ui| {
+                    if ui.button("Check now").clicked() {
+                        actions.check_for_updates = true;
+                    }
+                    if update_details_available
+                        && ui.button("Show details").clicked()
+                    {
+                        actions.show_update_status = true;
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Automatic checks run at most once per day across all open Viewr windows.",
+                    )
+                    .weak()
+                    .size(11.0),
+                );
+                ui.add_space(8.0);
+
                 ui.heading("Keybinds");
                 ui.label(
                     egui::RichText::new(
@@ -223,5 +267,6 @@ impl SettingsState {
         if changed {
             config.save();
         }
+        actions
     }
 }
