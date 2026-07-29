@@ -11,7 +11,7 @@ published, so these notes cover the complete public upgrade.
 * Verified in-app updates with release notes and Download now, Later, and Skip this version choices.
 * Restored window size and position plus configurable loading text, image information, and loading indicators.
 * Full-resolution preloading for the current and adjacent images, with viewport-first tiled loading while zoomed.
-* Selectable JPEG cache quality, faster libjpeg-turbo encoding, parallel restart-marker decoding, and better dark-gradient preservation.
+* Selectable JPEG cache quality, faster jpeg-rusturbo encoding, parallel restart-marker decoding, and better dark-gradient preservation.
 * Brighter, highlight-safe RAW development and extensive cache, decode, rating, XMP, and sidecar-persistence hardening.
 
 ### Breaking changes carried forward from the unpublished draft
