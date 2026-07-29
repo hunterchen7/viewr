@@ -2,21 +2,26 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: scripts/verify-release-assets.sh <asset-directory> <release-tag>" >&2
+  echo "usage: scripts/verify-release-assets.sh --manifest CARGO-TOML <asset-directory> <release-tag>" >&2
 }
 
-if [[ $# -ne 2 ]]; then
+if [[ $# -ne 4 || "$1" != "--manifest" ]]; then
   usage
   exit 2
 fi
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-asset_dir="$1"
-release_tag="$2"
+manifest_path="$2"
+asset_dir="$3"
+release_tag="$4"
+
+if [[ ! -f "$manifest_path" ]]; then
+  echo "Cargo manifest does not exist: $manifest_path" >&2
+  exit 1
+fi
 
 version="$(
   cargo metadata \
-    --manifest-path "$repo_root/Cargo.toml" \
+    --manifest-path "$manifest_path" \
     --locked \
     --no-deps \
     --format-version 1 |

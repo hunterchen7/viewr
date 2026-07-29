@@ -353,43 +353,138 @@ workflow directly. A repository-token release event is not used because those
 events do not start another GitHub Actions workflow. The release workflow can
 also be run manually for an existing draft tag.
 
-The release gate waits for the complete five-check main-branch CI workflow to
-pass for the exact tagged commit. It does not rerun those checks. Three
-isolated jobs then build and validate the platform files. A fourth job builds
-and validates the source archive. New main-branch pushes do not cancel an
-earlier commit's release-eligible CI run.
+The release gate gives GitHub's authenticated release list up to three minutes
+to expose the new stable draft. It records the draft's numeric release ID and
+uses that identity for later state and asset checks. It then waits for the
+complete five-check main-branch CI workflow to pass for the exact tagged
+commit. It does not rerun those checks. Three isolated jobs then build and
+validate the platform files. A fourth job builds and validates the source
+archive. New main-branch pushes do not cancel an earlier commit's
+release-eligible CI run.
+
+GitHub hides draft releases from read-only repository tokens. The gate
+therefore needs `contents: write` even though it does not mutate the release.
+It checks out the workflow's immutable `main` commit as the working tree,
+checks out the tagged source in a separate subdirectory, and does not persist
+Git credentials in either checkout. Privileged release helpers therefore come
+from the current workflow commit, including during recovery of an older tag.
 
 The publication job starts only after all four jobs pass. It checks the exact
 local and remote file sets and every remote SHA-256 digest, creates
 `SHA256SUMS`, creates GitHub provenance attestations for every artifact and for
-the checksum manifest, and uploads all files in one release command. A
-per-tag concurrency lock prevents two publication attempts from interleaving.
-The workflow publishes the draft only after the final remote verification
-passes. Every external GitHub Action is pinned to a reviewed commit.
+the checksum manifest, and uploads all files by the draft's numeric release ID.
+A per-tag concurrency lock prevents two publication attempts from interleaving.
+For a normal release, the workflow publishes that exact draft only after the
+final remote verification passes. Publication verifies both the numeric
+release identity and the immutable tag commit, and it retries bounded
+post-publication reads. Every external GitHub Action is pinned to a reviewed
+commit.
 
 The in-app updater uses the asset state, size, and digest from the GitHub release
 API. Thus, the publication job must continue to reject a missing digest. A
 change to a platform package name also requires a matching application change.
 
-To retry a failed draft release, dispatch the workflow at the release tag:
+To retry a failed draft release, dispatch the current `main` workflow for the
+release tag:
 
 ```bash
 release_tag=v0.2.0
 gh workflow run release-binaries.yml \
-  --ref "$release_tag" \
+  --ref main \
   -f release_tag="$release_tag"
 ```
 
-The workflow rejects a release tag whose commit does not match the workflow
-invocation commit. All downstream jobs check out that approved commit SHA, not
-the mutable tag reference. Before the workflow uploads files and before it
-publishes the release, it verifies that the tag still identifies the approved
-commit. This keeps artifact provenance tied to the released source.
+The workflow itself must run from `main`. An automatic release requires the
+release tag and workflow invocation to identify the same commit. A manual
+dispatch can use the fixed workflow from `main` to recover an older draft, but
+it still checks out the immutable tag and requires successful main-branch CI
+for that exact tagged commit. All downstream jobs use that approved commit SHA.
+Before the workflow uploads files, it verifies that the tag still identifies
+the approved commit.
 
-Verify an attestation with:
+GitHub's workflow token cannot publish some historical releases when their
+target commit changes workflow files. A historical recovery therefore uploads
+and verifies the exact assets but deliberately leaves the release as a draft.
+It creates a custom recovery attestation that records both the old source
+commit and the current workflow commit. After the recovery run succeeds, a
+maintainer downloads the immutable validated-artifact snapshot from that exact
+run. The publication helper compares every current draft asset's name, size,
+and GitHub-computed digest with that snapshot immediately before publication.
+It also rechecks the tag and draft identity.
+
+Run the exact command emitted in the successful recovery run summary. Its
+expanded form is:
 
 ```bash
-gh attestation verify PATH-TO-DOWNLOAD -R hunterchen7/viewr
+recovery_run_id=RECOVERY-RUN-ID
+recovery_run_attempt=RECOVERY-RUN-ATTEMPT
+workflow_sha=RECOVERY-WORKFLOW-COMMIT
+release_id=361510019
+release_sha=106284ee7dec2d9e05aa091121747adfa0642407
+release_tag=v0.2.0
+recovery_directory="$(mktemp -d)"
+
+gh run download "$recovery_run_id" \
+  --repo hunterchen7/viewr \
+  --name "historical-release-$release_id-attempt-$recovery_run_attempt" \
+  --dir "$recovery_directory/assets"
+git clone --no-checkout \
+  https://github.com/hunterchen7/viewr.git \
+  "$recovery_directory/release-tools"
+git -C "$recovery_directory/release-tools" \
+  checkout --detach "$workflow_sha"
+
+GH_TOKEN="$(gh auth token)" \
+GITHUB_REPOSITORY=hunterchen7/viewr \
+"$recovery_directory/release-tools/scripts/publish-draft-release.sh" \
+  --asset-directory "$recovery_directory/assets" \
+  --release-id "$release_id" \
+  --release-sha "$release_sha" \
+  --recovery-workflow-sha "$workflow_sha" \
+  "$release_tag"
+```
+
+Only the final helper process receives the maintainer's `gh` token, which must
+have `repo` and `workflow` scopes for this GitHub API case. The helper runs from
+the recovery workflow's immutable commit, resolves annotated tags, rejects a
+moved tag or replaced release, revalidates the exact assets, and publishes only
+the numeric draft ID. It uses GitHub's legacy latest-release selection so an
+older recovery cannot supersede a newer release. It validates the PATCH
+response, uses a three-minute bounded final-state check, rechecks the tag after
+publication, and restores the draft if that final tag check fails.
+
+Verify a normal release attestation with the exact reusable-workflow signer:
+
+```bash
+gh attestation verify PATH-TO-DOWNLOAD \
+  --repo hunterchen7/viewr \
+  --signer-workflow hunterchen7/viewr/.github/workflows/release-binaries.yml
+```
+
+Historical recovery artifacts use a custom predicate. Verify its signature and
+assert the recovery identity fields before publication:
+
+```bash
+predicate_type=https://github.com/hunterchen7/viewr/attestations/release-recovery/v1
+verification="$(
+  gh attestation verify PATH-TO-DOWNLOAD \
+    --repo hunterchen7/viewr \
+    --signer-workflow hunterchen7/viewr/.github/workflows/release-binaries.yml \
+    --signer-digest "$workflow_sha" \
+    --predicate-type "$predicate_type" \
+    --format json
+)"
+jq -e \
+  --argjson release_id "$release_id" \
+  --arg release_sha "$release_sha" \
+  --arg release_tag "$release_tag" \
+  --arg workflow_sha "$workflow_sha" \
+  'any(.[];
+    .verificationResult.statement.predicate.release.id == $release_id
+    and .verificationResult.statement.predicate.release.tag == $release_tag
+    and .verificationResult.statement.predicate.release.sourceCommit == $release_sha
+    and .verificationResult.statement.predicate.workflow.commit == $workflow_sha
+  )' <<<"$verification"
 ```
 
 Verify `SHA256SUMS` with the same command before you use it as a checksum

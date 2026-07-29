@@ -47,6 +47,7 @@ done
 
 manifest="$(
   "$repo_root/scripts/verify-release-assets.sh" \
+    --manifest "$repo_root/Cargo.toml" \
     "$asset_directory" \
     "v$version"
 )"
@@ -69,6 +70,7 @@ fi
 
 assert_rejected() {
   if "$repo_root/scripts/verify-release-assets.sh" \
+    --manifest "$repo_root/Cargo.toml" \
     "$asset_directory" \
     "$1" >/dev/null 2>&1
   then
