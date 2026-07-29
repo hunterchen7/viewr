@@ -353,11 +353,12 @@ workflow directly. A repository-token release event is not used because those
 events do not start another GitHub Actions workflow. The release workflow can
 also be run manually for an existing draft tag.
 
-The release gate waits for the complete five-check main-branch CI workflow to
-pass for the exact tagged commit. It does not rerun those checks. Three
-isolated jobs then build and validate the platform files. A fourth job builds
-and validates the source archive. New main-branch pushes do not cancel an
-earlier commit's release-eligible CI run.
+The release gate gives GitHub's release API up to three minutes to expose the
+new draft release. It then waits for the complete five-check main-branch CI
+workflow to pass for the exact tagged commit. It does not rerun those checks.
+Three isolated jobs then build and validate the platform files. A fourth job
+builds and validates the source archive. New main-branch pushes do not cancel
+an earlier commit's release-eligible CI run.
 
 The publication job starts only after all four jobs pass. It checks the exact
 local and remote file sets and every remote SHA-256 digest, creates

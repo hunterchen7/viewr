@@ -34,32 +34,22 @@ jobs:
       actions: read
       contents: read
     steps:
-      - name: Require an existing draft release
+      - name: Validate release tag
         env:
-          GH_TOKEN: ${{ github.token }}
           VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           if [[ ! "$VIEWR_RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "::error::Release tag is not a stable semantic version: $VIEWR_RELEASE_TAG"
             exit 1
           fi
-
-          release_json="$(
-            gh release view \
-              "$VIEWR_RELEASE_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --json isDraft,tagName
-          )"
-          if ! jq -e \
-            --arg tag "$VIEWR_RELEASE_TAG" \
-            '.tagName == $tag and .isDraft == true' \
-            <<< "$release_json" >/dev/null; then
-            echo "::error::Release $VIEWR_RELEASE_TAG must exist and remain a draft."
-            exit 1
-          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: refs/tags/${{ inputs.release_tag }}
+      - name: Require an existing draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: scripts/require-draft-release.sh "$VIEWR_RELEASE_TAG"
       - name: Match workflow provenance to the release tag
         id: release_commit
         env:
