@@ -53,6 +53,9 @@ for argument in "$@"; do
     --header)
       if [[ "$argument" == "Authorization: Bearer test-token" ]]; then
         authorization_seen=1
+      elif [[ "$argument" == @* ]] &&
+        grep -Fxq "Authorization: Bearer test-token" "${argument#@}"; then
+        authorization_seen=1
       fi
       ;;
   esac

@@ -33,7 +33,8 @@ jobs:
       release_sha: ${{ steps.release_commit.outputs.sha }}
     permissions:
       actions: read
-      contents: read
+      # GitHub exposes draft releases only to tokens with push access.
+      contents: write
     steps:
       - name: Validate release request
         env:
@@ -45,18 +46,20 @@ jobs:
             exit 1
           fi
           if [[ "$WORKFLOW_REF" != "refs/heads/main" ]]; then
-            echo "::error::Release workflows must run from protected main, not $WORKFLOW_REF."
+            echo "::error::Release workflows must run from main, not $WORKFLOW_REF."
             exit 1
           fi
       - name: Check out immutable release source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: refs/tags/${{ inputs.release_tag }}
-      - name: Check out protected release tools
+          persist-credentials: false
+      - name: Check out main release tools
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.sha }}
           path: .release-tools
+          persist-credentials: false
       - name: Require an existing draft release
         id: draft_release
         env:
@@ -80,7 +83,7 @@ jobs:
               echo "::error::Workflow commit $WORKFLOW_SHA does not match release commit $release_sha."
               exit 1
             fi
-            echo "::notice::Using protected-main workflow $WORKFLOW_SHA to recover release commit $release_sha."
+            echo "::notice::Using main workflow $WORKFLOW_SHA to recover release commit $release_sha."
           fi
           printf 'sha=%s\n' "$release_sha" >> "$GITHUB_OUTPUT"
       - name: Require successful CI for the tagged source
@@ -335,11 +338,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.gate.outputs.release_sha }}
-      - name: Check out protected release tools
+          persist-credentials: false
+      - name: Check out main release tools
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.sha }}
           path: .release-tools
+          persist-credentials: false
       - name: Require release to remain the same draft
         env:
           GH_TOKEN: ${{ github.token }}
@@ -361,7 +366,8 @@ jobs:
         env:
           VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          scripts/verify-release-assets.sh \
+          .release-tools/scripts/verify-release-assets.sh \
+            --manifest "$GITHUB_WORKSPACE/Cargo.toml" \
             dist \
             "$VIEWR_RELEASE_TAG"
       - name: Reject unexpected existing release assets
@@ -405,10 +411,10 @@ jobs:
           .release-tools/scripts/require-draft-release.sh \
             "$VIEWR_RELEASE_TAG" \
             "$VIEWR_RELEASE_ID" >/dev/null
-          gh release upload \
-            "$VIEWR_RELEASE_TAG" \
-            dist/* \
-            --clobber
+          .release-tools/scripts/upload-release-assets.sh \
+            --release-id "$VIEWR_RELEASE_ID" \
+            dist \
+            "$VIEWR_RELEASE_TAG"
       - name: Verify published release assets
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
