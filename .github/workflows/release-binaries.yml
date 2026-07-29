@@ -497,7 +497,7 @@ jobs:
         if: ${{ needs.gate.outputs.historical_recovery == 'true' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: historical-release-${{ needs.gate.outputs.release_id }}
+          name: historical-release-${{ needs.gate.outputs.release_id }}-attempt-${{ github.run_attempt }}
           path: dist/*
           if-no-files-found: error
           retention-days: 7
@@ -555,7 +555,7 @@ jobs:
             echo '```bash'
             echo 'recovery_directory="$(mktemp -d)"'
             echo "gh run download \"$GITHUB_RUN_ID\" --repo \"$GITHUB_REPOSITORY\" \\"
-            echo "  --name \"historical-release-$VIEWR_RELEASE_ID\" \\"
+            echo "  --name \"historical-release-$VIEWR_RELEASE_ID-attempt-$GITHUB_RUN_ATTEMPT\" \\"
             echo '  --dir "$recovery_directory/assets"'
             echo "git clone --no-checkout \"https://github.com/$GITHUB_REPOSITORY.git\" \\"
             echo '  "$recovery_directory/release-tools"'

@@ -417,6 +417,7 @@ expanded form is:
 
 ```bash
 recovery_run_id=RECOVERY-RUN-ID
+recovery_run_attempt=RECOVERY-RUN-ATTEMPT
 workflow_sha=RECOVERY-WORKFLOW-COMMIT
 release_id=361510019
 release_sha=106284ee7dec2d9e05aa091121747adfa0642407
@@ -425,7 +426,7 @@ recovery_directory="$(mktemp -d)"
 
 gh run download "$recovery_run_id" \
   --repo hunterchen7/viewr \
-  --name "historical-release-$release_id" \
+  --name "historical-release-$release_id-attempt-$recovery_run_attempt" \
   --dir "$recovery_directory/assets"
 git clone --no-checkout \
   https://github.com/hunterchen7/viewr.git \
