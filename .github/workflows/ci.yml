@@ -52,6 +52,7 @@ jobs:
       - name: Test release asset verification
         run: |
           scripts/test-require-draft-release.sh
+          scripts/test-upload-release-assets.sh
           scripts/test-verify-release-assets.sh
           scripts/test-verify-remote-release-assets.sh
       - name: Format
