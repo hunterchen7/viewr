@@ -920,14 +920,13 @@ struct Shared {
     disk: Option<DiskCache>,
     events: Sender<Event>,
     notify: Arc<dyn Fn() + Send + Sync>,
-    /// CPU-heavy work, its source/cache reads, and every nested Rayon operation
-    /// share this budget. Queue, UI, metadata, database/update, and disk-cache
-    /// persistence/maintenance service threads are separate.
-    processing_pool: rayon::ThreadPool,
-    /// A fixed user limit includes cache JPEG encoding. Automatic mode retains
-    /// the separately tuned JPEG pool so default foreground latency does not
-    /// regress.
-    limit_cache_encoding: bool,
+    /// A fixed user limit owns the pool that contains CPU-heavy work, its
+    /// source/cache reads, every nested Rayon operation, and cache JPEG
+    /// encoding. Automatic mode has no owned pool: it preserves the established
+    /// dispatcher/global-Rayon topology and separately tuned JPEG pool. Queue,
+    /// UI, metadata, database/update, and disk-cache persistence/maintenance
+    /// service threads remain separate.
+    processing_pool: Option<rayon::ThreadPool>,
     heavy: JobQueue,
     light: JobQueue,
     persistence: PersistenceQueue,
@@ -940,16 +939,14 @@ struct Shared {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineOptions {
     jpeg_quality: u8,
-    worker_threads: NonZeroUsize,
-    limit_cache_encoding: bool,
+    worker_threads: Option<NonZeroUsize>,
 }
 
 impl Default for EngineOptions {
     fn default() -> Self {
         Self {
             jpeg_quality: CACHE_JPEG_QUALITY,
-            worker_threads: available_worker_threads(),
-            limit_cache_encoding: false,
+            worker_threads: None,
         }
     }
 }
@@ -973,8 +970,7 @@ impl EngineOptions {
     /// processing workers.
     #[must_use]
     pub fn with_worker_threads(mut self, worker_threads: NonZeroUsize) -> Self {
-        self.worker_threads = resolve_worker_threads(worker_threads.get());
-        self.limit_cache_encoding = true;
+        self.worker_threads = Some(resolve_worker_threads(worker_threads.get()));
         self
     }
 }
@@ -1139,7 +1135,10 @@ impl Engine {
         notify: Arc<dyn Fn() + Send + Sync>,
     ) -> (Self, Receiver<Event>) {
         let (events, rx) = std::sync::mpsc::channel();
-        let processing_pool = build_processing_pool(options.worker_threads)
+        let processing_pool = options
+            .worker_threads
+            .map(build_processing_pool)
+            .transpose()
             .expect("failed to spawn image-processing worker pool");
         // Construct the owner before spawning. If any later spawn panics via
         // `expect`, `Engine::drop` closes both queues and joins every handle
@@ -1152,7 +1151,6 @@ impl Engine {
                 events,
                 notify,
                 processing_pool,
-                limit_cache_encoding: options.limit_cache_encoding,
                 heavy: JobQueue::new(),
                 light: JobQueue::new(),
                 persistence: PersistenceQueue::new(),
@@ -1399,16 +1397,14 @@ fn worker(shared: &Shared, light: bool) {
             action,
             &token,
             || {
-                if action == Action::Metadata {
+                match (action, &shared.processing_pool) {
                     // Container metadata scanning is a lightweight I/O service
                     // lane. Keeping it outside a one-thread processing pool
                     // prevents a folder-wide scan from delaying the current
-                    // image's first decode.
-                    run_job(shared, queue, id, action, &token)
-                } else {
-                    shared
-                        .processing_pool
-                        .install(|| run_job(shared, queue, id, action, &token))
+                    // image's first decode. Automatic mode also stays on the
+                    // established direct dispatcher path.
+                    (Action::Metadata, _) | (_, None) => run_job(shared, queue, id, action, &token),
+                    (_, Some(pool)) => pool.install(|| run_job(shared, queue, id, action, &token)),
                 }
             },
             &shared.events,
@@ -1541,12 +1537,7 @@ fn persistence_worker(shared: &Shared) {
         // rest available for newly interactive work. Automatic mode retains
         // the separately tuned JPEG pool used by previous releases.
         std::thread::yield_now();
-        let encoded = encode_cache_jpeg(
-            &shared.processing_pool,
-            shared.limit_cache_encoding,
-            &request.pixels,
-            quality,
-        );
+        let encoded = encode_cache_jpeg(shared.processing_pool.as_ref(), &request.pixels, quality);
         let mut persistence_error = None;
         let encode_error = encoded.as_ref().err().cloned();
         if let Ok(bytes) = &encoded
@@ -1940,23 +1931,21 @@ fn encode_jpeg_with_pool(
 }
 
 fn encode_cache_jpeg(
-    processing_pool: &rayon::ThreadPool,
-    limit_cache_encoding: bool,
+    processing_pool: Option<&rayon::ThreadPool>,
     buf: &PixelBuf,
     quality: u8,
 ) -> Result<Vec<u8>, String> {
     validate_jpeg_input(buf, quality)?;
-    with_cache_encoding_context(processing_pool, limit_cache_encoding, |encoder_threads| {
+    with_cache_encoding_context(processing_pool, |encoder_threads| {
         encode_jpeg_on_current_pool(buf, quality, encoder_threads)
     })?
 }
 
 fn with_cache_encoding_context<R: Send>(
-    processing_pool: &rayon::ThreadPool,
-    limit_cache_encoding: bool,
+    processing_pool: Option<&rayon::ThreadPool>,
     encode: impl FnOnce(u32) -> R + Send,
 ) -> Result<R, String> {
-    if limit_cache_encoding {
+    if let Some(processing_pool) = processing_pool {
         Ok(processing_pool.install(|| encode(1)))
     } else {
         Ok(jpeg_pool()?.install(|| encode(0)))
@@ -2117,14 +2106,27 @@ mod tests {
     }
 
     #[test]
-    fn engine_processing_pool_uses_the_requested_thread_limit() {
+    fn automatic_preserves_dispatcher_topology_and_fixed_builds_a_processing_pool() {
         let automatic = EngineOptions::default();
         let fixed_host_limit = automatic.with_worker_threads(available_worker_threads());
-        assert_eq!(automatic.worker_threads, fixed_host_limit.worker_threads);
-        assert!(
-            !automatic.limit_cache_encoding && fixed_host_limit.limit_cache_encoding,
-            "automatic mode keeps the separately tuned JPEG pool"
+        assert_eq!(automatic.worker_threads, None);
+        assert_eq!(
+            fixed_host_limit.worker_threads,
+            Some(available_worker_threads())
         );
+        let (automatic_engine, _events) = Engine::new_with_options(
+            Arc::new(Vec::new()),
+            0,
+            Arc::new(RamCache::new(0, 0, 0)),
+            None,
+            automatic,
+            Arc::new(|| {}),
+        );
+        assert!(
+            automatic_engine.shared.processing_pool.is_none(),
+            "automatic mode must preserve the established dispatcher/global-Rayon topology"
+        );
+
         let (engine, _events) = Engine::new_with_options(
             Arc::new(Vec::new()),
             0,
@@ -2134,12 +2136,14 @@ mod tests {
             Arc::new(|| {}),
         );
 
-        assert_eq!(engine.shared.processing_pool.current_num_threads(), 1);
-        assert!(engine.shared.limit_cache_encoding);
+        let processing_pool = engine
+            .shared
+            .processing_pool
+            .as_ref()
+            .expect("a fixed limit owns a processing pool");
+        assert_eq!(processing_pool.current_num_threads(), 1);
         assert_eq!(
-            engine
-                .shared
-                .processing_pool
+            processing_pool
                 .install(|| std::thread::current().name().map(str::to_owned))
                 .as_deref(),
             Some("viewr-processing-0")
@@ -2149,14 +2153,14 @@ mod tests {
     #[test]
     fn cache_encoding_strategy_distinguishes_automatic_from_a_fixed_limit() {
         let processing = build_processing_pool(NonZeroUsize::new(1).unwrap()).unwrap();
-        let strict = with_cache_encoding_context(&processing, true, |threads| {
+        let strict = with_cache_encoding_context(Some(&processing), |threads| {
             (threads, std::thread::current().name().map(str::to_owned))
         })
         .unwrap();
         assert_eq!(strict.0, 1);
         assert_eq!(strict.1.as_deref(), Some("viewr-processing-0"));
 
-        let automatic = with_cache_encoding_context(&processing, false, |threads| {
+        let automatic = with_cache_encoding_context(None, |threads| {
             (threads, std::thread::current().name().map(str::to_owned))
         })
         .unwrap();
@@ -2287,13 +2291,14 @@ mod tests {
                 let names = jxl_names.clone();
                 let completed = completed.clone();
                 jxl_pool.spawn(move || {
-                    names.lock().unwrap().insert(
-                        std::thread::current()
-                            .name()
-                            .expect("processing worker has a name")
-                            .to_owned(),
-                    );
-                    completed.send(()).unwrap();
+                    let name = std::thread::current()
+                        .name()
+                        .unwrap_or("<unnamed>")
+                        .to_owned();
+                    if let Ok(mut names) = names.lock() {
+                        names.insert(name);
+                    }
+                    let _ = completed.send(());
                 });
             }
             drop(completed);
@@ -2322,7 +2327,7 @@ mod tests {
 
         let encoded_one = encode_jpeg_with_pool(&one, &pixels, 97).unwrap();
         let encoded_two = encode_jpeg_with_pool(&two, &pixels, 97).unwrap();
-        let encoded_strict = encode_cache_jpeg(&two, true, &pixels, 97).unwrap();
+        let encoded_strict = encode_cache_jpeg(Some(&two), &pixels, 97).unwrap();
         assert_eq!(encoded_one, encoded_two);
         assert_eq!(encoded_one, encoded_strict);
 
@@ -2576,8 +2581,7 @@ mod tests {
                     .store(notify_queue.state.try_lock().is_ok(), Ordering::SeqCst);
                 notify_queue.set_plan(vec![(id, 0, 0, Action::Develop(Quality::Browse))], false);
             }),
-            processing_pool: test_processing_pool(),
-            limit_cache_encoding: false,
+            processing_pool: None,
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             persistence: PersistenceQueue::new(),
@@ -2810,7 +2814,7 @@ mod tests {
         disk: Option<DiskCache>,
         pending_budget_bytes: usize,
         jpeg_quality: u8,
-        limit_cache_encoding: bool,
+        fixed_processing_limit: bool,
     ) -> Arc<Shared> {
         let (events, _receiver) = std::sync::mpsc::channel();
         Arc::new(Shared {
@@ -2819,8 +2823,7 @@ mod tests {
             disk,
             events,
             notify: Arc::new(|| {}),
-            processing_pool: test_processing_pool(),
-            limit_cache_encoding,
+            processing_pool: fixed_processing_limit.then(test_processing_pool),
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             persistence: PersistenceQueue::with_budget(pending_budget_bytes),
@@ -3582,8 +3585,7 @@ mod tests {
             disk: Some(disk.clone()),
             events,
             notify: Arc::new(|| {}),
-            processing_pool: test_processing_pool(),
-            limit_cache_encoding: false,
+            processing_pool: None,
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             persistence: PersistenceQueue::new(),
@@ -3995,8 +3997,7 @@ mod tests {
             disk: Some(disk.clone()),
             events,
             notify: Arc::new(|| {}),
-            processing_pool: test_processing_pool(),
-            limit_cache_encoding: false,
+            processing_pool: None,
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             persistence: PersistenceQueue::new(),
