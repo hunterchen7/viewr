@@ -1362,6 +1362,7 @@ impl App {
                     let cell = vec2(thumb_h * 1.4, thumb_h + 18.0);
                     let spacing = ui.spacing().item_spacing.x;
                     let visible_pos = visible_position(&self.visible, current);
+                    filmstrip::configure_vertical_scroll(ui, self.config.vertical_scroll_filmstrip);
                     let mut strip = egui::ScrollArea::horizontal()
                         .id_salt("filmstrip")
                         .auto_shrink([false, false]);
