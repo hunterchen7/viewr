@@ -410,11 +410,12 @@ Before the workflow uploads files, it verifies that the tag still identifies
 the approved commit.
 
 The current trusted workflow also checks the immutable source before any build
-starts. A source that does not lock `jpeg-rusturbo` needs no JPEG notice. A
-source that locks exactly version 0.9.2 must contain the exact pinned upstream
-notice as the terminal block in `THIRD-PARTY-NOTICES.txt`. Another or multiple
-locked versions fail closed. An immutable historical source that lacks a
-required notice cannot be recovered; create a new compliant release instead.
+starts. Every release source must contain the pinned `jpeg-rusturbo` 0.9.2
+upstream notice as the terminal block in `THIRD-PARTY-NOTICES.txt`. The
+validator accepts only real paths from the tagged checkout and fails closed for
+a missing or duplicate marker or any changed notice bytes. Historical sources
+that predate this baseline cannot use the current recovery workflow; create a
+new compliant release instead.
 
 GitHub's workflow token cannot publish some historical releases when their
 target commit changes workflow files. A historical recovery therefore uploads

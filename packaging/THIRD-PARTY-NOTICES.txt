@@ -31,7 +31,7 @@ Viewr itself is available under the MIT license. See the LICENSE file.
 jpeg-rusturbo 0.9.2
 --------------------
 
-Viewr links jpeg-rusturbo 0.9.2 for JPEG encoding and decoding. The crate
+Viewr links jpeg-rusturbo 0.9.2 for JPEG encoding. The crate
 contains code translated or ported from libjpeg-turbo. The exact upstream
 NOTICE.md follows so its Independent JPEG Group acknowledgment and Modified
 BSD terms accompany every Viewr binary distribution.

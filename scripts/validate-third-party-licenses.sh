@@ -31,14 +31,19 @@ extract_jpeg_rusturbo_notice() {
     local marker_count
     local marker_position
     local marker_line
+    local notice_start_line
 
     if [[ ! -f "$notices_path" ]]; then
         echo "error: third-party notice file is missing: ${notices_path}" >&2
         return 1
     fi
+    if ! LC_ALL=C grep -Iq . "$notices_path"; then
+        echo "error: third-party notice file must be text: ${notices_path}" >&2
+        return 1
+    fi
 
     marker_count="$(
-        grep -Fxc -- "$JPEG_RUSTURBO_NOTICE_MARKER" "$notices_path" || true
+        LC_ALL=C grep -a -Fxc -- "$JPEG_RUSTURBO_NOTICE_MARKER" "$notices_path" || true
     )"
     if [[ "$marker_count" != "1" ]]; then
         echo "error: ${notices_path} must contain exactly one jpeg-rusturbo NOTICE marker" >&2
@@ -46,10 +51,15 @@ extract_jpeg_rusturbo_notice() {
     fi
 
     marker_position="$(
-        grep -Fnx -- "$JPEG_RUSTURBO_NOTICE_MARKER" "$notices_path"
+        LC_ALL=C grep -a -Fnx -- "$JPEG_RUSTURBO_NOTICE_MARKER" "$notices_path"
     )"
     marker_line="${marker_position%%:*}"
-    tail -n "+$((marker_line + 1))" "$notices_path" >"$destination_path"
+    if [[ ! "$marker_line" =~ ^[1-9][0-9]*$ ]]; then
+        echo "error: third-party notice marker has an invalid line number" >&2
+        return 1
+    fi
+    notice_start_line=$((10#$marker_line + 1))
+    tail -n "+$notice_start_line" "$notices_path" >"$destination_path"
 }
 
 actual_about_version="$(cargo about --version)"
