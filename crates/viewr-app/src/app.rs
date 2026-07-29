@@ -18,7 +18,7 @@ use viewr_core::cache_disk::DiskCache;
 use viewr_core::cache_ram::RamCache;
 use viewr_core::db::{Db, default_db_path};
 use viewr_core::folder::{FolderEntry, normalize_physical_path, scan};
-use viewr_core::jobs::{Engine, Event, NavState};
+use viewr_core::jobs::{Engine, EngineOptions, Event, NavState};
 use viewr_core::library::{
     Library, RatingLoad, load_ratings_with_owners, rating_owner_keys, try_load_ratings_with_owners,
 };
@@ -389,12 +389,23 @@ impl App {
 
         let ctx = self.ctx.clone();
         let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
-        let (engine, events) = Engine::new_with_jpeg_quality(
+        let engine_options = EngineOptions::default().with_jpeg_quality(self.config.jpeg_quality);
+        let engine_options = if let Some(worker_threads) = self.config.fixed_worker_threads() {
+            engine_options.with_worker_threads(worker_threads)
+        } else {
+            engine_options
+        };
+        // Do not let folder replacement briefly run two processing pools.
+        // All recoverable preparation above succeeds before the current
+        // session is released; engine construction has no recoverable error
+        // path and documents process-level spawn failures as panics.
+        drop(self.session.take());
+        let (engine, events) = Engine::new_with_options(
             entries.clone(),
             start,
             cache.clone(),
             disk,
-            self.config.jpeg_quality,
+            engine_options,
             notify,
         );
 

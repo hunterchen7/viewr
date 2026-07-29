@@ -1,11 +1,33 @@
 //! Preferences window: input mode, display, cache, updates, and keybinds.
 //! Viewer preferences save to viewr.toml; updater actions are returned to its
-//! cross-process store. Cache-profile changes apply on the next folder open.
+//! cross-process store. Processing and cache-profile changes apply on the next
+//! folder open.
+
+use std::num::NonZeroUsize;
 
 use eframe::egui;
 use viewr_core::jobs::{MAX_CACHE_JPEG_QUALITY, MIN_CACHE_JPEG_QUALITY};
 
-use crate::config::{ACTIONS, Action, Bind, Config, ScrollMode, TierIndicator};
+use crate::config::{
+    ACTIONS, Action, Bind, Config, MAX_CONFIGURED_PROCESSING_THREADS, ProcessingThreadLimit,
+    ScrollMode, TierIndicator,
+};
+
+fn max_processing_thread_choice(available: usize) -> usize {
+    available.clamp(1, MAX_CONFIGURED_PROCESSING_THREADS)
+}
+
+fn processing_threads_label(limit: ProcessingThreadLimit, available: usize) -> String {
+    match limit {
+        ProcessingThreadLimit::Automatic => {
+            format!("Automatic ({available} logical CPUs)")
+        }
+        ProcessingThreadLimit::Limited(limit) if limit.get() > available => {
+            format!("{} ({} available)", limit.get(), available)
+        }
+        ProcessingThreadLimit::Limited(limit) => limit.get().to_string(),
+    }
+}
 
 #[derive(Default)]
 pub struct SettingsActions {
@@ -68,6 +90,7 @@ impl SettingsState {
         egui::Window::new("Preferences")
             .open(&mut open)
             .default_width(380.0)
+            .vscroll(true)
             .show(ctx, |ui| {
                 ui.heading("Input");
                 ui.horizontal(|ui| {
@@ -145,6 +168,84 @@ impl SettingsState {
                 );
                 ui.add_space(8.0);
 
+                ui.heading("Performance");
+                let available =
+                    viewr_core::jobs::available_worker_threads().get();
+                let max_choice = max_processing_thread_choice(available);
+                ui.horizontal(|ui| {
+                    ui.label("Processing threads");
+                    let selected = processing_threads_label(
+                        config.processing_threads,
+                        available,
+                    );
+                    let combo = egui::ComboBox::from_id_salt(
+                        "processing-thread-limit",
+                    )
+                    .selected_text(selected)
+                    .width(190.0)
+                    .height(240.0)
+                    .show_ui(ui, |ui| {
+                        changed |= ui
+                            .selectable_value(
+                                &mut config.processing_threads,
+                                ProcessingThreadLimit::Automatic,
+                                format!(
+                                    "Automatic ({available} logical CPUs)"
+                                ),
+                            )
+                            .changed();
+                        if let ProcessingThreadLimit::Limited(current) =
+                            config.processing_threads
+                            && current.get() > available
+                        {
+                            changed |= ui
+                                .selectable_value(
+                                    &mut config.processing_threads,
+                                    ProcessingThreadLimit::Limited(current),
+                                    format!(
+                                        "Keep {} (uses {available} here)",
+                                        current.get()
+                                    ),
+                                )
+                                .changed();
+                            ui.separator();
+                        }
+                        for worker_threads in 1..=max_choice {
+                            let limit = NonZeroUsize::new(worker_threads)
+                                .expect("processing thread choice is non-zero");
+                            changed |= ui
+                                .selectable_value(
+                                    &mut config.processing_threads,
+                                    ProcessingThreadLimit::Limited(limit),
+                                    if worker_threads == 1 {
+                                        "1 thread".to_owned()
+                                    } else {
+                                        format!("{worker_threads} threads")
+                                    },
+                                )
+                                .changed();
+                        }
+                    });
+                    combo.response.on_hover_text(
+                        "A fixed value caps CPU-heavy RAW, resize, cache decode, and cache encode work",
+                    );
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Automatic keeps maximum throughput. A fixed value limits logical CPU use; interface, metadata, ratings, updates, and disk-cache persistence/maintenance threads remain separate.",
+                    )
+                    .weak()
+                    .size(11.0),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Processing and cache changes apply when the next folder is opened.",
+                    )
+                    .weak()
+                    .size(11.0),
+                );
+                ui.add_space(8.0);
+
                 ui.heading("Cache");
                 egui::Grid::new("cache-grid").num_columns(2).show(ui, |ui| {
                     ui.label("RAM budget (GB)");
@@ -178,13 +279,6 @@ impl SettingsState {
                     )
                     .weak()
                     .size(11.0),
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "Cache budgets and JPEG quality apply when the next folder is opened.",
-                    )
-                        .weak()
-                        .size(11.0),
                 );
                 ui.add_space(8.0);
 
@@ -280,5 +374,68 @@ impl SettingsState {
             config.save();
         }
         actions
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn processing_thread_labels_distinguish_automatic_and_portable_limits() {
+        assert_eq!(
+            processing_threads_label(ProcessingThreadLimit::Automatic, 10),
+            "Automatic (10 logical CPUs)"
+        );
+        assert_eq!(
+            processing_threads_label(
+                ProcessingThreadLimit::Limited(NonZeroUsize::new(4).unwrap()),
+                10,
+            ),
+            "4"
+        );
+        assert_eq!(
+            processing_threads_label(
+                ProcessingThreadLimit::Limited(NonZeroUsize::new(12).unwrap()),
+                10,
+            ),
+            "12 (10 available)"
+        );
+    }
+
+    #[test]
+    fn processing_thread_choices_match_the_persisted_safety_limit() {
+        assert_eq!(max_processing_thread_choice(10), 10);
+        assert_eq!(
+            max_processing_thread_choice(MAX_CONFIGURED_PROCESSING_THREADS + 1),
+            MAX_CONFIGURED_PROCESSING_THREADS
+        );
+    }
+
+    #[test]
+    fn preferences_scroll_within_a_constrained_viewport() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(420.0, 480.0));
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let mut settings = SettingsState {
+            open: true,
+            ..Default::default()
+        };
+        let mut config = Config::test_default();
+
+        let _ = ctx.run_ui(input, |ui| {
+            settings.show(ui.ctx(), &mut config, "Up to date", false, true);
+        });
+
+        let window = egui::AreaState::load(&ctx, egui::Id::new(Some("Preferences")))
+            .expect("preferences window state is stored");
+        assert!(screen.contains_rect(window.rect()));
+        assert!(
+            ctx.data(|data| data.count::<egui::scroll_area::State>()) >= 2,
+            "the window and keybind list should each own a scroll area"
+        );
     }
 }

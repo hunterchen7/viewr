@@ -13,7 +13,12 @@ priority lane, while main-image development follows a bounded outward wave
 from the current image with a ~3:1 forward bias. When disk caching is enabled,
 idle workers make a best-effort persistent pass to warm Browse renders across
 the folder. Metadata is scanned separately, without decoding every embedded
-preview.
+preview. Preferences can leave processing concurrency on the tuned Automatic
+mode or set a fixed logical-thread cap. A fixed cap covers RAW development,
+resizing, cache decode, and cache JPEG encoding, including source and cache
+reads performed by those image jobs. Lightweight interface, metadata scanning,
+ratings, updates, and disk-cache persistence and maintenance threads remain
+separate.
 
 Residency uses hard accounting limits and soft targets:
 
@@ -77,10 +82,11 @@ Zoom framing persists across images — cull a burst at 100% comparing
 the same detail. Viewr also restores the last window size and position.
 
 The Preferences window controls the loading message, performance details,
-exposure details, cache indicator, budgets, and cache JPEG quality. The cache
-indicator has border, mark, and hidden modes. JPEG quality changes apply when
-the next folder is opened. All binds, loupe scroll behavior, and optional
-vertical scrolling of the horizontal filmstrip are also configurable.
+exposure details, cache indicator, processing-thread limit, budgets, and cache
+JPEG quality. The cache indicator has border, mark, and hidden modes.
+Processing and cache changes apply when the next folder is opened. All binds,
+loupe scroll behavior, and optional vertical scrolling of the horizontal
+filmstrip are also configurable.
 Viewr stores these settings in
 `~/Library/Application Support/viewr/viewr.toml` on macOS. Viewr writes a
 documented template on the first run.

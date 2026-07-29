@@ -27,6 +27,11 @@ icu_normalizer.workspace = true
 tempfile.workspace = true
 criterion = { workspace = true, optional = true }
 
+[dev-dependencies]
+# rawler's JPEG-XL decoder uses this abstraction. Keep a direct regression
+# test that its ambient Rayon mode inherits Viewr's configured pool.
+jxl-threadpool = { version = "=1.0.0", features = ["rayon"] }
+
 [[bench]]
 name = "core_hot_paths"
 harness = false
