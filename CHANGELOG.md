@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.3.0](https://github.com/hunterchen7/viewr/compare/v0.2.0...v0.3.0) (2026-07-29)
+
+
+### Features
+
+* add bounded image processing executor ([8f72f2a](https://github.com/hunterchen7/viewr/commit/8f72f2a245ff9a1c630136352a34b04c66e6fa14))
+* add clickable star markers to the filmstrip scrollbar ([a14d411](https://github.com/hunterchen7/viewr/commit/a14d411a2bcb2dab5c9a599c139ef64e2e92b7a2))
+* add configurable image-processing thread limits ([805a6b8](https://github.com/hunterchen7/viewr/commit/805a6b88da8c96edce985206ad09cf0316575c5f))
+* add optional vertical filmstrip scrolling ([0295134](https://github.com/hunterchen7/viewr/commit/0295134301a7aac542b7c615b79675b48fc4c3cb))
+* add processing thread preference ([d93caa5](https://github.com/hunterchen7/viewr/commit/d93caa5ab74dad93d3f74f78c0e31bc906ef012e))
+* add vertical filmstrip scroll preference ([bbd4488](https://github.com/hunterchen7/viewr/commit/bbd44882512846bb56b2ba3a5977ed3690cc1c44))
+* mark starred images on filmstrip scrollbar ([79a8199](https://github.com/hunterchen7/viewr/commit/79a8199551ce02d0c9e973fb584d03da002278ec))
+* scroll filmstrip with vertical gestures ([995ccea](https://github.com/hunterchen7/viewr/commit/995ccea37311b57be9ab2b01455accf6fff17c5a))
+
+
+### Bug Fixes
+
+* **ci:** bind draft publication to release identity ([2962f0a](https://github.com/hunterchen7/viewr/commit/2962f0aa2276570494aa1020479a94eacedb1515))
+* **ci:** bind recovery publication to artifacts ([fc10989](https://github.com/hunterchen7/viewr/commit/fc1098933b78ad3fa83dd708893c8e5b85f0f6ed))
+* **ci:** harden release recovery and publication ([448c2c7](https://github.com/hunterchen7/viewr/commit/448c2c79333b061675e778351832808da53921c2))
+* **ci:** prefetch complete license graph ([#22](https://github.com/hunterchen7/viewr/issues/22)) ([cd59c8f](https://github.com/hunterchen7/viewr/commit/cd59c8f2cf3adf9b1f803f27480a01bd5c47e587))
+* **ci:** preserve retryable recovery artifacts ([f2c038b](https://github.com/hunterchen7/viewr/commit/f2c038bcea62187b91378d13f6ddc5084a887131))
+* **ci:** publish the verified release id ([fc15842](https://github.com/hunterchen7/viewr/commit/fc15842b25528a73e0199d1f3cdd8cd7b203220c))
+* **ci:** recover historical releases safely ([5c632f5](https://github.com/hunterchen7/viewr/commit/5c632f582cd716b577d9db6a9ebaaa7f4b0d25a3))
+* **ci:** upload release assets by exact id ([a4bca10](https://github.com/hunterchen7/viewr/commit/a4bca1068d5caaa06f7d58dab1ea828713e7d789))
+* **ci:** verify ambiguous release publication ([c36c905](https://github.com/hunterchen7/viewr/commit/c36c905ae193da0b91633704b170338265c13f77))
+* **ci:** wait for draft release visibility ([c77755f](https://github.com/hunterchen7/viewr/commit/c77755f19f201062a74437773040fbe1760998a7))
+* keep preferences controls reachable ([ca9152c](https://github.com/hunterchen7/viewr/commit/ca9152c2b1bb7792eb225433e06790e5e97e038f))
+* **packaging:** include JPEG upstream notice ([c305193](https://github.com/hunterchen7/viewr/commit/c305193614854a76022e3a92e58f8a0a51c3a407))
+* **packaging:** ship required JPEG attribution ([c846ac4](https://github.com/hunterchen7/viewr/commit/c846ac4d9448630e4dade1f4ba98899efbbedb44))
+* **release:** harden notice provenance checks ([7754cee](https://github.com/hunterchen7/viewr/commit/7754cee73c042e08b49d979ccafb8dab7aed8d22))
+* **release:** reject deficient tagged notices ([83fd94d](https://github.com/hunterchen7/viewr/commit/83fd94d5e83727a3cff5b31e88308f76c4dee919))
+* **release:** scan notice inputs completely ([853fa79](https://github.com/hunterchen7/viewr/commit/853fa79bac6f13cd7f484e48e237fc0559cc1bd7))
+
+
+### Performance Improvements
+
+* cache filmstrip star markers ([0b0aad9](https://github.com/hunterchen7/viewr/commit/0b0aad924ab46a6e6220e5eb050825cba5f391b7))
+* preserve automatic processing topology ([c5edd3f](https://github.com/hunterchen7/viewr/commit/c5edd3ff7f0d910925cc3b99417b42005378aaf7))
+
 ## [0.2.0](https://github.com/hunterchen7/viewr/compare/v0.1.1...v0.2.0) (2026-07-28)
 
 
