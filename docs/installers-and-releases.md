@@ -407,32 +407,83 @@ target commit changes workflow files. A historical recovery therefore uploads
 and verifies the exact assets but deliberately leaves the release as a draft.
 It creates a custom recovery attestation that records both the old source
 commit and the current workflow commit. After the recovery run succeeds, a
-maintainer whose `gh` token has `repo` and `workflow` scopes publishes the
-verified draft from an exact checkout of current `main`:
+maintainer downloads the immutable validated-artifact snapshot from that exact
+run. The publication helper compares every current draft asset's name, size,
+and GitHub-computed digest with that snapshot immediately before publication.
+It also rechecks the tag and draft identity.
+
+Run the exact command emitted in the successful recovery run summary. Its
+expanded form is:
 
 ```bash
-git switch main
-git pull --ff-only
+recovery_run_id=RECOVERY-RUN-ID
+workflow_sha=RECOVERY-WORKFLOW-COMMIT
 release_id=361510019
 release_sha=106284ee7dec2d9e05aa091121747adfa0642407
 release_tag=v0.2.0
+recovery_directory="$(mktemp -d)"
+
+gh run download "$recovery_run_id" \
+  --repo hunterchen7/viewr \
+  --name "historical-release-$release_id" \
+  --dir "$recovery_directory/assets"
+git clone --no-checkout \
+  https://github.com/hunterchen7/viewr.git \
+  "$recovery_directory/release-tools"
+git -C "$recovery_directory/release-tools" \
+  checkout --detach "$workflow_sha"
+
 GH_TOKEN="$(gh auth token)" \
 GITHUB_REPOSITORY=hunterchen7/viewr \
-scripts/publish-draft-release.sh \
+"$recovery_directory/release-tools/scripts/publish-draft-release.sh" \
+  --asset-directory "$recovery_directory/assets" \
   --release-id "$release_id" \
   --release-sha "$release_sha" \
+  --recovery-workflow-sha "$workflow_sha" \
   "$release_tag"
 ```
 
-The helper resolves annotated tags, rejects a moved tag or replaced release,
-publishes only the numeric draft ID, validates the PATCH response, and retries
-the exact post-publication read. The historical workflow run summary supplies
-the release ID, source SHA, tag, and exact command.
+Only the final helper process receives the maintainer's `gh` token, which must
+have `repo` and `workflow` scopes for this GitHub API case. The helper runs from
+the recovery workflow's immutable commit, resolves annotated tags, rejects a
+moved tag or replaced release, revalidates the exact assets, and publishes only
+the numeric draft ID. It uses GitHub's legacy latest-release selection so an
+older recovery cannot supersede a newer release. It validates the PATCH
+response, uses a three-minute bounded final-state check, rechecks the tag after
+publication, and restores the draft if that final tag check fails.
 
-Verify an attestation with:
+Verify a normal release attestation with the exact reusable-workflow signer:
 
 ```bash
-gh attestation verify PATH-TO-DOWNLOAD -R hunterchen7/viewr
+gh attestation verify PATH-TO-DOWNLOAD \
+  --repo hunterchen7/viewr \
+  --signer-workflow hunterchen7/viewr/.github/workflows/release-binaries.yml
+```
+
+Historical recovery artifacts use a custom predicate. Verify its signature and
+assert the recovery identity fields before publication:
+
+```bash
+predicate_type=https://github.com/hunterchen7/viewr/attestations/release-recovery/v1
+verification="$(
+  gh attestation verify PATH-TO-DOWNLOAD \
+    --repo hunterchen7/viewr \
+    --signer-workflow hunterchen7/viewr/.github/workflows/release-binaries.yml \
+    --signer-digest "$workflow_sha" \
+    --predicate-type "$predicate_type" \
+    --format json
+)"
+jq -e \
+  --argjson release_id "$release_id" \
+  --arg release_sha "$release_sha" \
+  --arg release_tag "$release_tag" \
+  --arg workflow_sha "$workflow_sha" \
+  'any(.[];
+    .verificationResult.statement.predicate.release.id == $release_id
+    and .verificationResult.statement.predicate.release.tag == $release_tag
+    and .verificationResult.statement.predicate.release.sourceCommit == $release_sha
+    and .verificationResult.statement.predicate.workflow.commit == $workflow_sha
+  )' <<<"$verification"
 ```
 
 Verify `SHA256SUMS` with the same command before you use it as a checksum

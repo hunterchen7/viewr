@@ -342,6 +342,17 @@ jobs:
       attestations: write
       artifact-metadata: write
     steps:
+      - name: Validate release mode
+        env:
+          HISTORICAL_RECOVERY: ${{ needs.gate.outputs.historical_recovery }}
+        run: |
+          case "$HISTORICAL_RECOVERY" in
+            true | false) ;;
+            *)
+              echo "::error::Invalid historical recovery mode: $HISTORICAL_RECOVERY"
+              exit 1
+              ;;
+          esac
       - name: Check out current release tools
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -423,12 +434,12 @@ jobs:
               }
             }' >"$RUNNER_TEMP/viewr-release-recovery-predicate.json"
       - name: Attest release assets
-        if: ${{ needs.gate.outputs.historical_recovery != 'true' }}
+        if: ${{ needs.gate.outputs.historical_recovery == 'false' }}
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
         with:
           subject-checksums: dist/SHA256SUMS
       - name: Attest checksum manifest
-        if: ${{ needs.gate.outputs.historical_recovery != 'true' }}
+        if: ${{ needs.gate.outputs.historical_recovery == 'false' }}
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
         with:
           subject-path: dist/SHA256SUMS
@@ -482,8 +493,16 @@ jobs:
             --release-id "$VIEWR_RELEASE_ID" \
             dist \
             "$VIEWR_RELEASE_TAG"
+      - name: Preserve validated historical recovery assets
+        if: ${{ needs.gate.outputs.historical_recovery == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: historical-release-${{ needs.gate.outputs.release_id }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
       - name: Publish validated release
-        if: ${{ needs.gate.outputs.historical_recovery != 'true' }}
+        if: ${{ needs.gate.outputs.historical_recovery == 'false' }}
         env:
           GH_TOKEN: ${{ github.token }}
           VIEWR_RELEASE_ID: ${{ needs.gate.outputs.release_id }}
@@ -501,6 +520,7 @@ jobs:
             exit 1
           fi
           scripts/publish-draft-release.sh \
+            --asset-directory dist \
             --release-id "$VIEWR_RELEASE_ID" \
             --release-sha "$VIEWR_RELEASE_SHA" \
             "$VIEWR_RELEASE_TAG"
@@ -513,6 +533,16 @@ jobs:
           VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
           VIEWR_RELEASE_QUERY_ATTEMPTS: "1"
         run: |
+          git fetch \
+            --force \
+            --no-tags \
+            origin \
+            "refs/tags/$VIEWR_RELEASE_TAG:refs/tags/$VIEWR_RELEASE_TAG"
+          current_release_sha="$(git rev-parse "$VIEWR_RELEASE_TAG^{commit}")"
+          if [[ "$current_release_sha" != "$VIEWR_RELEASE_SHA" ]]; then
+            echo "::error::Release tag moved from $VIEWR_RELEASE_SHA to $current_release_sha."
+            exit 1
+          fi
           scripts/require-draft-release.sh \
             "$VIEWR_RELEASE_TAG" \
             "$VIEWR_RELEASE_ID" >/dev/null
@@ -523,9 +553,21 @@ jobs:
             echo "A maintainer with a workflow-authorized token must publish this exact ID."
             echo
             echo '```bash'
+            echo 'recovery_directory="$(mktemp -d)"'
+            echo "gh run download \"$GITHUB_RUN_ID\" --repo \"$GITHUB_REPOSITORY\" \\"
+            echo "  --name \"historical-release-$VIEWR_RELEASE_ID\" \\"
+            echo '  --dir "$recovery_directory/assets"'
+            echo "git clone --no-checkout \"https://github.com/$GITHUB_REPOSITORY.git\" \\"
+            echo '  "$recovery_directory/release-tools"'
+            echo "git -C \"\$recovery_directory/release-tools\" checkout --detach \"$GITHUB_SHA\""
             echo 'GH_TOKEN="$(gh auth token)" \'
             echo "GITHUB_REPOSITORY=\"$GITHUB_REPOSITORY\" \\"
-            echo "scripts/publish-draft-release.sh --release-id \"$VIEWR_RELEASE_ID\" --release-sha \"$VIEWR_RELEASE_SHA\" \"$VIEWR_RELEASE_TAG\""
+            echo "\"\$recovery_directory/release-tools/scripts/publish-draft-release.sh\" \\"
+            echo '  --asset-directory "$recovery_directory/assets" \'
+            echo "  --release-id \"$VIEWR_RELEASE_ID\" \\"
+            echo "  --release-sha \"$VIEWR_RELEASE_SHA\" \\"
+            echo "  --recovery-workflow-sha \"$GITHUB_SHA\" \\"
+            echo "  \"$VIEWR_RELEASE_TAG\""
             echo '```'
           } >>"$GITHUB_STEP_SUMMARY"
           echo "::notice title=Historical recovery ready::Release $VIEWR_RELEASE_TAG (ID $VIEWR_RELEASE_ID) remains a verified draft for maintainer publication."
