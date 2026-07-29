@@ -225,7 +225,7 @@ impl SettingsState {
                 });
                 ui.label(
                     egui::RichText::new(
-                        "Automatic keeps maximum throughput. A fixed value limits logical CPU use; interface, disk I/O, ratings, and update threads remain separate.",
+                        "Automatic keeps maximum throughput. A fixed value limits logical CPU use; interface, metadata, disk I/O, ratings, and update threads remain separate.",
                     )
                     .weak()
                     .size(11.0),

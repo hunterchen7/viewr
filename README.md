@@ -16,7 +16,7 @@ the folder. Metadata is scanned separately, without decoding every embedded
 preview. Preferences can leave processing concurrency on the tuned Automatic
 mode or set a fixed logical-thread cap. A fixed cap covers RAW development,
 resizing, cache decode, and cache JPEG encoding; lightweight interface, disk
-I/O, ratings, and update threads remain separate.
+I/O, metadata scanning, ratings, and update threads remain separate.
 
 Residency uses hard accounting limits and soft targets:
 

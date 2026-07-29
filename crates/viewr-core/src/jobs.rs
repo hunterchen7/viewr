@@ -2727,6 +2727,24 @@ mod tests {
         pending_budget_bytes: usize,
         jpeg_quality: u8,
     ) -> Arc<Shared> {
+        persistence_shared_with_options(
+            entries,
+            cache,
+            disk,
+            pending_budget_bytes,
+            jpeg_quality,
+            false,
+        )
+    }
+
+    fn persistence_shared_with_options(
+        entries: Vec<FolderEntry>,
+        cache: Arc<RamCache>,
+        disk: Option<DiskCache>,
+        pending_budget_bytes: usize,
+        jpeg_quality: u8,
+        limit_cache_encoding: bool,
+    ) -> Arc<Shared> {
         let (events, _receiver) = std::sync::mpsc::channel();
         Arc::new(Shared {
             entries: Arc::new(entries),
@@ -2735,7 +2753,7 @@ mod tests {
             events,
             notify: Arc::new(|| {}),
             processing_pool: test_processing_pool(),
-            limit_cache_encoding: false,
+            limit_cache_encoding,
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             persistence: PersistenceQueue::with_budget(pending_budget_bytes),
@@ -3763,7 +3781,14 @@ mod tests {
             DiskCache::key(&entries[1], Tier::Browse),
         ];
         let cache = Arc::new(RamCache::new(0, 0, 1024 * 1024));
-        let shared = persistence_shared(entries, cache.clone(), Some(disk.clone()), 1024 * 1024);
+        let shared = persistence_shared_with_options(
+            entries,
+            cache.clone(),
+            Some(disk.clone()),
+            1024 * 1024,
+            CACHE_JPEG_QUALITY,
+            true,
+        );
 
         assert_eq!(
             shared.persistence.try_enqueue(persistence_request(

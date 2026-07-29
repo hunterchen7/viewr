@@ -556,7 +556,8 @@ show_exposure = true
 [performance]
 # CPU-heavy RAW and image processing workers. Zero automatically uses every
 # logical CPU available to Viewr; a positive value sets a portable upper limit.
-# Lightweight interface, disk I/O, ratings, and update threads remain separate.
+# Lightweight interface, metadata, disk I/O, ratings, and update threads remain
+# separate.
 worker_threads = 0
 
 [cache]
