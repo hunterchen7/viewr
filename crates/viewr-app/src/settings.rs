@@ -84,6 +84,15 @@ impl SettingsState {
                         .weak()
                         .size(11.0),
                 );
+                changed |= ui
+                    .checkbox(
+                        &mut config.vertical_scroll_filmstrip,
+                        "Use vertical scrolling to move the filmstrip",
+                    )
+                    .on_hover_text(
+                        "Applies only while the pointer is over the bottom filmstrip",
+                    )
+                    .changed();
                 ui.add_space(8.0);
 
                 ui.heading("Display");

@@ -4,6 +4,15 @@ use eframe::egui;
 
 pub(crate) const OVERSCAN_COLUMNS: usize = 2;
 
+/// Scope egui's single-axis wheel remapping to the horizontal filmstrip.
+///
+/// egui retains native smoothing, trackpad inertia, direction, and boundary
+/// handling. The surrounding scoped UI prevents this preference from changing
+/// vertical scrolling elsewhere in the app.
+pub(crate) fn configure_vertical_scroll(ui: &mut egui::Ui, enabled: bool) {
+    ui.style_mut().always_scroll_the_only_direction = enabled;
+}
+
 pub(crate) fn content_width(total: usize, column_width: f32, spacing: f32) -> f32 {
     if total == 0 || column_width <= 0.0 || !column_width.is_finite() || !spacing.is_finite() {
         0.0
@@ -166,5 +175,63 @@ mod tests {
 
         let last = centered_scroll_offset(100, 999, WIDTH, SPACING, 1_000.0);
         assert!((last - (content_width(100, WIDTH, SPACING) - 1_000.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn vertical_scroll_preference_is_scoped_to_the_filmstrip_ui() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            assert!(!ui.style().always_scroll_the_only_direction);
+            ui.scope(|ui| {
+                configure_vertical_scroll(ui, true);
+                assert!(ui.style().always_scroll_the_only_direction);
+            });
+            assert!(!ui.style().always_scroll_the_only_direction);
+        });
+    }
+
+    #[test]
+    fn vertical_wheel_moves_only_an_enabled_horizontal_filmstrip() {
+        fn frame(ctx: &egui::Context, enabled: bool, wheel: egui::Vec2) -> f32 {
+            let mut offset = None;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(240.0, 100.0),
+                )),
+                events: vec![
+                    egui::Event::PointerMoved(egui::pos2(50.0, 30.0)),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: wheel,
+                        phase: egui::TouchPhase::Move,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                configure_vertical_scroll(ui, enabled);
+                offset = Some(
+                    egui::ScrollArea::horizontal()
+                        .id_salt("test-filmstrip")
+                        .show(ui, |ui| {
+                            ui.allocate_space(egui::vec2(1_000.0, 50.0));
+                        })
+                        .state
+                        .offset
+                        .x,
+                );
+            });
+            offset.expect("filmstrip offset is captured")
+        }
+
+        let disabled = egui::Context::default();
+        let enabled = egui::Context::default();
+        let horizontal = egui::Context::default();
+
+        assert_eq!(frame(&disabled, false, egui::vec2(0.0, -80.0)), 0.0);
+        assert!(frame(&enabled, true, egui::vec2(0.0, -80.0)) > 0.0);
+        assert!(frame(&horizontal, false, egui::vec2(-80.0, 0.0)) > 0.0);
     }
 }

@@ -64,6 +64,7 @@ viewr dev <file.arw> [out]     decode one file, print per-stage timings
 | Space / Z / double-click | toggle fit ↔ 100% at cursor |
 | pinch or Ctrl/Cmd+scroll | zoom at cursor |
 | scroll or drag | pan (zoomed) |
+| vertical scroll over filmstrip (optional) | move filmstrip horizontally |
 | G (Enter in grid) | grid ↔ loupe |
 | I | metadata panel |
 | F | fullscreen |
@@ -77,8 +78,8 @@ the same detail. Viewr also restores the last window size and position.
 The Preferences window controls the loading message, performance details,
 exposure details, cache indicator, budgets, and cache JPEG quality. The cache
 indicator has border, mark, and hidden modes. JPEG quality changes apply when
-the next folder is opened. All binds and the scroll behavior are also
-configurable.
+the next folder is opened. All binds, loupe scroll behavior, and optional
+vertical scrolling of the horizontal filmstrip are also configurable.
 Viewr stores these settings in
 `~/Library/Application Support/viewr/viewr.toml` on macOS. Viewr writes a
 documented template on the first run.
