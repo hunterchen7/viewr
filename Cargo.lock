@@ -4627,6 +4627,7 @@ dependencies = [
  "icu_normalizer",
  "image",
  "jpeg-rusturbo",
+ "jxl-threadpool",
  "memchr",
  "quick-xml 0.36.2",
  "rawler",

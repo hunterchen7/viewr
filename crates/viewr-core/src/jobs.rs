@@ -2226,7 +2226,7 @@ mod tests {
     #[test]
     fn nested_rayon_work_stays_on_the_configured_processing_pool() {
         let pool = build_processing_pool(NonZeroUsize::new(2).unwrap()).unwrap();
-        let names: HashSet<String> = pool.install(|| {
+        let parallel_iterator_names: HashSet<String> = pool.install(|| {
             (0..4096)
                 .into_par_iter()
                 .map(|_| {
@@ -2238,10 +2238,74 @@ mod tests {
                 .collect()
         });
 
-        assert!(!names.is_empty());
-        assert!(names.len() <= 2);
+        assert!(!parallel_iterator_names.is_empty());
+        assert!(parallel_iterator_names.len() <= 2);
         assert!(
-            names
+            parallel_iterator_names
+                .iter()
+                .all(|name| name.starts_with("viewr-processing-"))
+        );
+
+        // rawler's JPEG-XL DNG path uses JxlThreadPool::rayon_global().
+        // Its "global" methods are ambient Rayon operations, so when the
+        // decoder runs inside `processing_pool.install` they must inherit this
+        // pool rather than escape to Rayon's process-global registry.
+        let jxl_names = Arc::new(Mutex::new(HashSet::new()));
+        pool.install(|| {
+            let jxl_pool = jxl_threadpool::JxlThreadPool::rayon_global();
+
+            let names = jxl_names.clone();
+            jxl_pool.for_each_vec((0..4096).collect(), move |_| {
+                names.lock().unwrap().insert(
+                    std::thread::current()
+                        .name()
+                        .expect("processing worker has a name")
+                        .to_owned(),
+                );
+            });
+
+            let names = jxl_names.clone();
+            jxl_pool.scope(|scope| {
+                for _ in 0..64 {
+                    let names = names.clone();
+                    scope.spawn(move |_| {
+                        names.lock().unwrap().insert(
+                            std::thread::current()
+                                .name()
+                                .expect("processing worker has a name")
+                                .to_owned(),
+                        );
+                    });
+                }
+            });
+
+            let (completed, completed_rx) = std::sync::mpsc::channel();
+            for _ in 0..64 {
+                let names = jxl_names.clone();
+                let completed = completed.clone();
+                jxl_pool.spawn(move || {
+                    names.lock().unwrap().insert(
+                        std::thread::current()
+                            .name()
+                            .expect("processing worker has a name")
+                            .to_owned(),
+                    );
+                    completed.send(()).unwrap();
+                });
+            }
+            drop(completed);
+            for _ in 0..64 {
+                completed_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("ambient JPEG-XL task did not complete");
+            }
+        });
+
+        let jxl_names = jxl_names.lock().unwrap();
+        assert!(!jxl_names.is_empty());
+        assert!(jxl_names.len() <= 2);
+        assert!(
+            jxl_names
                 .iter()
                 .all(|name| name.starts_with("viewr-processing-"))
         );
