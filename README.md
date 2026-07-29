@@ -15,8 +15,10 @@ idle workers make a best-effort persistent pass to warm Browse renders across
 the folder. Metadata is scanned separately, without decoding every embedded
 preview. Preferences can leave processing concurrency on the tuned Automatic
 mode or set a fixed logical-thread cap. A fixed cap covers RAW development,
-resizing, cache decode, and cache JPEG encoding; lightweight interface, disk
-I/O, metadata scanning, ratings, and update threads remain separate.
+resizing, cache decode, and cache JPEG encoding, including source and cache
+reads performed by those image jobs. Lightweight interface, metadata scanning,
+ratings, updates, and disk-cache persistence and maintenance threads remain
+separate.
 
 Residency uses hard accounting limits and soft targets:
 

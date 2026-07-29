@@ -920,8 +920,9 @@ struct Shared {
     disk: Option<DiskCache>,
     events: Sender<Event>,
     notify: Arc<dyn Fn() + Send + Sync>,
-    /// CPU-heavy work and every nested Rayon operation share this one budget.
-    /// Queue, UI, database, update, and disk-I/O service threads are separate.
+    /// CPU-heavy work, its source/cache reads, and every nested Rayon operation
+    /// share this budget. Queue, UI, metadata, database/update, and disk-cache
+    /// persistence/maintenance service threads are separate.
     processing_pool: rayon::ThreadPool,
     /// A fixed user limit includes cache JPEG encoding. Automatic mode retains
     /// the separately tuned JPEG pool so default foreground latency does not
@@ -966,8 +967,10 @@ impl EngineOptions {
     /// Selects the number of CPU-heavy image-processing workers.
     ///
     /// This also brings cache JPEG encoding under the same strict limit. It
-    /// does not count the UI/render thread or lightweight queue, database,
-    /// update, and disk-I/O service threads.
+    /// does not count the UI/render thread or lightweight queue, metadata,
+    /// database/update, and disk-cache persistence/maintenance service threads.
+    /// Source and cache reads performed by image jobs run within the selected
+    /// processing workers.
     #[must_use]
     pub fn with_worker_threads(mut self, worker_threads: NonZeroUsize) -> Self {
         self.worker_threads = resolve_worker_threads(worker_threads.get());
