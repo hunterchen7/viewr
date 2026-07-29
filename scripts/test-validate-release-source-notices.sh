@@ -6,6 +6,7 @@ validator="$repository_root/scripts/validate-release-source-notices.sh"
 temporary_directory="$(
   mktemp -d "${TMPDIR:-/tmp}/viewr-release-notice-test.XXXXXX"
 )"
+temporary_directory="$(cd "$temporary_directory" && pwd -P)"
 trap 'rm -rf "$temporary_directory"' EXIT
 
 new_source_root() {
@@ -48,6 +49,13 @@ expect_pass "real source containing the exact notice baseline" "$valid_root"
 symlink_root="$temporary_directory/symlink-root"
 ln -s "$valid_root" "$symlink_root"
 expect_fail "symlinked release source root" "$symlink_root"
+expect_fail "symlinked release source root with trailing slash" "$symlink_root/"
+
+ancestor_symlink="$temporary_directory/ancestor-symlink"
+ln -s "$temporary_directory" "$ancestor_symlink"
+expect_fail \
+  "release source root below a symlinked ancestor" \
+  "$ancestor_symlink/valid"
 
 missing_lock_root="$(new_source_root missing-lock)"
 rm "$missing_lock_root/Cargo.lock"
@@ -110,6 +118,23 @@ arithmetic_injection_root="$(new_source_root 'PATH[$(touch PWNED)]')"
 )
 if [[ -e "$temporary_directory/PWNED" ]]; then
   echo "validator evaluated source-path text as shell arithmetic" >&2
+  exit 1
+fi
+
+late_nul_root="$(new_source_root 'LATE[$(touch LATE_PWNED)]')"
+{
+  awk 'BEGIN { for (i = 0; i < 250000; i++) printf "A"; print "" }'
+  printf '\0'
+  cat "$repository_root/packaging/THIRD-PARTY-NOTICES.txt"
+} >"$late_nul_root/packaging/THIRD-PARTY-NOTICES.txt"
+(
+  cd "$temporary_directory"
+  expect_fail \
+    "late NUL after an early text match" \
+    "$late_nul_root"
+)
+if [[ -e "$temporary_directory/LATE_PWNED" ]]; then
+  echo "validator evaluated late binary-file output as shell arithmetic" >&2
   exit 1
 fi
 

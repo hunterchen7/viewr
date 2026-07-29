@@ -14,12 +14,17 @@ if [[ $# -ne 1 ]]; then
 fi
 
 source_root="$1"
+[[ -d "$source_root" ]] ||
+  fail "release source root must be a directory: $source_root"
+logical_source_root="$(cd -- "$source_root" && pwd -L)"
+physical_source_root="$(cd -- "$source_root" && pwd -P)"
+[[ "$logical_source_root" == "$physical_source_root" ]] ||
+  fail "release source root must not traverse symbolic links: $source_root"
+source_root="$physical_source_root"
 lock_path="$source_root/Cargo.lock"
 packaging_path="$source_root/packaging"
 notices_path="$source_root/packaging/THIRD-PARTY-NOTICES.txt"
 
-[[ -d "$source_root" && ! -L "$source_root" ]] ||
-  fail "release source root must be a real directory: $source_root"
 [[ -f "$lock_path" && ! -L "$lock_path" ]] ||
   fail "release source Cargo.lock must be a regular file: $lock_path"
 
@@ -27,8 +32,9 @@ notices_path="$source_root/packaging/THIRD-PARTY-NOTICES.txt"
   fail "release source packaging path must be a real directory: $packaging_path"
 [[ -f "$notices_path" && ! -L "$notices_path" ]] ||
   fail "release source third-party notices must be a regular file: $notices_path"
-LC_ALL=C grep -Iq . "$notices_path" ||
-  fail "release source third-party notices must be a text file"
+if ! LC_ALL=C tr -d '\000' <"$notices_path" | cmp -s "$notices_path" -; then
+  fail "release source third-party notices must not contain NUL bytes"
+fi
 
 marker_count="$(
   LC_ALL=C grep -a -Fxc -- "$JPEG_RUSTURBO_NOTICE_MARKER" "$notices_path" || true

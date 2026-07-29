@@ -18,8 +18,8 @@ extract_jpeg_rusturbo_notice() {
   local marker_line
   local notice_start_line
 
-  if ! LC_ALL=C grep -Iq . "$notices_path"; then
-    echo "$notices_path must be a text file" >&2
+  if ! LC_ALL=C tr -d '\000' <"$notices_path" | cmp -s "$notices_path" -; then
+    echo "$notices_path contains NUL bytes" >&2
     return 1
   fi
 

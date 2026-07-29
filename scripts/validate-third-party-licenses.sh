@@ -37,8 +37,8 @@ extract_jpeg_rusturbo_notice() {
         echo "error: third-party notice file is missing: ${notices_path}" >&2
         return 1
     fi
-    if ! LC_ALL=C grep -Iq . "$notices_path"; then
-        echo "error: third-party notice file must be text: ${notices_path}" >&2
+    if ! LC_ALL=C tr -d '\000' <"$notices_path" | cmp -s "$notices_path" -; then
+        echo "error: third-party notice file contains NUL bytes: ${notices_path}" >&2
         return 1
     fi
 
