@@ -152,6 +152,23 @@ fn visible_position(visible: &[usize], current: usize) -> usize {
     }
 }
 
+/// Positions of positively rated entries in the current sorted filmstrip.
+///
+/// Iterate the normally sparse rating map instead of every folder entry so
+/// marker extraction does not undo the filmstrip's viewport virtualization.
+fn starred_visible_positions<'a>(
+    visible: &'a [usize],
+    ratings: &'a HashMap<usize, u8>,
+) -> impl Iterator<Item = usize> + 'a {
+    ratings.iter().filter_map(move |(&index, &rating)| {
+        if rating == 0 {
+            None
+        } else {
+            visible.binary_search(&index).ok()
+        }
+    })
+}
+
 fn current_texture_candidates(current: usize) -> [(usize, Tier); 1] {
     [(current, Tier::Browse)]
 }
@@ -1363,6 +1380,7 @@ impl App {
                     let spacing = ui.spacing().item_spacing.x;
                     let visible_pos = visible_position(&self.visible, current);
                     filmstrip::configure_vertical_scroll(ui, self.config.vertical_scroll_filmstrip);
+                    let strip_outer_rect = ui.available_rect_before_wrap();
                     let mut strip = egui::ScrollArea::horizontal()
                         .id_salt("filmstrip")
                         .auto_shrink([false, false]);
@@ -1375,7 +1393,7 @@ impl App {
                             ui.available_width(),
                         ));
                     }
-                    strip.show_viewport(ui, |ui, viewport| {
+                    let strip_output = strip.show_viewport(ui, |ui, viewport| {
                         filmstrip::show_columns(
                             ui,
                             viewport,
@@ -1459,6 +1477,27 @@ impl App {
                             },
                         );
                     });
+                    let marker_clicked = filmstrip::show_star_markers(
+                        ui,
+                        strip_outer_rect,
+                        strip_output.inner_rect,
+                        self.visible.len(),
+                        cell.x,
+                        spacing,
+                        starred_visible_positions(&self.visible, &session.ratings),
+                    );
+                    if let Some(visible_position) = marker_clicked {
+                        let mut state = strip_output.state;
+                        state.offset.x = filmstrip::centered_scroll_offset(
+                            self.visible.len(),
+                            visible_position,
+                            cell.x,
+                            spacing,
+                            strip_output.inner_rect.width(),
+                        );
+                        state.store(ui.ctx(), strip_output.id);
+                        ui.ctx().request_repaint();
+                    }
                 });
             strip_height = Some(inner.response.rect.height());
         }
@@ -1882,6 +1921,16 @@ mod tests {
         assert_eq!(visible_position(&visible, 5), 2);
         assert_eq!(visible_position(&visible, 99), 3);
         assert_eq!(visible_position(&[], 5), 0);
+    }
+
+    #[test]
+    fn star_markers_follow_the_filtered_filmstrip_and_ignore_zero_ratings() {
+        let visible = [2, 7, 40, 99];
+        let ratings = HashMap::from([(2, 0), (7, 1), (99, 5), (120, 4)]);
+        let mut positions: Vec<_> = starred_visible_positions(&visible, &ratings).collect();
+        positions.sort_unstable();
+
+        assert_eq!(positions, [1, 3]);
     }
 
     #[test]

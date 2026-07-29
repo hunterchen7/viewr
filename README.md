@@ -65,6 +65,7 @@ viewr dev <file.arw> [out]     decode one file, print per-stage timings
 | pinch or Ctrl/Cmd+scroll | zoom at cursor |
 | scroll or drag | pan (zoomed) |
 | vertical scroll over filmstrip (optional) | move filmstrip horizontally |
+| yellow markers in filmstrip scrollbar | jump to starred images |
 | G (Enter in grid) | grid ↔ loupe |
 | I | metadata panel |
 | F | fullscreen |
