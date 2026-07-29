@@ -53,25 +53,6 @@ query_delay_seconds="${VIEWR_RELEASE_QUERY_DELAY_SECONDS:-2}"
 command -v gh >/dev/null || fail "gh is required"
 command -v jq >/dev/null || fail "jq is required"
 
-tag_object="$(
-  gh api "repos/$repository/git/ref/tags/$release_tag"
-)"
-object_type="$(jq -er '.object.type | strings' <<<"$tag_object")"
-object_sha="$(jq -er '.object.sha | strings' <<<"$tag_object")"
-tag_depth=0
-while [[ "$object_type" == "tag" && "$tag_depth" -lt 8 ]]; do
-  tag_object="$(
-    gh api "repos/$repository/git/tags/$object_sha"
-  )"
-  object_type="$(jq -er '.object.type | strings' <<<"$tag_object")"
-  object_sha="$(jq -er '.object.sha | strings' <<<"$tag_object")"
-  tag_depth=$((tag_depth + 1))
-done
-[[ "$object_type" == "commit" ]] ||
-  fail "release tag does not resolve to a commit"
-[[ "$object_sha" == "$release_sha" ]] ||
-  fail "release tag moved from $release_sha to $object_sha"
-
 matches_state() {
   local expected_draft="$1"
   jq -e \
@@ -93,22 +74,49 @@ if ! matches_state true <<<"$release_json"; then
   fail "GitHub did not return the expected stable draft release"
 fi
 
-publish_json="$(
+tag_object="$(
+  gh api "repos/$repository/git/ref/tags/$release_tag"
+)"
+object_type="$(jq -er '.object.type | strings' <<<"$tag_object")"
+object_sha="$(jq -er '.object.sha | strings' <<<"$tag_object")"
+tag_depth=0
+while [[ "$object_type" == "tag" && "$tag_depth" -lt 8 ]]; do
+  [[ "$object_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] ||
+    fail "release tag contains an invalid object ID"
+  tag_object="$(
+    gh api "repos/$repository/git/tags/$object_sha"
+  )"
+  object_type="$(jq -er '.object.type | strings' <<<"$tag_object")"
+  object_sha="$(jq -er '.object.sha | strings' <<<"$tag_object")"
+  tag_depth=$((tag_depth + 1))
+done
+[[ "$object_type" == "commit" ]] ||
+  fail "release tag does not resolve to a commit"
+[[ "$object_sha" == "$release_sha" ]] ||
+  fail "release tag moved from $release_sha to $object_sha"
+
+publish_response_valid=false
+if publish_json="$(
   gh api \
     --method PATCH \
     "repos/$repository/releases/$release_id" \
     -F draft=false
-)"
-if ! matches_state false <<<"$publish_json"; then
-  fail "GitHub returned an invalid response after publishing release $release_id"
+)"; then
+  if matches_state false <<<"$publish_json"; then
+    publish_response_valid=true
+  else
+    echo "::warning::GitHub returned an unexpected publication response; checking the exact release state." >&2
+  fi
+else
+  echo "::warning::The publication request returned an error; checking whether it took effect." >&2
 fi
 
 attempt=1
 while ((attempt <= query_attempts)); do
-  release_json="$(
+  release_json=""
+  if release_json="$(
     gh api "repos/$repository/releases/$release_id"
-  )"
-  if matches_state false <<<"$release_json"; then
+  )" && matches_state false <<<"$release_json"; then
     echo "Published $repository release $release_tag (ID $release_id)"
     exit 0
   fi
@@ -121,4 +129,7 @@ while ((attempt <= query_attempts)); do
   attempt=$((attempt + 1))
 done
 
-fail "release $release_id was published but its final state could not be verified"
+if [[ "$publish_response_valid" == "true" ]]; then
+  fail "release $release_id was published but its final state could not be verified"
+fi
+fail "publication of release $release_id could not be confirmed"

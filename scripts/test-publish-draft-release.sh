@@ -60,7 +60,7 @@ case "$*" in
         printf '%s\n' \
           '{"id":123,"tag_name":"v1.2.3","draft":true,"prerelease":true}'
         ;;
-      delayed:2)
+      delayed:2 | bad-patch:*)
         printf '%s\n' "$draft"
         ;;
       *)
@@ -76,6 +76,8 @@ case "$*" in
     printf 'patch\n' >>"$FAKE_OPERATION_LOG"
     if [[ "${FAKE_RELEASE_MODE:-success}" == "bad-patch" ]]; then
       printf '%s\n' "$draft"
+    elif [[ "${FAKE_RELEASE_MODE:-success}" == "patch-error-visible" ]]; then
+      exit 1
     else
       printf '%s\n' "$published"
     fi
@@ -106,7 +108,7 @@ run_publisher() {
 
 unset FAKE_RELEASE_MODE
 run_publisher >/dev/null
-expected_operations=$'tag\nget:1\npatch\nget:2'
+expected_operations=$'get:1\ntag\npatch\nget:2'
 if [[ "$(<"$operation_log")" != "$expected_operations" ]]; then
   echo "publisher did not use the exact release ID and verify publication" >&2
   diff \
@@ -117,7 +119,7 @@ fi
 
 export FAKE_RELEASE_MODE=delayed
 run_publisher >/dev/null
-expected_operations=$'tag\nget:1\npatch\nget:2\nget:3'
+expected_operations=$'get:1\ntag\npatch\nget:2\nget:3'
 if [[ "$(<"$operation_log")" != "$expected_operations" ]]; then
   echo "publisher did not retry a stale post-publication read" >&2
   exit 1
@@ -143,7 +145,7 @@ assert_rejected_before_patch moved-tag
 
 export FAKE_RELEASE_MODE=annotated-tag
 run_publisher >/dev/null
-expected_operations=$'tag\npeel\nget:1\npatch\nget:2'
+expected_operations=$'get:1\ntag\npeel\npatch\nget:2'
 if [[ "$(<"$operation_log")" != "$expected_operations" ]]; then
   echo "publisher did not resolve an annotated release tag" >&2
   exit 1
@@ -158,5 +160,13 @@ grep -Fxq patch "$operation_log" || {
   echo "publisher did not attempt the expected exact-ID PATCH" >&2
   exit 1
 }
+
+export FAKE_RELEASE_MODE=patch-error-visible
+run_publisher >/dev/null
+expected_operations=$'get:1\ntag\npatch\nget:2'
+if [[ "$(<"$operation_log")" != "$expected_operations" ]]; then
+  echo "publisher did not resolve an ambiguous PATCH result by exact ID" >&2
+  exit 1
+fi
 
 echo "Exact-ID draft publication tests passed."
