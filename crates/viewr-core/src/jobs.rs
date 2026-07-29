@@ -2321,7 +2321,7 @@ mod tests {
 
     #[test]
     fn jpeg_results_are_identical_across_processing_thread_limits() {
-        let pixels = patterned_buf(192, 128);
+        let pixels = textured_buf(1023, 769);
         let one = build_processing_pool(NonZeroUsize::new(1).unwrap()).unwrap();
         let two = build_processing_pool(NonZeroUsize::new(2).unwrap()).unwrap();
 
@@ -2332,9 +2332,22 @@ mod tests {
         assert_eq!(encoded_one, encoded_strict);
 
         let serial = decode_jpeg_serial(&encoded_one).unwrap();
+        assert!(
+            one.install(|| crate::jpeg_restart::try_decode(&encoded_one))
+                .is_none(),
+            "a one-thread limit must use the serial cache decode fallback"
+        );
+        let parallel_two = two
+            .install(|| crate::jpeg_restart::try_decode(&encoded_two))
+            .unwrap_or_else(|| {
+                panic!(
+                    "production-size cache JPEG uses parallel restart decoding ({} bytes)",
+                    encoded_two.len()
+                )
+            });
         let decoded_one = one.install(|| decode_jpeg(&encoded_one)).unwrap();
         let decoded_two = two.install(|| decode_jpeg(&encoded_two)).unwrap();
-        for decoded in [&decoded_one, &decoded_two] {
+        for decoded in [&parallel_two, &decoded_one, &decoded_two] {
             assert_eq!(
                 (decoded.width, decoded.height),
                 (serial.width, serial.height)
@@ -2359,50 +2372,63 @@ mod tests {
     #[test]
     fn partial_engine_construction_joins_started_threads_during_unwind() {
         let spawn_count = 1 + HEAVY_WORKERS + LIGHT_WORKERS;
-        for failure_at in 1..=spawn_count {
-            let active_threads = Arc::new(AtomicUsize::new(0));
-            let active_for_construction = active_threads.clone();
-            let (weak_shared, weak_receiver) = std::sync::mpsc::channel();
-            let construction = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                let shared =
-                    persistence_shared(Vec::new(), Arc::new(RamCache::new(0, 0, 0)), None, 0);
-                weak_shared.send(Arc::downgrade(&shared)).unwrap();
-                let mut engine = Engine {
-                    shared,
-                    workers: Vec::with_capacity(HEAVY_WORKERS + LIGHT_WORKERS),
-                    persistence_worker: None,
-                };
-                let mut attempts = 0;
+        for fixed_processing_limit in [false, true] {
+            for failure_at in 1..=spawn_count {
+                let active_threads = Arc::new(AtomicUsize::new(0));
+                let active_for_construction = active_threads.clone();
+                let (weak_shared, weak_receiver) = std::sync::mpsc::channel();
+                let construction =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        let shared = persistence_shared_with_options(
+                            Vec::new(),
+                            Arc::new(RamCache::new(0, 0, 0)),
+                            None,
+                            0,
+                            CACHE_JPEG_QUALITY,
+                            fixed_processing_limit,
+                        );
+                        weak_shared.send(Arc::downgrade(&shared)).unwrap();
+                        let mut engine = Engine {
+                            shared,
+                            workers: Vec::with_capacity(HEAVY_WORKERS + LIGHT_WORKERS),
+                            persistence_worker: None,
+                        };
+                        let mut attempts = 0;
 
-                spawn_engine_threads(&mut engine, |name, task| {
-                    attempts += 1;
-                    if attempts == failure_at {
-                        return Err(std::io::Error::other("injected worker spawn failure"));
-                    }
-                    let active_threads = active_for_construction.clone();
-                    let (started, started_wait) = std::sync::mpsc::channel();
-                    let handle = std::thread::Builder::new().name(name).spawn(move || {
-                        active_threads.fetch_add(1, Ordering::SeqCst);
-                        started.send(()).unwrap();
-                        task();
-                        active_threads.fetch_sub(1, Ordering::SeqCst);
-                    })?;
-                    started_wait.recv().unwrap();
-                    Ok(handle)
-                })
-                .expect("injected worker spawn failure must unwind construction");
-            }));
+                        spawn_engine_threads(&mut engine, |name, task| {
+                            attempts += 1;
+                            if attempts == failure_at {
+                                return Err(std::io::Error::other("injected worker spawn failure"));
+                            }
+                            let active_threads = active_for_construction.clone();
+                            let (started, started_wait) = std::sync::mpsc::channel();
+                            let handle =
+                                std::thread::Builder::new().name(name).spawn(move || {
+                                    active_threads.fetch_add(1, Ordering::SeqCst);
+                                    started.send(()).unwrap();
+                                    task();
+                                    active_threads.fetch_sub(1, Ordering::SeqCst);
+                                })?;
+                            started_wait.recv().unwrap();
+                            Ok(handle)
+                        })
+                        .expect("injected worker spawn failure must unwind construction");
+                    }));
 
-            assert!(construction.is_err(), "spawn {failure_at} must fail");
-            assert_eq!(
-                active_threads.load(Ordering::SeqCst),
-                0,
-                "spawn {failure_at} left a started worker running"
-            );
-            assert!(
-                weak_receiver.recv().unwrap().upgrade().is_none(),
-                "spawn {failure_at} left a worker retaining the engine"
-            );
+                assert!(
+                    construction.is_err(),
+                    "fixed={fixed_processing_limit} spawn {failure_at} must fail"
+                );
+                assert_eq!(
+                    active_threads.load(Ordering::SeqCst),
+                    0,
+                    "fixed={fixed_processing_limit} spawn {failure_at} left a started worker running"
+                );
+                assert!(
+                    weak_receiver.recv().unwrap().upgrade().is_none(),
+                    "fixed={fixed_processing_limit} spawn {failure_at} left a worker retaining the engine"
+                );
+            }
         }
     }
 
@@ -2686,6 +2712,29 @@ mod tests {
                     (x * 255 / width.max(1)) as u8,
                     (y * 255 / height.max(1)) as u8,
                     ((x + y) * 255 / (width + height).max(1)) as u8,
+                    255,
+                ]);
+            }
+        }
+        PixelBuf {
+            width,
+            height,
+            rgba,
+        }
+    }
+
+    fn textured_buf(width: u32, height: u32) -> PixelBuf {
+        let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+        let mut state = 0x9E37_79B9u32;
+        for y in 0..height {
+            for x in 0..width {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = (state >> 24) as u8;
+                let edge = if (x / 37 + y / 23) % 2 == 0 { 200 } else { 40 };
+                rgba.extend_from_slice(&[
+                    ((x * 255) / width.max(1)) as u8,
+                    ((y * 255) / height.max(1)) as u8 ^ (noise >> 3),
+                    edge ^ (noise >> 2),
                     255,
                 ]);
             }
