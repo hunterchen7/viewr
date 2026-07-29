@@ -14,6 +14,8 @@ use eframe::egui;
 use serde::Deserialize;
 use viewr_core::jobs::{CACHE_JPEG_QUALITY, MAX_CACHE_JPEG_QUALITY, MIN_CACHE_JPEG_QUALITY};
 
+pub(crate) const MAX_CONFIGURED_PROCESSING_THREADS: usize = 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     Next,
@@ -291,6 +293,11 @@ fn parse_key(name: &str) -> Option<egui::Key> {
 }
 
 impl Config {
+    #[cfg(test)]
+    pub(crate) fn test_default() -> Self {
+        Self::from_raw(RawConfig::default())
+    }
+
     pub fn load() -> Self {
         let raw = config_path()
             .and_then(|p| match std::fs::read_to_string(&p) {
@@ -463,8 +470,6 @@ fn finite_clamp(value: f32, fallback: f32, minimum: f32, maximum: f32) -> f32 {
         fallback
     }
 }
-
-const MAX_CONFIGURED_PROCESSING_THREADS: usize = 1024;
 
 fn normalize_worker_thread_limit(value: i64) -> ProcessingThreadLimit {
     if value <= 0 {
