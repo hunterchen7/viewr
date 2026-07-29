@@ -364,16 +364,21 @@ release-eligible CI run.
 
 GitHub hides draft releases from read-only repository tokens. The gate
 therefore needs `contents: write` even though it does not mutate the release.
-It runs release helpers from the workflow's immutable `main` commit and does
-not persist Git credentials in either checkout.
+It checks out the workflow's immutable `main` commit as the working tree,
+checks out the tagged source in a separate subdirectory, and does not persist
+Git credentials in either checkout. Privileged release helpers therefore come
+from the current workflow commit, including during recovery of an older tag.
 
 The publication job starts only after all four jobs pass. It checks the exact
 local and remote file sets and every remote SHA-256 digest, creates
 `SHA256SUMS`, creates GitHub provenance attestations for every artifact and for
-the checksum manifest, and uploads all files in one release command. A
-per-tag concurrency lock prevents two publication attempts from interleaving.
-The workflow publishes the draft only after the final remote verification
-passes. Every external GitHub Action is pinned to a reviewed commit.
+the checksum manifest, and uploads all files by the draft's numeric release ID.
+A per-tag concurrency lock prevents two publication attempts from interleaving.
+For a normal release, the workflow publishes that exact draft only after the
+final remote verification passes. Publication verifies both the numeric
+release identity and the immutable tag commit, and it retries bounded
+post-publication reads. Every external GitHub Action is pinned to a reviewed
+commit.
 
 The in-app updater uses the asset state, size, and digest from the GitHub release
 API. Thus, the publication job must continue to reject a missing digest. A
@@ -394,9 +399,35 @@ release tag and workflow invocation to identify the same commit. A manual
 dispatch can use the fixed workflow from `main` to recover an older draft, but
 it still checks out the immutable tag and requires successful main-branch CI
 for that exact tagged commit. All downstream jobs use that approved commit SHA.
-Before the workflow uploads files and before it publishes the release, it
-verifies that the tag still identifies the approved commit. This keeps artifact
-provenance tied to the released source.
+Before the workflow uploads files, it verifies that the tag still identifies
+the approved commit.
+
+GitHub's workflow token cannot publish some historical releases when their
+target commit changes workflow files. A historical recovery therefore uploads
+and verifies the exact assets but deliberately leaves the release as a draft.
+It creates a custom recovery attestation that records both the old source
+commit and the current workflow commit. After the recovery run succeeds, a
+maintainer whose `gh` token has `repo` and `workflow` scopes publishes the
+verified draft from an exact checkout of current `main`:
+
+```bash
+git switch main
+git pull --ff-only
+release_id=361510019
+release_sha=106284ee7dec2d9e05aa091121747adfa0642407
+release_tag=v0.2.0
+GH_TOKEN="$(gh auth token)" \
+GITHUB_REPOSITORY=hunterchen7/viewr \
+scripts/publish-draft-release.sh \
+  --release-id "$release_id" \
+  --release-sha "$release_sha" \
+  "$release_tag"
+```
+
+The helper resolves annotated tags, rejects a moved tag or replaced release,
+publishes only the numeric draft ID, validates the PATCH response, and retries
+the exact post-publication read. The historical workflow run summary supplies
+the release ID, source SHA, tag, and exact command.
 
 Verify an attestation with:
 

@@ -1,18 +1,20 @@
 # Builds, validates, and attaches versioned archives and native installers to
-# a draft release. The release becomes public only after every check passes.
+# a draft release. A normal release becomes public only after every check
+# passes. A manual rebuild of an older tag remains a verified draft so a
+# workflow-authorized maintainer can publish it.
 name: Release binaries
 run-name: Release binaries for ${{ inputs.release_tag }}
 on:
   workflow_call:
     inputs:
       release_tag:
-        description: Existing draft release tag to build and publish
+        description: Existing draft release tag to build and publish or recover
         required: true
         type: string
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing draft release tag to build and publish
+        description: Existing draft release tag to build and publish or recover
         required: true
         type: string
 
@@ -29,6 +31,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     outputs:
+      historical_recovery: ${{ steps.release_commit.outputs.historical }}
       release_id: ${{ steps.draft_release.outputs.id }}
       release_sha: ${{ steps.release_commit.outputs.sha }}
     permissions:
@@ -49,16 +52,16 @@ jobs:
             echo "::error::Release workflows must run from main, not $WORKFLOW_REF."
             exit 1
           fi
+      - name: Check out current release tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       - name: Check out immutable release source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: refs/tags/${{ inputs.release_tag }}
-          persist-credentials: false
-      - name: Check out main release tools
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.sha }}
-          path: .release-tools
+          path: release-source
           persist-credentials: false
       - name: Require an existing draft release
         id: draft_release
@@ -67,7 +70,7 @@ jobs:
           VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           release_id="$(
-            .release-tools/scripts/require-draft-release.sh \
+            scripts/require-draft-release.sh \
               "$VIEWR_RELEASE_TAG"
           )"
           printf 'id=%s\n' "$release_id" >> "$GITHUB_OUTPUT"
@@ -77,14 +80,17 @@ jobs:
           WORKFLOW_EVENT: ${{ github.event_name }}
           WORKFLOW_SHA: ${{ github.sha }}
         run: |
-          release_sha="$(git rev-parse HEAD)"
+          release_sha="$(git -C release-source rev-parse HEAD)"
+          historical=false
           if [[ "$release_sha" != "$WORKFLOW_SHA" ]]; then
             if [[ "$WORKFLOW_EVENT" != "workflow_dispatch" ]]; then
               echo "::error::Workflow commit $WORKFLOW_SHA does not match release commit $release_sha."
               exit 1
             fi
+            historical=true
             echo "::notice::Using main workflow $WORKFLOW_SHA to recover release commit $release_sha."
           fi
+          printf 'historical=%s\n' "$historical" >> "$GITHUB_OUTPUT"
           printf 'sha=%s\n' "$release_sha" >> "$GITHUB_OUTPUT"
       - name: Require successful CI for the tagged source
         env:
@@ -97,6 +103,7 @@ jobs:
               gh run list \
                 --repo "$GITHUB_REPOSITORY" \
                 --workflow ci.yml \
+                --branch main \
                 --commit "$RELEASE_SHA" \
                 --event push \
                 --limit 1 \
@@ -335,15 +342,16 @@ jobs:
       attestations: write
       artifact-metadata: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ needs.gate.outputs.release_sha }}
-          persist-credentials: false
-      - name: Check out main release tools
+      - name: Check out current release tools
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.sha }}
-          path: .release-tools
+          persist-credentials: false
+      - name: Check out immutable release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.gate.outputs.release_sha }}
+          path: release-source
           persist-credentials: false
       - name: Require release to remain the same draft
         env:
@@ -352,7 +360,7 @@ jobs:
           VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
           VIEWR_RELEASE_QUERY_ATTEMPTS: "1"
         run: |
-          .release-tools/scripts/require-draft-release.sh \
+          scripts/require-draft-release.sh \
             "$VIEWR_RELEASE_TAG" \
             "$VIEWR_RELEASE_ID" >/dev/null
       - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
@@ -366,8 +374,8 @@ jobs:
         env:
           VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          .release-tools/scripts/verify-release-assets.sh \
-            --manifest "$GITHUB_WORKSPACE/Cargo.toml" \
+          scripts/verify-release-assets.sh \
+            --manifest "$GITHUB_WORKSPACE/release-source/Cargo.toml" \
             dist \
             "$VIEWR_RELEASE_TAG"
       - name: Reject unexpected existing release assets
@@ -377,19 +385,67 @@ jobs:
           VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          .release-tools/scripts/verify-remote-release-assets.sh \
+          scripts/verify-remote-release-assets.sh \
             --allow-missing \
             --release-id "$VIEWR_RELEASE_ID" \
             dist \
             "$VIEWR_RELEASE_TAG"
+      - name: Write historical recovery attestation predicate
+        if: ${{ needs.gate.outputs.historical_recovery == 'true' }}
+        env:
+          RELEASE_ID: ${{ needs.gate.outputs.release_id }}
+          RELEASE_SHA: ${{ needs.gate.outputs.release_sha }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          WORKFLOW_REF: ${{ github.ref }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --argjson release_id "$RELEASE_ID" \
+            --arg release_sha "$RELEASE_SHA" \
+            --arg release_tag "$RELEASE_TAG" \
+            --arg run_url \
+              "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg workflow_ref "$WORKFLOW_REF" \
+            --arg workflow_sha "$WORKFLOW_SHA" \
+            '{
+              schemaVersion: 1,
+              release: {
+                repository: $repository,
+                id: $release_id,
+                tag: $release_tag,
+                sourceCommit: $release_sha
+              },
+              workflow: {
+                ref: $workflow_ref,
+                commit: $workflow_sha,
+                run: $run_url
+              }
+            }' >"$RUNNER_TEMP/viewr-release-recovery-predicate.json"
       - name: Attest release assets
+        if: ${{ needs.gate.outputs.historical_recovery != 'true' }}
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
         with:
           subject-checksums: dist/SHA256SUMS
       - name: Attest checksum manifest
+        if: ${{ needs.gate.outputs.historical_recovery != 'true' }}
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
         with:
           subject-path: dist/SHA256SUMS
+      - name: Attest historical recovery assets
+        if: ${{ needs.gate.outputs.historical_recovery == 'true' }}
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
+        with:
+          subject-checksums: dist/SHA256SUMS
+          predicate-type: https://github.com/hunterchen7/viewr/attestations/release-recovery/v1
+          predicate-path: ${{ runner.temp }}/viewr-release-recovery-predicate.json
+      - name: Attest historical recovery checksum manifest
+        if: ${{ needs.gate.outputs.historical_recovery == 'true' }}
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
+        with:
+          subject-path: dist/SHA256SUMS
+          predicate-type: https://github.com/hunterchen7/viewr/attestations/release-recovery/v1
+          predicate-path: ${{ runner.temp }}/viewr-release-recovery-predicate.json
       - name: Upload all release assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -408,31 +464,31 @@ jobs:
             echo "::error::Release tag moved from $VIEWR_RELEASE_SHA to $current_release_sha."
             exit 1
           fi
-          .release-tools/scripts/require-draft-release.sh \
+          scripts/require-draft-release.sh \
             "$VIEWR_RELEASE_TAG" \
             "$VIEWR_RELEASE_ID" >/dev/null
-          .release-tools/scripts/upload-release-assets.sh \
+          scripts/upload-release-assets.sh \
             --release-id "$VIEWR_RELEASE_ID" \
             dist \
             "$VIEWR_RELEASE_TAG"
-      - name: Verify published release assets
+      - name: Verify uploaded release assets
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
           VIEWR_RELEASE_ID: ${{ needs.gate.outputs.release_id }}
           VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          .release-tools/scripts/verify-remote-release-assets.sh \
+          scripts/verify-remote-release-assets.sh \
             --release-id "$VIEWR_RELEASE_ID" \
             dist \
             "$VIEWR_RELEASE_TAG"
       - name: Publish validated release
+        if: ${{ needs.gate.outputs.historical_recovery != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           VIEWR_RELEASE_ID: ${{ needs.gate.outputs.release_id }}
           VIEWR_RELEASE_SHA: ${{ needs.gate.outputs.release_sha }}
           VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
-          VIEWR_RELEASE_QUERY_ATTEMPTS: "1"
         run: |
           git fetch \
             --force \
@@ -444,28 +500,32 @@ jobs:
             echo "::error::Release tag moved from $VIEWR_RELEASE_SHA to $current_release_sha."
             exit 1
           fi
-          .release-tools/scripts/require-draft-release.sh \
-            "$VIEWR_RELEASE_TAG" \
-            "$VIEWR_RELEASE_ID" >/dev/null
-          gh api \
-            --method PATCH \
-            "repos/$GITHUB_REPOSITORY/releases/$VIEWR_RELEASE_ID" \
-            -F draft=false \
-            --silent
-      - name: Verify exact release publication
+          scripts/publish-draft-release.sh \
+            --release-id "$VIEWR_RELEASE_ID" \
+            --release-sha "$VIEWR_RELEASE_SHA" \
+            "$VIEWR_RELEASE_TAG"
+      - name: Preserve verified historical recovery draft
+        if: ${{ needs.gate.outputs.historical_recovery == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           VIEWR_RELEASE_ID: ${{ needs.gate.outputs.release_id }}
+          VIEWR_RELEASE_SHA: ${{ needs.gate.outputs.release_sha }}
           VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
+          VIEWR_RELEASE_QUERY_ATTEMPTS: "1"
         run: |
-          gh api \
-            "repos/$GITHUB_REPOSITORY/releases/$VIEWR_RELEASE_ID" |
-            jq -e \
-              --arg tag "$VIEWR_RELEASE_TAG" \
-              --argjson id "$VIEWR_RELEASE_ID" \
-              '
-                .id == $id
-                and .tag_name == $tag
-                and .draft == false
-                and .prerelease == false
-              ' >/dev/null
+          scripts/require-draft-release.sh \
+            "$VIEWR_RELEASE_TAG" \
+            "$VIEWR_RELEASE_ID" >/dev/null
+          {
+            echo "### Historical release recovery is ready"
+            echo
+            echo "Release \`$VIEWR_RELEASE_TAG\` (ID \`$VIEWR_RELEASE_ID\`) remains a verified draft."
+            echo "A maintainer with a workflow-authorized token must publish this exact ID."
+            echo
+            echo '```bash'
+            echo 'GH_TOKEN="$(gh auth token)" \'
+            echo "GITHUB_REPOSITORY=\"$GITHUB_REPOSITORY\" \\"
+            echo "scripts/publish-draft-release.sh --release-id \"$VIEWR_RELEASE_ID\" --release-sha \"$VIEWR_RELEASE_SHA\" \"$VIEWR_RELEASE_TAG\""
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+          echo "::notice title=Historical recovery ready::Release $VIEWR_RELEASE_TAG (ID $VIEWR_RELEASE_ID) remains a verified draft for maintainer publication."
