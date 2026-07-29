@@ -152,21 +152,30 @@ fn visible_position(visible: &[usize], current: usize) -> usize {
     }
 }
 
-/// Positions of positively rated entries in the current sorted filmstrip.
+/// Cache positively rated positions in the current sorted filmstrip.
 ///
-/// Iterate the normally sparse rating map instead of every folder entry so
-/// marker extraction does not undo the filmstrip's viewport virtualization.
-fn starred_visible_positions<'a>(
-    visible: &'a [usize],
-    ratings: &'a HashMap<usize, u8>,
-) -> impl Iterator<Item = usize> + 'a {
-    ratings.iter().filter_map(move |(&index, &rating)| {
-        if rating == 0 {
-            None
-        } else {
-            visible.binary_search(&index).ok()
-        }
-    })
+/// Sparse maps use binary-search intersection; dense maps scan the visible
+/// sequence once. Rebuilding happens only when ratings or visibility change.
+fn rebuild_starred_visible_positions(
+    positions: &mut Vec<usize>,
+    visible: &[usize],
+    ratings: &HashMap<usize, u8>,
+) {
+    positions.clear();
+    let binary_search_cost = visible.len().max(1).ilog2() as usize + 1;
+    let ratings_are_sparse = ratings.len() <= visible.len() / binary_search_cost;
+    if ratings_are_sparse {
+        positions.extend(ratings.iter().filter_map(|(&index, &rating)| {
+            (rating > 0)
+                .then(|| visible.binary_search(&index).ok())
+                .flatten()
+        }));
+        positions.sort_unstable();
+    } else {
+        positions.extend(visible.iter().enumerate().filter_map(|(position, index)| {
+            (ratings.get(index).copied().unwrap_or(0) > 0).then_some(position)
+        }));
+    }
 }
 
 fn current_texture_candidates(current: usize) -> [(usize, Tier); 1] {
@@ -295,6 +304,10 @@ pub struct App {
     last_logical: Option<egui::Vec2>,
     status: Status,
     scroll_to_current: bool,
+    starred_visible_positions: Vec<usize>,
+    star_markers_dirty: bool,
+    star_marker_revision: u64,
+    star_marker_cache: filmstrip::StarMarkerCache,
 }
 
 impl App {
@@ -321,6 +334,10 @@ impl App {
             last_logical: None,
             status: Status::Empty,
             scroll_to_current: true,
+            starred_visible_positions: Vec::new(),
+            star_markers_dirty: true,
+            star_marker_revision: 0,
+            star_marker_cache: filmstrip::StarMarkerCache::default(),
         }
     }
 
@@ -410,6 +427,9 @@ impl App {
         self.filter_dirty = true;
         self.nav_started = Some(Instant::now());
         self.scroll_to_current = true;
+        self.starred_visible_positions.clear();
+        self.star_markers_dirty = true;
+        self.star_marker_cache = filmstrip::StarMarkerCache::default();
         self.apply_filter();
         self.replan();
         Ok(())
@@ -452,6 +472,7 @@ impl App {
         };
         session.engine.set_sequence(engine_sequence);
         self.filter_dirty = false;
+        self.star_markers_dirty = true;
     }
 
     fn replan(&self) {
@@ -468,6 +489,23 @@ impl App {
     /// current image was filtered out).
     fn visible_pos(&self) -> usize {
         visible_position(&self.visible, self.current)
+    }
+
+    fn refresh_star_marker_positions(&mut self) {
+        if !self.star_markers_dirty {
+            return;
+        }
+        if let Some(session) = &self.session {
+            rebuild_starred_visible_positions(
+                &mut self.starred_visible_positions,
+                &self.visible,
+                &session.ratings,
+            );
+        } else {
+            self.starred_visible_positions.clear();
+        }
+        self.star_marker_revision = self.star_marker_revision.wrapping_add(1);
+        self.star_markers_dirty = false;
     }
 
     fn navigate(&mut self, delta: isize) {
@@ -523,6 +561,7 @@ impl App {
             session.explicit_ratings.insert(member, rating);
         }
         session.library.set_rating(&session.entries[index], rating);
+        self.star_markers_dirty = true;
         if filter_changed {
             self.filter_dirty = true;
         }
@@ -535,6 +574,7 @@ impl App {
         };
         let mut replan = false;
         let mut filter_dirty = false;
+        let mut star_markers_dirty = false;
         let accept_metadata_ratings = !session.rating_sources_blocked;
         while let Ok(event) = session.events.try_recv() {
             match event {
@@ -544,6 +584,7 @@ impl App {
                     // the demand path below safely queues a replacement decode.
                     session.thumb_requests.remove(&index);
                     session.thumb_retry_after.remove(&index);
+                    let old_rating = session.ratings.get(&index).copied().unwrap_or(0);
                     filter_dirty |= install_metadata(
                         &mut session.ratings,
                         &mut session.metas,
@@ -552,8 +593,11 @@ impl App {
                         self.filter,
                         accept_metadata_ratings,
                     );
+                    let new_rating = session.ratings.get(&index).copied().unwrap_or(0);
+                    star_markers_dirty |= (old_rating > 0) != (new_rating > 0);
                 }
                 Event::MetadataReady { index, meta } => {
+                    let old_rating = session.ratings.get(&index).copied().unwrap_or(0);
                     filter_dirty |= install_metadata(
                         &mut session.ratings,
                         &mut session.metas,
@@ -562,6 +606,8 @@ impl App {
                         self.filter,
                         accept_metadata_ratings,
                     );
+                    let new_rating = session.ratings.get(&index).copied().unwrap_or(0);
+                    star_markers_dirty |= (old_rating > 0) != (new_rating > 0);
                 }
                 Event::ImageReady { .. } => replan = true,
                 Event::ImageFailed { index, tier, error } => {
@@ -581,6 +627,7 @@ impl App {
             }
         }
         self.filter_dirty |= filter_dirty;
+        self.star_markers_dirty |= star_markers_dirty;
         if replan {
             self.replan();
         }
@@ -614,6 +661,7 @@ impl App {
                     session.rating_sources_blocked = false;
                     session.rating_refresh_after = None;
                     self.filter_dirty = true;
+                    self.star_markers_dirty = true;
                 }
                 Err(error) => {
                     eprintln!("rating database refresh failed; scheduling retry: {error}");
@@ -1359,6 +1407,8 @@ impl App {
     }
 
     fn loupe_mode(&mut self, ui: &mut egui::Ui) {
+        self.refresh_star_marker_positions();
+        let mut star_marker_cache = std::mem::take(&mut self.star_marker_cache);
         // Filmstrip over the visible sequence. Drag the divider to
         // resize; the height persists to viewr.toml.
         let mut clicked: Option<usize> = None;
@@ -1479,12 +1529,16 @@ impl App {
                     });
                     let marker_clicked = filmstrip::show_star_markers(
                         ui,
-                        strip_outer_rect,
-                        strip_output.inner_rect,
-                        self.visible.len(),
-                        cell.x,
-                        spacing,
-                        starred_visible_positions(&self.visible, &session.ratings),
+                        filmstrip::StarMarkerSpec {
+                            outer_rect: strip_outer_rect,
+                            viewport_rect: strip_output.inner_rect,
+                            total: self.visible.len(),
+                            column_width: cell.x,
+                            spacing,
+                            revision: self.star_marker_revision,
+                            positions: &self.starred_visible_positions,
+                        },
+                        &mut star_marker_cache,
                     );
                     if let Some(visible_position) = marker_clicked {
                         let mut state = strip_output.state;
@@ -1501,6 +1555,7 @@ impl App {
                 });
             strip_height = Some(inner.response.rect.height());
         }
+        self.star_marker_cache = star_marker_cache;
         self.manage_thumbnail_textures(&demanded_thumbs);
         // Persist a divider-drag once the mouse is released.
         if let Some(h) = strip_height
@@ -1927,10 +1982,27 @@ mod tests {
     fn star_markers_follow_the_filtered_filmstrip_and_ignore_zero_ratings() {
         let visible = [2, 7, 40, 99];
         let ratings = HashMap::from([(2, 0), (7, 1), (99, 5), (120, 4)]);
-        let mut positions: Vec<_> = starred_visible_positions(&visible, &ratings).collect();
-        positions.sort_unstable();
+        let mut positions = Vec::new();
+        rebuild_starred_visible_positions(&mut positions, &visible, &ratings);
 
         assert_eq!(positions, [1, 3]);
+    }
+
+    #[test]
+    fn sparse_and_dense_rating_maps_build_the_same_marker_positions() {
+        let visible: Vec<_> = (0..100).collect();
+        let sparse = HashMap::from([(7, 1), (80, 5)]);
+        let mut dense: HashMap<_, _> = visible.iter().map(|&index| (index, 0)).collect();
+        dense.insert(7, 1);
+        dense.insert(80, 5);
+        let mut sparse_positions = Vec::new();
+        let mut dense_positions = Vec::new();
+
+        rebuild_starred_visible_positions(&mut sparse_positions, &visible, &sparse);
+        rebuild_starred_visible_positions(&mut dense_positions, &visible, &dense);
+
+        assert_eq!(sparse_positions, [7, 80]);
+        assert_eq!(dense_positions, sparse_positions);
     }
 
     #[test]

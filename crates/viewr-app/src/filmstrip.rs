@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::{collections::HashMap, ops::Range};
 
 use eframe::egui;
 
@@ -12,6 +12,33 @@ struct StarMarkerBucket {
     visible_position: usize,
     count: usize,
     representative_distance: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StarMarkerCacheKey {
+    track_left: u32,
+    track_right: u32,
+    pixels_per_point: u32,
+    total: usize,
+    column_width: u32,
+    spacing: u32,
+    revision: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct StarMarkerCache {
+    key: Option<StarMarkerCacheKey>,
+    buckets: Vec<StarMarkerBucket>,
+}
+
+pub(crate) struct StarMarkerSpec<'a> {
+    pub outer_rect: egui::Rect,
+    pub viewport_rect: egui::Rect,
+    pub total: usize,
+    pub column_width: f32,
+    pub spacing: f32,
+    pub revision: u64,
+    pub positions: &'a [usize],
 }
 
 /// Scope egui's single-axis wheel remapping to the horizontal filmstrip.
@@ -132,8 +159,10 @@ fn star_marker_buckets(
 
     let requested_buckets = ((track.width() * pixels_per_point).ceil() as usize).saturating_add(1);
     let bucket_count = requested_buckets.clamp(1, MAX_STAR_MARKER_BUCKETS);
-    let mut buckets: Vec<Option<StarMarkerBucket>> = vec![None; bucket_count];
     let last_bucket = bucket_count.saturating_sub(1);
+    let positions = positions.into_iter();
+    let marker_capacity = positions.size_hint().1.unwrap_or(0).min(bucket_count);
+    let mut buckets: HashMap<usize, StarMarkerBucket> = HashMap::with_capacity(marker_capacity);
 
     for visible_position in positions {
         let Some(x) = star_marker_x(track, total, visible_position, column_width, spacing) else {
@@ -147,8 +176,7 @@ fn star_marker_buckets(
             track.left() + bucket_index as f32 / last_bucket as f32 * track.width()
         };
         let representative_distance = (x - bucket_x).abs();
-        let bucket = &mut buckets[bucket_index];
-        match bucket {
+        match buckets.get_mut(&bucket_index) {
             Some(existing) => {
                 existing.count += 1;
                 if representative_distance < existing.representative_distance
@@ -160,17 +188,25 @@ fn star_marker_buckets(
                 }
             }
             None => {
-                *bucket = Some(StarMarkerBucket {
-                    x: bucket_x,
-                    visible_position,
-                    count: 1,
-                    representative_distance,
-                });
+                buckets.insert(
+                    bucket_index,
+                    StarMarkerBucket {
+                        x: bucket_x,
+                        visible_position,
+                        count: 1,
+                        representative_distance,
+                    },
+                );
             }
         }
     }
 
-    buckets.into_iter().flatten().collect()
+    let mut buckets: Vec<_> = buckets.into_values().collect();
+    buckets.sort_unstable_by(|a, b| {
+        a.x.total_cmp(&b.x)
+            .then_with(|| a.visible_position.cmp(&b.visible_position))
+    });
+    buckets
 }
 
 fn nearest_star_marker(
@@ -205,13 +241,18 @@ fn nearest_star_marker(
 /// thumbnail center without selecting the image.
 pub(crate) fn show_star_markers(
     ui: &mut egui::Ui,
-    outer_rect: egui::Rect,
-    viewport_rect: egui::Rect,
-    total: usize,
-    column_width: f32,
-    spacing: f32,
-    positions: impl IntoIterator<Item = usize>,
+    spec: StarMarkerSpec<'_>,
+    cache: &mut StarMarkerCache,
 ) -> Option<usize> {
+    let StarMarkerSpec {
+        outer_rect,
+        viewport_rect,
+        total,
+        column_width,
+        spacing,
+        revision,
+        positions,
+    } = spec;
     let content_width = content_width(total, column_width, spacing);
     if content_width.ceil() <= viewport_rect.width().ceil() {
         return None;
@@ -228,33 +269,57 @@ pub(crate) fn show_star_markers(
         return None;
     }
 
-    let buckets = star_marker_buckets(
-        track,
-        ui.ctx().pixels_per_point(),
+    let pixels_per_point = ui.ctx().pixels_per_point();
+    let cache_key = StarMarkerCacheKey {
+        track_left: track.left().to_bits(),
+        track_right: track.right().to_bits(),
+        pixels_per_point: pixels_per_point.to_bits(),
         total,
-        column_width,
-        spacing,
-        positions,
-    );
+        column_width: column_width.to_bits(),
+        spacing: spacing.to_bits(),
+        revision,
+    };
+    if cache.key != Some(cache_key) {
+        cache.buckets = star_marker_buckets(
+            track,
+            pixels_per_point,
+            total,
+            column_width,
+            spacing,
+            positions.iter().copied(),
+        );
+        cache.key = Some(cache_key);
+    }
+    let buckets = &cache.buckets;
     let painter = ui.painter();
-    for bucket in &buckets {
-        let width = if bucket.count > 1 { 2.0 } else { 1.5 };
+    for bucket in buckets {
+        let (width, color) = if bucket.count > 1 {
+            (1.0, egui::Color32::GOLD.gamma_multiply(0.55))
+        } else {
+            (1.5, egui::Color32::GOLD)
+        };
         painter.line_segment(
             [
-                egui::pos2(bucket.x, track.top() + 1.0),
+                egui::pos2(bucket.x, track.center().y + 1.0),
                 egui::pos2(bucket.x, track.bottom() - 1.0),
             ],
-            egui::Stroke::new(width, egui::Color32::GOLD),
+            egui::Stroke::new(width, color),
         );
     }
 
+    let pointer_over_track = ui.is_enabled() && ui.rect_contains_pointer(track);
     let hover = ui.input(|input| input.pointer.hover_pos());
-    if hover.is_some_and(|pointer| {
-        nearest_star_marker(&buckets, pointer, track, STAR_MARKER_HIT_RADIUS).is_some()
-    }) {
+    if pointer_over_track
+        && hover.is_some_and(|pointer| {
+            nearest_star_marker(buckets, pointer, track, STAR_MARKER_HIT_RADIUS).is_some()
+        })
+    {
         ui.set_cursor_icon(egui::CursorIcon::PointingHand);
     }
 
+    if !pointer_over_track {
+        return None;
+    }
     let click = ui.input(|input| {
         input
             .pointer
@@ -262,7 +327,7 @@ pub(crate) fn show_star_markers(
             .then(|| input.pointer.interact_pos())
             .flatten()
     });
-    click.and_then(|pointer| nearest_star_marker(&buckets, pointer, track, STAR_MARKER_HIT_RADIUS))
+    click.and_then(|pointer| nearest_star_marker(buckets, pointer, track, STAR_MARKER_HIT_RADIUS))
 }
 
 pub(crate) fn show_columns<R>(
@@ -432,6 +497,7 @@ mod tests {
         fn frame(
             ctx: &egui::Context,
             events: Vec<egui::Event>,
+            cache: &mut StarMarkerCache,
         ) -> (egui::Rect, egui::Rect, Option<usize>, f32) {
             let mut captured = None;
             let _ = ctx.run_ui(input(events), |ui| {
@@ -445,8 +511,19 @@ mod tests {
                     .show(ui, |ui| {
                         ui.allocate_space(egui::vec2(content_width(100, WIDTH, SPACING), 60.0));
                     });
-                let clicked =
-                    show_star_markers(ui, outer_rect, output.inner_rect, 100, WIDTH, SPACING, [50]);
+                let clicked = show_star_markers(
+                    ui,
+                    StarMarkerSpec {
+                        outer_rect,
+                        viewport_rect: output.inner_rect,
+                        total: 100,
+                        column_width: WIDTH,
+                        spacing: SPACING,
+                        revision: 1,
+                        positions: &[50],
+                    },
+                    cache,
+                );
                 let mut state = output.state;
                 if let Some(position) = clicked {
                     state.offset.x = centered_scroll_offset(
@@ -465,7 +542,8 @@ mod tests {
         }
 
         let ctx = egui::Context::default();
-        let (outer, viewport, _, _) = frame(&ctx, Vec::new());
+        let mut cache = StarMarkerCache::default();
+        let (outer, viewport, _, _) = frame(&ctx, Vec::new(), &mut cache);
         let scroll = ctx.style_of(egui::Theme::Dark).spacing.scroll;
         let track = egui::Rect::from_min_max(
             egui::pos2(viewport.left(), outer.bottom() - scroll.bar_width),
@@ -485,21 +563,24 @@ mod tests {
         frame(
             &ctx,
             vec![egui::Event::PointerMoved(marker), pointer_event(true)],
+            &mut cache,
         );
         let (_, _, clicked, stored_offset) = frame(
             &ctx,
             vec![egui::Event::PointerMoved(marker), pointer_event(false)],
+            &mut cache,
         );
 
         assert_eq!(clicked, Some(50));
         let expected = centered_scroll_offset(100, 50, WIDTH, SPACING, viewport.width());
         assert!((stored_offset - expected).abs() < 0.01);
 
-        let (_, _, _, next_frame_offset) = frame(&ctx, Vec::new());
+        let (_, _, _, next_frame_offset) = frame(&ctx, Vec::new(), &mut cache);
         assert!((next_frame_offset - expected).abs() < 0.01);
 
         let native_click_ctx = egui::Context::default();
-        frame(&native_click_ctx, Vec::new());
+        let mut native_click_cache = StarMarkerCache::default();
+        frame(&native_click_ctx, Vec::new(), &mut native_click_cache);
         let native_track_click = egui::pos2(track.right() - 20.0, track.center().y);
         let native_event = |pressed| egui::Event::PointerButton {
             pos: native_track_click,
@@ -513,6 +594,7 @@ mod tests {
                 egui::Event::PointerMoved(native_track_click),
                 native_event(true),
             ],
+            &mut native_click_cache,
         );
         let (_, _, non_marker_clicked, native_offset) = frame(
             &native_click_ctx,
@@ -520,12 +602,14 @@ mod tests {
                 egui::Event::PointerMoved(native_track_click),
                 native_event(false),
             ],
+            &mut native_click_cache,
         );
         assert_eq!(non_marker_clicked, None);
         assert!(native_offset > expected);
 
         let native_drag_ctx = egui::Context::default();
-        frame(&native_drag_ctx, Vec::new());
+        let mut native_drag_cache = StarMarkerCache::default();
+        frame(&native_drag_ctx, Vec::new(), &mut native_drag_cache);
         let handle_start = egui::pos2(track.left() + 2.0, track.center().y);
         frame(
             &native_drag_ctx,
@@ -538,11 +622,17 @@ mod tests {
                     modifiers: egui::Modifiers::NONE,
                 },
             ],
+            &mut native_drag_cache,
         );
-        frame(&native_drag_ctx, vec![egui::Event::PointerMoved(marker)]);
+        frame(
+            &native_drag_ctx,
+            vec![egui::Event::PointerMoved(marker)],
+            &mut native_drag_cache,
+        );
         let (_, _, drag_clicked, drag_offset) = frame(
             &native_drag_ctx,
             vec![egui::Event::PointerMoved(marker), pointer_event(false)],
+            &mut native_drag_cache,
         );
         assert_eq!(drag_clicked, None);
         assert!(drag_offset > 0.0);
