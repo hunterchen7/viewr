@@ -309,11 +309,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
       - name: Install license inventory tool
         run: cargo install cargo-about --version 0.9.1 --locked --features cli
-      - name: Fetch all release target dependency graphs
+      - name: Fetch complete locked dependency graph
         run: |
-          cargo fetch --locked --target aarch64-apple-darwin
-          cargo fetch --locked --target x86_64-pc-windows-msvc
-          cargo fetch --locked --target x86_64-unknown-linux-gnu
+          # cargo-about resolves Cargo metadata offline before filtering to the
+          # release targets. Omitting --target fetches every locked target graph.
+          cargo fetch --locked
       - name: Validate third-party license inventories
         run: scripts/validate-third-party-licenses.sh
       - name: Build and validate vendored source archive
