@@ -325,11 +325,12 @@ The source archive contains the repository files and versioned, vendored Rust
 dependencies. CI requires two source-package builds to be byte-identical. The
 validator rejects duplicate, noncanonical, linked, and special members. It
 checks offline Cargo metadata for both the app and JPEG benchmark workspaces,
-the source-only codec license files, the benchmark tests, the exact rawler
-license, and an offline release link after it prepares and edits a local rawler
-replacement. The generated third-party inventory covers the shipped app
-dependency graph; experimental benchmark crates retain licenses alongside
-their vendored source. See `packaging/SOURCE-BUILD.md` inside the archive.
+the source-only codec license files, and the benchmark tests. The validator also
+checks the exact rawler license and the exact `jpeg-rusturbo` notice. It then
+prepares and edits a local rawler replacement before an offline release link.
+The generated third-party inventory covers the shipped app dependency graph.
+Experimental benchmark crates retain licenses with their vendored source. See
+`packaging/SOURCE-BUILD.md` in the archive.
 
 ## License inventories
 
@@ -345,6 +346,12 @@ Each native installer and portable archive contains:
 CI uses cargo-about 0.9.1 with a locked union of all three release targets. An
 unknown or unreviewed license fails CI. CI also verifies that the checked-in
 Rust standard-library inventory matches the pinned toolchain.
+
+Some dependencies contain required notices that Cargo license metadata does not
+describe. CI locates `jpeg-rusturbo` 0.9.2 in locked Cargo metadata. It pins the
+upstream `NOTICE.md` by SHA-256 and requires its exact bytes at the end of
+`THIRD-PARTY-NOTICES.txt`. The source validator applies the same check to the
+vendored notice.
 
 ## Release publication
 
@@ -388,7 +395,7 @@ To retry a failed draft release, dispatch the current `main` workflow for the
 release tag:
 
 ```bash
-release_tag=v0.2.0
+release_tag=vMAJOR.MINOR.PATCH
 gh workflow run release-binaries.yml \
   --ref main \
   -f release_tag="$release_tag"
@@ -401,6 +408,14 @@ it still checks out the immutable tag and requires successful main-branch CI
 for that exact tagged commit. All downstream jobs use that approved commit SHA.
 Before the workflow uploads files, it verifies that the tag still identifies
 the approved commit.
+
+The current trusted workflow also checks the immutable source before any build
+starts. Every release source must contain the pinned `jpeg-rusturbo` 0.9.2
+upstream notice as the terminal block in `THIRD-PARTY-NOTICES.txt`. The
+validator accepts only real paths from the tagged checkout and fails closed for
+a missing or duplicate marker or any changed notice bytes. Historical sources
+that predate this baseline cannot use the current recovery workflow; create a
+new compliant release instead.
 
 GitHub's workflow token cannot publish some historical releases when their
 target commit changes workflow files. A historical recovery therefore uploads
@@ -419,9 +434,9 @@ expanded form is:
 recovery_run_id=RECOVERY-RUN-ID
 recovery_run_attempt=RECOVERY-RUN-ATTEMPT
 workflow_sha=RECOVERY-WORKFLOW-COMMIT
-release_id=361510019
-release_sha=106284ee7dec2d9e05aa091121747adfa0642407
-release_tag=v0.2.0
+release_id=RELEASE-ID
+release_sha=RELEASE-SOURCE-COMMIT
+release_tag=vMAJOR.MINOR.PATCH
 recovery_directory="$(mktemp -d)"
 
 gh run download "$recovery_run_id" \

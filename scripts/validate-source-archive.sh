@@ -2,8 +2,45 @@
 set -euo pipefail
 export LC_ALL=C
 
+readonly JPEG_RUSTURBO_VERSION="0.9.2"
+readonly JPEG_RUSTURBO_NOTICE_SHA256="fe5e4bf805fbfb2f4f5443decec492c801722a1b4376eb4878d7edf99cc697eb"
+readonly JPEG_RUSTURBO_NOTICE_MARKER="----- BEGIN EXACT jpeg-rusturbo 0.9.2 NOTICE.md -----"
+
 usage() {
   echo "usage: scripts/validate-source-archive.sh <source-archive>" >&2
+}
+
+extract_jpeg_rusturbo_notice() {
+  local notices_path="$1"
+  local destination_path="$2"
+  local marker_count
+  local marker_position
+  local marker_line
+  local notice_start_line
+
+  if ! LC_ALL=C tr -d '\000' <"$notices_path" | cmp -s "$notices_path" -; then
+    echo "$notices_path contains NUL bytes" >&2
+    return 1
+  fi
+
+  marker_count="$(
+    LC_ALL=C grep -a -Fxc -- "$JPEG_RUSTURBO_NOTICE_MARKER" "$notices_path" || true
+  )"
+  if [[ "$marker_count" != "1" ]]; then
+    echo "$notices_path must contain exactly one jpeg-rusturbo NOTICE marker" >&2
+    return 1
+  fi
+
+  marker_position="$(
+    LC_ALL=C grep -a -Fnx -- "$JPEG_RUSTURBO_NOTICE_MARKER" "$notices_path"
+  )"
+  marker_line="${marker_position%%:*}"
+  if [[ ! "$marker_line" =~ ^[1-9][0-9]*$ ]]; then
+    echo "$notices_path marker has an invalid line number" >&2
+    return 1
+  fi
+  notice_start_line=$((10#$marker_line + 1))
+  tail -n "+$notice_start_line" "$notices_path" >"$destination_path"
 }
 
 if [[ $# -ne 1 ]]; then
@@ -36,11 +73,13 @@ required=(
   "$top_level/Cargo.lock"
   "$top_level/Cargo.toml"
   "$top_level/packaging/SOURCE-BUILD.md"
+  "$top_level/packaging/THIRD-PARTY-NOTICES.txt"
   "$top_level/scripts/prepare-local-rawler.sh"
   "$top_level/tools/jpeg-bakeoff/Cargo.lock"
   "$top_level/tools/jpeg-bakeoff/Cargo.toml"
   "$top_level/vendor/jpeg-encoder-0.6.1/LICENSE-APACHE"
   "$top_level/vendor/jpeg-encoder-0.6.1/LICENSE-MIT"
+  "$top_level/vendor/jpeg-rusturbo-0.9.2/NOTICE.md"
   "$top_level/vendor/rawler-0.7.2/LICENSE"
   "$top_level/vendor/turbojpeg-sys-1.2.0/libjpeg-turbo/LICENSE.md"
   "$top_level/vendor/turbojpeg-sys-1.2.0/libjpeg-turbo/README.ijg"
@@ -112,6 +151,21 @@ if [[ "$(
   sha256sum "$source_root/vendor/rawler-0.7.2/LICENSE" | awk '{print $1}'
 )" != "4bb33cc4cd956b56b779b501f18cae46a9e26f8c8500cca86ed758b8bc5e1788" ]]; then
   echo "vendored rawler 0.7.2 license does not match the package source" >&2
+  exit 1
+fi
+jpeg_rusturbo_notice="$source_root/vendor/jpeg-rusturbo-${JPEG_RUSTURBO_VERSION}/NOTICE.md"
+if [[ "$(
+  sha256sum "$jpeg_rusturbo_notice" | awk '{print $1}'
+)" != "$JPEG_RUSTURBO_NOTICE_SHA256" ]]; then
+  echo "vendored jpeg-rusturbo ${JPEG_RUSTURBO_VERSION} NOTICE has an unexpected SHA-256" >&2
+  exit 1
+fi
+packaged_jpeg_rusturbo_notice="$work_dir/packaged-jpeg-rusturbo-NOTICE.md"
+extract_jpeg_rusturbo_notice \
+  "$source_root/packaging/THIRD-PARTY-NOTICES.txt" \
+  "$packaged_jpeg_rusturbo_notice"
+if ! cmp -s "$jpeg_rusturbo_notice" "$packaged_jpeg_rusturbo_notice"; then
+  echo "source archive third-party notices do not end with the exact jpeg-rusturbo ${JPEG_RUSTURBO_VERSION} NOTICE" >&2
   exit 1
 fi
 
