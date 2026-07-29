@@ -1,11 +1,28 @@
 //! Preferences window: input mode, display, cache, updates, and keybinds.
 //! Viewer preferences save to viewr.toml; updater actions are returned to its
-//! cross-process store. Cache-profile changes apply on the next folder open.
+//! cross-process store. Processing and cache-profile changes apply on the next
+//! folder open.
+
+use std::num::NonZeroUsize;
 
 use eframe::egui;
 use viewr_core::jobs::{MAX_CACHE_JPEG_QUALITY, MIN_CACHE_JPEG_QUALITY};
 
-use crate::config::{ACTIONS, Action, Bind, Config, ScrollMode, TierIndicator};
+use crate::config::{
+    ACTIONS, Action, Bind, Config, ProcessingThreadLimit, ScrollMode, TierIndicator,
+};
+
+fn processing_threads_label(limit: ProcessingThreadLimit, available: usize) -> String {
+    match limit {
+        ProcessingThreadLimit::Automatic => {
+            format!("Automatic ({available} logical CPUs)")
+        }
+        ProcessingThreadLimit::Limited(limit) if limit.get() > available => {
+            format!("{} ({} available)", limit.get(), available)
+        }
+        ProcessingThreadLimit::Limited(limit) => limit.get().to_string(),
+    }
+}
 
 #[derive(Default)]
 pub struct SettingsActions {
@@ -145,6 +162,83 @@ impl SettingsState {
                 );
                 ui.add_space(8.0);
 
+                ui.heading("Performance");
+                let available =
+                    viewr_core::jobs::available_worker_threads().get();
+                ui.horizontal(|ui| {
+                    ui.label("Processing threads");
+                    let selected = processing_threads_label(
+                        config.processing_threads,
+                        available,
+                    );
+                    let combo = egui::ComboBox::from_id_salt(
+                        "processing-thread-limit",
+                    )
+                    .selected_text(selected)
+                    .width(190.0)
+                    .height(240.0)
+                    .show_ui(ui, |ui| {
+                        changed |= ui
+                            .selectable_value(
+                                &mut config.processing_threads,
+                                ProcessingThreadLimit::Automatic,
+                                format!(
+                                    "Automatic ({available} logical CPUs)"
+                                ),
+                            )
+                            .changed();
+                        if let ProcessingThreadLimit::Limited(current) =
+                            config.processing_threads
+                            && current.get() > available
+                        {
+                            changed |= ui
+                                .selectable_value(
+                                    &mut config.processing_threads,
+                                    ProcessingThreadLimit::Limited(current),
+                                    format!(
+                                        "Keep {} (uses {available} here)",
+                                        current.get()
+                                    ),
+                                )
+                                .changed();
+                            ui.separator();
+                        }
+                        for worker_threads in 1..=available {
+                            let limit = NonZeroUsize::new(worker_threads)
+                                .expect("processing thread choice is non-zero");
+                            changed |= ui
+                                .selectable_value(
+                                    &mut config.processing_threads,
+                                    ProcessingThreadLimit::Limited(limit),
+                                    if worker_threads == 1 {
+                                        "1 thread".to_owned()
+                                    } else {
+                                        format!("{worker_threads} threads")
+                                    },
+                                )
+                                .changed();
+                        }
+                    });
+                    combo.response.on_hover_text(
+                        "A fixed value caps CPU-heavy RAW, resize, cache decode, and cache encode work",
+                    );
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Automatic keeps maximum throughput. A fixed value limits logical CPU use; interface, disk I/O, ratings, and update threads remain separate.",
+                    )
+                    .weak()
+                    .size(11.0),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Processing and cache changes apply when the next folder is opened.",
+                    )
+                    .weak()
+                    .size(11.0),
+                );
+                ui.add_space(8.0);
+
                 ui.heading("Cache");
                 egui::Grid::new("cache-grid").num_columns(2).show(ui, |ui| {
                     ui.label("RAM budget (GB)");
@@ -178,13 +272,6 @@ impl SettingsState {
                     )
                     .weak()
                     .size(11.0),
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "Cache budgets and JPEG quality apply when the next folder is opened.",
-                    )
-                        .weak()
-                        .size(11.0),
                 );
                 ui.add_space(8.0);
 
@@ -280,5 +367,32 @@ impl SettingsState {
             config.save();
         }
         actions
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn processing_thread_labels_distinguish_automatic_and_portable_limits() {
+        assert_eq!(
+            processing_threads_label(ProcessingThreadLimit::Automatic, 10),
+            "Automatic (10 logical CPUs)"
+        );
+        assert_eq!(
+            processing_threads_label(
+                ProcessingThreadLimit::Limited(NonZeroUsize::new(4).unwrap()),
+                10,
+            ),
+            "4"
+        );
+        assert_eq!(
+            processing_threads_label(
+                ProcessingThreadLimit::Limited(NonZeroUsize::new(12).unwrap()),
+                10,
+            ),
+            "12 (10 available)"
+        );
     }
 }

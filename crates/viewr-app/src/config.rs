@@ -1,4 +1,4 @@
-//! User configuration: input behavior, UI prefs, cache budgets, keybinds.
+//! User configuration: input behavior, UI prefs, processing, cache, keybinds.
 //!
 //! Lives at `~/Library/Application Support/viewr/viewr.toml`. A
 //! documented template is written on first run; absent file or absent
@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::io::Write as _;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use eframe::egui;
@@ -56,6 +57,25 @@ impl TierIndicator {
             Self::Border => "border",
             Self::Marks => "marks",
             Self::Hidden => "hidden",
+        }
+    }
+}
+
+/// User-selected logical-thread budget for CPU-heavy image processing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProcessingThreadLimit {
+    /// Use every logical CPU currently available to Viewr.
+    #[default]
+    Automatic,
+    /// Use no more than this many logical CPU workers.
+    Limited(NonZeroUsize),
+}
+
+impl ProcessingThreadLimit {
+    fn serialized(self) -> usize {
+        match self {
+            Self::Automatic => 0,
+            Self::Limited(limit) => limit.get(),
         }
     }
 }
@@ -119,6 +139,9 @@ pub struct Config {
     /// JPEG quality for Browse and Full cache objects. Applies on the next
     /// folder open.
     pub jpeg_quality: u8,
+    /// Logical CPU workers for RAW/image processing. Automatic is represented
+    /// separately from fixed values so a configuration stays portable.
+    pub processing_threads: ProcessingThreadLimit,
     binds: HashMap<Action, Vec<Bind>>,
 }
 
@@ -127,6 +150,7 @@ pub struct Config {
 struct RawConfig {
     input: RawInput,
     ui: RawUi,
+    performance: RawPerformance,
     cache: RawCache,
     binds: HashMap<String, Vec<String>>,
 }
@@ -164,6 +188,14 @@ impl Default for RawUi {
             grid_cell: 200.0,
         }
     }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RawPerformance {
+    /// Zero is automatic. Signed input lets malformed negative hand-edits
+    /// recover to automatic instead of rejecting the entire configuration.
+    worker_threads: i64,
 }
 
 #[derive(Deserialize)]
@@ -328,7 +360,26 @@ impl Config {
                 )
                 .try_into()
                 .expect("clamped JPEG quality fits in u8"),
+            processing_threads: normalize_worker_thread_limit(raw.performance.worker_threads),
             binds,
+        }
+    }
+
+    /// Resolves Automatic or a portable fixed cap for the current host.
+    pub fn resolved_worker_threads(&self) -> NonZeroUsize {
+        match self.processing_threads {
+            ProcessingThreadLimit::Automatic => viewr_core::jobs::available_worker_threads(),
+            ProcessingThreadLimit::Limited(limit) => {
+                viewr_core::jobs::resolve_worker_threads(limit.get())
+            }
+        }
+    }
+
+    /// Returns a strict processing cap, or `None` for tuned automatic mode.
+    pub fn fixed_worker_threads(&self) -> Option<NonZeroUsize> {
+        match self.processing_threads {
+            ProcessingThreadLimit::Automatic => None,
+            ProcessingThreadLimit::Limited(_) => Some(self.resolved_worker_threads()),
         }
     }
 
@@ -376,7 +427,7 @@ impl Config {
              # hand-edits are read at startup but comments are not kept.\n\n[input]\n",
         );
         out.push_str(&format!(
-            "scroll = \"{}\"\nvertical_scroll_filmstrip = {}\n\n[ui]\ntier_indicator = \"{}\"\nshow_loading = {}\nshow_performance = {}\nshow_exposure = {}\nfilmstrip_height = {:.0}\ngrid_cell = {:.0}\n\n[cache]\nram_gb = {:.1}\ndisk_gb = {:.1}\njpeg_quality = {}\n\n[binds]\n",
+            "scroll = \"{}\"\nvertical_scroll_filmstrip = {}\n\n[ui]\ntier_indicator = \"{}\"\nshow_loading = {}\nshow_performance = {}\nshow_exposure = {}\nfilmstrip_height = {:.0}\ngrid_cell = {:.0}\n\n[performance]\nworker_threads = {}\n\n[cache]\nram_gb = {:.1}\ndisk_gb = {:.1}\njpeg_quality = {}\n\n[binds]\n",
             match self.scroll {
                 ScrollMode::Pan => "pan",
                 ScrollMode::Zoom => "zoom",
@@ -388,6 +439,7 @@ impl Config {
             self.show_exposure,
             self.filmstrip_height,
             self.grid_cell,
+            self.processing_threads.serialized(),
             self.ram_gb,
             self.disk_gb,
             self.jpeg_quality,
@@ -410,6 +462,18 @@ fn finite_clamp(value: f32, fallback: f32, minimum: f32, maximum: f32) -> f32 {
     } else {
         fallback
     }
+}
+
+const MAX_CONFIGURED_PROCESSING_THREADS: usize = 1024;
+
+fn normalize_worker_thread_limit(value: i64) -> ProcessingThreadLimit {
+    if value <= 0 {
+        return ProcessingThreadLimit::Automatic;
+    }
+    let value = (value as u64).min(MAX_CONFIGURED_PROCESSING_THREADS as u64) as usize;
+    ProcessingThreadLimit::Limited(
+        NonZeroUsize::new(value).expect("a positive processing thread limit is non-zero"),
+    )
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -488,6 +552,12 @@ show_loading = true
 show_performance = true
 # Show ISO, shutter, aperture, and focal length in the toolbar.
 show_exposure = true
+
+[performance]
+# CPU-heavy RAW and image processing workers. Zero automatically uses every
+# logical CPU available to Viewr; a positive value sets a portable upper limit.
+# Lightweight interface, disk I/O, ratings, and update threads remain separate.
+worker_threads = 0
 
 [cache]
 # Total RAM cache budget in GB, including thumbnails.
@@ -599,6 +669,78 @@ mod tests {
 
         let reparsed: RawConfig = toml::from_str(&enabled.serialized()).unwrap();
         assert!(Config::from_raw(reparsed).vertical_scroll_filmstrip);
+    }
+
+    #[test]
+    fn worker_thread_limit_defaults_to_automatic_and_round_trips() {
+        let automatic = Config::from_raw(RawConfig::default());
+        assert_eq!(
+            automatic.processing_threads,
+            ProcessingThreadLimit::Automatic
+        );
+        assert_eq!(
+            automatic.resolved_worker_threads().get(),
+            viewr_core::jobs::available_worker_threads().get()
+        );
+        assert_eq!(automatic.fixed_worker_threads(), None);
+
+        let fixed: RawConfig = toml::from_str(
+            r#"
+            [performance]
+            worker_threads = 2
+            "#,
+        )
+        .unwrap();
+        let fixed = Config::from_raw(fixed);
+        let expected = 2;
+        assert_eq!(
+            fixed.processing_threads,
+            ProcessingThreadLimit::Limited(NonZeroUsize::new(expected).unwrap())
+        );
+        assert_eq!(
+            fixed.resolved_worker_threads().get(),
+            expected.min(viewr_core::jobs::available_worker_threads().get())
+        );
+        assert_eq!(
+            fixed.fixed_worker_threads().map(NonZeroUsize::get),
+            Some(expected.min(viewr_core::jobs::available_worker_threads().get()))
+        );
+
+        let automatic_round_trip: RawConfig = toml::from_str(&automatic.serialized()).unwrap();
+        assert_eq!(
+            Config::from_raw(automatic_round_trip).processing_threads,
+            ProcessingThreadLimit::Automatic
+        );
+        let fixed_round_trip: RawConfig = toml::from_str(&fixed.serialized()).unwrap();
+        assert_eq!(
+            Config::from_raw(fixed_round_trip).processing_threads,
+            ProcessingThreadLimit::Limited(NonZeroUsize::new(expected).unwrap())
+        );
+    }
+
+    #[test]
+    fn worker_thread_limit_normalizes_invalid_and_oversized_values() {
+        let automatic = ProcessingThreadLimit::Automatic;
+        assert_eq!(normalize_worker_thread_limit(-1), automatic);
+        assert_eq!(normalize_worker_thread_limit(0), automatic);
+        assert_eq!(
+            normalize_worker_thread_limit(1),
+            ProcessingThreadLimit::Limited(NonZeroUsize::new(1).unwrap())
+        );
+        assert_eq!(
+            normalize_worker_thread_limit(4),
+            ProcessingThreadLimit::Limited(NonZeroUsize::new(4).unwrap())
+        );
+        assert_eq!(
+            normalize_worker_thread_limit(64),
+            ProcessingThreadLimit::Limited(NonZeroUsize::new(64).unwrap())
+        );
+        assert_eq!(
+            normalize_worker_thread_limit(i64::MAX),
+            ProcessingThreadLimit::Limited(
+                NonZeroUsize::new(MAX_CONFIGURED_PROCESSING_THREADS).unwrap()
+            )
+        );
     }
 
     #[test]
@@ -734,6 +876,7 @@ mod tests {
         assert_eq!(cfg.ram_gb, 4.5);
         assert_eq!(cfg.disk_gb, 20.0);
         assert_eq!(cfg.jpeg_quality, CACHE_JPEG_QUALITY);
+        assert_eq!(cfg.processing_threads, ProcessingThreadLimit::Automatic);
     }
 
     #[test]
