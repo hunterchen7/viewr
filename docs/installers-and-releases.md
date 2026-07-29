@@ -325,11 +325,12 @@ The source archive contains the repository files and versioned, vendored Rust
 dependencies. CI requires two source-package builds to be byte-identical. The
 validator rejects duplicate, noncanonical, linked, and special members. It
 checks offline Cargo metadata for both the app and JPEG benchmark workspaces,
-the source-only codec license files, the benchmark tests, the exact rawler
-license, and an offline release link after it prepares and edits a local rawler
-replacement. The generated third-party inventory covers the shipped app
-dependency graph; experimental benchmark crates retain licenses alongside
-their vendored source. See `packaging/SOURCE-BUILD.md` inside the archive.
+the source-only codec license files, and the benchmark tests. The validator also
+checks the exact rawler license and the exact `jpeg-rusturbo` notice. It then
+prepares and edits a local rawler replacement before an offline release link.
+The generated third-party inventory covers the shipped app dependency graph.
+Experimental benchmark crates retain licenses with their vendored source. See
+`packaging/SOURCE-BUILD.md` in the archive.
 
 ## License inventories
 
@@ -345,6 +346,12 @@ Each native installer and portable archive contains:
 CI uses cargo-about 0.9.1 with a locked union of all three release targets. An
 unknown or unreviewed license fails CI. CI also verifies that the checked-in
 Rust standard-library inventory matches the pinned toolchain.
+
+Some dependencies contain required notices that Cargo license metadata does not
+describe. CI locates `jpeg-rusturbo` 0.9.2 in locked Cargo metadata. It pins the
+upstream `NOTICE.md` by SHA-256 and requires its exact bytes at the end of
+`THIRD-PARTY-NOTICES.txt`. The source validator applies the same check to the
+vendored notice.
 
 ## Release publication
 
