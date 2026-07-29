@@ -29,37 +29,58 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     outputs:
+      release_id: ${{ steps.draft_release.outputs.id }}
       release_sha: ${{ steps.release_commit.outputs.sha }}
     permissions:
       actions: read
       contents: read
     steps:
-      - name: Validate release tag
+      - name: Validate release request
         env:
+          WORKFLOW_REF: ${{ github.ref }}
           VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           if [[ ! "$VIEWR_RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "::error::Release tag is not a stable semantic version: $VIEWR_RELEASE_TAG"
             exit 1
           fi
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+          if [[ "$WORKFLOW_REF" != "refs/heads/main" ]]; then
+            echo "::error::Release workflows must run from protected main, not $WORKFLOW_REF."
+            exit 1
+          fi
+      - name: Check out immutable release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: refs/tags/${{ inputs.release_tag }}
+      - name: Check out protected release tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tools
       - name: Require an existing draft release
+        id: draft_release
         env:
           GH_TOKEN: ${{ github.token }}
           VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
-        run: scripts/require-draft-release.sh "$VIEWR_RELEASE_TAG"
+        run: |
+          release_id="$(
+            .release-tools/scripts/require-draft-release.sh \
+              "$VIEWR_RELEASE_TAG"
+          )"
+          printf 'id=%s\n' "$release_id" >> "$GITHUB_OUTPUT"
       - name: Match workflow provenance to the release tag
         id: release_commit
         env:
+          WORKFLOW_EVENT: ${{ github.event_name }}
           WORKFLOW_SHA: ${{ github.sha }}
         run: |
           release_sha="$(git rev-parse HEAD)"
           if [[ "$release_sha" != "$WORKFLOW_SHA" ]]; then
-            echo "::error::Workflow commit $WORKFLOW_SHA does not match release commit $release_sha."
-            echo "::error::Manually dispatch this workflow with --ref set to the release tag."
-            exit 1
+            if [[ "$WORKFLOW_EVENT" != "workflow_dispatch" ]]; then
+              echo "::error::Workflow commit $WORKFLOW_SHA does not match release commit $release_sha."
+              exit 1
+            fi
+            echo "::notice::Using protected-main workflow $WORKFLOW_SHA to recover release commit $release_sha."
           fi
           printf 'sha=%s\n' "$release_sha" >> "$GITHUB_OUTPUT"
       - name: Require successful CI for the tagged source
@@ -308,24 +329,24 @@ jobs:
       attestations: write
       artifact-metadata: write
     steps:
-      - name: Require release to remain a draft
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
-        run: |
-          if [[ "$(
-            gh release view \
-              "$VIEWR_RELEASE_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --json isDraft \
-              --jq '.isDraft'
-          )" != "true" ]]; then
-            echo "::error::Release $VIEWR_RELEASE_TAG is no longer a draft."
-            exit 1
-          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.gate.outputs.release_sha }}
+      - name: Check out protected release tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tools
+      - name: Require release to remain the same draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VIEWR_RELEASE_ID: ${{ needs.gate.outputs.release_id }}
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
+          VIEWR_RELEASE_QUERY_ATTEMPTS: "1"
+        run: |
+          .release-tools/scripts/require-draft-release.sh \
+            "$VIEWR_RELEASE_TAG" \
+            "$VIEWR_RELEASE_ID" >/dev/null
       - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
       - name: Download release assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -343,11 +364,13 @@ jobs:
       - name: Reject unexpected existing release assets
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
+          VIEWR_RELEASE_ID: ${{ needs.gate.outputs.release_id }}
           VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          scripts/verify-remote-release-assets.sh \
+          .release-tools/scripts/verify-remote-release-assets.sh \
             --allow-missing \
+            --release-id "$VIEWR_RELEASE_ID" \
             dist \
             "$VIEWR_RELEASE_TAG"
       - name: Attest release assets
@@ -361,8 +384,10 @@ jobs:
       - name: Upload all release assets
         env:
           GH_TOKEN: ${{ github.token }}
+          VIEWR_RELEASE_ID: ${{ needs.gate.outputs.release_id }}
           VIEWR_RELEASE_SHA: ${{ needs.gate.outputs.release_sha }}
           VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
+          VIEWR_RELEASE_QUERY_ATTEMPTS: "1"
         run: |
           git fetch \
             --force \
@@ -374,16 +399,9 @@ jobs:
             echo "::error::Release tag moved from $VIEWR_RELEASE_SHA to $current_release_sha."
             exit 1
           fi
-          if [[ "$(
-            gh release view \
-              "$VIEWR_RELEASE_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --json isDraft \
-              --jq '.isDraft'
-          )" != "true" ]]; then
-            echo "::error::Release $VIEWR_RELEASE_TAG is no longer a draft."
-            exit 1
-          fi
+          .release-tools/scripts/require-draft-release.sh \
+            "$VIEWR_RELEASE_TAG" \
+            "$VIEWR_RELEASE_ID" >/dev/null
           gh release upload \
             "$VIEWR_RELEASE_TAG" \
             dist/* \
@@ -391,17 +409,21 @@ jobs:
       - name: Verify published release assets
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
+          VIEWR_RELEASE_ID: ${{ needs.gate.outputs.release_id }}
           VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          scripts/verify-remote-release-assets.sh \
+          .release-tools/scripts/verify-remote-release-assets.sh \
+            --release-id "$VIEWR_RELEASE_ID" \
             dist \
             "$VIEWR_RELEASE_TAG"
       - name: Publish validated release
         env:
           GH_TOKEN: ${{ github.token }}
+          VIEWR_RELEASE_ID: ${{ needs.gate.outputs.release_id }}
           VIEWR_RELEASE_SHA: ${{ needs.gate.outputs.release_sha }}
           VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
+          VIEWR_RELEASE_QUERY_ATTEMPTS: "1"
         run: |
           git fetch \
             --force \
@@ -413,18 +435,28 @@ jobs:
             echo "::error::Release tag moved from $VIEWR_RELEASE_SHA to $current_release_sha."
             exit 1
           fi
-          if [[ "$(
-            gh release view \
-              "$VIEWR_RELEASE_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --json isDraft \
-              --jq '.isDraft'
-          )" != "true" ]]; then
-            echo "::error::Release $VIEWR_RELEASE_TAG is no longer a draft."
-            exit 1
-          fi
+          .release-tools/scripts/require-draft-release.sh \
+            "$VIEWR_RELEASE_TAG" \
+            "$VIEWR_RELEASE_ID" >/dev/null
           gh release edit \
             "$VIEWR_RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --draft=false \
             --verify-tag
+      - name: Verify exact release publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VIEWR_RELEASE_ID: ${{ needs.gate.outputs.release_id }}
+          VIEWR_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          gh api \
+            "repos/$GITHUB_REPOSITORY/releases/$VIEWR_RELEASE_ID" |
+            jq -e \
+              --arg tag "$VIEWR_RELEASE_TAG" \
+              --argjson id "$VIEWR_RELEASE_ID" \
+              '
+                .id == $id
+                and .tag_name == $tag
+                and .draft == false
+                and .prerelease == false
+              ' >/dev/null

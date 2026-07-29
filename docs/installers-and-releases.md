@@ -353,12 +353,14 @@ workflow directly. A repository-token release event is not used because those
 events do not start another GitHub Actions workflow. The release workflow can
 also be run manually for an existing draft tag.
 
-The release gate gives GitHub's release API up to three minutes to expose the
-new draft release. It then waits for the complete five-check main-branch CI
-workflow to pass for the exact tagged commit. It does not rerun those checks.
-Three isolated jobs then build and validate the platform files. A fourth job
-builds and validates the source archive. New main-branch pushes do not cancel
-an earlier commit's release-eligible CI run.
+The release gate gives GitHub's authenticated release list up to three minutes
+to expose the new stable draft. It records the draft's numeric release ID and
+uses that identity for later state and asset checks. It then waits for the
+complete five-check main-branch CI workflow to pass for the exact tagged
+commit. It does not rerun those checks. Three isolated jobs then build and
+validate the platform files. A fourth job builds and validates the source
+archive. New main-branch pushes do not cancel an earlier commit's
+release-eligible CI run.
 
 The publication job starts only after all four jobs pass. It checks the exact
 local and remote file sets and every remote SHA-256 digest, creates
@@ -372,20 +374,24 @@ The in-app updater uses the asset state, size, and digest from the GitHub releas
 API. Thus, the publication job must continue to reject a missing digest. A
 change to a platform package name also requires a matching application change.
 
-To retry a failed draft release, dispatch the workflow at the release tag:
+To retry a failed draft release, dispatch the protected-main workflow for the
+release tag:
 
 ```bash
 release_tag=v0.2.0
 gh workflow run release-binaries.yml \
-  --ref "$release_tag" \
+  --ref main \
   -f release_tag="$release_tag"
 ```
 
-The workflow rejects a release tag whose commit does not match the workflow
-invocation commit. All downstream jobs check out that approved commit SHA, not
-the mutable tag reference. Before the workflow uploads files and before it
-publishes the release, it verifies that the tag still identifies the approved
-commit. This keeps artifact provenance tied to the released source.
+The workflow itself must run from protected `main`. An automatic release
+requires the release tag and workflow invocation to identify the same commit.
+A manual dispatch can use the fixed workflow from `main` to recover an older
+draft, but it still checks out the immutable tag and requires successful
+main-branch CI for that exact tagged commit. All downstream jobs use that
+approved commit SHA. Before the workflow uploads files and before it publishes
+the release, it verifies that the tag still identifies the approved commit.
+This keeps artifact provenance tied to the released source.
 
 Verify an attestation with:
 

@@ -2,14 +2,34 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: scripts/verify-remote-release-assets.sh [--allow-missing] <asset-directory> <release-tag>" >&2
+  echo "usage: scripts/verify-remote-release-assets.sh [--allow-missing] --release-id ID <asset-directory> <release-tag>" >&2
 }
 
 allow_missing=0
-if [[ "${1:-}" == "--allow-missing" ]]; then
-  allow_missing=1
-  shift
-fi
+release_id=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --allow-missing)
+      allow_missing=1
+      shift
+      ;;
+    --release-id)
+      if [[ $# -lt 2 ]]; then
+        usage
+        exit 2
+      fi
+      release_id="$2"
+      shift 2
+      ;;
+    --*)
+      usage
+      exit 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
 if [[ $# -ne 2 ]]; then
   usage
   exit 2
@@ -25,6 +45,10 @@ if [[ ! -d "$asset_dir" ]]; then
 fi
 if [[ -z "$release_tag" ]]; then
   echo "release tag must not be empty" >&2
+  exit 1
+fi
+if [[ ! "$release_id" =~ ^[1-9][0-9]*$ ]]; then
+  echo "release ID must be a positive integer" >&2
   exit 1
 fi
 if [[ ! "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
@@ -45,13 +69,19 @@ local_names="$(
     LC_ALL=C sort
 )"
 remote_json="$(
-  gh release view \
-    "$release_tag" \
-    --repo "$repository" \
-    --json assets
+  gh api "repos/$repository/releases/$release_id"
 )"
-if ! jq -e '.assets | type == "array"' <<< "$remote_json" >/dev/null; then
-  echo "GitHub did not return a release asset array" >&2
+if ! jq -e \
+  --arg tag "$release_tag" \
+  --argjson id "$release_id" \
+  '
+    .id == $id
+    and .tag_name == $tag
+    and .prerelease == false
+    and (.assets | type == "array")
+  ' \
+  <<<"$remote_json" >/dev/null; then
+  echo "GitHub did not return the expected stable release and asset array" >&2
   exit 1
 fi
 remote_names="$(
