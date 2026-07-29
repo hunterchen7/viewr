@@ -395,7 +395,7 @@ To retry a failed draft release, dispatch the current `main` workflow for the
 release tag:
 
 ```bash
-release_tag=v0.2.0
+release_tag=vMAJOR.MINOR.PATCH
 gh workflow run release-binaries.yml \
   --ref main \
   -f release_tag="$release_tag"
@@ -408,6 +408,13 @@ it still checks out the immutable tag and requires successful main-branch CI
 for that exact tagged commit. All downstream jobs use that approved commit SHA.
 Before the workflow uploads files, it verifies that the tag still identifies
 the approved commit.
+
+The current trusted workflow also checks the immutable source before any build
+starts. A source that does not lock `jpeg-rusturbo` needs no JPEG notice. A
+source that locks exactly version 0.9.2 must contain the exact pinned upstream
+notice as the terminal block in `THIRD-PARTY-NOTICES.txt`. Another or multiple
+locked versions fail closed. An immutable historical source that lacks a
+required notice cannot be recovered; create a new compliant release instead.
 
 GitHub's workflow token cannot publish some historical releases when their
 target commit changes workflow files. A historical recovery therefore uploads
@@ -426,9 +433,9 @@ expanded form is:
 recovery_run_id=RECOVERY-RUN-ID
 recovery_run_attempt=RECOVERY-RUN-ATTEMPT
 workflow_sha=RECOVERY-WORKFLOW-COMMIT
-release_id=361510019
-release_sha=106284ee7dec2d9e05aa091121747adfa0642407
-release_tag=v0.2.0
+release_id=RELEASE-ID
+release_sha=RELEASE-SOURCE-COMMIT
+release_tag=vMAJOR.MINOR.PATCH
 recovery_directory="$(mktemp -d)"
 
 gh run download "$recovery_run_id" \

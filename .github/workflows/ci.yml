@@ -49,11 +49,12 @@ jobs:
           cargo fetch --locked
       - name: Validate third-party license inventories
         run: scripts/validate-third-party-licenses.sh
-      - name: Test release asset verification
+      - name: Test release verification helpers
         run: |
           scripts/test-publish-draft-release.sh
           scripts/test-require-draft-release.sh
           scripts/test-upload-release-assets.sh
+          scripts/test-validate-release-source-notices.sh
           scripts/test-verify-release-assets.sh
           scripts/test-verify-remote-release-assets.sh
       - name: Format

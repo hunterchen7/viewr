@@ -63,6 +63,8 @@ jobs:
           ref: refs/tags/${{ inputs.release_tag }}
           path: release-source
           persist-credentials: false
+      - name: Require release-source notices
+        run: scripts/validate-release-source-notices.sh release-source
       - name: Require an existing draft release
         id: draft_release
         env:
