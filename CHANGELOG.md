@@ -1,5 +1,95 @@
 # Changelog
 
+## [0.2.0](https://github.com/hunterchen7/viewr/compare/v0.1.1...v0.2.0) (2026-07-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* **db:** record_rating_pending_sidecar now rejects paths without a resolvable physical sidecar owner instead of journaling unresolved work. Db::open also requires WAL-capable storage and DbError adds WalUnavailable.
+
+### Features
+
+* add installer launch and release source support ([6e76d3c](https://github.com/hunterchen7/viewr/commit/6e76d3cfd37c60cd05879ac66d44e5a211648f75))
+* add validated native installers to releases ([2b961e9](https://github.com/hunterchen7/viewr/commit/2b961e9b37794bb1ea8298c4154791e1c229110f))
+* add verified in-app updates ([2b48ac5](https://github.com/hunterchen7/viewr/commit/2b48ac537d5f8849b4336f60381df1d6977f0363))
+* add verified in-app updates ([42d0ec4](https://github.com/hunterchen7/viewr/commit/42d0ec495b4bb1a3676546b31c6a90300fbcb8c9))
+* establish updater foundations ([9f129a4](https://github.com/hunterchen7/viewr/commit/9f129a4a4c6ce6bc8c80eb9a6d69022b2d1639df))
+* expose cache JPEG quality preference ([9cebb8b](https://github.com/hunterchen7/viewr/commit/9cebb8baff8fef600b7fa6084383045d1b81a99b))
+* isolate selectable JPEG cache profiles ([fba8d88](https://github.com/hunterchen7/viewr/commit/fba8d8800f6a91e261fc8b731e51e32c534c3703))
+* **linux:** add Debian installer ([24dc547](https://github.com/hunterchen7/viewr/commit/24dc547c32bb1137315deb13859344cf13bfde45))
+* **linux:** add install and MIME integration checks ([bbdfbed](https://github.com/hunterchen7/viewr/commit/bbdfbed1e33fbd448c6cfe5a790049db91854323))
+* load full textures viewport first ([67e16e3](https://github.com/hunterchen7/viewr/commit/67e16e3eaaf8eaa7d37030ce780ce6aa101f6a48))
+* **macos:** add native package installer ([bc53079](https://github.com/hunterchen7/viewr/commit/bc53079aabd0099512ee105c1fe6abb9afcc74e2))
+* **raw:** add highlight-safe culling exposure ([b1d8176](https://github.com/hunterchen7/viewr/commit/b1d81761ccc8d34646c53a982dc65f2c0a350210))
+* **ui:** persist windows and customize indicators ([65c12b6](https://github.com/hunterchen7/viewr/commit/65c12b6c67185d1a06c04928e04472535e93a4cb))
+* **windows:** add native MSI installer ([19d9a00](https://github.com/hunterchen7/viewr/commit/19d9a001dcd293863d248a3f800eb51c1ef4cbdf))
+
+
+### Bug Fixes
+
+* bind ratings to native raw identity ([6e4972c](https://github.com/hunterchen7/viewr/commit/6e4972c27c6f4af415c230296705a96b8d3aebe2))
+* **ci:** harden installer integration validation ([6b6738f](https://github.com/hunterchen7/viewr/commit/6b6738f36ee34f6e1134845db6a8cea4c6ca8bc1))
+* constrain disk cache garbage collection ([b0ca7c8](https://github.com/hunterchen7/viewr/commit/b0ca7c8fe42820064dc927f33095008e08b73622))
+* contain panics in decode workers ([57af577](https://github.com/hunterchen7/viewr/commit/57af577c9ac00c99e428f31deba063fb17ce4471))
+* **db:** avoid redundant concurrent repair ([1995d3b](https://github.com/hunterchen7/viewr/commit/1995d3bfd05589e6a231c075effe5b3423c3c982))
+* **db:** guard delayed rating journals with revisions ([8e8bdba](https://github.com/hunterchen7/viewr/commit/8e8bdba91e367c13d8af3559d1b8f933656f6155))
+* **db:** harden rating recovery across filesystem aliases ([af1b5b0](https://github.com/hunterchen7/viewr/commit/af1b5b011257391d4abee830993bea1e0cb7ee7f))
+* **db:** preserve legacy owner ordering ([110b8c7](https://github.com/hunterchen7/viewr/commit/110b8c71ceba77723b9f9462e8f736a41b869ed7))
+* **db:** scope recovery ordering by sidecar owner ([0c69539](https://github.com/hunterchen7/viewr/commit/0c695391f1c6e0d28c696ae31286b44e9330b346))
+* **db:** separate rating generation from completion ([dd36d5d](https://github.com/hunterchen7/viewr/commit/dd36d5df5788f8248637fdf6c12f034f706a2442))
+* **db:** serialize repair and legacy ambiguity ([235339a](https://github.com/hunterchen7/viewr/commit/235339abe362513bf6661e339a343f3dee90525b))
+* fail closed on malformed RAW metadata ([8bdaa31](https://github.com/hunterchen7/viewr/commit/8bdaa31cb20416598aaac039ab5b7f2f6bfb608d))
+* **folder:** match sidecar owners to filesystem identity ([4d9fd4a](https://github.com/hunterchen7/viewr/commit/4d9fd4ae50db5e863025058fce3e607548e5c56b))
+* guard sidecar recovery with raw identity ([9813af7](https://github.com/hunterchen7/viewr/commit/9813af7bcd6d59f07fc5e1ca4e5f420942d03519))
+* harden updater handoff and coordination ([44c790f](https://github.com/hunterchen7/viewr/commit/44c790f67bff7f5954bd0dc4aac9be35d2b5ad56))
+* honor the total RAM cache budget ([415f28d](https://github.com/hunterchen7/viewr/commit/415f28d9a58de2ff016e08382f458352d03355e4))
+* **jobs:** linearize events with worker generations ([393c1eb](https://github.com/hunterchen7/viewr/commit/393c1eb3a593abdd3ce7c7885052ac225e454473))
+* **jpeg:** harden native release boundary ([98a27de](https://github.com/hunterchen7/viewr/commit/98a27de0e4614c138f5a13810983829b5956ab7d))
+* **jpeg:** isolate background encoding work ([64e6967](https://github.com/hunterchen7/viewr/commit/64e6967de82ac7452dbe873f6cdfe2dc132eb037))
+* **library:** make rating persistence ownership-safe ([65c3d2c](https://github.com/hunterchen7/viewr/commit/65c3d2cd9ab9b9f1b3973747ef1a51cca8a29c6a))
+* **library:** retain configured database authority ([22059ad](https://github.com/hunterchen7/viewr/commit/22059adf04aa26c6e2b0c383bdd57186591e3825))
+* **library:** unify sidecar ownership across aliases ([d31ab63](https://github.com/hunterchen7/viewr/commit/d31ab63b6506807461c9bce2af74095056ddc36e))
+* **macos:** preserve batched open semantics ([e87f814](https://github.com/hunterchen7/viewr/commit/e87f814f9ed6ee3534613510705388a362efc32c))
+* **macos:** preserve explicit ARW defaults ([d4e10a1](https://github.com/hunterchen7/viewr/commit/d4e10a17fa6a122509763f262ada1c8b9c28ec28))
+* **macos:** preserve regular viewer integration ([094e9e2](https://github.com/hunterchen7/viewr/commit/094e9e2958f71fdee1f39a474738861433f9a662))
+* **macos:** test Finder-equivalent ARW routing ([072bb2c](https://github.com/hunterchen7/viewr/commit/072bb2c03ffec1c7b2309f2ba73b71779ea5d6a4))
+* **packaging:** align installer contracts ([b9ee5bf](https://github.com/hunterchen7/viewr/commit/b9ee5bf6c79b0682b4fb46e0308f669db5dd8500))
+* **packaging:** clean up interrupted installer tests ([8fa2a66](https://github.com/hunterchen7/viewr/commit/8fa2a66de336fe072aca7f1eb567ac8d6dddf4e9))
+* **packaging:** enforce archive platform invariants ([5fbeed8](https://github.com/hunterchen7/viewr/commit/5fbeed8d38948345dbae84d5f5b4d1e52f951353))
+* **packaging:** make installer validation portable ([28c8f14](https://github.com/hunterchen7/viewr/commit/28c8f1467354965d86c5b1e3b167880319007393))
+* pin version 5 JPEG cache identity ([908f982](https://github.com/hunterchen7/viewr/commit/908f982a18d07fb2e732d69ad2365a9251a096c3))
+* preserve dark gradients in cache JPEGs ([87a4ba9](https://github.com/hunterchen7/viewr/commit/87a4ba990cacb4c396c6f284fa98c90cf53d7791))
+* preserve database API compatibility ([936a974](https://github.com/hunterchen7/viewr/commit/936a974e53e1b2904bd1aa5e36114bc159fac108))
+* preserve sidecar replacement boundaries ([dfc1844](https://github.com/hunterchen7/viewr/commit/dfc1844ed36b63c89791c26d61830807fcbc7d77))
+* reject non-finite configuration values ([c9a2582](https://github.com/hunterchen7/viewr/commit/c9a2582adbc1a033d713860b76e039fa708d43ef))
+* **release:** bind artifacts to the release tag ([4651661](https://github.com/hunterchen7/viewr/commit/465166178cbd5218dabc1c304d857db0b6e63ed0))
+* **release:** pin jobs to the gated commit ([03fdc25](https://github.com/hunterchen7/viewr/commit/03fdc258029921932503c01751189b4335b8ba05))
+* **release:** publish only validated installer assets ([e6e9236](https://github.com/hunterchen7/viewr/commit/e6e923616fb45c0d5833777edcb4f7c8cbcd8010))
+* remove LRU map entries in release builds ([a90e7e6](https://github.com/hunterchen7/viewr/commit/a90e7e64741c21a8f7f180daf560a4dc2e014518))
+* retain ratings until journaling succeeds ([2488ddc](https://github.com/hunterchen7/viewr/commit/2488ddc033a37e6bd1941e47987f74f73fd00d93))
+* serialize sidecar publication ownership ([79440d6](https://github.com/hunterchen7/viewr/commit/79440d66be28d599a795976c6a17a530f8eb01d3))
+* suppress stale worker panic events ([6d8709f](https://github.com/hunterchen7/viewr/commit/6d8709fa04c7f8894ee173569a1da3fd4f1aae37))
+* **ui:** limit persistence to window geometry ([7d23a3a](https://github.com/hunterchen7/viewr/commit/7d23a3ab456e2fb6a2289a65062c4e127db5e685))
+* **windows:** make installer components ICE-clean ([554c3d5](https://github.com/hunterchen7/viewr/commit/554c3d5db6bc44a71e587dfaa85f28834d57a7f2))
+* **windows:** remove duplicate WiX UI property ([476f54e](https://github.com/hunterchen7/viewr/commit/476f54ef1a53d94de8dda138af31e6a272deaf12))
+
+
+### Performance Improvements
+
+* **cache:** preload full-resolution neighbors ([a8ff878](https://github.com/hunterchen7/viewr/commit/a8ff8785528e4be69c630dc1cd25697ea7986715))
+* **db:** make schema initialization constant-time ([ea8433a](https://github.com/hunterchen7/viewr/commit/ea8433ae4082c7161e4b006beb529e88f0d02508))
+* decouple cache GC from session teardown ([bb73d92](https://github.com/hunterchen7/viewr/commit/bb73d9208e8d645bdb4c081b86c04460be2e094c))
+* **jpeg:** decode cache JPEGs in parallel via row-aligned restart markers ([2ed0f21](https://github.com/hunterchen7/viewr/commit/2ed0f214408e27fb97d5d1b30799f5d2000b5aab))
+* **jpeg:** decode row-restart cache JPEGs in parallel ([e6ca210](https://github.com/hunterchen7/viewr/commit/e6ca21009f2f95f9a52921a335f9d5eed04e00e1))
+* **jpeg:** promote fastest M5 encoder ([786a772](https://github.com/hunterchen7/viewr/commit/786a77214875a1beb5aa27d9975481df19743bcc))
+* **jpeg:** schedule six decode chunks per worker ([3bc4a88](https://github.com/hunterchen7/viewr/commit/3bc4a88840812c7b4f641e5247114f7ab00e0028))
+* **jpeg:** select fastest dedicated worker count ([c195b86](https://github.com/hunterchen7/viewr/commit/c195b86a60047076f91d597422f6981703a5455e))
+* **jpeg:** switch cache encoding to libjpeg-turbo ([cc4394a](https://github.com/hunterchen7/viewr/commit/cc4394adf791cf7211395a92440c240ea0f35baf))
+* keep rating flushes off navigation ([5a0ba76](https://github.com/hunterchen7/viewr/commit/5a0ba761f1c9100dd5eadf576c14ff3c5624ac33))
+* **ratings:** batch folder startup state ([d830df3](https://github.com/hunterchen7/viewr/commit/d830df39eef1017c346010b551529d74414543c4))
+* **raw:** fuse integer conversion and CFA scaling ([d2b5c6c](https://github.com/hunterchen7/viewr/commit/d2b5c6c7a5c91b301dcc2be95150c5aa14304a08))
+* **raw:** shorten CFA normalization ([c4f7416](https://github.com/hunterchen7/viewr/commit/c4f7416a1595f7281ec086129123b9d1162657e9))
+
 ## [0.1.1](https://github.com/hunterchen7/viewr/compare/v0.1.0...v0.1.1) (2026-07-22)
 
 
