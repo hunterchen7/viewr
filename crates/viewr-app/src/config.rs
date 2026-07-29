@@ -99,6 +99,9 @@ impl Bind {
 
 pub struct Config {
     pub scroll: ScrollMode,
+    /// Let vertical wheel/trackpad motion move the horizontal filmstrip while
+    /// the pointer is over it.
+    pub vertical_scroll_filmstrip: bool,
     pub tier_indicator: TierIndicator,
     pub show_loading: bool,
     pub show_performance: bool,
@@ -132,6 +135,7 @@ struct RawConfig {
 #[serde(default)]
 struct RawInput {
     scroll: ScrollMode,
+    vertical_scroll_filmstrip: bool,
 }
 
 #[derive(Deserialize)]
@@ -301,6 +305,7 @@ impl Config {
         });
         Self {
             scroll: raw.input.scroll,
+            vertical_scroll_filmstrip: raw.input.vertical_scroll_filmstrip,
             tier_indicator,
             show_loading: raw.ui.show_loading,
             show_performance: raw.ui.show_performance,
@@ -371,11 +376,12 @@ impl Config {
              # hand-edits are read at startup but comments are not kept.\n\n[input]\n",
         );
         out.push_str(&format!(
-            "scroll = \"{}\"\n\n[ui]\ntier_indicator = \"{}\"\nshow_loading = {}\nshow_performance = {}\nshow_exposure = {}\nfilmstrip_height = {:.0}\ngrid_cell = {:.0}\n\n[cache]\nram_gb = {:.1}\ndisk_gb = {:.1}\njpeg_quality = {}\n\n[binds]\n",
+            "scroll = \"{}\"\nvertical_scroll_filmstrip = {}\n\n[ui]\ntier_indicator = \"{}\"\nshow_loading = {}\nshow_performance = {}\nshow_exposure = {}\nfilmstrip_height = {:.0}\ngrid_cell = {:.0}\n\n[cache]\nram_gb = {:.1}\ndisk_gb = {:.1}\njpeg_quality = {}\n\n[binds]\n",
             match self.scroll {
                 ScrollMode::Pan => "pan",
                 ScrollMode::Zoom => "zoom",
             },
+            self.vertical_scroll_filmstrip,
             self.tier_indicator.as_str(),
             self.show_loading,
             self.show_performance,
@@ -467,6 +473,9 @@ const TEMPLATE: &str = r#"# viewr configuration.
 # "pan":  plain scroll pans the zoomed image; pinch or Ctrl/Cmd+scroll zooms.
 # "zoom": plain scroll zooms.
 scroll = "pan"
+# While the pointer is over the filmstrip, use vertical wheel/trackpad motion
+# to move it horizontally.
+vertical_scroll_filmstrip = false
 
 [ui]
 # Cache state below each thumbnail: "marks", "border", or "hidden".
@@ -561,6 +570,7 @@ mod tests {
         .unwrap();
         let cfg = Config::from_raw(raw);
         assert_eq!(cfg.scroll, ScrollMode::Zoom);
+        assert!(!cfg.vertical_scroll_filmstrip);
         assert!((cfg.ram_gb - 8.0).abs() < f32::EPSILON);
         assert_eq!(cfg.jpeg_quality, 91);
         assert_eq!(cfg.tier_indicator, TierIndicator::Marks);
@@ -570,6 +580,25 @@ mod tests {
         assert_eq!(cfg.binds[&Action::Next].len(), 1);
         assert_eq!(cfg.binds[&Action::Next][0].key, egui::Key::D);
         assert_eq!(cfg.binds[&Action::Prev][0].key, egui::Key::ArrowLeft);
+    }
+
+    #[test]
+    fn vertical_filmstrip_scroll_is_opt_in_and_round_trips() {
+        let default = Config::from_raw(RawConfig::default());
+        assert!(!default.vertical_scroll_filmstrip);
+
+        let enabled: RawConfig = toml::from_str(
+            r#"
+            [input]
+            vertical_scroll_filmstrip = true
+            "#,
+        )
+        .unwrap();
+        let enabled = Config::from_raw(enabled);
+        assert!(enabled.vertical_scroll_filmstrip);
+
+        let reparsed: RawConfig = toml::from_str(&enabled.serialized()).unwrap();
+        assert!(Config::from_raw(reparsed).vertical_scroll_filmstrip);
     }
 
     #[test]
@@ -695,6 +724,7 @@ mod tests {
         let cfg = Config::from_raw(raw);
 
         assert_eq!(cfg.scroll, ScrollMode::Pan);
+        assert!(!cfg.vertical_scroll_filmstrip);
         assert_eq!(cfg.tier_indicator, TierIndicator::Marks);
         assert!(cfg.show_loading);
         assert!(cfg.show_performance);
