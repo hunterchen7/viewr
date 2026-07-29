@@ -42,6 +42,9 @@ while ((attempt <= query_attempts)); do
       --paginate \
       "repos/$repository/releases?per_page=100" 2>"$query_error_file"
   )"; then
+    if [[ -s "$query_error_file" ]]; then
+      cat "$query_error_file" >&2
+    fi
     if ! matching_releases="$(
       jq -sc \
         --arg tag "$release_tag" \
@@ -92,12 +95,12 @@ while ((attempt <= query_attempts)); do
   fi
 
   if ((attempt == query_attempts)); then
-    echo "::error::Release $release_tag did not become visible after $query_attempts attempts." >&2
+    echo "::error::Could not resolve stable draft release $release_tag after $query_attempts attempts." >&2
     echo "$query_error" >&2
     exit 1
   fi
 
-  echo "::warning::Release $release_tag is not visible yet (attempt $attempt/$query_attempts); retrying." >&2
+  echo "::warning::Could not resolve stable draft release $release_tag (attempt $attempt/$query_attempts); retrying." >&2
   sleep "$query_delay_seconds"
   attempt=$((attempt + 1))
 done

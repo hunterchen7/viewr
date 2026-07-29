@@ -441,11 +441,11 @@ jobs:
           .release-tools/scripts/require-draft-release.sh \
             "$VIEWR_RELEASE_TAG" \
             "$VIEWR_RELEASE_ID" >/dev/null
-          gh release edit \
-            "$VIEWR_RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --draft=false \
-            --verify-tag
+          gh api \
+            --method PATCH \
+            "repos/$GITHUB_REPOSITORY/releases/$VIEWR_RELEASE_ID" \
+            -F draft=false \
+            --silent
       - name: Verify exact release publication
         env:
           GH_TOKEN: ${{ github.token }}
