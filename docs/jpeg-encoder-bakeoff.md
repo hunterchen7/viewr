@@ -22,6 +22,16 @@ No UI behavior or setting changed. The existing q80–q100 preference, q97
 default, 4:4:4 chroma, opaque decode, and content-dependent file sizing remain
 the same.
 
+### Current processing-limit integration
+
+A later processing-thread preference preserves this dedicated ten-worker pool
+in Automatic mode, so the measured default foreground/background isolation
+remains unchanged. When the user selects a fixed processing-thread cap, cache
+encoding instead runs serially on one worker in the engine-owned processing
+pool. This keeps the fixed cap strict and leaves the remaining permitted
+workers available for foreground RAW work. JPEG bytes are identical across
+both strategies.
+
 ## Candidates
 
 | Label | Implementation | Version | Relevant mode |
