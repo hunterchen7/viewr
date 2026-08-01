@@ -4596,6 +4596,7 @@ name = "viewr"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "criterion",
  "dirs",
  "eframe",
@@ -4620,6 +4621,7 @@ name = "viewr-core"
 version = "0.3.0"
 dependencies = [
  "blake3",
+ "chrono",
  "criterion",
  "dirs",
  "fast_image_resize",

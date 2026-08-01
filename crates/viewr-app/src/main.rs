@@ -11,6 +11,7 @@ mod app;
 mod color;
 mod config;
 mod filmstrip;
+mod image_info;
 mod loupe;
 mod progressive_texture;
 mod rating_groups;

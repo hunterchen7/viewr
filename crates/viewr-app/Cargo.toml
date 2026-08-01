@@ -29,6 +29,7 @@ tempfile.workspace = true
 ureq.workspace = true
 url.workspace = true
 criterion = { workspace = true, optional = true }
+chrono.workspace = true
 
 [[bench]]
 name = "filmstrip_scaling"

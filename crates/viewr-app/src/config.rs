@@ -63,6 +63,97 @@ impl TierIndicator {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageInfoPosition {
+    /// Place image information between the main toolbar and the image.
+    #[default]
+    Above,
+    /// Place image information between the image and the filmstrip.
+    Below,
+}
+
+impl ImageInfoPosition {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Above => "above",
+            Self::Below => "below",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct ImageInfoFields {
+    pub file_name: bool,
+    pub captured: bool,
+    pub modified: bool,
+    pub camera: bool,
+    pub lens: bool,
+    pub iso: bool,
+    pub shutter: bool,
+    pub aperture: bool,
+    pub focal_length: bool,
+    pub file_size: bool,
+}
+
+impl ImageInfoFields {
+    pub fn none() -> Self {
+        Self {
+            file_name: false,
+            captured: false,
+            modified: false,
+            camera: false,
+            lens: false,
+            iso: false,
+            shutter: false,
+            aperture: false,
+            focal_length: false,
+            file_size: false,
+        }
+    }
+
+    pub fn any_enabled(self) -> bool {
+        self != Self::none()
+    }
+}
+
+impl Default for ImageInfoFields {
+    fn default() -> Self {
+        Self {
+            file_name: true,
+            captured: true,
+            modified: true,
+            camera: true,
+            lens: true,
+            iso: true,
+            shutter: true,
+            aperture: true,
+            focal_length: true,
+            file_size: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct ImageInfoConfig {
+    pub enabled: bool,
+    pub position: ImageInfoPosition,
+    #[serde(flatten)]
+    pub fields: ImageInfoFields,
+}
+
+impl Default for ImageInfoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            position: ImageInfoPosition::Above,
+            fields: ImageInfoFields::default(),
+        }
+    }
+}
+
 /// User-selected logical-thread budget for CPU-heavy image processing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProcessingThreadLimit {
@@ -127,7 +218,7 @@ pub struct Config {
     pub tier_indicator: TierIndicator,
     pub show_loading: bool,
     pub show_performance: bool,
-    pub show_exposure: bool,
+    pub image_info: ImageInfoConfig,
     /// Filmstrip panel height in px (drag the divider to change).
     pub filmstrip_height: f32,
     /// Grid cell width in px.
@@ -174,7 +265,7 @@ struct RawUi {
     tier_border: Option<bool>,
     show_loading: bool,
     show_performance: bool,
-    show_exposure: bool,
+    image_info: ImageInfoConfig,
     filmstrip_height: f32,
     grid_cell: f32,
 }
@@ -185,7 +276,7 @@ impl Default for RawUi {
             tier_border: None,
             show_loading: true,
             show_performance: true,
-            show_exposure: true,
+            image_info: ImageInfoConfig::default(),
             filmstrip_height: 112.0,
             grid_cell: 200.0,
         }
@@ -348,7 +439,7 @@ impl Config {
             tier_indicator,
             show_loading: raw.ui.show_loading,
             show_performance: raw.ui.show_performance,
-            show_exposure: raw.ui.show_exposure,
+            image_info: raw.ui.image_info,
             filmstrip_height: finite_clamp(
                 raw.ui.filmstrip_height,
                 default_ui.filmstrip_height,
@@ -434,7 +525,7 @@ impl Config {
              # hand-edits are read at startup but comments are not kept.\n\n[input]\n",
         );
         out.push_str(&format!(
-            "scroll = \"{}\"\nvertical_scroll_filmstrip = {}\n\n[ui]\ntier_indicator = \"{}\"\nshow_loading = {}\nshow_performance = {}\nshow_exposure = {}\nfilmstrip_height = {:.0}\ngrid_cell = {:.0}\n\n[performance]\nworker_threads = {}\n\n[cache]\nram_gb = {:.1}\ndisk_gb = {:.1}\njpeg_quality = {}\n\n[binds]\n",
+            "scroll = \"{}\"\nvertical_scroll_filmstrip = {}\n\n[ui]\ntier_indicator = \"{}\"\nshow_loading = {}\nshow_performance = {}\nfilmstrip_height = {:.0}\ngrid_cell = {:.0}\n\n[ui.image_info]\nenabled = {}\nposition = \"{}\"\nfile_name = {}\ncaptured = {}\nmodified = {}\ncamera = {}\nlens = {}\niso = {}\nshutter = {}\naperture = {}\nfocal_length = {}\nfile_size = {}\n\n[performance]\nworker_threads = {}\n\n[cache]\nram_gb = {:.1}\ndisk_gb = {:.1}\njpeg_quality = {}\n\n[binds]\n",
             match self.scroll {
                 ScrollMode::Pan => "pan",
                 ScrollMode::Zoom => "zoom",
@@ -443,9 +534,20 @@ impl Config {
             self.tier_indicator.as_str(),
             self.show_loading,
             self.show_performance,
-            self.show_exposure,
             self.filmstrip_height,
             self.grid_cell,
+            self.image_info.enabled,
+            self.image_info.position.as_str(),
+            self.image_info.fields.file_name,
+            self.image_info.fields.captured,
+            self.image_info.fields.modified,
+            self.image_info.fields.camera,
+            self.image_info.fields.lens,
+            self.image_info.fields.iso,
+            self.image_info.fields.shutter,
+            self.image_info.fields.aperture,
+            self.image_info.fields.focal_length,
+            self.image_info.fields.file_size,
             self.processing_threads.serialized(),
             self.ram_gb,
             self.disk_gb,
@@ -555,8 +657,23 @@ tier_indicator = "marks"
 show_loading = true
 # Show load time and RAM/JPEG cache usage in the toolbar.
 show_performance = true
-# Show ISO, shutter, aperture, and focal length in the toolbar.
-show_exposure = true
+
+[ui.image_info]
+# Show a one-line image-information strip outside the image.
+enabled = true
+# "above" places the strip below the toolbar; "below" places it above the filmstrip.
+position = "above"
+# Choose the fields in the strip. Missing metadata is omitted without a placeholder.
+file_name = true
+captured = true
+modified = true
+camera = true
+lens = true
+iso = true
+shutter = true
+aperture = true
+focal_length = true
+file_size = true
 
 [performance]
 # CPU-heavy RAW and image processing workers. Zero automatically uses every
@@ -653,7 +770,7 @@ mod tests {
         assert_eq!(cfg.tier_indicator, TierIndicator::Marks);
         assert!(cfg.show_loading);
         assert!(cfg.show_performance);
-        assert!(cfg.show_exposure);
+        assert_eq!(cfg.image_info, ImageInfoConfig::default());
         assert_eq!(cfg.binds[&Action::Next].len(), 1);
         assert_eq!(cfg.binds[&Action::Next][0].key, egui::Key::D);
         assert_eq!(cfg.binds[&Action::Prev][0].key, egui::Key::ArrowLeft);
@@ -877,13 +994,86 @@ mod tests {
         assert_eq!(cfg.tier_indicator, TierIndicator::Marks);
         assert!(cfg.show_loading);
         assert!(cfg.show_performance);
-        assert!(cfg.show_exposure);
+        assert_eq!(cfg.image_info, ImageInfoConfig::default());
         assert_eq!(cfg.filmstrip_height, 112.0);
         assert_eq!(cfg.grid_cell, 200.0);
         assert_eq!(cfg.ram_gb, 4.5);
         assert_eq!(cfg.disk_gb, 20.0);
         assert_eq!(cfg.jpeg_quality, CACHE_JPEG_QUALITY);
         assert_eq!(cfg.processing_threads, ProcessingThreadLimit::Automatic);
+    }
+
+    #[test]
+    fn image_info_settings_round_trip_every_field_and_below_placement() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [ui.image_info]
+            enabled = false
+            position = "below"
+            file_name = false
+            captured = true
+            modified = false
+            camera = true
+            lens = false
+            iso = true
+            shutter = false
+            aperture = true
+            focal_length = false
+            file_size = true
+            "#,
+        )
+        .unwrap();
+        let expected = ImageInfoConfig {
+            enabled: false,
+            position: ImageInfoPosition::Below,
+            fields: ImageInfoFields {
+                file_name: false,
+                captured: true,
+                modified: false,
+                camera: true,
+                lens: false,
+                iso: true,
+                shutter: false,
+                aperture: true,
+                focal_length: false,
+                file_size: true,
+            },
+        };
+
+        let configured = Config::from_raw(raw);
+        assert_eq!(configured.image_info, expected);
+
+        let reparsed: RawConfig = toml::from_str(&configured.serialized()).unwrap();
+        assert_eq!(Config::from_raw(reparsed).image_info, expected);
+        assert!(!configured.serialized().contains("show_exposure"));
+    }
+
+    #[test]
+    fn image_info_explicitly_hidden_fields_stay_hidden_after_round_trip() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [ui.image_info]
+            position = "above"
+            file_name = false
+            captured = false
+            modified = false
+            camera = false
+            lens = false
+            iso = false
+            shutter = false
+            aperture = false
+            focal_length = false
+            file_size = false
+            "#,
+        )
+        .unwrap();
+        let configured = Config::from_raw(raw);
+        assert!(configured.image_info.enabled);
+        assert_eq!(configured.image_info.position, ImageInfoPosition::Above);
+        assert!(!configured.image_info.fields.any_enabled());
+
+        let reparsed: RawConfig = toml::from_str(&configured.serialized()).unwrap();
+        assert!(!Config::from_raw(reparsed).image_info.fields.any_enabled());
     }
 
     #[test]

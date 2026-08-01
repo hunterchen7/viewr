@@ -9,8 +9,8 @@ use eframe::egui;
 use viewr_core::jobs::{MAX_CACHE_JPEG_QUALITY, MIN_CACHE_JPEG_QUALITY};
 
 use crate::config::{
-    ACTIONS, Action, Bind, Config, MAX_CONFIGURED_PROCESSING_THREADS, ProcessingThreadLimit,
-    ScrollMode, TierIndicator,
+    ACTIONS, Action, Bind, Config, ImageInfoPosition, MAX_CONFIGURED_PROCESSING_THREADS,
+    ProcessingThreadLimit, ScrollMode, TierIndicator,
 };
 
 fn max_processing_thread_choice(available: usize) -> usize {
@@ -147,11 +147,66 @@ impl SettingsState {
                     )
                     .changed();
                 changed |= ui
-                    .checkbox(
-                        &mut config.show_exposure,
-                        "Exposure details in the toolbar",
+                    .checkbox(&mut config.image_info.enabled, "Image information strip")
+                    .on_hover_text(
+                        "A separate one-line strip outside the image; the I-key details panel remains independent",
                     )
                     .changed();
+                let image_info_enabled = config.image_info.enabled;
+                ui.add_enabled_ui(image_info_enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Placement:");
+                        changed |= ui
+                            .radio_value(
+                                &mut config.image_info.position,
+                                ImageInfoPosition::Above,
+                                "Above image",
+                            )
+                            .changed();
+                        changed |= ui
+                            .radio_value(
+                                &mut config.image_info.position,
+                                ImageInfoPosition::Below,
+                                "Below image",
+                            )
+                            .changed();
+                    });
+                    ui.label(egui::RichText::new("Information fields").weak().size(11.0));
+                    ui.columns(2, |columns| {
+                        changed |= columns[0]
+                            .checkbox(&mut config.image_info.fields.file_name, "File name")
+                            .changed();
+                        changed |= columns[0]
+                            .checkbox(&mut config.image_info.fields.captured, "Captured time")
+                            .on_hover_text("Camera-recorded capture time; timezone is shown only when recorded")
+                            .changed();
+                        changed |= columns[0]
+                            .checkbox(&mut config.image_info.fields.modified, "Modified time")
+                            .on_hover_text("Filesystem modification time in this computer's local timezone")
+                            .changed();
+                        changed |= columns[0]
+                            .checkbox(&mut config.image_info.fields.camera, "Camera")
+                            .changed();
+                        changed |= columns[0]
+                            .checkbox(&mut config.image_info.fields.lens, "Lens")
+                            .changed();
+                        changed |= columns[1]
+                            .checkbox(&mut config.image_info.fields.iso, "ISO")
+                            .changed();
+                        changed |= columns[1]
+                            .checkbox(&mut config.image_info.fields.shutter, "Shutter")
+                            .changed();
+                        changed |= columns[1]
+                            .checkbox(&mut config.image_info.fields.aperture, "Aperture")
+                            .changed();
+                        changed |= columns[1]
+                            .checkbox(&mut config.image_info.fields.focal_length, "Focal length")
+                            .changed();
+                        changed |= columns[1]
+                            .checkbox(&mut config.image_info.fields.file_size, "File size")
+                            .changed();
+                    });
+                });
                 ui.horizontal(|ui| {
                     ui.label("Grid cell size");
                     changed |= ui

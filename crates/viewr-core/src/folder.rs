@@ -551,7 +551,7 @@ pub fn scan(dir: &Path) -> io::Result<Vec<FolderEntry>> {
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as i64)
+                .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
                 .unwrap_or(0);
             Some(FolderEntry {
                 path: entry_path,

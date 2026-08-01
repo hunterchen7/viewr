@@ -27,6 +27,7 @@ use viewr_core::types::{PixelBuf, Tier};
 
 use crate::config::{Action, Config, ScrollMode, TierIndicator};
 use crate::filmstrip;
+use crate::image_info;
 use crate::loupe::{self, LoupeResponse, Zoom};
 use crate::progressive_texture::{self, TileCoord};
 use crate::rating_groups::{build_owner_members, install_rating_for_members};
@@ -1224,19 +1225,9 @@ impl App {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let mut filter_changed = false;
         let session_len = self.session.as_ref().map_or(0, |s| s.entries.len());
-        let file_name = self
-            .session
-            .as_ref()
-            .map(|s| s.entries[self.current].file_name.clone())
-            .unwrap_or_default();
         egui::Panel::top("status").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(format!(
-                    "{}/{}  {}",
-                    self.visible_pos() + 1,
-                    self.visible.len(),
-                    file_name,
-                ));
+                ui.label(format!("{}/{}", self.visible_pos() + 1, self.visible.len()));
                 if self.visible.len() != session_len {
                     ui.label(egui::RichText::new(format!("(of {session_len})")).weak());
                 }
@@ -1287,27 +1278,6 @@ impl App {
                     });
                 ui.separator();
 
-                if self.config.show_exposure
-                    && let Some(meta) = self
-                        .session
-                        .as_ref()
-                        .and_then(|s| s.metas.get(&self.current))
-                {
-                    let mut parts: Vec<String> = Vec::new();
-                    if let Some(iso) = meta.iso {
-                        parts.push(format!("ISO {iso}"));
-                    }
-                    if let Some(s) = &meta.shutter {
-                        parts.push(s.clone());
-                    }
-                    if let Some(a) = &meta.aperture {
-                        parts.push(a.clone());
-                    }
-                    if let Some(f) = meta.focal_mm {
-                        parts.push(format!("{f:.0}mm"));
-                    }
-                    ui.label(parts.join("  "));
-                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .button("⚙")
@@ -1402,9 +1372,9 @@ impl App {
                             ui.label(format!("{f:.0}mm"));
                             ui.end_row();
                         }
-                        if let Some(t) = &m.taken {
-                            ui.label("Taken");
-                            ui.label(t);
+                        if let Some(captured) = &m.captured {
+                            ui.label("Captured");
+                            ui.label(captured.to_string());
                             ui.end_row();
                         }
                         ui.label("Size");
@@ -1579,6 +1549,15 @@ impl App {
         self.scroll_to_current = false;
         if let Some(i) = clicked {
             self.select(i);
+        }
+
+        if let Some(session) = &self.session {
+            let items = image_info::build_items(
+                &self.config.image_info,
+                &session.entries[self.current],
+                session.metas.get(&self.current),
+            );
+            image_info::show(ui, self.config.image_info.position, &items);
         }
 
         // Loupe. The zoom state lives in full-res "logical" space so the
