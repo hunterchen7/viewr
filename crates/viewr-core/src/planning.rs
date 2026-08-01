@@ -1,6 +1,8 @@
 //! Pure navigation-wave planning, separated from cache and worker state so
 //! scheduling behavior can be tested and benchmarked deterministically.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::types::Tier;
 
 const BROWSE_WINDOW: u32 = 24;
@@ -14,6 +16,9 @@ pub enum PlanKind {
     /// A display candidate. The engine chooses develop versus rehydrate from
     /// current cache state.
     Display,
+    /// A Full-resolution candidate admitted by the adaptive RAM working set.
+    /// It is useful for instant future zooming but is not yet user-visible.
+    Prefetch,
     /// A far browse render that should warm ring 2 and disk without entering
     /// the decoded RGBA ring.
     ///
@@ -21,6 +26,45 @@ pub enum PlanKind {
     /// [`crate::jobs::Engine`] planning uses its separate persistent warm lane
     /// instead of rebuilding these targets on every navigation.
     Warm,
+}
+
+#[derive(Debug, Clone)]
+/// Byte estimates used to grow the Full-resolution navigation working set.
+///
+/// Current and immediate visible neighbors are mandatory even when their
+/// estimated total exceeds `budget_bytes`. Farther candidates form one
+/// direction-weighted prefix and are admitted only while the complete prefix
+/// fits. Unknown images use a non-zero conservative fallback estimate.
+pub struct FullPrefetchBudget {
+    budget_bytes: u64,
+    fallback_bytes: u64,
+    known_bytes: HashMap<usize, u64>,
+}
+
+impl FullPrefetchBudget {
+    /// Creates a Full-resolution prefetch budget and per-folder size estimates.
+    pub fn new(budget_bytes: u64, fallback_bytes: u64, known_bytes: HashMap<usize, u64>) -> Self {
+        Self {
+            budget_bytes,
+            fallback_bytes: fallback_bytes.max(1),
+            known_bytes,
+        }
+    }
+
+    fn bytes_for(&self, index: usize) -> u64 {
+        self.known_bytes
+            .get(&index)
+            .copied()
+            .unwrap_or(self.fallback_bytes)
+            .max(1)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FullSelection {
+    index: usize,
+    effective_distance: u32,
+    required: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,6 +211,267 @@ pub fn build_plan_targets(
     }
 
     targets
+}
+
+/// Build the production navigation wave with an adaptive Full-resolution
+/// working set.
+///
+/// The Browse wave remains bounded by [`BROWSE_WINDOW`]. Full candidates begin
+/// with the current image and both immediate visible neighbors, then grow in a
+/// forward-biased 3:1 wave until the next candidate would cross the byte
+/// budget. Optional Full work is lower priority than the complete interactive
+/// Browse wave and is identified as [`PlanKind::Prefetch`].
+pub fn build_plan_targets_with_full_prefetch(
+    len: usize,
+    current: usize,
+    direction: i8,
+    zoomed: bool,
+    sequence: &[usize],
+    full_budget: &FullPrefetchBudget,
+    include_warm: bool,
+) -> Vec<PlanTarget> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let current = current.min(len - 1);
+    let full = adaptive_full_selections(len, current, direction, sequence, full_budget);
+    let required_full: HashMap<_, _> = full
+        .iter()
+        .filter(|selection| selection.required)
+        .map(|selection| (selection.index, selection.effective_distance))
+        .collect();
+    let mut targets = Vec::with_capacity(if include_warm {
+        len.saturating_add(full.len()).saturating_add(2)
+    } else {
+        INTERACTIVE_TARGET_CAPACITY.saturating_add(full.len())
+    });
+    targets.push(PlanTarget {
+        index: current,
+        tier: Tier::Browse,
+        class: 0,
+        effective_distance: 0,
+        kind: PlanKind::Display,
+    });
+    targets.push(PlanTarget {
+        index: current,
+        tier: Tier::Full,
+        class: u8::from(!zoomed),
+        effective_distance: 0,
+        kind: PlanKind::Display,
+    });
+
+    let current_position = current_position(current, sequence);
+    let mut add_browse_neighbor = |position: usize, index: usize| {
+        if index == current || index >= len {
+            return;
+        }
+        let (distance, effective_distance) =
+            weighted_distance(position, current_position, direction);
+        if distance <= FULL_NEIGHBOR_WINDOW {
+            targets.push(PlanTarget {
+                index,
+                tier: Tier::Browse,
+                class: 2,
+                effective_distance,
+                kind: PlanKind::Display,
+            });
+            if required_full.contains_key(&index) {
+                targets.push(PlanTarget {
+                    index,
+                    tier: Tier::Full,
+                    class: 2,
+                    effective_distance,
+                    kind: PlanKind::Display,
+                });
+            }
+        } else if effective_distance <= BROWSE_WINDOW {
+            targets.push(PlanTarget {
+                index,
+                tier: Tier::Browse,
+                class: 4,
+                effective_distance,
+                kind: PlanKind::Display,
+            });
+        }
+    };
+    let (positions_before, positions_after) = if direction >= 0 {
+        ((BROWSE_WINDOW / 3) as usize, BROWSE_WINDOW as usize)
+    } else {
+        (BROWSE_WINDOW as usize, (BROWSE_WINDOW / 3) as usize)
+    };
+    if sequence.is_empty() {
+        let first = current_position.saturating_sub(positions_before);
+        let last = current_position
+            .saturating_add(positions_after)
+            .min(len - 1);
+        for index in first..=last {
+            add_browse_neighbor(index, index);
+        }
+    } else if !sequence.is_empty() {
+        let first = current_position.saturating_sub(positions_before);
+        let last = current_position
+            .saturating_add(positions_after)
+            .min(sequence.len() - 1);
+        for (offset, &index) in sequence[first..=last].iter().enumerate() {
+            add_browse_neighbor(first + offset, index);
+        }
+    }
+
+    targets.extend(
+        full.into_iter()
+            .filter(|selection| !selection.required)
+            .map(|selection| PlanTarget {
+                index: selection.index,
+                tier: Tier::Full,
+                class: 5,
+                effective_distance: selection.effective_distance,
+                kind: PlanKind::Prefetch,
+            }),
+    );
+
+    if include_warm {
+        for index in 0..len {
+            if index == current {
+                continue;
+            }
+            let ahead = (index > current) == (direction >= 0);
+            let distance = index.abs_diff(current).min(u32::MAX as usize) as u32;
+            let effective_distance = if ahead {
+                distance
+            } else {
+                distance.saturating_mul(3)
+            };
+            if effective_distance > BROWSE_WINDOW {
+                targets.push(PlanTarget {
+                    index,
+                    tier: Tier::Browse,
+                    class: 6,
+                    effective_distance,
+                    kind: PlanKind::Warm,
+                });
+            }
+        }
+    }
+
+    targets
+}
+
+fn adaptive_full_selections(
+    len: usize,
+    current: usize,
+    direction: i8,
+    sequence: &[usize],
+    budget: &FullPrefetchBudget,
+) -> Vec<FullSelection> {
+    let ordered_len = if sequence.is_empty() {
+        len
+    } else {
+        sequence.len()
+    };
+    let current_position = current_position(current, sequence).min(ordered_len.saturating_sub(1));
+    let index_at = |position: usize| {
+        if sequence.is_empty() {
+            position
+        } else {
+            sequence[position]
+        }
+    };
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+    let mut used_bytes = 0_u64;
+    let mut add_required = |index: usize, effective_distance: u32| {
+        if index < len && seen.insert(index) {
+            used_bytes = used_bytes.saturating_add(budget.bytes_for(index));
+            selected.push(FullSelection {
+                index,
+                effective_distance,
+                required: true,
+            });
+        }
+    };
+    add_required(current, 0);
+    for position in current_position.saturating_sub(1)
+        ..=(current_position + 1).min(ordered_len.saturating_sub(1))
+    {
+        let (_, effective_distance) = weighted_distance(position, current_position, direction);
+        add_required(index_at(position), effective_distance);
+    }
+
+    let forward = direction >= 0;
+    let mut ahead_distance = 1_usize;
+    let mut behind_distance = 1_usize;
+    loop {
+        let ahead_position = if forward {
+            current_position.checked_add(ahead_distance)
+        } else {
+            current_position.checked_sub(ahead_distance)
+        }
+        .filter(|position| *position < ordered_len);
+        let behind_position = if forward {
+            current_position.checked_sub(behind_distance)
+        } else {
+            current_position.checked_add(behind_distance)
+        }
+        .filter(|position| *position < ordered_len);
+        let choose_ahead = match (ahead_position, behind_position) {
+            (None, None) => break,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (Some(_), Some(_)) => ahead_distance <= behind_distance.saturating_mul(3),
+        };
+        let (position, effective_distance) = if choose_ahead {
+            let position = ahead_position.expect("ahead candidate was selected");
+            let effective_distance = ahead_distance.min(u32::MAX as usize) as u32;
+            ahead_distance = ahead_distance.saturating_add(1);
+            (position, effective_distance)
+        } else {
+            let position = behind_position.expect("behind candidate was selected");
+            let effective_distance =
+                (behind_distance.min(u32::MAX as usize) as u32).saturating_mul(3);
+            behind_distance = behind_distance.saturating_add(1);
+            (position, effective_distance)
+        };
+        let index = index_at(position);
+        if index >= len || !seen.insert(index) {
+            continue;
+        }
+        let bytes = budget.bytes_for(index);
+        let Some(next_bytes) = used_bytes.checked_add(bytes) else {
+            break;
+        };
+        if next_bytes > budget.budget_bytes {
+            break;
+        }
+        used_bytes = next_bytes;
+        selected.push(FullSelection {
+            index,
+            effective_distance,
+            required: false,
+        });
+    }
+    selected
+}
+
+fn current_position(current: usize, sequence: &[usize]) -> usize {
+    if sequence.is_empty() {
+        current
+    } else {
+        sequence
+            .iter()
+            .position(|&index| index == current)
+            .unwrap_or_default()
+    }
+}
+
+fn weighted_distance(position: usize, current_position: usize, direction: i8) -> (u32, u32) {
+    let ahead = (position > current_position) == (direction >= 0);
+    let distance = position.abs_diff(current_position).min(u32::MAX as usize) as u32;
+    let effective_distance = if ahead {
+        distance
+    } else {
+        distance.saturating_mul(3)
+    };
+    (distance, effective_distance)
 }
 
 #[cfg(test)]
@@ -423,6 +728,92 @@ mod tests {
             targets
                 .iter()
                 .all(|target| !(target.index == 42 && target.kind == PlanKind::Warm))
+        );
+    }
+
+    #[test]
+    fn adaptive_full_prefetch_fills_a_directional_prefix_to_its_byte_budget() {
+        let budget = FullPrefetchBudget::new(700, 100, HashMap::new());
+        let targets = build_plan_targets_with_full_prefetch(100, 50, 1, false, &[], &budget, false);
+        let full: Vec<_> = targets
+            .iter()
+            .filter(|target| target.tier == Tier::Full)
+            .map(|target| (target.index, target.kind, target.effective_distance))
+            .collect();
+
+        assert_eq!(
+            full,
+            [
+                (50, PlanKind::Display, 0),
+                (49, PlanKind::Display, 3),
+                (51, PlanKind::Display, 1),
+                (52, PlanKind::Prefetch, 2),
+                (53, PlanKind::Prefetch, 3),
+                (54, PlanKind::Prefetch, 4),
+                (55, PlanKind::Prefetch, 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn mandatory_full_targets_survive_a_budget_shortfall_without_extras() {
+        let known = HashMap::from([(49, 200), (50, 200), (51, 200)]);
+        let budget = FullPrefetchBudget::new(500, 100, known);
+        let targets = build_plan_targets_with_full_prefetch(100, 50, 1, false, &[], &budget, false);
+        let full: Vec<_> = targets
+            .iter()
+            .filter(|target| target.tier == Tier::Full)
+            .map(|target| (target.index, target.kind))
+            .collect();
+
+        assert_eq!(
+            full,
+            [
+                (50, PlanKind::Display),
+                (49, PlanKind::Display),
+                (51, PlanKind::Display),
+            ]
+        );
+    }
+
+    #[test]
+    fn adaptive_full_prefetch_does_not_skip_a_nearer_nonfitting_candidate() {
+        let known = HashMap::from([(49, 100), (50, 100), (51, 100), (52, 300), (53, 50)]);
+        let budget = FullPrefetchBudget::new(550, 100, known);
+        let targets = build_plan_targets_with_full_prefetch(100, 50, 1, false, &[], &budget, false);
+
+        assert!(targets.iter().all(|target| {
+            target.tier != Tier::Full || !matches!(target.kind, PlanKind::Prefetch)
+        }));
+    }
+
+    #[test]
+    fn adaptive_full_prefetch_follows_filtered_order_in_both_directions() {
+        let budget = FullPrefetchBudget::new(500, 100, HashMap::new());
+        let targets = build_plan_targets_with_full_prefetch(
+            10,
+            4,
+            -1,
+            false,
+            &[9, 2, 7, 4, 8, 1],
+            &budget,
+            false,
+        );
+        let full: Vec<_> = targets
+            .iter()
+            .filter(|target| target.tier == Tier::Full)
+            .map(|target| (target.index, target.kind, target.effective_distance))
+            .collect();
+
+        assert_eq!(
+            full,
+            [
+                (4, PlanKind::Display, 0),
+                (7, PlanKind::Display, 1),
+                (8, PlanKind::Display, 3),
+                (2, PlanKind::Prefetch, 2),
+                (9, PlanKind::Prefetch, 3),
+            ]
         );
     }
 }

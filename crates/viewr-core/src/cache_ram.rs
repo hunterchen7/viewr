@@ -1,10 +1,10 @@
 //! Byte-budgeted RAM cache rings.
 //!
-//! Ring 1: decoded RGBA (instant display). Ring 2: encoded JPEG bytes of
-//! developed images (~10–20× smaller; cheap re-inflate). Both are LRU by
-//! bytes — never by image count. Pinned keys (current ±1) are never
-//! evicted. Thumbs live in their own small RGBA ring and have no JPEG
-//! form.
+//! Independent rings hold thumbnail, Browse RGBA, Full RGBA, and encoded JPEG
+//! payloads. Every ring is exact LRU by bytes, never by image count. Pinned
+//! keys (current ±1) are never evicted. The Full ring additionally follows an
+//! explicit navigation working set, so stale speculative renders are removed
+//! immediately and late completions cannot repopulate them.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -301,6 +301,62 @@ impl<V: Clone> ByteLru<V> {
     fn used_bytes(&self) -> u64 {
         self.bytes
     }
+
+    fn budget_bytes(&self) -> u64 {
+        self.budget
+    }
+
+    fn retain_keys(&mut self, mut keep: impl FnMut(&Key) -> bool) {
+        let removed: Vec<_> = self.map.keys().filter(|key| !keep(key)).copied().collect();
+        for key in removed {
+            self.remove(&key);
+        }
+    }
+}
+
+/// Conservative reservation before Viewr has observed a rendered size in the
+/// current folder. It covers a typical 61 MP RGBA8 frame.
+const DEFAULT_FULL_RESERVATION_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Independent byte budgets for every in-memory payload ring.
+pub struct RamCacheBudgets {
+    /// Embedded-preview thumbnail RGBA bytes.
+    pub thumb_rgba_bytes: u64,
+    /// Browse-quality developed RGBA bytes.
+    pub browse_rgba_bytes: u64,
+    /// Full-resolution developed RGBA bytes.
+    pub full_rgba_bytes: u64,
+    /// Encoded Browse and Full JPEG bytes.
+    pub jpeg_bytes: u64,
+}
+
+impl RamCacheBudgets {
+    /// Creates explicit independent ring budgets.
+    pub const fn new(
+        thumb_rgba_bytes: u64,
+        browse_rgba_bytes: u64,
+        full_rgba_bytes: u64,
+        jpeg_bytes: u64,
+    ) -> Self {
+        Self {
+            thumb_rgba_bytes,
+            browse_rgba_bytes,
+            full_rgba_bytes,
+            jpeg_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+/// Atomic size-estimate snapshot used by adaptive Full prefetch planning.
+pub struct FullPrefetchSnapshot {
+    /// Target payload bytes for the dedicated Full RGBA ring.
+    pub budget_bytes: u64,
+    /// Estimate for an image without a per-index observation.
+    pub fallback_bytes: u64,
+    /// Exact Full sizes or conservative estimates derived from Browse pixels.
+    pub known_bytes: HashMap<usize, u64>,
 }
 
 /// Current payload-byte usage for each in-memory cache ring.
@@ -309,6 +365,10 @@ impl<V: Clone> ByteLru<V> {
 pub struct RamCacheStats {
     /// Decoded Browse and Full RGBA payload bytes.
     pub rgba_bytes: u64,
+    /// Browse-quality portion of [`Self::rgba_bytes`].
+    pub browse_rgba_bytes: u64,
+    /// Full-resolution portion of [`Self::rgba_bytes`].
+    pub full_rgba_bytes: u64,
     /// Encoded JPEG payload bytes.
     pub jpeg_bytes: u64,
     /// Decoded thumbnail RGBA payload bytes.
@@ -317,10 +377,11 @@ pub struct RamCacheStats {
 
 /// Thread-safe, byte-budgeted cache shared by UI and worker threads.
 ///
-/// Thumbnails, developed RGBA buffers, and developed JPEGs occupy independent
-/// exact-LRU rings. Reads through `get_*` promote an entry; `has_*` probes do
-/// not. Pinned entries cannot be evicted, so a ring may temporarily exceed its
-/// configured budget when all possible victims are pinned.
+/// Thumbnails, Browse RGBA buffers, Full RGBA buffers, and developed JPEGs
+/// occupy independent exact-LRU rings. Reads through `get_*` promote an entry;
+/// `has_*` probes do not. Pinned entries cannot be evicted, so a ring may
+/// temporarily exceed its configured budget when all possible victims are
+/// pinned.
 ///
 /// All operations serialize through one mutex. A panic while that mutex is
 /// held poisons the cache and causes later operations to panic.
@@ -330,9 +391,13 @@ pub struct RamCache {
 
 struct Inner {
     thumbs: ByteLru<Arc<PixelBuf>>,
-    rgba: ByteLru<Arc<PixelBuf>>,
+    browse_rgba: ByteLru<Arc<PixelBuf>>,
+    full_rgba: ByteLru<Arc<PixelBuf>>,
     jpeg: ByteLru<Arc<Vec<u8>>>,
     pinned: HashSet<Key>,
+    full_working_set: HashSet<Key>,
+    observed_browse_bytes: HashMap<usize, u64>,
+    observed_full_bytes: HashMap<usize, u64>,
 }
 
 impl RamCache {
@@ -341,12 +406,26 @@ impl RamCache {
     ///
     /// A zero budget is valid: unpinned inserts are immediately evicted.
     pub fn new(thumb_budget: u64, rgba_budget: u64, jpeg_budget: u64) -> Self {
+        Self::with_budgets(RamCacheBudgets::new(
+            thumb_budget,
+            rgba_budget,
+            rgba_budget,
+            jpeg_budget,
+        ))
+    }
+
+    /// Creates empty rings from explicit independent byte budgets.
+    pub fn with_budgets(budgets: RamCacheBudgets) -> Self {
         Self {
             inner: Mutex::new(Inner {
-                thumbs: ByteLru::new(thumb_budget),
-                rgba: ByteLru::new(rgba_budget),
-                jpeg: ByteLru::new(jpeg_budget),
+                thumbs: ByteLru::new(budgets.thumb_rgba_bytes),
+                browse_rgba: ByteLru::new(budgets.browse_rgba_bytes),
+                full_rgba: ByteLru::new(budgets.full_rgba_bytes),
+                jpeg: ByteLru::new(budgets.jpeg_bytes),
                 pinned: HashSet::new(),
+                full_working_set: HashSet::new(),
+                observed_browse_bytes: HashMap::new(),
+                observed_full_bytes: HashMap::new(),
             }),
         }
     }
@@ -364,17 +443,61 @@ impl RamCache {
 
         for key in removed {
             inner.thumbs.set_pinned(&key, false);
-            inner.rgba.set_pinned(&key, false);
+            inner.browse_rgba.set_pinned(&key, false);
+            inner.full_rgba.set_pinned(&key, false);
             inner.jpeg.set_pinned(&key, false);
         }
         for key in added {
             inner.thumbs.set_pinned(&key, true);
-            inner.rgba.set_pinned(&key, true);
+            inner.browse_rgba.set_pinned(&key, true);
+            inner.full_rgba.set_pinned(&key, true);
             inner.jpeg.set_pinned(&key, true);
         }
         inner.pinned = new_pins;
         inner.thumbs.evict_over_budget();
-        inner.rgba.evict_over_budget();
+        inner.browse_rgba.evict_over_budget();
+        inner.full_rgba.evict_over_budget();
+        inner.jpeg.evict_over_budget();
+    }
+
+    /// Atomically installs navigation pins and the desired Full working set.
+    ///
+    /// Full entries outside `full_keys` are removed immediately even when the
+    /// ring is below budget. Later worker completions for those stale keys are
+    /// rejected by [`insert_rgba`](Self::insert_rgba) under the same mutex.
+    pub fn set_navigation_policy(
+        &self,
+        pins: impl IntoIterator<Item = Key>,
+        full_keys: impl IntoIterator<Item = Key>,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        let new_pins: HashSet<_> = pins.into_iter().collect();
+        let removed: Vec<_> = inner.pinned.difference(&new_pins).copied().collect();
+        let added: Vec<_> = new_pins.difference(&inner.pinned).copied().collect();
+        for key in removed {
+            inner.thumbs.set_pinned(&key, false);
+            inner.browse_rgba.set_pinned(&key, false);
+            inner.full_rgba.set_pinned(&key, false);
+            inner.jpeg.set_pinned(&key, false);
+        }
+        for key in added {
+            inner.thumbs.set_pinned(&key, true);
+            inner.browse_rgba.set_pinned(&key, true);
+            inner.full_rgba.set_pinned(&key, true);
+            inner.jpeg.set_pinned(&key, true);
+        }
+        inner.pinned = new_pins;
+        let full_working_set: HashSet<_> = full_keys
+            .into_iter()
+            .filter(|(_, tier)| *tier == Tier::Full)
+            .collect();
+        inner
+            .full_rgba
+            .retain_keys(|key| full_working_set.contains(key));
+        inner.full_working_set = full_working_set;
+        inner.thumbs.evict_over_budget();
+        inner.browse_rgba.evict_over_budget();
+        inner.full_rgba.evict_over_budget();
         inner.jpeg.evict_over_budget();
     }
 
@@ -387,7 +510,8 @@ impl RamCache {
         let mut inner = self.inner.lock().unwrap();
         match key.1 {
             Tier::Thumb => inner.thumbs.get(&key),
-            _ => inner.rgba.get(&key),
+            Tier::Browse => inner.browse_rgba.get(&key),
+            Tier::Full => inner.full_rgba.get(&key),
         }
     }
 
@@ -396,7 +520,8 @@ impl RamCache {
         let inner = self.inner.lock().unwrap();
         match key.1 {
             Tier::Thumb => inner.thumbs.contains(&key),
-            _ => inner.rgba.contains(&key),
+            Tier::Browse => inner.browse_rgba.contains(&key),
+            Tier::Full => inner.full_rgba.contains(&key),
         }
     }
 
@@ -414,13 +539,28 @@ impl RamCache {
     ///
     /// Payload size is the buffer's actual [`PixelBuf::byte_len`], even if its
     /// dimensions and storage length are inconsistent.
-    pub fn insert_rgba(&self, key: Key, buf: Arc<PixelBuf>) {
+    pub fn insert_rgba(&self, key: Key, buf: Arc<PixelBuf>) -> bool {
         let bytes = buf.byte_len() as u64;
         let mut inner = self.inner.lock().unwrap();
         let pinned = inner.pinned.contains(&key);
         match key.1 {
-            Tier::Thumb => inner.thumbs.insert(key, buf, bytes, pinned),
-            _ => inner.rgba.insert(key, buf, bytes, pinned),
+            Tier::Thumb => {
+                inner.thumbs.insert(key, buf, bytes, pinned);
+                inner.thumbs.contains(&key)
+            }
+            Tier::Browse => {
+                inner.observed_browse_bytes.insert(key.0, bytes);
+                inner.browse_rgba.insert(key, buf, bytes, pinned);
+                inner.browse_rgba.contains(&key)
+            }
+            Tier::Full => {
+                inner.observed_full_bytes.insert(key.0, bytes);
+                if !inner.full_working_set.contains(&key) {
+                    return false;
+                }
+                inner.full_rgba.insert(key, buf, bytes, pinned);
+                inner.full_rgba.contains(&key)
+            }
         }
     }
 
@@ -436,13 +576,39 @@ impl RamCache {
         self.inner.lock().unwrap().jpeg.remove(&key)
     }
 
-    /// Returns a payload-byte snapshot for all three rings.
+    /// Returns a payload-byte snapshot for all four rings.
     pub fn stats(&self) -> RamCacheStats {
         let inner = self.inner.lock().unwrap();
+        let browse_rgba_bytes = inner.browse_rgba.used_bytes();
+        let full_rgba_bytes = inner.full_rgba.used_bytes();
         RamCacheStats {
-            rgba_bytes: inner.rgba.used_bytes(),
+            rgba_bytes: browse_rgba_bytes.saturating_add(full_rgba_bytes),
+            browse_rgba_bytes,
+            full_rgba_bytes,
             jpeg_bytes: inner.jpeg.used_bytes(),
             thumb_bytes: inner.thumbs.used_bytes(),
+        }
+    }
+
+    /// Returns one lock-consistent Full budget and size-estimate snapshot.
+    pub fn full_prefetch_snapshot(&self) -> FullPrefetchSnapshot {
+        let inner = self.inner.lock().unwrap();
+        let mut known_bytes = inner.observed_full_bytes.clone();
+        for (&index, &bytes) in &inner.observed_browse_bytes {
+            known_bytes
+                .entry(index)
+                .or_insert_with(|| bytes.saturating_mul(5));
+        }
+        let fallback_bytes = known_bytes
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(DEFAULT_FULL_RESERVATION_BYTES)
+            .max(1);
+        FullPrefetchSnapshot {
+            budget_bytes: inner.full_rgba.budget_bytes(),
+            fallback_bytes,
+            known_bytes,
         }
     }
 }
@@ -740,6 +906,71 @@ mod tests {
         let stats = cache.stats();
         assert!(stats.rgba_bytes <= 256);
         assert!(stats.jpeg_bytes <= 128);
+    }
+
+    #[test]
+    fn full_working_set_evicts_stale_full_without_touching_other_rings() {
+        let cache = RamCache::with_budgets(RamCacheBudgets::new(16, 16, 64, 16));
+        let old_full = (0, Tier::Full);
+        let kept_full = (1, Tier::Full);
+        cache.set_navigation_policy(
+            [(0, Tier::Thumb), (0, Tier::Browse), kept_full],
+            [old_full, kept_full],
+        );
+        assert!(cache.insert_rgba((0, Tier::Thumb), buf(8)));
+        assert!(cache.insert_rgba((0, Tier::Browse), buf(8)));
+        assert!(cache.insert_rgba(old_full, buf(8)));
+        assert!(cache.insert_rgba(kept_full, buf(8)));
+        cache.insert_jpeg((0, Tier::Browse), Arc::new(vec![1; 8]));
+
+        cache.set_navigation_policy(
+            [(0, Tier::Thumb), (0, Tier::Browse), kept_full],
+            [kept_full],
+        );
+
+        assert!(!cache.has_rgba(old_full));
+        assert!(cache.has_rgba(kept_full));
+        assert!(cache.has_rgba((0, Tier::Thumb)));
+        assert!(cache.has_rgba((0, Tier::Browse)));
+        assert!(cache.has_jpeg((0, Tier::Browse)));
+    }
+
+    #[test]
+    fn late_full_completion_outside_the_working_set_is_rejected() {
+        let cache = RamCache::with_budgets(RamCacheBudgets::new(0, 0, 64, 0));
+        cache.set_navigation_policy([], [(1, Tier::Full)]);
+
+        assert!(!cache.insert_rgba((0, Tier::Full), buf(8)));
+        assert!(cache.insert_rgba((1, Tier::Full), buf(8)));
+        assert!(!cache.has_rgba((0, Tier::Full)));
+        assert!(cache.has_rgba((1, Tier::Full)));
+    }
+
+    #[test]
+    fn full_eviction_releases_the_cache_arc_owner() {
+        let cache = RamCache::with_budgets(RamCacheBudgets::new(0, 0, 64, 0));
+        cache.set_navigation_policy([], [(0, Tier::Full)]);
+        let pixels = buf(8);
+        let weak = Arc::downgrade(&pixels);
+        assert!(cache.insert_rgba((0, Tier::Full), pixels));
+
+        cache.set_navigation_policy([], []);
+
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn full_prefetch_snapshot_uses_exact_full_and_conservative_browse_estimates() {
+        let cache = RamCache::with_budgets(RamCacheBudgets::new(0, 64, 1_000, 0));
+        cache.set_navigation_policy([], [(2, Tier::Full)]);
+        assert!(cache.insert_rgba((1, Tier::Browse), buf(10)));
+        assert!(cache.insert_rgba((2, Tier::Full), buf(24)));
+
+        let snapshot = cache.full_prefetch_snapshot();
+        assert_eq!(snapshot.budget_bytes, 1_000);
+        assert_eq!(snapshot.known_bytes.get(&1), Some(&50));
+        assert_eq!(snapshot.known_bytes.get(&2), Some(&24));
+        assert_eq!(snapshot.fallback_bytes, 50);
     }
 
     fn model_key(value: usize) -> Key {

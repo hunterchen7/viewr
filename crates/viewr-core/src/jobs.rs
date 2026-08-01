@@ -1238,7 +1238,7 @@ impl Engine {
         for target in targets {
             let id = (target.index, target.tier);
             match target.kind {
-                PlanKind::Display => {
+                PlanKind::Display | PlanKind::Prefetch => {
                     if cache.has_rgba(id) {
                         continue;
                     }
