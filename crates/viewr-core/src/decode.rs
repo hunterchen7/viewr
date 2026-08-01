@@ -156,6 +156,18 @@ mod tests {
             })
     }
 
+    fn assert_ui_metadata_consistent(first: &FileMeta, second: &FileMeta) {
+        assert_eq!(first.orient, second.orient);
+        assert_eq!(first.rating, second.rating);
+        assert_eq!(first.camera, second.camera);
+        assert_eq!(first.lens, second.lens);
+        assert_eq!(first.iso, second.iso);
+        assert_eq!(first.shutter, second.shutter);
+        assert_eq!(first.aperture, second.aperture);
+        assert_eq!(first.focal_mm, second.focal_mm);
+        assert_eq!(first.captured, second.captured);
+    }
+
     #[test]
     #[ignore = "requires the pinned public-domain Sony RAW fixture or VIEWR_TEST_RAW"]
     fn real_sony_raw_decode_thumbnail_and_metadata_are_consistent() {
@@ -167,9 +179,7 @@ mod tests {
 
         assert!(decoded.raw.width > 0);
         assert!(decoded.raw.height > 0);
-        assert_eq!(metadata.orient, result.meta.orient);
-        assert_eq!(metadata.rating, result.meta.rating);
-        assert_eq!(metadata.camera, result.meta.camera);
+        assert_ui_metadata_consistent(&metadata, &result.meta);
         assert!(!metadata.camera.is_empty());
         assert!(result.thumb.width > 0);
         assert!(result.thumb.height > 0);
@@ -191,9 +201,7 @@ mod tests {
         let metadata = metadata(&path).expect("portrait fixture metadata decodes");
 
         assert_eq!(result.meta.orient, Orient::R270);
-        assert_eq!(metadata.orient, result.meta.orient);
-        assert_eq!(metadata.rating, result.meta.rating);
-        assert_eq!(metadata.camera, result.meta.camera);
+        assert_ui_metadata_consistent(&metadata, &result.meta);
         assert_eq!(result.thumb.height, 360);
         assert!(result.thumb.height > result.thumb.width);
         assert_eq!(

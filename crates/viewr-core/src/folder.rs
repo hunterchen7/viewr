@@ -551,7 +551,7 @@ pub fn scan(dir: &Path) -> io::Result<Vec<FolderEntry>> {
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+                .and_then(duration_as_mtime_ns)
                 .unwrap_or(0);
             Some(FolderEntry {
                 path: entry_path,
@@ -563,6 +563,10 @@ pub fn scan(dir: &Path) -> io::Result<Vec<FolderEntry>> {
         .collect();
     entries.sort_by(|a, b| a.file_name.cmp(&b.file_name));
     Ok(entries)
+}
+
+fn duration_as_mtime_ns(duration: std::time::Duration) -> Option<i64> {
+    i64::try_from(duration.as_nanos()).ok()
 }
 
 /// Iteration order for background work: outward from `start`, forward-biased
@@ -597,12 +601,24 @@ pub fn outward_order(len: usize, start: usize) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        duration_as_mtime_ns, normalize_physical_path, outward_order, scan,
+        sidecar_owner_collision_token, sidecar_owner_key, sidecar_owner_keys,
+    };
     #[cfg(windows)]
     use super::{legacy_windows_path_spellings, path_spelling_family, path_spelling_is_stable};
-    use super::{
-        normalize_physical_path, outward_order, scan, sidecar_owner_collision_token,
-        sidecar_owner_key, sidecar_owner_keys,
-    };
+
+    #[test]
+    fn modification_timestamp_conversion_never_wraps() {
+        assert_eq!(
+            duration_as_mtime_ns(std::time::Duration::from_nanos(i64::MAX as u64)),
+            Some(i64::MAX)
+        );
+        assert_eq!(
+            duration_as_mtime_ns(std::time::Duration::from_nanos(i64::MAX as u64 + 1)),
+            None
+        );
+    }
 
     #[test]
     fn collision_tokens_cover_extension_case_and_unicode_aliases() {

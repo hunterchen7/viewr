@@ -1077,6 +1077,29 @@ mod tests {
     }
 
     #[test]
+    fn partial_image_info_table_keeps_field_defaults() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [ui.image_info]
+            position = "below"
+            lens = false
+            "#,
+        )
+        .unwrap();
+
+        let configured = Config::from_raw(raw).image_info;
+
+        assert_eq!(configured.position, ImageInfoPosition::Below);
+        assert!(!configured.fields.lens);
+        assert!(configured.enabled);
+        assert!(configured.fields.file_name);
+        assert!(configured.fields.captured);
+        assert!(configured.fields.modified);
+        assert!(configured.fields.iso);
+        assert!(configured.fields.file_size);
+    }
+
+    #[test]
     fn durable_config_replacement_publishes_complete_contents() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("viewr.toml");

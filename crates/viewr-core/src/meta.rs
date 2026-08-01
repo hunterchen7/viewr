@@ -126,33 +126,28 @@ impl FileMeta {
             lens: md
                 .lens
                 .as_ref()
-                .map(|l| l.lens_name.clone())
-                .or_else(|| exif.lens_model.clone())
-                .and_then(|lens| {
-                    let lens = lens.trim().to_owned();
-                    (!lens.is_empty()).then_some(lens)
+                .and_then(|lens| nonempty_trimmed(&lens.lens_name))
+                .or_else(|| exif.lens_model.as_deref().and_then(nonempty_trimmed)),
+            iso: display_iso(exif),
+            shutter: exif
+                .exposure_time
+                .filter(|r| r.n != 0 && r.d != 0)
+                .map(|r| {
+                    if r.n == 1 {
+                        format!("1/{}", r.d)
+                    } else if r.d == 1 {
+                        format!("{}s", r.n)
+                    } else {
+                        format!("{:.1}s", r.n as f64 / r.d as f64)
+                    }
                 }),
-            iso: exif
-                .iso_speed_ratings
-                .map(u32::from)
-                .or(exif.iso_speed)
-                .or(exif.recommended_exposure_index),
-            shutter: exif.exposure_time.filter(|r| r.d != 0).map(|r| {
-                if r.n == 1 {
-                    format!("1/{}", r.d)
-                } else if r.d == 1 {
-                    format!("{}s", r.n)
-                } else {
-                    format!("{:.1}s", r.n as f64 / r.d as f64)
-                }
-            }),
             aperture: exif
                 .fnumber
-                .filter(|r| r.d != 0)
+                .filter(|r| r.n != 0 && r.d != 0)
                 .map(|r| format!("f/{:.1}", r.n as f64 / r.d as f64)),
             focal_mm: exif
                 .focal_length
-                .filter(|r| r.d != 0)
+                .filter(|r| r.n != 0 && r.d != 0)
                 .map(|r| r.n as f32 / r.d as f32),
             captured: exif
                 .date_time_original
@@ -164,6 +159,14 @@ impl FileMeta {
                         exif.offset_time_original.as_deref(),
                     )
                 })
+                .map(|timestamp| {
+                    timestamp.with_legacy_offset(
+                        exif.timezone_offset
+                            .as_deref()
+                            .and_then(|offsets| offsets.first())
+                            .copied(),
+                    )
+                })
                 .or_else(|| {
                     exif.create_date.as_deref().and_then(|date| {
                         CaptureTimestamp::from_exif_parts(
@@ -172,16 +175,31 @@ impl FileMeta {
                             exif.offset_time_digitized.as_deref(),
                         )
                     })
-                })
-                .map(|timestamp| {
-                    timestamp.with_legacy_offset(
-                        exif.timezone_offset
-                            .as_deref()
-                            .and_then(|offsets| offsets.first())
-                            .copied(),
-                    )
                 }),
         }
+    }
+}
+
+fn nonempty_trimmed(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn display_iso(exif: &rawler::exif::Exif) -> Option<u32> {
+    let legacy = exif
+        .iso_speed_ratings
+        .filter(|iso| *iso != 0 && *iso != u16::MAX)
+        .map(u32::from);
+    let iso_speed = exif.iso_speed.filter(|iso| *iso != 0);
+    let recommended = exif.recommended_exposure_index.filter(|iso| *iso != 0);
+    match exif.sensitivity_type {
+        // Recommended exposure index, optionally with standard output sensitivity.
+        Some(2 | 4) => recommended.or(legacy).or(iso_speed),
+        // ISO speed is explicitly present (possibly alongside other measures).
+        Some(3 | 5 | 6 | 7) => iso_speed.or(legacy).or(recommended),
+        // Rawler does not currently expose StandardOutputSensitivity, so use
+        // whichever modern numeric sensitivity the file did provide.
+        _ => legacy.or(iso_speed).or(recommended),
     }
 }
 
@@ -190,6 +208,7 @@ mod tests {
     use super::FileMeta;
     use rawler::decoders::RawMetadata;
     use rawler::formats::tiff::Rational;
+    use rawler::lens::{LensDescription, LensIdentifier};
 
     #[test]
     fn malformed_zero_denominator_rationals_are_omitted() {
@@ -197,6 +216,20 @@ mod tests {
         metadata.exif.exposure_time = Some(Rational { n: 1, d: 0 });
         metadata.exif.fnumber = Some(Rational { n: 28, d: 0 });
         metadata.exif.focal_length = Some(Rational { n: 50, d: 0 });
+
+        let file = FileMeta::from_metadata(&metadata);
+
+        assert_eq!(file.shutter, None);
+        assert_eq!(file.aperture, None);
+        assert_eq!(file.focal_mm, None);
+    }
+
+    #[test]
+    fn zero_numerator_exposure_values_are_omitted() {
+        let mut metadata = RawMetadata::default();
+        metadata.exif.exposure_time = Some(Rational { n: 0, d: 1 });
+        metadata.exif.fnumber = Some(Rational { n: 0, d: 10 });
+        metadata.exif.focal_length = Some(Rational { n: 0, d: 1 });
 
         let file = FileMeta::from_metadata(&metadata);
 
@@ -285,5 +318,84 @@ mod tests {
 
         metadata.exif.iso_speed_ratings = Some(6_400);
         assert_eq!(FileMeta::from_metadata(&metadata).iso, Some(6_400));
+
+        metadata.exif.iso_speed_ratings = Some(u16::MAX);
+        metadata.exif.iso_speed = Some(204_800);
+        assert_eq!(FileMeta::from_metadata(&metadata).iso, Some(204_800));
+
+        metadata.exif.sensitivity_type = Some(2);
+        metadata.exif.recommended_exposure_index = Some(102_400);
+        assert_eq!(FileMeta::from_metadata(&metadata).iso, Some(102_400));
+
+        metadata.exif.sensitivity_type = Some(3);
+        assert_eq!(FileMeta::from_metadata(&metadata).iso, Some(204_800));
+
+        metadata.exif.iso_speed_ratings = Some(6_400);
+        assert_eq!(FileMeta::from_metadata(&metadata).iso, Some(204_800));
+
+        metadata.exif.iso_speed_ratings = Some(0);
+        metadata.exif.iso_speed = Some(0);
+        metadata.exif.recommended_exposure_index = Some(0);
+        assert_eq!(FileMeta::from_metadata(&metadata).iso, None);
+    }
+
+    #[test]
+    fn blank_decoded_lens_falls_back_to_a_trimmed_exif_model() {
+        let mut metadata = RawMetadata {
+            lens: Some(LensDescription {
+                identifiers: LensIdentifier {
+                    name: Some("blank-test".into()),
+                    id: None,
+                    nikon_id: None,
+                    olympus_id: None,
+                },
+                mount: String::new(),
+                lens_make: String::new(),
+                lens_model: String::new(),
+                focal_range: [Rational { n: 0, d: 1 }; 2],
+                aperture_range: [Rational { n: 0, d: 1 }; 2],
+                lens_name: " \t ".into(),
+            }),
+            ..RawMetadata::default()
+        };
+        metadata.exif.lens_model = Some("  EXIF Lens  ".into());
+
+        assert_eq!(
+            FileMeta::from_metadata(&metadata).lens.as_deref(),
+            Some("EXIF Lens")
+        );
+    }
+
+    #[test]
+    fn legacy_capture_timezone_uses_the_first_recorded_offset() {
+        let mut metadata = RawMetadata::default();
+        metadata.exif.date_time_original = Some("2024:01:02 03:04:05".into());
+        metadata.exif.timezone_offset = Some(vec![-7, 2]);
+
+        assert_eq!(
+            FileMeta::from_metadata(&metadata)
+                .captured
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("2024-01-02 03:04:05 -07:00")
+        );
+    }
+
+    #[test]
+    fn legacy_original_timezone_is_not_attached_to_create_date_fallback() {
+        let mut metadata = RawMetadata::default();
+        metadata.exif.date_time_original = Some("not a date".into());
+        metadata.exif.create_date = Some("2024:01:02 03:04:05".into());
+        metadata.exif.timezone_offset = Some(vec![-7, 2]);
+
+        assert_eq!(
+            FileMeta::from_metadata(&metadata)
+                .captured
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("2024-01-02 03:04:05")
+        );
     }
 }

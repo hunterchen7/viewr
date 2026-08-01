@@ -82,8 +82,11 @@ Zoom framing persists across images — cull a burst at 100% comparing
 the same detail. Viewr also restores the last window size and position.
 
 The Preferences window controls the loading message, performance details,
-exposure details, cache indicator, processing-thread limit, budgets, and cache
-JPEG quality. The cache indicator has border, mark, and hidden modes.
+cache indicator, processing-thread limit, budgets, and cache JPEG quality. A
+separate image-information strip can sit above or below the loupe; filename,
+camera and lens, capture and modified timestamps, exposure, focal length, and
+file size can each be shown or hidden. The cache indicator has border, mark,
+and hidden modes.
 Processing and cache changes apply when the next folder is opened. All binds,
 loupe scroll behavior, and optional vertical scrolling of the horizontal
 filmstrip are also configurable.

@@ -138,7 +138,7 @@ fn compact_value(value: &str) -> Option<String> {
         if chars >= MAX_VALUE_CHARS {
             break;
         }
-        if pending_space && chars < MAX_VALUE_CHARS {
+        if pending_space && chars + 1 < MAX_VALUE_CHARS {
             compact.push(' ');
             chars += 1;
         }
@@ -169,21 +169,61 @@ fn format_file_size(bytes: u64) -> String {
 }
 
 fn format_modified_time(mtime_ns: i64) -> Option<String> {
+    let utc = modified_utc(mtime_ns)?;
+    let local_offset = *utc.with_timezone(&Local).offset();
+    format_modified_time_at_offset(mtime_ns, local_offset)
+}
+
+fn modified_utc(mtime_ns: i64) -> Option<DateTime<Utc>> {
     if mtime_ns <= 0 {
         return None;
     }
     let seconds = mtime_ns.div_euclid(1_000_000_000);
     let nanoseconds = mtime_ns.rem_euclid(1_000_000_000) as u32;
-    let utc = DateTime::<Utc>::from_timestamp(seconds, nanoseconds)?;
+    DateTime::<Utc>::from_timestamp(seconds, nanoseconds)
+}
+
+fn format_modified_time_at_offset(mtime_ns: i64, offset: chrono::FixedOffset) -> Option<String> {
+    let utc = modified_utc(mtime_ns)?;
     Some(
-        utc.with_timezone(&Local)
+        utc.with_timezone(&offset)
             .format("%Y-%m-%d %H:%M:%S %:z")
             .to_string(),
     )
 }
 
-/// Renders a fixed-height, non-overlay strip and returns its consumed rectangle.
-pub(crate) fn show(
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ImageInfoLayout {
+    strip_rect: Option<egui::Rect>,
+    loupe_rect: egui::Rect,
+}
+
+impl ImageInfoLayout {
+    pub(crate) fn loupe_rect(self) -> egui::Rect {
+        debug_assert!(self.strip_rect.is_none_or(|strip| {
+            strip.bottom() <= self.loupe_rect.top() || self.loupe_rect.bottom() <= strip.top()
+        }));
+        self.loupe_rect
+    }
+}
+
+/// Reserves the fixed-height information strip before measuring the loupe.
+///
+/// Keeping these operations together prevents future call sites from measuring
+/// the image first and accidentally turning the strip into an overlap.
+pub(crate) fn reserve_loupe(
+    ui: &mut egui::Ui,
+    position: ImageInfoPosition,
+    items: &[ImageInfoItem],
+) -> ImageInfoLayout {
+    let strip_rect = show(ui, position, items);
+    ImageInfoLayout {
+        strip_rect,
+        loupe_rect: ui.available_rect_before_wrap(),
+    }
+}
+
+fn show(
     ui: &mut egui::Ui,
     position: ImageInfoPosition,
     items: &[ImageInfoItem],
@@ -191,16 +231,6 @@ pub(crate) fn show(
     if items.is_empty() {
         return None;
     }
-    let compact = items
-        .iter()
-        .map(|item| item.text.as_str())
-        .collect::<Vec<_>>()
-        .join("  ·  ");
-    let details = items
-        .iter()
-        .map(|item| item.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
     let panel = match position {
         ImageInfoPosition::Above => egui::Panel::top("image-information"),
         ImageInfoPosition::Below => egui::Panel::bottom("image-information"),
@@ -209,12 +239,29 @@ pub(crate) fn show(
         panel
             .exact_size(STRIP_HEIGHT)
             .show(ui, |ui| {
-                ui.centered_and_justified(|ui| {
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(compact).weak().size(12.0)).truncate(),
-                    )
-                    .on_hover_text(details);
-                });
+                egui::ScrollArea::horizontal()
+                    .id_salt("image-information-fields")
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: egui::scroll_area::DragScroll::Always,
+                        ..Default::default()
+                    })
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.horizontal_centered(|ui| {
+                            for (index, item) in items.iter().enumerate() {
+                                if index != 0 {
+                                    ui.label(egui::RichText::new("·").weak().size(12.0));
+                                }
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&item.text).weak().size(12.0),
+                                    )
+                                    .extend(),
+                                );
+                            }
+                        });
+                    });
             })
             .response
             .rect,
@@ -381,6 +428,50 @@ mod tests {
                 .iter()
                 .all(|item| item.text.chars().count() <= MAX_ITEM_CHARS)
         );
+        assert!(items.iter().all(|item| !item.text.ends_with(' ')));
+    }
+
+    #[test]
+    fn invalid_modified_timestamps_are_omitted_without_panicking() {
+        assert_eq!(format_modified_time(i64::MIN), None);
+        assert_eq!(format_modified_time(-1), None);
+        assert_eq!(format_modified_time(0), None);
+        let _ = format_modified_time(i64::MAX);
+    }
+
+    #[test]
+    fn field_text_is_explicit_and_stable() {
+        let mut config = ImageInfoConfig::default();
+        config.fields.modified = false;
+
+        let items = build_items(&config, &entry(), Some(&metadata()));
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "File test.ARW",
+                "Captured 2024-01-02 03:04:05.25 -07:00",
+                "Camera Sony A1",
+                "Lens FE 50mm F1.2 GM",
+                "ISO 800",
+                "Shutter 1/1000",
+                "Aperture f/2.8",
+                "Focal 50 mm",
+                "Size 24.5 MB",
+            ]
+        );
+    }
+
+    #[test]
+    fn modified_time_format_is_deterministic_for_an_explicit_offset() {
+        let offset = chrono::FixedOffset::east_opt(5 * 60 * 60 + 30 * 60).unwrap();
+        assert_eq!(
+            format_modified_time_at_offset(1_704_164_645_000_000_000, offset).as_deref(),
+            Some("2024-01-02 08:34:05 +05:30")
+        );
     }
 
     fn layout(
@@ -404,8 +495,9 @@ mod tests {
                 .show(ui, |_| {})
                 .response
                 .rect;
-            info_rect = show(ui, position, items);
-            loupe_rect = ui.available_rect_before_wrap();
+            let layout = reserve_loupe(ui, position, items);
+            info_rect = layout.strip_rect;
+            loupe_rect = layout.loupe_rect;
         });
         (info_rect, loupe_rect, filmstrip_rect)
     }
