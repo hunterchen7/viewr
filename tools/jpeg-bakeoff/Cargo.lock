@@ -1916,6 +1916,7 @@ name = "viewr-core"
 version = "0.3.0"
 dependencies = [
  "blake3",
+ "chrono",
  "dirs",
  "fast_image_resize",
  "icu_casemap",

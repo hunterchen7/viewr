@@ -11,6 +11,7 @@ benchmarks = ["dep:criterion"]
 
 [dependencies]
 rawler.workspace = true
+chrono.workspace = true
 rayon.workspace = true
 thiserror.workspace = true
 image.workspace = true
