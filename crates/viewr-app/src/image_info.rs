@@ -251,12 +251,18 @@ fn show(
                         ui.horizontal_centered(|ui| {
                             for (index, item) in items.iter().enumerate() {
                                 if index != 0 {
-                                    ui.label(egui::RichText::new("·").weak().size(12.0));
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new("·").weak().size(12.0),
+                                        )
+                                        .selectable(false),
+                                    );
                                 }
                                 ui.add(
                                     egui::Label::new(
                                         egui::RichText::new(&item.text).weak().size(12.0),
                                     )
+                                    .selectable(false)
                                     .extend(),
                                 );
                             }
