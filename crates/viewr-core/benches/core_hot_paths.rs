@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use viewr_core::cache_disk::DiskCache;
-use viewr_core::cache_ram::RamCache;
+use viewr_core::cache_ram::{RamCache, RamCacheBudgets};
 use viewr_core::db::{
     Db, benchmark_insert_rating, benchmark_pending_sidecars, benchmark_rating_cardinalities,
     benchmark_rating_lookup,
@@ -18,7 +18,9 @@ use viewr_core::jobs::{
     benchmark_encode_jpeg_plain, benchmark_jpeg_quality, decode_jpeg, encode_jpeg,
 };
 use viewr_core::library::{benchmark_load_ratings_legacy_full_scan, try_load_ratings_with_owners};
-use viewr_core::planning::build_plan_targets;
+use viewr_core::planning::{
+    FullPrefetchBudget, build_plan_targets, build_plan_targets_with_full_prefetch,
+};
 use viewr_core::resize::{apply_orient, downscale_to_fit, resize_exact};
 use viewr_core::types::{Orient, PixelBuf, Tier};
 use viewr_core::xmp::{parse_rating, update_rating_xml};
@@ -83,6 +85,8 @@ fn bench_navigation_plan(c: &mut Criterion) {
     group.sample_size(20);
     group.warm_up_time(Duration::from_millis(300));
     group.measurement_time(Duration::from_millis(1_500));
+    let adaptive_budget =
+        FullPrefetchBudget::new(1024 * 1024 * 1024, 128 * 1024 * 1024, Default::default());
 
     for len in [100_usize, 1_000, 10_000] {
         group.bench_with_input(BenchmarkId::new("identity", len), &len, |b, &len| {
@@ -97,6 +101,24 @@ fn bench_navigation_plan(c: &mut Criterion) {
                 ))
             });
         });
+
+        group.bench_with_input(
+            BenchmarkId::new("adaptive_identity", len),
+            &len,
+            |b, &len| {
+                b.iter(|| {
+                    black_box(build_plan_targets_with_full_prefetch(
+                        black_box(len),
+                        black_box(len / 2),
+                        black_box(1),
+                        black_box(false),
+                        black_box(&[]),
+                        black_box(&adaptive_budget),
+                        black_box(false),
+                    ))
+                });
+            },
+        );
 
         // This includes the production heap/index synchronization but keeps
         // decoder threads and filesystem cache probes out of the measurement.
@@ -113,6 +135,19 @@ fn bench_navigation_plan(c: &mut Criterion) {
                 b.iter(|| {
                     queue_current = (queue_current + 1) % len;
                     black_box(queue.navigate(black_box(queue_current)))
+                });
+            },
+        );
+
+        let fixed_queue = BenchmarkNavigationQueue::new(len);
+        let mut fixed_current = len / 2;
+        group.bench_with_input(
+            BenchmarkId::new("fixed_queue_sync_reference", len),
+            &len,
+            |b, &len| {
+                b.iter(|| {
+                    fixed_current = (fixed_current + 1) % len;
+                    black_box(fixed_queue.navigate_fixed_reference(black_box(fixed_current)))
                 });
             },
         );
@@ -1490,11 +1525,12 @@ fn bench_ram_cache(c: &mut Criterion) {
     let rgba = Arc::new(synthetic_photo(512, 384));
     let rgba_bytes = rgba.byte_len() as u64;
     let jpeg = Arc::new(encode_jpeg(&rgba, 85).expect("cache fixture must encode"));
-    let cache = RamCache::new(
+    let cache = RamCache::new(RamCacheBudgets::new(
         0,
         rgba_bytes * RESIDENT_ENTRIES as u64,
+        0,
         jpeg.len() as u64 * RESIDENT_ENTRIES as u64,
-    );
+    ));
 
     for index in 0..RESIDENT_ENTRIES {
         cache.insert_rgba((index, Tier::Browse), Arc::clone(&rgba));
@@ -1527,7 +1563,7 @@ fn bench_ram_cache(c: &mut Criterion) {
 
     // Reuse the payload so this isolates LRU/hash-map churn rather than buffer
     // allocation. Every insert has a fresh key and evicts one resident entry.
-    let churn = RamCache::new(0, rgba_bytes * 8, 0);
+    let churn = RamCache::new(RamCacheBudgets::new(0, rgba_bytes * 8, 0, 0));
     for index in 0..8 {
         churn.insert_rgba((index, Tier::Browse), Arc::clone(&rgba));
     }
@@ -1557,7 +1593,7 @@ fn bench_ram_cache_eviction_scaling(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
 
     for entries in [8_usize, 128, 1_024, 10_000] {
-        let cache = RamCache::new(0, entries as u64 * 4, 0);
+        let cache = RamCache::new(RamCacheBudgets::new(0, entries as u64 * 4, 0, 0));
         for index in 0..entries {
             cache.insert_rgba((index, Tier::Browse), Arc::clone(&payload));
         }

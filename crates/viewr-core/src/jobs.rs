@@ -24,11 +24,15 @@ use std::time::Duration;
 
 use crate::cache_disk::{DEFAULT_CACHE_JPEG_QUALITY, DiskCache};
 use crate::cache_ram::RamCache;
+#[cfg(test)]
+use crate::cache_ram::RamCacheBudgets;
 use crate::decode;
 use crate::develop::{Quality, develop};
 use crate::folder::{FolderEntry, outward_order};
 use crate::meta::FileMeta;
-use crate::planning::{PlanKind, build_plan_targets};
+#[cfg(feature = "benchmarks")]
+use crate::planning::build_plan_targets;
+use crate::planning::{FullPrefetchBudget, PlanKind, build_plan_targets_with_full_prefetch};
 use crate::resize::apply_orient;
 use crate::types::{PixelBuf, Tier};
 
@@ -171,10 +175,33 @@ enum Action {
     Metadata,
     Thumb,
     Develop(Quality),
+    /// Populate only the adaptive Full RGBA working set. Existing RAM/disk
+    /// JPEGs may be rehydrated, but a RAW miss is not encoded or persisted.
+    PrefetchFull,
     /// Develop only to fill ring 2 + disk (P3 folder warm): no RGBA
     /// insert, no event — keeps far images from thrashing ring 1.
     WarmDevelop(Quality),
     Rehydrate,
+}
+
+impl Action {
+    fn compatible_with(self, requested: Self) -> bool {
+        self == requested
+            || matches!(
+                (self, requested),
+                (
+                    Self::PrefetchFull,
+                    Self::Develop(Quality::Full) | Self::Rehydrate
+                ) | (
+                    Self::Develop(Quality::Full) | Self::Rehydrate,
+                    Self::PrefetchFull
+                )
+            )
+    }
+
+    fn is_speculative_full(self) -> bool {
+        self == Self::PrefetchFull
+    }
 }
 
 struct QueuedJob {
@@ -563,8 +590,10 @@ impl JobQueue {
                 .get(id)
                 .is_some_and(|background| Arc::ptr_eq(&background.token, &running.token));
             let wanted_action = state.queued.get(id).map(|wanted| wanted.action);
-            if (!is_background && wanted_action != Some(running.action))
-                || (is_background && wanted_action.is_some_and(|action| action != running.action))
+            if (!is_background
+                && !wanted_action.is_some_and(|action| running.action.compatible_with(action)))
+                || (is_background
+                    && wanted_action.is_some_and(|action| !running.action.compatible_with(action)))
             {
                 running.token.cancel();
             }
@@ -578,11 +607,9 @@ impl JobQueue {
         for (id, class, eff_dist, action) in plan {
             // Skip only if a LIVE instance is already running; a cancelled
             // in-flight instance won't publish, so queue a fresh one.
-            if state
-                .in_flight
-                .get(&id)
-                .is_some_and(|running| running.action == action && !running.token.cancelled())
-            {
+            if state.in_flight.get(&id).is_some_and(|running| {
+                running.action.compatible_with(action) && !running.token.cancelled()
+            }) {
                 state.queued.remove(&id);
                 continue;
             }
@@ -676,6 +703,102 @@ impl JobQueue {
         true
     }
 
+    fn claim(
+        state: &mut QueueState,
+        id: JobId,
+        action: Action,
+    ) -> (JobId, Action, Arc<CancelToken>) {
+        let token = Arc::new(CancelToken::default());
+        state.in_flight.insert(
+            id,
+            InFlight {
+                action,
+                token: token.clone(),
+            },
+        );
+        (id, action, token)
+    }
+
+    /// Claims the highest-priority runnable job without waiting.
+    fn try_claim_locked(state: &mut QueueState) -> Option<(JobId, Action, Arc<CancelToken>)> {
+        let urgent_len = state.urgent.len();
+        for _ in 0..urgent_len {
+            let (id, action) = state
+                .urgent
+                .pop_front()
+                .expect("urgent length was captured under the queue lock");
+            if let Some(running) = state.in_flight.get(&id) {
+                if running.action == action && !running.token.cancelled() {
+                    continue;
+                }
+                // Cooperative cancellation cannot interrupt a decoder. Keep
+                // the replacement pending until the old generation exits so
+                // one file is never decoded concurrently by two workers.
+                running.token.cancel();
+                state.urgent.push_back((id, action));
+                continue;
+            }
+            // Invalidate a background copy only when this urgent copy is
+            // actually claimed. Until then, replacing the urgent viewport
+            // leaves the original background priority untouched.
+            state.queued.remove(&id);
+            return Some(Self::claim(state, id, action));
+        }
+
+        let speculative_full_active = state
+            .in_flight
+            .values()
+            .any(|running| running.action.is_speculative_full());
+        let mut blocked = Vec::new();
+        let mut selected = None;
+        while let Some(job) = state.heap.pop() {
+            if state.queued.get(&job.id).map(|queued| queued.epoch) != Some(job.epoch) {
+                continue; // superseded by a newer plan
+            }
+            if state.in_flight.contains_key(&job.id)
+                || (job.action.is_speculative_full() && speculative_full_active)
+            {
+                blocked.push(job);
+                continue;
+            }
+            state.queued.remove(&job.id);
+            selected = Some(Self::claim(state, job.id, job.action));
+            break;
+        }
+        state.heap.extend(blocked);
+        if selected.is_some() {
+            return selected;
+        }
+
+        // Persistent folder warming is strictly below both replaceable lanes
+        // and owns at most one worker. A speculative Full job may use one more,
+        // leaving at least one heavy dispatcher ready for foreground work.
+        if !state.background_in_flight.is_empty() {
+            return None;
+        }
+        let background_len = state.background.len();
+        for _ in 0..background_len {
+            let (id, action) = state
+                .background
+                .pop_front()
+                .expect("background length was captured under the queue lock");
+            if state.in_flight.contains_key(&id) {
+                state.background.push_back((id, action));
+                continue;
+            }
+            let claimed = Self::claim(state, id, action);
+            state.background_in_flight.insert(
+                id,
+                InFlight {
+                    action,
+                    token: claimed.2.clone(),
+                },
+            );
+            return Some(claimed);
+        }
+        None
+    }
+
     /// Block until a valid job is available (or shutdown).
     fn pop(&self) -> Option<(JobId, Action, Arc<CancelToken>)> {
         let mut state = self.state.lock().unwrap();
@@ -683,78 +806,19 @@ impl JobQueue {
             if state.closed {
                 return None;
             }
-            while let Some((id, action)) = state.urgent.pop_front() {
-                if state
-                    .in_flight
-                    .get(&id)
-                    .is_some_and(|running| running.action == action && !running.token.cancelled())
-                {
-                    continue;
-                }
-                // Invalidate a background copy only when this urgent copy is
-                // actually claimed. Until then, replacing the urgent viewport
-                // leaves the original background priority untouched.
-                state.queued.remove(&id);
-                if let Some(displaced) = state.in_flight.get(&id) {
-                    displaced.token.cancel();
-                }
-                let token = Arc::new(CancelToken::default());
-                state.in_flight.insert(
-                    id,
-                    InFlight {
-                        action,
-                        token: token.clone(),
-                    },
-                );
-                return Some((id, action, token));
-            }
-            while let Some(job) = state.heap.pop() {
-                if state.queued.get(&job.id).map(|queued| queued.epoch) != Some(job.epoch) {
-                    continue; // superseded by a newer plan
-                }
-                state.queued.remove(&job.id);
-                let token = Arc::new(CancelToken::default());
-                state.in_flight.insert(
-                    job.id,
-                    InFlight {
-                        action: job.action,
-                        token: token.clone(),
-                    },
-                );
-                return Some((job.id, job.action, token));
-            }
-            // Persistent folder warming is strictly below both replaceable
-            // lanes. Rotate candidates whose foreground generation is still
-            // active; `finish` wakes us when one becomes runnable.
-            let background_len = state.background.len();
-            for _ in 0..background_len {
-                let (id, action) = state
-                    .background
-                    .pop_front()
-                    .expect("background length was captured under the queue lock");
-                if state.in_flight.contains_key(&id) {
-                    state.background.push_back((id, action));
-                    continue;
-                }
-                let token = Arc::new(CancelToken::default());
-                state.background_in_flight.insert(
-                    id,
-                    InFlight {
-                        action,
-                        token: token.clone(),
-                    },
-                );
-                state.in_flight.insert(
-                    id,
-                    InFlight {
-                        action,
-                        token: token.clone(),
-                    },
-                );
-                return Some((id, action, token));
+            if let Some(job) = Self::try_claim_locked(&mut state) {
+                return Some(job);
             }
             state = self.cond.wait(state).unwrap();
         }
+    }
+
+    #[cfg(test)]
+    fn try_pop(&self) -> Option<(JobId, Action, Arc<CancelToken>)> {
+        let mut state = self.state.lock().unwrap();
+        (!state.closed)
+            .then(|| Self::try_claim_locked(&mut state))
+            .flatten()
     }
 
     #[cfg(test)]
@@ -1199,8 +1263,9 @@ impl Engine {
     /// Call this after navigation or zoom changes and after image completion
     /// events. Obsolete jobs are cooperatively cancelled. Current and immediate
     /// visible neighbors are always requested and pinned at Full resolution;
-    /// zoom mode raises the current Full job's priority. The first call with a
-    /// disk cache also installs the one-shot folder-wide Browse warm lane.
+    /// farther Full renders grow to the dedicated ring's byte budget. Zoom
+    /// mode raises the current Full job's priority. The first call with a disk
+    /// cache also installs the one-shot folder-wide Browse warm lane.
     pub fn navigate(&self, nav: NavState) {
         let len = self.shared.entries.len();
         if len == 0 {
@@ -1213,6 +1278,12 @@ impl Engine {
         };
         let current = nav.current;
         let cache = &self.shared.cache;
+        let full_snapshot = cache.full_prefetch_snapshot();
+        let full_budget = FullPrefetchBudget::from_observations(
+            full_snapshot.budget_bytes,
+            full_snapshot.fallback_bytes,
+            full_snapshot.exact_full_bytes,
+        );
 
         let disk = &self.shared.disk;
         let (pins, targets, navigation_changed) = {
@@ -1220,25 +1291,33 @@ impl Engine {
             let navigation_changed = navigation.update_navigation(nav);
             (
                 navigation_pins(len, current, &navigation.indices),
-                build_plan_targets(
+                build_plan_targets_with_full_prefetch(
                     len,
                     current,
                     nav.direction,
                     nav.zoomed,
                     &navigation.indices,
+                    &full_budget,
                     false,
                 ),
                 navigation_changed,
             )
         };
         // Filtered navigation pins visible neighbors rather than unrelated raw
-        // indices. Full buffers stay ready across fit/zoom transitions.
-        cache.set_pins(pins);
+        // indices. Installing the desired Full keys under that same cache lock
+        // also evicts stale speculative buffers and rejects late completions.
+        cache.set_navigation_policy(
+            pins,
+            targets
+                .iter()
+                .filter(|target| target.tier == Tier::Full)
+                .map(|target| (target.index, Tier::Full)),
+        );
         let mut plan: Vec<(JobId, u8, u32, Action)> = Vec::with_capacity(targets.len());
         for target in targets {
             let id = (target.index, target.tier);
             match target.kind {
-                PlanKind::Display | PlanKind::Prefetch => {
+                PlanKind::Display => {
                     if cache.has_rgba(id) {
                         continue;
                     }
@@ -1254,6 +1333,16 @@ impl Engine {
                         })
                     };
                     plan.push((id, target.class, target.effective_distance, action));
+                }
+                PlanKind::Prefetch => {
+                    if !cache.has_rgba(id) {
+                        plan.push((
+                            id,
+                            target.class,
+                            target.effective_distance,
+                            Action::PrefetchFull,
+                        ));
+                    }
                 }
                 PlanKind::Warm => {
                     // Folder warming lives in the persistent background lane,
@@ -1354,6 +1443,7 @@ impl BenchmarkMetadataQueue {
 pub struct BenchmarkNavigationQueue {
     queue: JobQueue,
     len: usize,
+    full_budget: FullPrefetchBudget,
 }
 
 #[cfg(feature = "benchmarks")]
@@ -1363,11 +1453,50 @@ impl BenchmarkNavigationQueue {
         Self {
             queue: JobQueue::new(),
             len,
+            full_budget: FullPrefetchBudget::new(
+                1024 * 1024 * 1024,
+                128 * 1024 * 1024,
+                HashMap::new(),
+            ),
         }
     }
 
-    /// Replans one fit-mode navigation and returns the queued target count.
+    /// Replans one production adaptive fit-mode navigation and returns the
+    /// queued target count.
     pub fn navigate(&self, current: usize) -> usize {
+        let plan = build_plan_targets_with_full_prefetch(
+            self.len,
+            current,
+            1,
+            false,
+            &[],
+            &self.full_budget,
+            false,
+        )
+        .into_iter()
+        .filter_map(|target| {
+            let action = match target.kind {
+                PlanKind::Display => Action::Develop(match target.tier {
+                    Tier::Full => Quality::Full,
+                    Tier::Thumb | Tier::Browse => Quality::Browse,
+                }),
+                PlanKind::Prefetch => Action::PrefetchFull,
+                PlanKind::Warm => return None,
+            };
+            Some((
+                (target.index, target.tier),
+                target.class,
+                target.effective_distance,
+                action,
+            ))
+        })
+        .collect();
+        self.queue.set_plan(plan, true);
+        self.queue.state.lock().unwrap().heap.len()
+    }
+
+    /// Replans the prior fixed ±1 Full policy as a benchmark reference.
+    pub fn navigate_fixed_reference(&self, current: usize) -> usize {
         let plan = build_plan_targets(self.len, current, 1, false, &[], false)
             .into_iter()
             .filter(|target| target.kind == PlanKind::Display)
@@ -1476,7 +1605,7 @@ fn worker_panic_event(
     let error = format!("worker panicked: {detail}");
     match action {
         Action::Metadata => Some(Event::MetadataFailed { index, error }),
-        Action::Thumb | Action::Develop(_) | Action::Rehydrate => {
+        Action::Thumb | Action::Develop(_) | Action::PrefetchFull | Action::Rehydrate => {
             Some(Event::ImageFailed { index, tier, error })
         }
         // Folder-wide warming is intentionally invisible to the event/UI
@@ -1599,9 +1728,23 @@ fn run_job(
     match action {
         Action::Metadata => run_metadata(shared, index, token, &emit),
         Action::Thumb => run_thumb(shared, index, &emit),
-        Action::Rehydrate => run_rehydrate(shared, index, tier, token, &emit),
+        Action::Rehydrate => {
+            run_rehydrate(shared, index, tier, token, DevelopMode::Display, &emit);
+        }
+        Action::PrefetchFull => {
+            debug_assert_eq!(tier, Tier::Full);
+            run_rehydrate(shared, index, tier, token, DevelopMode::Prefetch, &emit);
+        }
         Action::Develop(quality) => {
-            let _ = run_develop(shared, index, tier, quality, token, false, &emit);
+            let _ = run_develop(
+                shared,
+                index,
+                tier,
+                quality,
+                token,
+                DevelopMode::Display,
+                &emit,
+            );
         }
         Action::WarmDevelop(quality) => {
             return run_warm_develop(shared, index, tier, quality, token, &emit);
@@ -1636,6 +1779,16 @@ enum DevelopCompletion {
         outcome: PersistenceEnqueue,
         retained_bytes: usize,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DevelopMode {
+    /// Install decoded pixels, publish readiness, and persist a cache miss.
+    Display,
+    /// Install only into the adaptive Full RGBA ring.
+    Prefetch,
+    /// Populate encoded RAM/disk cache without installing decoded pixels.
+    Warm,
 }
 
 fn warm_job_completion(completion: DevelopCompletion) -> JobCompletion {
@@ -1693,7 +1846,15 @@ fn run_warm_develop(
     {
         return JobCompletion::Complete;
     }
-    warm_job_completion(run_develop(shared, index, tier, quality, token, true, emit))
+    warm_job_completion(run_develop(
+        shared,
+        index,
+        tier,
+        quality,
+        token,
+        DevelopMode::Warm,
+        emit,
+    ))
 }
 
 fn run_thumb(shared: &Shared, index: usize, emit: &dyn Fn(Event)) {
@@ -1755,12 +1916,12 @@ fn run_develop(
     tier: Tier,
     quality: Quality,
     token: &CancelToken,
-    warm_only: bool,
+    mode: DevelopMode,
     emit: &dyn Fn(Event),
 ) -> DevelopCompletion {
     let path = &shared.entries[index].path;
     let fail = |e: String| {
-        if !token.cancelled() {
+        if mode != DevelopMode::Warm && !token.cancelled() {
             emit(Event::ImageFailed {
                 index,
                 tier,
@@ -1799,25 +1960,32 @@ fn run_develop(
     };
     let buf = Arc::new(apply_orient(buf, meta.orient));
 
-    // Completed work always lands in the cache; the event is suppressed
-    // for cancelled jobs so the UI never sees stale publishes.
-    if !warm_only {
-        shared.cache.insert_rgba((index, tier), buf.clone());
-        if !token.cancelled() {
-            emit(Event::ImageReady { index, tier });
+    // Cancellation is checked after every non-interruptible stage. Full-ring
+    // admission and navigation-policy replacement share the cache mutex, so a
+    // late speculative completion cannot repopulate a stale working set.
+    if token.cancelled() {
+        return DevelopCompletion::Cancelled;
+    }
+    if mode != DevelopMode::Warm {
+        if !shared.cache.insert_rgba((index, tier), buf.clone()) {
+            return DevelopCompletion::Finished;
         }
+        emit(Event::ImageReady { index, tier });
+    }
+    if mode == DevelopMode::Prefetch {
+        return DevelopCompletion::Finished;
     }
 
     // Ring-2 + ring-3 insurance runs on a bounded background lane. ImageReady
     // can trigger a replan that cancels this token immediately; persistence is
     // deliberately independent of that token once completed pixels enqueue.
-    if warm_only || !shared.cache.has_jpeg((index, tier)) {
+    if mode == DevelopMode::Warm || !shared.cache.has_jpeg((index, tier)) {
         let retained_bytes = buf.byte_len();
         let enqueue = shared.persistence.enqueue(PersistenceRequest {
             id: (index, tier),
             pixels: buf,
-            insert_ram: !warm_only,
-            warm_completion: warm_only,
+            insert_ram: mode == DevelopMode::Display,
+            warm_completion: mode == DevelopMode::Warm,
         });
         if enqueue == PersistenceEnqueue::Oversized {
             eprintln!(
@@ -1838,6 +2006,7 @@ fn run_rehydrate(
     index: usize,
     tier: Tier,
     token: &CancelToken,
+    mode: DevelopMode,
     emit: &dyn Fn(Event),
 ) {
     // Ring 2 first, then ring 3 (disk). Disk bytes enter RAM only after JPEG
@@ -1849,7 +2018,8 @@ fn run_rehydrate(
     let id = (index, tier);
     if let Some(bytes) = shared.cache.get_jpeg(id) {
         if let Ok(buf) = decode_jpeg(&bytes) {
-            return install_rehydrated(shared, index, tier, buf, token, emit);
+            install_rehydrated(shared, index, tier, buf, token, emit);
+            return;
         }
         shared.cache.remove_jpeg(id);
     }
@@ -1865,8 +2035,12 @@ fn run_rehydrate(
                 return;
             }
             if let Ok(buf) = decode_jpeg(&bytes) {
-                shared.cache.insert_jpeg(id, Arc::new(bytes));
-                return install_rehydrated(shared, index, tier, buf, token, emit);
+                if install_rehydrated(shared, index, tier, buf, token, emit)
+                    && mode == DevelopMode::Display
+                {
+                    shared.cache.insert_jpeg(id, Arc::new(bytes));
+                }
+                return;
             }
             if let Err(error) = disk.remove(&key) {
                 eprintln!("failed to remove corrupt disk cache object: {error}");
@@ -1874,7 +2048,7 @@ fn run_rehydrate(
         }
     }
 
-    develop_cache_miss(shared, index, tier, token, emit);
+    develop_cache_miss(shared, index, tier, token, mode, emit);
 }
 
 fn install_rehydrated(
@@ -1884,11 +2058,12 @@ fn install_rehydrated(
     buf: PixelBuf,
     token: &CancelToken,
     emit: &dyn Fn(Event),
-) {
-    shared.cache.insert_rgba((index, tier), Arc::new(buf));
-    if !token.cancelled() {
-        emit(Event::ImageReady { index, tier });
+) -> bool {
+    if token.cancelled() || !shared.cache.insert_rgba((index, tier), Arc::new(buf)) {
+        return false;
     }
+    emit(Event::ImageReady { index, tier });
+    true
 }
 
 fn develop_cache_miss(
@@ -1896,13 +2071,14 @@ fn develop_cache_miss(
     index: usize,
     tier: Tier,
     token: &CancelToken,
+    mode: DevelopMode,
     emit: &dyn Fn(Event),
 ) {
     let quality = match tier {
         Tier::Full => Quality::Full,
         _ => Quality::Browse,
     };
-    run_develop(shared, index, tier, quality, token, false, emit);
+    run_develop(shared, index, tier, quality, token, mode, emit);
 }
 
 /// Encodes a tightly packed RGBA8 buffer as a JPEG.
@@ -2095,6 +2271,15 @@ mod tests {
         build_processing_pool(NonZeroUsize::new(1).unwrap()).unwrap()
     }
 
+    fn test_cache(thumb_bytes: u64, browse_bytes: u64, jpeg_bytes: u64) -> RamCache {
+        RamCache::new(RamCacheBudgets::new(
+            thumb_bytes,
+            browse_bytes,
+            browse_bytes,
+            jpeg_bytes,
+        ))
+    }
+
     #[test]
     fn worker_thread_limits_resolve_against_available_parallelism() {
         assert_eq!(resolve_worker_threads_for_available(0, 8).get(), 8);
@@ -2117,7 +2302,7 @@ mod tests {
         let (automatic_engine, _events) = Engine::new_with_options(
             Arc::new(Vec::new()),
             0,
-            Arc::new(RamCache::new(0, 0, 0)),
+            Arc::new(test_cache(0, 0, 0)),
             None,
             automatic,
             Arc::new(|| {}),
@@ -2130,7 +2315,7 @@ mod tests {
         let (engine, _events) = Engine::new_with_options(
             Arc::new(Vec::new()),
             0,
-            Arc::new(RamCache::new(0, 0, 0)),
+            Arc::new(test_cache(0, 0, 0)),
             None,
             EngineOptions::default().with_worker_threads(NonZeroUsize::new(1).unwrap()),
             Arc::new(|| {}),
@@ -2381,7 +2566,7 @@ mod tests {
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                         let shared = persistence_shared_with_options(
                             Vec::new(),
-                            Arc::new(RamCache::new(0, 0, 0)),
+                            Arc::new(test_cache(0, 0, 0)),
                             None,
                             0,
                             CACHE_JPEG_QUALITY,
@@ -2598,7 +2783,7 @@ mod tests {
         let notify_unlocked_callback = notify_unlocked.clone();
         let shared = Shared {
             entries: Arc::new(Vec::new()),
-            cache: Arc::new(RamCache::new(0, 0, 0)),
+            cache: Arc::new(test_cache(0, 0, 0)),
             disk: None,
             events,
             notify: Arc::new(move || {
@@ -2635,6 +2820,9 @@ mod tests {
                 tier: Tier::Browse
             })
         ));
+        assert!(token.cancelled());
+        assert!(queue.try_pop().is_none());
+        queue.finish(claimed_id, &token);
         let (replacement_id, replacement_action, replacement_token) = queue.pop().unwrap();
         assert_eq!(
             (replacement_id, replacement_action),
@@ -2666,6 +2854,8 @@ mod tests {
             receiver.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Empty)
         ));
+        assert!(queue.try_pop().is_none());
+        queue.finish(claimed_id, &stale_token);
 
         let (replacement_id, replacement_action, replacement_token) = queue.pop().unwrap();
         assert_eq!(
@@ -2896,6 +3086,49 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_rehydrate_cannot_publish_pixels_to_the_full_ring() {
+        let cache = Arc::new(RamCache::new(RamCacheBudgets::new(0, 0, 64, 0)));
+        cache.set_navigation_policy([], [(0, Tier::Full)]);
+        let shared = persistence_shared(Vec::new(), cache.clone(), None, 0);
+        let token = CancelToken::default();
+        token.cancel();
+        let events = Mutex::new(Vec::new());
+
+        install_rehydrated(
+            &shared,
+            0,
+            Tier::Full,
+            patterned_buf(2, 2),
+            &token,
+            &|event| events.lock().unwrap().push(event),
+        );
+
+        assert!(!cache.has_rgba((0, Tier::Full)));
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rehydrate_rejected_by_a_new_working_set_cannot_emit_ready() {
+        let cache = Arc::new(RamCache::new(RamCacheBudgets::new(0, 0, 64, 0)));
+        cache.set_navigation_policy([], [(1, Tier::Full)]);
+        let shared = persistence_shared(Vec::new(), cache.clone(), None, 0);
+        let token = CancelToken::default();
+        let events = Mutex::new(Vec::new());
+
+        install_rehydrated(
+            &shared,
+            0,
+            Tier::Full,
+            patterned_buf(2, 2),
+            &token,
+            &|event| events.lock().unwrap().push(event),
+        );
+
+        assert!(!cache.has_rgba((0, Tier::Full)));
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn successful_thumbnail_emits_one_ready_event_without_metadata_fallback() {
         let mut fallback_called = false;
         let mut installed = None;
@@ -3086,21 +3319,15 @@ mod tests {
         // exact image becomes interactive.
         q.set_plan(vec![(id, 0, 0, Action::Develop(Quality::Browse))], false);
         assert!(background_token.cancelled());
+        assert!(q.try_pop().is_none());
+
+        // The cooperative background generation exits before the foreground
+        // replacement can claim the same source file. Its canceled one-shot
+        // obligation returns behind the untouched background item.
+        q.finish_with(id, &background_token, JobCompletion::RetryBackground);
         let (foreground_id, foreground_action, foreground_token) = q.pop().unwrap();
         assert_eq!(foreground_id, id);
         assert_eq!(foreground_action, Action::Develop(Quality::Browse));
-
-        // The stale warm completion cannot erase the foreground generation,
-        // and its canceled item returns behind the untouched background item.
-        q.finish_with(id, &background_token, JobCompletion::RetryBackground);
-        assert!(
-            q.state
-                .lock()
-                .unwrap()
-                .in_flight
-                .get(&id)
-                .is_some_and(|current| Arc::ptr_eq(&current.token, &foreground_token))
-        );
         q.finish(foreground_id, &foreground_token);
 
         let (next, _, next_token) = q.pop().unwrap();
@@ -3418,14 +3645,13 @@ mod tests {
         assert_eq!(action, Action::Metadata);
 
         assert!(q.set_urgent([(requested, Action::Thumb)]));
+        assert!(q.try_pop().is_none());
+        assert!(metadata_token.cancelled());
+        q.finish(requested, &metadata_token);
+
         let (id, action, thumbnail_token) = q.pop().unwrap();
         assert_eq!(id, requested);
         assert_eq!(action, Action::Thumb);
-        assert!(metadata_token.cancelled());
-
-        // The displaced generation can finish after the thumbnail starts,
-        // but it must not erase the thumbnail's live queue state.
-        q.finish(requested, &metadata_token);
         assert!(
             q.state
                 .lock()
@@ -3519,6 +3745,92 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_generation_must_exit_before_the_same_id_is_reclaimed() {
+        let q = JobQueue::new();
+        let id = (7, Tier::Full);
+        q.set_plan(vec![(id, 0, 0, Action::Develop(Quality::Full))], true);
+        let (_, _, stale) = q.pop().unwrap();
+
+        q.set_plan(Vec::new(), true);
+        q.set_plan(vec![(id, 0, 0, Action::Develop(Quality::Full))], true);
+        assert!(stale.cancelled());
+        assert!(q.try_pop().is_none());
+
+        q.finish(id, &stale);
+        let (replacement_id, _, replacement) = q.try_pop().unwrap();
+        assert_eq!(replacement_id, id);
+        assert!(!Arc::ptr_eq(&stale, &replacement));
+        q.finish(id, &replacement);
+    }
+
+    #[test]
+    fn speculative_full_uses_one_worker_and_yields_to_lower_priority_foreground() {
+        let q = JobQueue::new();
+        q.set_plan(
+            vec![
+                ((0, Tier::Full), 5, 1, Action::PrefetchFull),
+                ((1, Tier::Full), 5, 2, Action::PrefetchFull),
+                ((2, Tier::Browse), 6, 0, Action::Develop(Quality::Browse)),
+            ],
+            true,
+        );
+
+        let (first, first_action, first_token) = q.pop().unwrap();
+        assert_eq!(
+            (first, first_action),
+            ((0, Tier::Full), Action::PrefetchFull)
+        );
+        let (second, second_action, second_token) = q.try_pop().unwrap();
+        assert_eq!(
+            (second, second_action),
+            ((2, Tier::Browse), Action::Develop(Quality::Browse))
+        );
+        assert!(q.try_pop().is_none());
+
+        q.finish(first, &first_token);
+        let (third, third_action, third_token) = q.try_pop().unwrap();
+        assert_eq!(
+            (third, third_action),
+            ((1, Tier::Full), Action::PrefetchFull)
+        );
+        q.finish(second, &second_token);
+        q.finish(third, &third_token);
+    }
+
+    #[test]
+    fn folder_warming_uses_at_most_one_worker() {
+        let q = JobQueue::new();
+        assert!(q.initialize_background(|| {
+            [
+                ((0, Tier::Browse), Action::WarmDevelop(Quality::Browse)),
+                ((1, Tier::Browse), Action::WarmDevelop(Quality::Browse)),
+            ]
+        }));
+
+        let (first, _, first_token) = q.pop().unwrap();
+        assert_eq!(first, (0, Tier::Browse));
+        assert!(q.try_pop().is_none());
+
+        q.finish(first, &first_token);
+        let (second, _, second_token) = q.try_pop().unwrap();
+        assert_eq!(second, (1, Tier::Browse));
+        q.finish(second, &second_token);
+    }
+
+    #[test]
+    fn live_speculative_full_can_be_promoted_without_restart() {
+        let q = JobQueue::new();
+        let id = (7, Tier::Full);
+        q.set_plan(vec![(id, 5, 1, Action::PrefetchFull)], true);
+        let (_, _, token) = q.pop().unwrap();
+
+        q.set_plan(vec![(id, 0, 0, Action::Develop(Quality::Full))], true);
+        assert!(!token.cancelled());
+        assert!(q.try_pop().is_none());
+        q.finish(id, &token);
+    }
+
+    #[test]
     fn replan_replaces_live_job_when_action_changes() {
         let q = JobQueue::new();
         let id = (7, Tier::Browse);
@@ -3531,14 +3843,12 @@ mod tests {
 
         q.set_plan(vec![(id, 0, 0, Action::Develop(Quality::Browse))], true);
         assert!(warm_token.cancelled());
+        assert!(q.try_pop().is_none());
+        q.finish(id, &warm_token);
 
         let (_, action, display_token) = q.pop().unwrap();
         assert_eq!(action, Action::Develop(Quality::Browse));
         assert!(!display_token.cancelled());
-
-        // Completion from the displaced warm generation must not erase the
-        // foreground replacement.
-        q.finish(id, &warm_token);
         assert!(
             q.state
                 .lock()
@@ -3560,34 +3870,6 @@ mod tests {
 
         q.set_plan(vec![job((0, Tier::Browse), 0, 0)], true);
         assert!(q.pop().is_none());
-    }
-
-    #[test]
-    fn stale_completion_does_not_finish_replacement_generation() {
-        let q = JobQueue::new();
-        let id = (0, Tier::Browse);
-
-        q.set_plan(vec![job(id, 1, 0)], true);
-        let (_, _, stale) = q.pop().unwrap();
-        q.set_plan(Vec::new(), true);
-        assert!(stale.cancelled());
-
-        q.set_plan(vec![job(id, 1, 0)], true);
-        let (_, _, replacement) = q.pop().unwrap();
-        assert!(!Arc::ptr_eq(&stale, &replacement));
-
-        q.finish(id, &stale);
-        assert!(
-            q.state
-                .lock()
-                .unwrap()
-                .in_flight
-                .get(&id)
-                .is_some_and(|current| Arc::ptr_eq(&current.token, &replacement))
-        );
-
-        q.finish(id, &replacement);
-        assert!(!q.state.lock().unwrap().in_flight.contains_key(&id));
     }
 
     #[test]
@@ -3630,7 +3912,7 @@ mod tests {
         let (events, receiver) = std::sync::mpsc::channel();
         let shared = Shared {
             entries: Arc::new(vec![entry]),
-            cache: Arc::new(RamCache::new(0, 0, 0)),
+            cache: Arc::new(test_cache(0, 0, 0)),
             disk: Some(disk.clone()),
             events,
             notify: Arc::new(|| {}),
@@ -3667,7 +3949,7 @@ mod tests {
             size: 123,
             mtime_ns: 456,
         };
-        let cache = Arc::new(RamCache::new(0, 0, 1024 * 1024));
+        let cache = Arc::new(test_cache(0, 0, 1024 * 1024));
         let shared = persistence_shared(
             vec![entry],
             cache,
@@ -3898,7 +4180,7 @@ mod tests {
             DiskCache::key(&entries[0], Tier::Browse),
             DiskCache::key(&entries[1], Tier::Browse),
         ];
-        let cache = Arc::new(RamCache::new(0, 0, 1024 * 1024));
+        let cache = Arc::new(test_cache(0, 0, 1024 * 1024));
         let shared = persistence_shared_with_options(
             entries,
             cache.clone(),
@@ -3959,7 +4241,7 @@ mod tests {
         let disk = DiskCache::open_at(dir.path().join("cache"));
         let entries = vec![entry(dir.path().join("stale.arw"), 100)];
         let key = DiskCache::key(&entries[0], Tier::Browse);
-        let cache = Arc::new(RamCache::new(0, 0, 1024 * 1024));
+        let cache = Arc::new(test_cache(0, 0, 1024 * 1024));
         let shared = persistence_shared(entries, cache.clone(), Some(disk.clone()), 1024 * 1024);
 
         shared
@@ -3993,7 +4275,7 @@ mod tests {
         let entries = vec![entry(dir.path().join("quality-90.arw"), 100)];
         let default_key = DiskCache::key(&entries[0], Tier::Browse);
         let selected_key = DiskCache::key_with_jpeg_quality(&entries[0], Tier::Browse, 90);
-        let cache = Arc::new(RamCache::new(0, 0, 1024 * 1024));
+        let cache = Arc::new(test_cache(0, 0, 1024 * 1024));
         let shared = persistence_shared_with_quality(
             entries,
             cache.clone(),
@@ -4018,12 +4300,14 @@ mod tests {
         assert!(!disk.has(&default_key));
         assert!(disk.has(&selected_key));
         assert!(!cache.has_jpeg((0, Tier::Browse)));
+        cache.set_pins([(0, Tier::Browse)]);
 
         run_rehydrate(
             &shared,
             0,
             Tier::Browse,
             &CancelToken::default(),
+            DevelopMode::Display,
             &|event| publish(&shared, event),
         );
         assert!(cache.has_jpeg((0, Tier::Browse)));
@@ -4037,7 +4321,7 @@ mod tests {
         let key = DiskCache::key(&raw_entry, Tier::Browse);
         disk.put(&key, b"not a jpeg").unwrap();
 
-        let cache = Arc::new(RamCache::new(0, 0, 1024));
+        let cache = Arc::new(test_cache(0, 0, 1024));
         cache.insert_jpeg((0, Tier::Browse), Arc::new(b"not a jpeg".to_vec()));
         let (events, receiver) = std::sync::mpsc::channel();
         let shared = Shared {
@@ -4059,6 +4343,7 @@ mod tests {
             0,
             Tier::Browse,
             &CancelToken::default(),
+            DevelopMode::Display,
             &|event| publish(&shared, event),
         );
 

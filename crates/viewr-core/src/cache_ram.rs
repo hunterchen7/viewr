@@ -355,8 +355,8 @@ pub struct FullPrefetchSnapshot {
     pub budget_bytes: u64,
     /// Estimate for an image without a per-index observation.
     pub fallback_bytes: u64,
-    /// Exact Full sizes or conservative estimates derived from Browse pixels.
-    pub known_bytes: HashMap<usize, u64>,
+    /// Exact Full payload observations, shared without a per-navigation clone.
+    pub exact_full_bytes: Arc<HashMap<usize, u64>>,
 }
 
 /// Current payload-byte usage for each in-memory cache ring.
@@ -396,26 +396,15 @@ struct Inner {
     jpeg: ByteLru<Arc<Vec<u8>>>,
     pinned: HashSet<Key>,
     full_working_set: HashSet<Key>,
-    observed_browse_bytes: HashMap<usize, u64>,
-    observed_full_bytes: HashMap<usize, u64>,
+    observed_full_bytes: Arc<HashMap<usize, u64>>,
+    largest_observed_full_estimate: Option<u64>,
 }
 
 impl RamCache {
-    /// Creates empty thumbnail, developed-RGBA, and JPEG rings with independent
-    /// byte budgets.
+    /// Creates empty rings from explicit independent byte budgets.
     ///
     /// A zero budget is valid: unpinned inserts are immediately evicted.
-    pub fn new(thumb_budget: u64, rgba_budget: u64, jpeg_budget: u64) -> Self {
-        Self::with_budgets(RamCacheBudgets::new(
-            thumb_budget,
-            rgba_budget,
-            rgba_budget,
-            jpeg_budget,
-        ))
-    }
-
-    /// Creates empty rings from explicit independent byte budgets.
-    pub fn with_budgets(budgets: RamCacheBudgets) -> Self {
+    pub fn new(budgets: RamCacheBudgets) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 thumbs: ByteLru::new(budgets.thumb_rgba_bytes),
@@ -424,8 +413,8 @@ impl RamCache {
                 jpeg: ByteLru::new(budgets.jpeg_bytes),
                 pinned: HashSet::new(),
                 full_working_set: HashSet::new(),
-                observed_browse_bytes: HashMap::new(),
-                observed_full_bytes: HashMap::new(),
+                observed_full_bytes: Arc::new(HashMap::new()),
+                largest_observed_full_estimate: None,
             }),
         }
     }
@@ -549,12 +538,22 @@ impl RamCache {
                 inner.thumbs.contains(&key)
             }
             Tier::Browse => {
-                inner.observed_browse_bytes.insert(key.0, bytes);
+                let estimate = bytes.saturating_mul(5);
+                inner.largest_observed_full_estimate = Some(
+                    inner
+                        .largest_observed_full_estimate
+                        .map_or(estimate, |largest| largest.max(estimate)),
+                );
                 inner.browse_rgba.insert(key, buf, bytes, pinned);
                 inner.browse_rgba.contains(&key)
             }
             Tier::Full => {
-                inner.observed_full_bytes.insert(key.0, bytes);
+                Arc::make_mut(&mut inner.observed_full_bytes).insert(key.0, bytes);
+                inner.largest_observed_full_estimate = Some(
+                    inner
+                        .largest_observed_full_estimate
+                        .map_or(bytes, |largest| largest.max(bytes)),
+                );
                 if !inner.full_working_set.contains(&key) {
                     return false;
                 }
@@ -593,22 +592,14 @@ impl RamCache {
     /// Returns one lock-consistent Full budget and size-estimate snapshot.
     pub fn full_prefetch_snapshot(&self) -> FullPrefetchSnapshot {
         let inner = self.inner.lock().unwrap();
-        let mut known_bytes = inner.observed_full_bytes.clone();
-        for (&index, &bytes) in &inner.observed_browse_bytes {
-            known_bytes
-                .entry(index)
-                .or_insert_with(|| bytes.saturating_mul(5));
-        }
-        let fallback_bytes = known_bytes
-            .values()
-            .copied()
-            .max()
+        let fallback_bytes = inner
+            .largest_observed_full_estimate
             .unwrap_or(DEFAULT_FULL_RESERVATION_BYTES)
             .max(1);
         FullPrefetchSnapshot {
             budget_bytes: inner.full_rgba.budget_bytes(),
             fallback_bytes,
-            known_bytes,
+            exact_full_bytes: Arc::clone(&inner.observed_full_bytes),
         }
     }
 }
@@ -699,9 +690,18 @@ mod tests {
         })
     }
 
+    fn browse_cache(thumb_bytes: u64, browse_bytes: u64, jpeg_bytes: u64) -> RamCache {
+        RamCache::new(RamCacheBudgets::new(
+            thumb_bytes,
+            browse_bytes,
+            browse_bytes,
+            jpeg_bytes,
+        ))
+    }
+
     #[test]
     fn evicts_lru_when_over_byte_budget() {
-        let cache = RamCache::new(0, 100, 0);
+        let cache = browse_cache(0, 100, 0);
         cache.insert_rgba((0, Tier::Browse), buf(60));
         cache.insert_rgba((1, Tier::Browse), buf(60)); // 120 > 100 → evict LRU (0)
         assert!(!cache.has_rgba((0, Tier::Browse)));
@@ -710,7 +710,7 @@ mod tests {
 
     #[test]
     fn get_refreshes_recency() {
-        let cache = RamCache::new(0, 100, 0);
+        let cache = browse_cache(0, 100, 0);
         cache.insert_rgba((0, Tier::Browse), buf(40));
         cache.insert_rgba((1, Tier::Browse), buf(40));
         cache.get_rgba((0, Tier::Browse)); // 0 now most-recent
@@ -721,7 +721,7 @@ mod tests {
 
     #[test]
     fn pinned_keys_survive_eviction() {
-        let cache = RamCache::new(0, 100, 0);
+        let cache = browse_cache(0, 100, 0);
         cache.set_pins([(0, Tier::Browse)]);
         cache.insert_rgba((0, Tier::Browse), buf(60));
         cache.insert_rgba((1, Tier::Browse), buf(60));
@@ -732,7 +732,7 @@ mod tests {
 
     #[test]
     fn replacing_a_key_accounts_bytes_once() {
-        let cache = RamCache::new(0, 100, 0);
+        let cache = browse_cache(0, 100, 0);
         cache.insert_rgba((0, Tier::Browse), buf(80));
         cache.insert_rgba((0, Tier::Browse), buf(90)); // replace, not add
         assert_eq!(cache.stats().rgba_bytes, 90);
@@ -740,7 +740,7 @@ mod tests {
 
     #[test]
     fn unpinning_evicts_entries_that_exceed_the_budget() {
-        let cache = RamCache::new(0, 100, 0);
+        let cache = browse_cache(0, 100, 0);
         cache.set_pins([(0, Tier::Browse), (1, Tier::Browse)]);
         cache.insert_rgba((0, Tier::Browse), buf(60));
         cache.insert_rgba((1, Tier::Browse), buf(60));
@@ -755,7 +755,7 @@ mod tests {
 
     #[test]
     fn stale_pinned_recency_is_preserved_for_later_eviction() {
-        let cache = RamCache::new(0, 20, 0);
+        let cache = browse_cache(0, 20, 0);
         cache.insert_rgba((0, Tier::Browse), buf(10));
         cache.insert_rgba((1, Tier::Browse), buf(10));
         cache.set_pins([(0, Tier::Browse)]);
@@ -774,7 +774,7 @@ mod tests {
 
     #[test]
     fn access_while_pinned_still_refreshes_recency() {
-        let cache = RamCache::new(0, 20, 0);
+        let cache = browse_cache(0, 20, 0);
         cache.insert_rgba((0, Tier::Browse), buf(10));
         cache.insert_rgba((1, Tier::Browse), buf(10));
         cache.set_pins([(0, Tier::Browse)]);
@@ -840,7 +840,7 @@ mod tests {
 
     #[test]
     fn cache_rings_have_independent_budgets_and_stats() {
-        let cache = RamCache::new(8, 12, 6);
+        let cache = browse_cache(8, 12, 6);
         cache.insert_rgba((0, Tier::Thumb), buf(8));
         cache.insert_rgba((0, Tier::Browse), buf(12));
         cache.insert_jpeg((0, Tier::Browse), Arc::new(vec![1; 6]));
@@ -856,7 +856,7 @@ mod tests {
 
     #[test]
     fn removing_pinned_jpeg_repairs_lru_accounting() {
-        let cache = RamCache::new(0, 0, 10);
+        let cache = browse_cache(0, 0, 10);
         let pinned = (0, Tier::Browse);
         let other = (1, Tier::Browse);
         cache.set_pins([pinned]);
@@ -875,7 +875,8 @@ mod tests {
 
     #[test]
     fn oversized_unpinned_entry_is_immediately_evicted() {
-        let cache = RamCache::new(0, 10, 0);
+        let cache = RamCache::new(RamCacheBudgets::new(0, 0, 10, 0));
+        cache.set_navigation_policy([], [(0, Tier::Full)]);
         cache.insert_rgba((0, Tier::Full), buf(11));
         assert!(!cache.has_rgba((0, Tier::Full)));
         assert_eq!(cache.stats().rgba_bytes, 0);
@@ -883,7 +884,7 @@ mod tests {
 
     #[test]
     fn concurrent_cache_access_preserves_budget_accounting() {
-        let cache = Arc::new(RamCache::new(0, 256, 128));
+        let cache = Arc::new(browse_cache(0, 256, 128));
         let workers: Vec<_> = (0..4)
             .map(|worker| {
                 let cache = cache.clone();
@@ -910,7 +911,7 @@ mod tests {
 
     #[test]
     fn full_working_set_evicts_stale_full_without_touching_other_rings() {
-        let cache = RamCache::with_budgets(RamCacheBudgets::new(16, 16, 64, 16));
+        let cache = RamCache::new(RamCacheBudgets::new(16, 16, 64, 16));
         let old_full = (0, Tier::Full);
         let kept_full = (1, Tier::Full);
         cache.set_navigation_policy(
@@ -937,7 +938,7 @@ mod tests {
 
     #[test]
     fn late_full_completion_outside_the_working_set_is_rejected() {
-        let cache = RamCache::with_budgets(RamCacheBudgets::new(0, 0, 64, 0));
+        let cache = RamCache::new(RamCacheBudgets::new(0, 0, 64, 0));
         cache.set_navigation_policy([], [(1, Tier::Full)]);
 
         assert!(!cache.insert_rgba((0, Tier::Full), buf(8)));
@@ -948,7 +949,7 @@ mod tests {
 
     #[test]
     fn full_eviction_releases_the_cache_arc_owner() {
-        let cache = RamCache::with_budgets(RamCacheBudgets::new(0, 0, 64, 0));
+        let cache = RamCache::new(RamCacheBudgets::new(0, 0, 64, 0));
         cache.set_navigation_policy([], [(0, Tier::Full)]);
         let pixels = buf(8);
         let weak = Arc::downgrade(&pixels);
@@ -961,16 +962,31 @@ mod tests {
 
     #[test]
     fn full_prefetch_snapshot_uses_exact_full_and_conservative_browse_estimates() {
-        let cache = RamCache::with_budgets(RamCacheBudgets::new(0, 64, 1_000, 0));
+        let cache = RamCache::new(RamCacheBudgets::new(0, 64, 1_000, 0));
         cache.set_navigation_policy([], [(2, Tier::Full)]);
         assert!(cache.insert_rgba((1, Tier::Browse), buf(10)));
         assert!(cache.insert_rgba((2, Tier::Full), buf(24)));
 
         let snapshot = cache.full_prefetch_snapshot();
         assert_eq!(snapshot.budget_bytes, 1_000);
-        assert_eq!(snapshot.known_bytes.get(&1), Some(&50));
-        assert_eq!(snapshot.known_bytes.get(&2), Some(&24));
+        assert_eq!(snapshot.exact_full_bytes.get(&2), Some(&24));
         assert_eq!(snapshot.fallback_bytes, 50);
+    }
+
+    #[test]
+    fn full_prefetch_snapshots_are_stable_across_copy_on_write_updates() {
+        let cache = RamCache::new(RamCacheBudgets::new(0, 0, 64, 0));
+        cache.set_navigation_policy([], [(0, Tier::Full), (1, Tier::Full)]);
+        assert!(cache.insert_rgba((0, Tier::Full), buf(8)));
+        let before = cache.full_prefetch_snapshot();
+
+        assert!(cache.insert_rgba((1, Tier::Full), buf(12)));
+        let after = cache.full_prefetch_snapshot();
+
+        assert_eq!(before.exact_full_bytes.get(&0), Some(&8));
+        assert_eq!(before.exact_full_bytes.get(&1), None);
+        assert_eq!(after.exact_full_bytes.get(&0), Some(&8));
+        assert_eq!(after.exact_full_bytes.get(&1), Some(&12));
     }
 
     fn model_key(value: usize) -> Key {

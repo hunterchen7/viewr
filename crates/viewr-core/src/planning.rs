@@ -2,6 +2,7 @@
 //! scheduling behavior can be tested and benchmarked deterministically.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::types::Tier;
 
@@ -38,7 +39,7 @@ pub enum PlanKind {
 pub struct FullPrefetchBudget {
     budget_bytes: u64,
     fallback_bytes: u64,
-    known_bytes: HashMap<usize, u64>,
+    exact_full_bytes: Arc<HashMap<usize, u64>>,
 }
 
 impl FullPrefetchBudget {
@@ -47,12 +48,26 @@ impl FullPrefetchBudget {
         Self {
             budget_bytes,
             fallback_bytes: fallback_bytes.max(1),
-            known_bytes,
+            exact_full_bytes: Arc::new(known_bytes),
+        }
+    }
+
+    /// Creates a budget from shared cache observations without cloning the
+    /// per-folder maps on every navigation.
+    pub fn from_observations(
+        budget_bytes: u64,
+        fallback_bytes: u64,
+        exact_full_bytes: Arc<HashMap<usize, u64>>,
+    ) -> Self {
+        Self {
+            budget_bytes,
+            fallback_bytes: fallback_bytes.max(1),
+            exact_full_bytes,
         }
     }
 
     fn bytes_for(&self, index: usize) -> u64 {
-        self.known_bytes
+        self.exact_full_bytes
             .get(&index)
             .copied()
             .unwrap_or(self.fallback_bytes)
