@@ -342,6 +342,47 @@ mod tests {
     }
 
     #[test]
+    fn banded_parallel_rotation_matches_the_serial_reference() {
+        // Wide enough to cross the 256*256 threshold that selects the banded
+        // Rayon path, with non-multiple-of-16 dimensions so the final band is
+        // partial in both orientations.
+        let width = 331u32;
+        let height = 203u32;
+        let mut state = 0xDEAD_BEEFu32;
+        let rgba: Vec<u8> = (0..width * height * 4)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect();
+        let source = PixelBuf {
+            width,
+            height,
+            rgba,
+        };
+        assert!((width * height) >= 256 * 256);
+
+        for orient in [Orient::R90, Orient::R270] {
+            let (sw, sh) = (width as usize, height as usize);
+            let mut expected = vec![0u8; source.rgba.len()];
+            for (yd, row) in expected.chunks_exact_mut(sh * 4).enumerate() {
+                for (xd, out) in row.chunks_exact_mut(4).enumerate() {
+                    let (xs, ys) = match orient {
+                        Orient::R90 => (yd, sh - 1 - xd),
+                        _ => (sw - 1 - yd, xd),
+                    };
+                    let i = (ys * sw + xs) * 4;
+                    out.copy_from_slice(&source.rgba[i..i + 4]);
+                }
+            }
+
+            let rotated = apply_orient(source.clone(), orient);
+            assert_eq!((rotated.width, rotated.height), (height, width));
+            assert_eq!(rotated.rgba, expected, "{orient:?}");
+        }
+    }
+
+    #[test]
     fn inverse_and_full_turn_rotations_restore_every_pixel() {
         for width in 0..=7 {
             for height in 0..=7 {
