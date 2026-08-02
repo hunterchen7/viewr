@@ -198,8 +198,10 @@ scripts/test-macos-pkg-install.sh \
 
 The validator checks the package layout, arm64 support, and the macOS 11
 requirement. It also checks bundle data, the ARW declaration, the deployment
-target, signatures, and licenses. The open-event test checks one same-folder
-batch and two later open events. Run the install test only on a disposable Mac.
+target, signatures, licenses, and the absence of bundle relocation rules. The
+package always targets `/Applications/Viewr.app`, even if Launch Services has
+seen another copy of Viewr. The open-event test checks one same-folder batch
+and two later open events. Run the install test only on a disposable Mac.
 The test installs the package in `/Applications`. It checks the receipt,
 payload, permissions, command, Launch Services registration, and handler
 preferences. It uses the ARW file to test Finder-equivalent default routing.
@@ -218,8 +220,9 @@ public-domain fixture that the core compatibility tests use.
 
 The install test requires exact preservation of explicit Launch Services
 preferences. On an account without an explicit ARW choice, Launch Services can
-recompute its inferred default while Viewr is installed. The test verifies
-that removal restores the prior effective default.
+recompute its inferred default while temporary test bundles appear and
+disappear. The test verifies that the installer does not change handler
+preferences and that cleanup removes the canonical app registration.
 
 The installer supports macOS 11. The install test requires macOS 12 because it
 uses newer Launch Services inspection APIs.

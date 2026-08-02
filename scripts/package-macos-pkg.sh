@@ -58,19 +58,23 @@ fi
 
 product_requirements="$repo_root/packaging/macos/ProductRequirements.plist"
 package_scripts="$repo_root/packaging/macos/scripts"
+component_properties="$repo_root/packaging/macos/Components.plist"
 
 /bin/mkdir -p "$(dirname "$output_arg")"
 output_dir="$(cd "$(dirname "$output_arg")" && pwd)"
 output_pkg="$output_dir/$(basename "$output_arg")"
 
-for command in pkgbuild plutil productbuild; do
+for command in ditto pkgbuild plutil productbuild; do
     command -v "$command" >/dev/null || fail "required command is unavailable: $command"
 done
 [[ -f "$product_requirements" ]] ||
     fail "product requirements do not exist: $product_requirements"
+[[ -f "$component_properties" && ! -L "$component_properties" ]] ||
+    fail "installer component properties do not exist"
 [[ -x "$package_scripts/postinstall" && ! -L "$package_scripts/postinstall" ]] ||
     fail "installer postinstall script is missing or not executable"
 plutil -lint "$product_requirements" >/dev/null
+plutil -lint "$component_properties" >/dev/null
 
 workspace_version="$(
     awk -F'"' '/^version = "/ { print $2; exit }' "$repo_root/Cargo.toml"
@@ -101,8 +105,12 @@ else
 fi
 
 component_pkg="$work_dir/Viewr-component.pkg"
+payload_root="$work_dir/payload-root"
+/bin/mkdir -p "$payload_root"
+/usr/bin/ditto "$app" "$payload_root/Viewr.app"
 pkgbuild \
-    --component "$app" \
+    --root "$payload_root" \
+    --component-plist "$component_properties" \
     --scripts "$package_scripts" \
     --install-location /Applications \
     --identifier com.hunterchen.viewr.pkg \

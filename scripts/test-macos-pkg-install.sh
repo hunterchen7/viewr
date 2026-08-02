@@ -190,8 +190,13 @@ cleanup() {
                 "$app" \
                 "$fixture"
         )" || cleanup_failed=1
-        if [[ "${default_after_cleanup:-}" != "$default_before" ||
-            "${type_default_after_cleanup:-}" != "$type_default_before" ]]; then
+        # Launch Services may choose a different temporary Viewr build as its
+        # implicit default after the installed app is unregistered. An explicit
+        # user selection must remain exact; the preferences comparison below
+        # separately proves that the installer did not write a new selection.
+        if [[ "$explicit_binding_before" == "present" &&
+            ( "${default_after_cleanup:-}" != "$default_before" ||
+                "${type_default_after_cleanup:-}" != "$type_default_before" ) ]]; then
             echo "error: cleanup changed the default ARW application" >&2
             echo "file default before: ${default_before:-<none>}" >&2
             echo "file default after: ${default_after_cleanup:-<none>}" >&2
@@ -288,8 +293,10 @@ if ! sudo -n /usr/sbin/installer \
     fail "macOS Installer rejected the Viewr package"
 fi
 
-[[ -d "$app" && ! -L "$app" ]] ||
+if [[ ! -d "$app" || -L "$app" ]]; then
+    /bin/cat "$install_log" >&2
     fail "macOS Installer did not create a regular $app"
+fi
 [[ ! -e "$recovery_bundle" && ! -L "$recovery_bundle" ]] ||
     fail "macOS Installer did not remove the retained recovery bundle"
 recovery_fixture_created=0

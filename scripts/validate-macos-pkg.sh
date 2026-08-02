@@ -230,6 +230,13 @@ package_attribute() {
 [[ "$(
     xmllint \
         --xpath \
+        'count(/pkg-info/relocate/bundle[@id="com.hunterchen.viewr"])' \
+        "$package_info"
+)" == "0" ]] ||
+    fail "installer must not relocate Viewr to another registered bundle path"
+[[ "$(
+    xmllint \
+        --xpath \
         'count(/pkg-info/scripts/postinstall[@file="./postinstall"])' \
         "$package_info"
 )" == "1" ]] ||
