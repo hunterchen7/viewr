@@ -44,6 +44,24 @@ source_root="$stage_root/viewr-$version"
 mkdir -p "$source_root/.cargo"
 
 git -C "$repo_root" archive HEAD | tar -xf - -C "$source_root"
+# git archive records submodules as bare gitlinks, so the in-tree rawler fork
+# is staged explicitly. The guard rejects a checkout whose submodule drifted
+# from the recorded rev or was never initialized, so an archive can never
+# silently ship the wrong (or no) rawler source.
+recorded_rawler_rev="$(git -C "$repo_root" rev-parse HEAD:vendor/dnglab)"
+checked_out_rawler_rev="$(git -C "$repo_root/vendor/dnglab" rev-parse HEAD 2>/dev/null || true)"
+if [[ "$checked_out_rawler_rev" != "$recorded_rawler_rev" ]]; then
+  echo "vendor/dnglab checkout ($checked_out_rawler_rev) does not match the recorded submodule rev ($recorded_rawler_rev); run 'git submodule update --init'" >&2
+  exit 1
+fi
+stage_rawler_fork() {
+  mkdir -p "$source_root/vendor/dnglab"
+  git -C "$repo_root/vendor/dnglab" archive HEAD | tar -xf - -C "$source_root/vendor/dnglab"
+}
+# cargo vendor must see the workspace's rawler patch target to resolve the
+# lockfile, then rewrites the vendor directory and deletes it — so the fork
+# is staged before vendoring and staged again afterwards.
+stage_rawler_fork
 (
   cd "$source_root"
   cargo vendor \
@@ -52,19 +70,7 @@ git -C "$repo_root" archive HEAD | tar -xf - -C "$source_root"
     --sync tools/jpeg-bakeoff/Cargo.toml \
     vendor >.cargo/config.toml
 )
-# git archive records submodules as bare gitlinks, and cargo vendor rewrites
-# the vendor directory, so the in-tree rawler fork is staged afterwards. The
-# guard rejects a checkout whose submodule drifted from the recorded rev or
-# was never initialized, so an archive can never silently ship the wrong (or
-# no) rawler source.
-recorded_rawler_rev="$(git -C "$repo_root" rev-parse HEAD:vendor/dnglab)"
-checked_out_rawler_rev="$(git -C "$repo_root/vendor/dnglab" rev-parse HEAD 2>/dev/null || true)"
-if [[ "$checked_out_rawler_rev" != "$recorded_rawler_rev" ]]; then
-  echo "vendor/dnglab checkout ($checked_out_rawler_rev) does not match the recorded submodule rev ($recorded_rawler_rev); run 'git submodule update --init'" >&2
-  exit 1
-fi
-mkdir -p "$source_root/vendor/dnglab"
-git -C "$repo_root/vendor/dnglab" archive HEAD | tar -xf - -C "$source_root/vendor/dnglab"
+stage_rawler_fork
 
 if touch -h -d "@$source_date_epoch" "$source_root" 2>/dev/null; then
   find "$source_root" -exec touch -h -d "@$source_date_epoch" {} +
