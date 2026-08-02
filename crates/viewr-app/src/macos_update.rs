@@ -10,8 +10,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -251,30 +253,48 @@ pub(crate) fn apply(plan_path: &Path) -> Result<(), UpdateError> {
         &plan.staging_root,
         &lock,
     )?;
-    lock_parent_gate(&lock)?;
+    if let Err(error) = lock_parent_gate(&lock) {
+        // Readiness is already observable. Keep the same recovery contract as
+        // every later failure instead of letting the helper disappear after
+        // the GUI has committed to exiting.
+        thread::sleep(LAUNCH_PROBE_DELAY);
+        return reopen_after_failure(&plan, before_mutation_failure(&plan, error));
+    }
 
     let result = apply_after_parent_exit(&plan);
     if let Err(failure) = result {
-        let recovery = relaunch_bundle(&failure.recovery_bundle, &plan.relaunch_arguments);
-        let rollback = failure
-            .rollback_error
-            .as_deref()
-            .map(|message| format!("; recovery was incomplete: {message}"))
-            .unwrap_or_default();
-        return match recovery {
-            Ok(_) => Err(UpdateError::InvalidRelease(format!(
-                "{}{rollback}; reopened the previous app from {}",
-                failure.error,
-                failure.recovery_bundle.display()
-            ))),
-            Err(recovery_error) => Err(UpdateError::InvalidRelease(format!(
-                "{}{rollback}; the previous Viewr app at {} could not be reopened: {recovery_error}",
-                failure.error,
-                failure.recovery_bundle.display()
-            ))),
-        };
+        return reopen_after_failure(&plan, failure);
     }
     Ok(())
+}
+
+fn before_mutation_failure(plan: &UpdatePlan, error: UpdateError) -> ApplyFailure {
+    ApplyFailure {
+        error,
+        recovery_bundle: plan.previous_bundle.clone(),
+        rollback_error: None,
+    }
+}
+
+fn reopen_after_failure(plan: &UpdatePlan, failure: ApplyFailure) -> Result<(), UpdateError> {
+    let recovery = relaunch_bundle(&failure.recovery_bundle, &plan.relaunch_arguments);
+    let rollback = failure
+        .rollback_error
+        .as_deref()
+        .map(|message| format!("; recovery was incomplete: {message}"))
+        .unwrap_or_default();
+    match recovery {
+        Ok(_) => Err(UpdateError::InvalidRelease(format!(
+            "{}{rollback}; reopened the previous app from {}",
+            failure.error,
+            failure.recovery_bundle.display()
+        ))),
+        Err(recovery_error) => Err(UpdateError::InvalidRelease(format!(
+            "{}{rollback}; the previous Viewr app at {} could not be reopened: {recovery_error}",
+            failure.error,
+            failure.recovery_bundle.display()
+        ))),
+    }
 }
 
 fn publish_ready_marker(path: &Path, staging_root: &Path, lock: &File) -> Result<(), UpdateError> {
@@ -323,11 +343,7 @@ fn lock_parent_gate(lock: &File) -> Result<(), UpdateError> {
 }
 
 fn apply_after_parent_exit(plan: &UpdatePlan) -> Result<(), ApplyFailure> {
-    let before_mutation = |error| ApplyFailure {
-        error,
-        recovery_bundle: plan.previous_bundle.clone(),
-        rollback_error: None,
-    };
+    let before_mutation = |error| before_mutation_failure(plan, error);
     let version = Version::parse(&plan.expected_version).map_err(|_| {
         before_mutation(UpdateError::InvalidRelease(
             "the prepared update version is invalid".into(),
@@ -356,11 +372,7 @@ fn lock_application_updates() -> Result<File, UpdateError> {
 }
 
 fn apply_transaction(plan: &UpdatePlan, version: &Version) -> Result<(), ApplyFailure> {
-    let before_mutation = |error| ApplyFailure {
-        error,
-        recovery_bundle: plan.previous_bundle.clone(),
-        rollback_error: None,
-    };
+    let before_mutation = |error| before_mutation_failure(plan, error);
     let had_target = match plan.target_bundle.symlink_metadata() {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => true,
         Ok(_) => {
@@ -870,6 +882,7 @@ fn require_arm64(executable: &Path) -> Result<(), UpdateError> {
 
 fn bounded_output(command: &mut Command, label: &str) -> Result<Output, UpdateError> {
     let mut child = command
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -882,27 +895,32 @@ fn bounded_output(command: &mut Command, label: &str) -> Result<Output, UpdateEr
         .stderr
         .take()
         .ok_or_else(|| io::Error::other("validation stderr pipe is unavailable"))?;
-    let stdout_reader = thread::spawn(move || {
+    let (reader_tx, reader_rx) = mpsc::sync_channel(2);
+    let stdout_tx = reader_tx.clone();
+    thread::spawn(move || {
         let mut bytes = Vec::new();
-        stdout
+        let result = stdout
             .take(MAX_VALIDATION_OUTPUT_BYTES + 1)
             .read_to_end(&mut bytes)
-            .map(|_| bytes)
+            .map(|_| bytes);
+        let _ = stdout_tx.send((true, result));
     });
-    let stderr_reader = thread::spawn(move || {
+    thread::spawn(move || {
         let mut bytes = Vec::new();
-        stderr
+        let result = stderr
             .take(MAX_VALIDATION_OUTPUT_BYTES + 1)
             .read_to_end(&mut bytes)
-            .map(|_| bytes)
+            .map(|_| bytes);
+        let _ = reader_tx.send((false, result));
     });
     let deadline = std::time::Instant::now() + VALIDATION_PROBE_TIMEOUT;
+    let process_group = child.id();
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
         }
         if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
+            kill_process_group(process_group);
             let _ = child.wait();
             return Err(UpdateError::InvalidRelease(format!(
                 "the {label} timed out"
@@ -910,12 +928,27 @@ fn bounded_output(command: &mut Command, label: &str) -> Result<Output, UpdateEr
         }
         thread::sleep(HELPER_READY_POLL);
     };
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| io::Error::other("validation stdout reader panicked"))??;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| io::Error::other("validation stderr reader panicked"))??;
+    let mut stdout = None;
+    let mut stderr = None;
+    while stdout.is_none() || stderr.is_none() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let (is_stdout, result) = match reader_rx.recv_timeout(remaining) {
+            Ok(result) => result,
+            Err(_) => {
+                kill_process_group(process_group);
+                return Err(UpdateError::InvalidRelease(format!(
+                    "the {label} left its output stream open"
+                )));
+            }
+        };
+        if is_stdout {
+            stdout = Some(result?);
+        } else {
+            stderr = Some(result?);
+        }
+    }
+    let stdout = stdout.expect("reader loop collected stdout");
+    let stderr = stderr.expect("reader loop collected stderr");
     if stdout.len() as u64 > MAX_VALIDATION_OUTPUT_BYTES
         || stderr.len() as u64 > MAX_VALIDATION_OUTPUT_BYTES
     {
@@ -928,6 +961,16 @@ fn bounded_output(command: &mut Command, label: &str) -> Result<Output, UpdateEr
         stdout,
         stderr,
     })
+}
+
+fn kill_process_group(process_group: u32) {
+    let _ = Command::new("/bin/kill")
+        .arg("-KILL")
+        .arg(format!("-{process_group}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn plist_value(path: &Path, key: &str) -> Result<String, UpdateError> {
@@ -1207,6 +1250,32 @@ mod tests {
         let marker = root.path().join("helper.ready");
         std::fs::write(&marker, b"read").unwrap();
         assert!(ready_marker_is_complete(&marker).is_err());
+    }
+
+    #[test]
+    fn post_readiness_gate_failure_recovers_the_untouched_previous_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join(APP_NAME);
+        let staging = root.path().join(".Viewr-update-test");
+        let plan = UpdatePlan {
+            expected_version: "0.5.0".into(),
+            previous_bundle: target.clone(),
+            target_bundle: target.clone(),
+            staged_bundle: staging.join(APP_NAME),
+            backup_bundle: root.path().join(".Viewr-backup-test.app"),
+            staging_root: staging.clone(),
+            lock_path: staging.join("parent.lock"),
+            backup_policy: BackupPolicy::DeleteAfterSuccess,
+            relaunch_arguments: Vec::new(),
+        };
+
+        let failure = before_mutation_failure(
+            &plan,
+            UpdateError::Io(io::Error::other("injected gate failure")),
+        );
+
+        assert_eq!(failure.recovery_bundle, target);
+        assert!(failure.rollback_error.is_none());
     }
 
     #[test]

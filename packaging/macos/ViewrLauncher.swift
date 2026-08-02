@@ -27,31 +27,17 @@ private func runLauncherSelfTest() -> Int32 {
         return 1
     }
 
-    let output = Pipe()
-    let process = Process()
-    process.executableURL = viewer
-    process.arguments = ["--version"]
-    process.standardInput = FileHandle.nullDevice
-    process.standardOutput = output
-    process.standardError = FileHandle.nullDevice
-
-    do {
-        try process.run()
-        process.waitUntilExit()
-    } catch {
-        writeSelfTestMessage(
-            "viewr-launcher self-test failed",
-            to: .standardError
-        )
-        return 1
-    }
-
-    guard process.terminationReason == .exit,
-          process.terminationStatus == 0,
-          let reported = String(
-              data: output.fileHandleForReading.readDataToEndOfFile(),
-              encoding: .utf8
-          )
+    guard Bundle.main.bundleIdentifier == "com.hunterchen.viewr",
+          let executable = Bundle.main.object(
+              forInfoDictionaryKey: "CFBundleExecutable"
+          ) as? String,
+          executable == "ViewrLauncher",
+          let version = Bundle.main.object(
+              forInfoDictionaryKey: "CFBundleShortVersionString"
+          ) as? String,
+          !version.isEmpty,
+          !version.contains("\n"),
+          !version.contains("\r")
     else {
         writeSelfTestMessage(
             "viewr-launcher self-test failed",
@@ -60,23 +46,6 @@ private func runLauncherSelfTest() -> Int32 {
         return 1
     }
 
-    let versionOutput = reported.hasSuffix("\n")
-        ? String(reported.dropLast())
-        : reported
-    let prefix = "viewr "
-    guard versionOutput.hasPrefix(prefix),
-          !versionOutput.dropFirst(prefix.count).isEmpty,
-          !versionOutput.contains("\n"),
-          !versionOutput.contains("\r")
-    else {
-        writeSelfTestMessage(
-            "viewr-launcher self-test failed",
-            to: .standardError
-        )
-        return 1
-    }
-
-    let version = String(versionOutput.dropFirst(prefix.count))
     writeSelfTestMessage("viewr-launcher \(version)", to: .standardOutput)
     return 0
 }
