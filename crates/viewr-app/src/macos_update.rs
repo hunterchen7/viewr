@@ -641,6 +641,15 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    fn archive_tree(source_app: &Path, archive_path: &Path) {
+        let output = File::create(archive_path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(output, flate2::Compression::best());
+        let mut archive = tar::Builder::new(encoder);
+        archive.follow_symlinks(false);
+        archive.append_dir_all(APP_NAME, source_app).unwrap();
+        archive.into_inner().unwrap().finish().unwrap();
+    }
+
     #[test]
     fn bundle_detection_requires_the_exact_layout() {
         assert_eq!(
@@ -689,6 +698,43 @@ mod tests {
         symlink("real", app.join("link")).unwrap();
 
         assert!(verify_no_links(&app, 0).is_err());
+    }
+
+    #[test]
+    fn app_archives_extract_with_paths_and_bytes_intact() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source").join(APP_NAME);
+        std::fs::create_dir_all(source.join("Contents/MacOS")).unwrap();
+        std::fs::write(source.join("Contents/MacOS/viewr-bin"), b"viewer").unwrap();
+        let archive = root.path().join("viewr-macos-arm64.tar.gz");
+        archive_tree(&source, &archive);
+
+        let destination = root.path().join("destination");
+        std::fs::create_dir(&destination).unwrap();
+        extract_app_archive(&archive, &destination).unwrap();
+
+        assert_eq!(
+            std::fs::read(destination.join("Viewr.app/Contents/MacOS/viewr-bin")).unwrap(),
+            b"viewer"
+        );
+    }
+
+    #[test]
+    fn app_archives_reject_links_before_they_are_unpacked() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source").join(APP_NAME);
+        std::fs::create_dir_all(source.join("Contents")).unwrap();
+        std::fs::write(source.join("Contents/real"), b"viewer").unwrap();
+        symlink("real", source.join("Contents/link")).unwrap();
+        let archive = root.path().join("viewr-macos-arm64.tar.gz");
+        archive_tree(&source, &archive);
+
+        let destination = root.path().join("destination");
+        std::fs::create_dir(&destination).unwrap();
+        assert!(extract_app_archive(&archive, &destination).is_err());
+        assert!(!destination.join("Viewr.app/Contents/link").exists());
     }
 
     #[test]
