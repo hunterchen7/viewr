@@ -32,14 +32,71 @@ pub enum ResizeError {
 /// When resizing is required, returns [`ResizeError::Fir`] if source RGBA
 /// storage is malformed or the resize operation fails.
 pub fn downscale_to_fit(buf: PixelBuf, max_edge: u32) -> Result<PixelBuf, ResizeError> {
-    let long = buf.width.max(buf.height);
+    match fit_dimensions(buf.width, buf.height, max_edge) {
+        None => Ok(buf),
+        Some((dst_w, dst_h)) => resize_exact(buf, dst_w, dst_h),
+    }
+}
+
+/// Downscales tightly packed RGB8 to fit `max_edge` and expands the result to
+/// RGBA8.
+///
+/// Convolving in the native three-channel layout skips a full-resolution RGBA
+/// expansion and filters 25% fewer bytes; only the small result is expanded.
+/// Output is byte-identical to expanding to RGBA first and calling
+/// [`downscale_to_fit`]: channels convolve independently, and a constant
+/// opaque alpha plane resizes to itself (both pinned by tests).
+///
+/// # Errors
+///
+/// When resizing is required, returns [`ResizeError::Fir`] if RGB storage
+/// does not match the dimensions or the resize operation fails.
+pub fn downscale_rgb8_to_rgba_fit(
+    width: u32,
+    height: u32,
+    rgb: Vec<u8>,
+    max_edge: u32,
+) -> Result<PixelBuf, ResizeError> {
+    let Some((dst_w, dst_h)) = fit_dimensions(width, height, max_edge) else {
+        return Ok(expand_rgb8(width, height, &rgb));
+    };
+    let src = fir::images::Image::from_vec_u8(width, height, rgb, fir::PixelType::U8x3)
+        .map_err(|e| ResizeError::Fir(e.to_string()))?;
+    let mut dst = fir::images::Image::new(dst_w, dst_h, fir::PixelType::U8x3);
+    let options = fir::ResizeOptions::new()
+        .resize_alg(fir::ResizeAlg::Convolution(fir::FilterType::CatmullRom))
+        .use_alpha(false);
+    RESIZER
+        .with(|resizer| resizer.borrow_mut().resize(&src, &mut dst, &options))
+        .map_err(|e| ResizeError::Fir(e.to_string()))?;
+    Ok(expand_rgb8(dst_w, dst_h, dst.buffer()))
+}
+
+/// Downscale geometry shared by every fit entry point: `None` when the image
+/// already fits.
+fn fit_dimensions(width: u32, height: u32, max_edge: u32) -> Option<(u32, u32)> {
+    let long = width.max(height);
     if long <= max_edge {
-        return Ok(buf);
+        return None;
     }
     let scale = max_edge as f64 / long as f64;
-    let dst_w = ((buf.width as f64 * scale).round() as u32).max(1);
-    let dst_h = ((buf.height as f64 * scale).round() as u32).max(1);
-    resize_exact(buf, dst_w, dst_h)
+    Some((
+        ((width as f64 * scale).round() as u32).max(1),
+        ((height as f64 * scale).round() as u32).max(1),
+    ))
+}
+
+fn expand_rgb8(width: u32, height: u32, rgb: &[u8]) -> PixelBuf {
+    let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
+    rgba.extend(
+        rgb.chunks_exact(3)
+            .flat_map(|px| [px[0], px[1], px[2], 255]),
+    );
+    PixelBuf {
+        width,
+        height,
+        rgba,
+    }
 }
 
 /// Resizes an RGBA8 buffer to exact dimensions with a Catmull-Rom filter.
@@ -197,6 +254,50 @@ mod tests {
 
     fn labels(buf: &PixelBuf) -> Vec<u8> {
         buf.rgba.chunks_exact(4).map(|pixel| pixel[0]).collect()
+    }
+
+    #[test]
+    fn rgb_downscale_matches_rgba_downscale_exactly() {
+        for (w, h, max_edge) in [
+            (1_616u32, 1_080u32, 360u32),
+            (1_617, 1_081, 360),
+            (640, 480, 359),
+            (240, 160, 512), // fits: expansion-only path
+            (5, 3, 2),
+        ] {
+            let mut state = 0x1234_5678u32;
+            let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+            for _ in 0..w * h {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                rgb.extend_from_slice(&[
+                    (state >> 8) as u8,
+                    (state >> 16) as u8,
+                    (state >> 24) as u8,
+                ]);
+            }
+            let rgba: Vec<u8> = rgb
+                .chunks_exact(3)
+                .flat_map(|px| [px[0], px[1], px[2], 255])
+                .collect();
+
+            let via_rgba = downscale_to_fit(
+                PixelBuf {
+                    width: w,
+                    height: h,
+                    rgba,
+                },
+                max_edge,
+            )
+            .unwrap();
+            let via_rgb = downscale_rgb8_to_rgba_fit(w, h, rgb, max_edge).unwrap();
+
+            assert_eq!(
+                (via_rgb.width, via_rgb.height),
+                (via_rgba.width, via_rgba.height)
+            );
+            assert!(via_rgba.rgba.chunks_exact(4).all(|px| px[3] == 255));
+            assert_eq!(via_rgb.rgba, via_rgba.rgba, "{w}x{h} fit {max_edge}");
+        }
     }
 
     #[test]
