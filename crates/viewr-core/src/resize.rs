@@ -1,9 +1,19 @@
 //! SIMD downscaling and orientation rotation for PixelBuf.
 
+use std::cell::RefCell;
+
 use fast_image_resize as fir;
 use rayon::prelude::*;
 
 use crate::types::{Orient, PixelBuf};
+
+thread_local! {
+    /// Reused per-thread resizer. `fir::Resizer` owns internal convolution
+    /// scratch buffers that a fresh instance reallocates on every resize; the
+    /// buffers are the only state it keeps between calls, so reuse cannot
+    /// change output.
+    static RESIZER: RefCell<fir::Resizer> = RefCell::new(fir::Resizer::new());
+}
 
 #[derive(Debug, thiserror::Error)]
 /// Failure while constructing or resizing an RGBA image.
@@ -50,8 +60,8 @@ pub fn resize_exact(buf: PixelBuf, dst_w: u32, dst_h: u32) -> Result<PixelBuf, R
     let options = fir::ResizeOptions::new()
         .resize_alg(fir::ResizeAlg::Convolution(fir::FilterType::CatmullRom))
         .use_alpha(false);
-    fir::Resizer::new()
-        .resize(&src, &mut dst, &options)
+    RESIZER
+        .with(|resizer| resizer.borrow_mut().resize(&src, &mut dst, &options))
         .map_err(|e| ResizeError::Fir(e.to_string()))?;
     Ok(PixelBuf {
         width: dst_w,
