@@ -13,6 +13,8 @@ mod config;
 mod filmstrip;
 mod image_info;
 mod loupe;
+#[cfg(target_os = "macos")]
+mod macos_update;
 mod progressive_texture;
 mod rating_groups;
 mod settings;
@@ -28,8 +30,15 @@ use viewr_core::develop::{Quality, develop};
 
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
+    #[cfg(target_os = "macos")]
+    ApplyMacosUpdate {
+        plan: PathBuf,
+    },
     Browse(PathBuf),
-    Develop { input: PathBuf, out_dir: PathBuf },
+    Develop {
+        input: PathBuf,
+        out_dir: PathBuf,
+    },
     NotifyFileAssociations,
     PickFolder,
     PrintUsage,
@@ -47,6 +56,10 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> Result<Command> {
         [flag] if flag == "--version" || flag == "-V" => Ok(Command::PrintVersion),
         [flag] if flag == "--notify-file-associations" => Ok(Command::NotifyFileAssociations),
         [flag] if flag == "--pick-folder" => Ok(Command::PickFolder),
+        #[cfg(target_os = "macos")]
+        [flag, plan] if flag == "--apply-macos-update" => Ok(Command::ApplyMacosUpdate {
+            plan: PathBuf::from(plan),
+        }),
         [command, input] if command == "dev" => Ok(Command::Develop {
             input: PathBuf::from(input),
             out_dir: PathBuf::from("."),
@@ -61,6 +74,10 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> Result<Command> {
         [flag, ..] if flag == "--pick-folder" => {
             bail!("usage: viewr --pick-folder");
         }
+        #[cfg(target_os = "macos")]
+        [flag, ..] if flag == "--apply-macos-update" => {
+            bail!("invalid internal macOS update command");
+        }
         [flag, ..] if flag == "--notify-file-associations" => {
             bail!("usage: viewr --notify-file-associations");
         }
@@ -74,6 +91,10 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> Result<Command> {
 
 fn run(command: Command) -> Result<()> {
     match command {
+        #[cfg(target_os = "macos")]
+        Command::ApplyMacosUpdate { plan } => {
+            macos_update::apply(&plan).context("failed to apply the macOS update")
+        }
         Command::Browse(path) => {
             if path.is_dir() {
                 app::run(&path, None)
@@ -248,6 +269,19 @@ mod tests {
         assert_eq!(parse(&["-V"]).unwrap(), Command::PrintVersion);
         assert!(parse(&["--version", "extra"]).is_err());
         assert!(parse(&["-V", "extra"]).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parses_only_the_exact_internal_macos_update_command() {
+        assert_eq!(
+            parse(&["--apply-macos-update", "/tmp/update-plan.json"]).unwrap(),
+            Command::ApplyMacosUpdate {
+                plan: PathBuf::from("/tmp/update-plan.json"),
+            }
+        );
+        assert!(parse(&["--apply-macos-update"]).is_err());
+        assert!(parse(&["--apply-macos-update", "plan", "extra"]).is_err());
     }
 
     #[test]

@@ -25,6 +25,8 @@ const GITHUB_API_VERSION: &str = "2026-03-10";
 const USER_AGENT: &str = concat!("viewr/", env!("CARGO_PKG_VERSION"), " updater");
 const MAX_RELEASE_JSON_BYTES: usize = 1024 * 1024;
 const MAX_RELEASE_NOTES_BYTES: usize = 64 * 1024;
+const MAX_RELEASE_NOTE_BLOCKS: usize = 128;
+const MAX_RELEASE_NOTE_SPANS: usize = 16;
 const MAX_RELEASE_ASSETS: usize = 128;
 const MAX_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 5;
@@ -62,6 +64,7 @@ pub(crate) enum CheckSource {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PackageKind {
+    Application,
     Installer,
     Portable,
 }
@@ -69,6 +72,7 @@ pub(crate) enum PackageKind {
 impl PackageKind {
     pub(crate) fn noun(self) -> &'static str {
         match self {
+            Self::Application => "application update",
             Self::Installer => "installer",
             Self::Portable => "portable update",
         }
@@ -93,7 +97,7 @@ pub(crate) enum Delivery {
 #[derive(Clone, Debug)]
 pub(crate) struct Release {
     pub(crate) version: Version,
-    pub(crate) notes: String,
+    notes: Arc<[ReleaseNoteBlock]>,
     pub(crate) delivery: Delivery,
 }
 
@@ -114,6 +118,7 @@ pub(crate) enum CheckOutcome {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PlatformAssets {
+    application: Option<&'static str>,
     installer: &'static str,
     portable: &'static str,
 }
@@ -121,14 +126,17 @@ struct PlatformAssets {
 fn platform_assets(target_os: &str, target_arch: &str) -> Option<PlatformAssets> {
     match (target_os, target_arch) {
         ("macos", "aarch64") => Some(PlatformAssets {
+            application: Some("viewr-macos-arm64.tar.gz"),
             installer: "viewr-macos-arm64.pkg",
             portable: "viewr-macos-arm64.tar.gz",
         }),
         ("windows", "x86_64") => Some(PlatformAssets {
+            application: None,
             installer: "viewr-windows-x64.msi",
             portable: "viewr-windows-x64.zip",
         }),
         ("linux", "x86_64") => Some(PlatformAssets {
+            application: None,
             installer: "viewr-linux-x64.deb",
             portable: "viewr-linux-x64.tar.gz",
         }),
@@ -137,14 +145,30 @@ fn platform_assets(target_os: &str, target_arch: &str) -> Option<PlatformAssets>
 }
 
 fn current_delivery_spec() -> Option<(&'static str, PackageKind)> {
-    let assets = platform_assets(std::env::consts::OS, std::env::consts::ARCH)?;
-    let kind = if native_install_detected() {
+    delivery_spec_for(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        native_install_detected(),
+    )
+}
+
+fn delivery_spec_for(
+    target_os: &str,
+    target_arch: &str,
+    native_install: bool,
+) -> Option<(&'static str, PackageKind)> {
+    let assets = platform_assets(target_os, target_arch)?;
+    if let Some(application) = assets.application {
+        return Some((application, PackageKind::Application));
+    }
+    let kind = if native_install {
         PackageKind::Installer
     } else {
         PackageKind::Portable
     };
     Some((
         match kind {
+            PackageKind::Application => unreachable!("handled above"),
             PackageKind::Installer => assets.installer,
             PackageKind::Portable => assets.portable,
         },
@@ -294,6 +318,293 @@ fn sanitized_notes(body: Option<&str>) -> String {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReleaseNoteSpan {
+    Text(String),
+    Strong(String),
+    Link { label: String, url: String },
+}
+
+impl ReleaseNoteSpan {
+    #[cfg(test)]
+    fn label(&self) -> &str {
+        match self {
+            Self::Text(text) | Self::Strong(text) => text,
+            Self::Link { label, .. } => label,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReleaseNoteBlock {
+    Heading {
+        level: u8,
+        spans: Vec<ReleaseNoteSpan>,
+    },
+    Bullet(Vec<ReleaseNoteSpan>),
+    Paragraph(Vec<ReleaseNoteSpan>),
+}
+
+impl ReleaseNoteBlock {
+    #[cfg(test)]
+    fn spans(&self) -> std::slice::Iter<'_, ReleaseNoteSpan> {
+        match self {
+            Self::Heading { spans, .. } | Self::Bullet(spans) | Self::Paragraph(spans) => {
+                spans.iter()
+            }
+        }
+    }
+}
+
+fn parse_release_notes(notes: &str) -> Vec<ReleaseNoteBlock> {
+    let mut blocks = Vec::new();
+    for line in notes.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if blocks.len() == MAX_RELEASE_NOTE_BLOCKS - 1 {
+            blocks.push(ReleaseNoteBlock::Paragraph(vec![ReleaseNoteSpan::Text(
+                "More details are available on the release page.".into(),
+            )]));
+            break;
+        }
+        let heading_marks = line.bytes().take_while(|byte| *byte == b'#').count();
+        if (1..=6).contains(&heading_marks) && line.as_bytes().get(heading_marks) == Some(&b' ') {
+            blocks.push(ReleaseNoteBlock::Heading {
+                level: heading_marks as u8,
+                spans: parse_release_note_spans(line[heading_marks + 1..].trim()),
+            });
+            continue;
+        }
+        if let Some(bullet) = line.strip_prefix("* ").or_else(|| line.strip_prefix("- ")) {
+            blocks.push(ReleaseNoteBlock::Bullet(parse_release_note_spans(
+                bullet.trim(),
+            )));
+            continue;
+        }
+        blocks.push(ReleaseNoteBlock::Paragraph(parse_release_note_spans(line)));
+    }
+    blocks
+}
+
+fn parse_release_note_spans(line: &str) -> Vec<ReleaseNoteSpan> {
+    let mut spans = Vec::new();
+    let mut emitted = 0;
+    let mut scan = 0;
+    while scan < line.len() {
+        let Some(open_offset) = line[scan..].find('[') else {
+            break;
+        };
+        let open = scan + open_offset;
+        let Some(close_offset) = line[open + 1..].find(']') else {
+            break;
+        };
+        let close = open + 1 + close_offset;
+        let url_start = close + 1;
+        if line.as_bytes().get(url_start) != Some(&b'(') {
+            scan = close + 1;
+            continue;
+        }
+        let url_start = url_start + 1;
+        let Some(url_end_offset) = line[url_start..].find(')') else {
+            break;
+        };
+        let url_end = url_start + url_end_offset;
+        let label = &line[open + 1..close];
+        let url = &line[url_start..url_end];
+        let trusted = !label.is_empty()
+            && Url::parse(url).is_ok_and(|url| {
+                url.scheme() == "https"
+                    && url.port_or_known_default() == Some(443)
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.host_str() == Some("github.com")
+                    && url.path().starts_with("/hunterchen7/viewr/")
+            });
+        if !trusted {
+            scan = url_end + 1;
+            continue;
+        }
+        if spans.len() >= MAX_RELEASE_NOTE_SPANS - 2 {
+            break;
+        }
+        if emitted < open {
+            spans.push(ReleaseNoteSpan::Text(line[emitted..open].to_owned()));
+        }
+        spans.push(ReleaseNoteSpan::Link {
+            label: label.to_owned(),
+            url: url.to_owned(),
+        });
+        emitted = url_end + 1;
+        scan = emitted;
+    }
+    if emitted < line.len() {
+        spans.push(ReleaseNoteSpan::Text(line[emitted..].to_owned()));
+    }
+    parse_release_note_emphasis(spans)
+}
+
+fn parse_release_note_emphasis(spans: Vec<ReleaseNoteSpan>) -> Vec<ReleaseNoteSpan> {
+    let mut output = Vec::with_capacity(spans.len());
+    for span in spans {
+        let text = match span {
+            ReleaseNoteSpan::Text(text) => text,
+            other => {
+                if !push_release_note_span(&mut output, other) {
+                    return output;
+                }
+                continue;
+            }
+        };
+        let mut emitted = 0;
+        let mut scan = 0;
+        while scan < text.len() {
+            let Some(open_offset) = text[scan..].find("**") else {
+                break;
+            };
+            let open = scan + open_offset;
+            let content_start = open + 2;
+            let Some(close_offset) = text[content_start..].find("**") else {
+                break;
+            };
+            let close = content_start + close_offset;
+            if close == content_start {
+                scan = content_start;
+                continue;
+            }
+            if emitted < open
+                && !push_release_note_span(
+                    &mut output,
+                    ReleaseNoteSpan::Text(text[emitted..open].to_owned()),
+                )
+            {
+                return output;
+            }
+            if !push_release_note_span(
+                &mut output,
+                ReleaseNoteSpan::Strong(text[content_start..close].to_owned()),
+            ) {
+                return output;
+            }
+            emitted = close + 2;
+            scan = emitted;
+        }
+        if emitted < text.len()
+            && !push_release_note_span(
+                &mut output,
+                ReleaseNoteSpan::Text(text[emitted..].to_owned()),
+            )
+        {
+            return output;
+        }
+    }
+    if output.is_empty() {
+        output.push(ReleaseNoteSpan::Text(String::new()));
+    }
+    output
+}
+
+fn push_release_note_span(output: &mut Vec<ReleaseNoteSpan>, span: ReleaseNoteSpan) -> bool {
+    if output.len() < MAX_RELEASE_NOTE_SPANS - 1 {
+        output.push(span);
+        true
+    } else {
+        output.push(ReleaseNoteSpan::Text("…".into()));
+        false
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReleaseNoteStyle {
+    Heading(u8),
+    Body,
+}
+
+fn release_note_text(text: &str, style: ReleaseNoteStyle, strong: bool) -> egui::RichText {
+    let text = egui::RichText::new(text);
+    let text = match style {
+        ReleaseNoteStyle::Heading(1 | 2) => text.strong().size(15.0),
+        ReleaseNoteStyle::Heading(_) => text.strong().size(13.0),
+        ReleaseNoteStyle::Body => text,
+    };
+    if strong { text.strong() } else { text }
+}
+
+fn release_note_job(
+    ui: &egui::Ui,
+    text: &str,
+    style: ReleaseNoteStyle,
+    strong: bool,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    release_note_text(text, style, strong).append_to(
+        &mut job,
+        ui.style(),
+        egui::FontSelection::Default,
+        egui::Align::Center,
+    );
+    job
+}
+
+fn show_release_note_inline(ui: &mut egui::Ui, spans: &[ReleaseNoteSpan], style: ReleaseNoteStyle) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        for span in spans {
+            match span {
+                ReleaseNoteSpan::Text(text) | ReleaseNoteSpan::Strong(text) => {
+                    let strong = matches!(span, ReleaseNoteSpan::Strong(_));
+                    ui.add(egui::Label::new(release_note_job(ui, text, style, strong)).wrap());
+                }
+                ReleaseNoteSpan::Link { label, url } => {
+                    ui.hyperlink_to(release_note_job(ui, label, style, false), url);
+                }
+            }
+        }
+    });
+}
+
+fn show_release_note_spans(
+    ui: &mut egui::Ui,
+    spans: &[ReleaseNoteSpan],
+    style: ReleaseNoteStyle,
+    bullet: bool,
+) {
+    if bullet {
+        ui.horizontal_top(|ui| {
+            ui.label(release_note_text("•", style, false));
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                show_release_note_inline(ui, spans, style);
+            });
+        });
+    } else {
+        show_release_note_inline(ui, spans, style);
+    }
+}
+
+fn show_release_notes(ui: &mut egui::Ui, notes: &[ReleaseNoteBlock]) {
+    for (index, block) in notes.iter().enumerate() {
+        if index > 0 {
+            ui.add_space(match block {
+                ReleaseNoteBlock::Heading { .. } => 6.0,
+                ReleaseNoteBlock::Bullet(_) | ReleaseNoteBlock::Paragraph(_) => 2.0,
+            });
+        }
+        match block {
+            ReleaseNoteBlock::Heading { level, spans } => {
+                show_release_note_spans(ui, spans, ReleaseNoteStyle::Heading(*level), false);
+            }
+            ReleaseNoteBlock::Bullet(spans) => {
+                show_release_note_spans(ui, spans, ReleaseNoteStyle::Body, true);
+            }
+            ReleaseNoteBlock::Paragraph(spans) => {
+                show_release_note_spans(ui, spans, ReleaseNoteStyle::Body, false);
+            }
+        }
+    }
+}
+
 fn parse_release(
     bytes: &[u8],
     running: &Version,
@@ -318,7 +629,8 @@ fn parse_release(
         return Ok(CheckOutcome::Current(version));
     }
 
-    let notes = sanitized_notes(raw.body.as_deref());
+    let notes: Arc<[ReleaseNoteBlock]> =
+        Arc::from(parse_release_notes(&sanitized_notes(raw.body.as_deref())));
     let delivery = match delivery_spec {
         None => Delivery::ReleasePageOnly {
             reason: format!(
@@ -872,7 +1184,7 @@ fn check_due(previous: Option<u64>, now: u64, minimum_age: u64) -> bool {
     })
 }
 
-fn open_lock_file(path: &Path) -> io::Result<File> {
+pub(crate) fn open_lock_file(path: &Path) -> io::Result<File> {
     if path
         .symlink_metadata()
         .is_ok_and(|metadata| metadata.file_type().is_symlink())
@@ -896,7 +1208,7 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-fn ensure_private_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn ensure_private_directory(path: &Path) -> io::Result<()> {
     match path.symlink_metadata() {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(io::Error::new(
@@ -1317,6 +1629,20 @@ enum UpdateState {
         asset: ReleaseAsset,
         progress: Arc<AtomicU64>,
     },
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    PreparingApplication {
+        id: u64,
+        release: Release,
+    },
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    StartingApplication {
+        id: u64,
+        release: Release,
+    },
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    ApplyingApplication {
+        release: Release,
+    },
     Ready {
         release: Release,
         asset: ReleaseAsset,
@@ -1361,6 +1687,20 @@ enum WorkerEvent {
         release: Release,
         asset: ReleaseAsset,
         result: Result<PathBuf, UpdateError>,
+    },
+    #[cfg(target_os = "macos")]
+    ApplicationPrepared {
+        id: u64,
+        release: Release,
+        asset: ReleaseAsset,
+        result: Result<crate::macos_update::PreparedUpdate, UpdateError>,
+    },
+    #[cfg(target_os = "macos")]
+    ApplicationStarted {
+        id: u64,
+        release: Release,
+        asset: ReleaseAsset,
+        result: Result<(), UpdateError>,
     },
     InstallerVerified {
         id: u64,
@@ -1664,6 +2004,9 @@ impl UpdateManager {
             UpdateState::Available { .. }
                 | UpdateState::Deferred { .. }
                 | UpdateState::Downloading { .. }
+                | UpdateState::PreparingApplication { .. }
+                | UpdateState::StartingApplication { .. }
+                | UpdateState::ApplyingApplication { .. }
                 | UpdateState::Ready { .. }
                 | UpdateState::VerifyingInstaller { .. }
                 | UpdateState::InstallerOpened { .. }
@@ -1697,6 +2040,15 @@ impl UpdateManager {
                 asset.kind.noun(),
                 download_percent(progress.load(Ordering::Relaxed), asset.size)
             ),
+            UpdateState::PreparingApplication { release, .. } => {
+                format!("Preparing Viewr {}", release.version)
+            }
+            UpdateState::StartingApplication { release, .. } => {
+                format!("Starting Viewr {} update", release.version)
+            }
+            UpdateState::ApplyingApplication { release } => {
+                format!("Restarting into Viewr {}", release.version)
+            }
             UpdateState::Ready { release, .. } => {
                 format!("Viewr {} is ready", release.version)
             }
@@ -1723,6 +2075,9 @@ impl UpdateManager {
             self.state,
             UpdateState::Checking { .. }
                 | UpdateState::Downloading { .. }
+                | UpdateState::PreparingApplication { .. }
+                | UpdateState::StartingApplication { .. }
+                | UpdateState::ApplyingApplication { .. }
                 | UpdateState::VerifyingInstaller { .. }
         ) {
             return;
@@ -1853,6 +2208,91 @@ impl UpdateManager {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn start_application_preparation(
+        &mut self,
+        release: Release,
+        asset: ReleaseAsset,
+        path: PathBuf,
+    ) {
+        let id = self.next_request_id();
+        self.state = UpdateState::PreparingApplication {
+            id,
+            release: release.clone(),
+        };
+        self.dialog_open = true;
+        let sender = self.sender.clone();
+        let ctx = self.ctx.clone();
+        let worker_release = release.clone();
+        let worker_asset = asset.clone();
+        let worker_path = path.clone();
+        let version = release.version.clone();
+        let spawn = std::thread::Builder::new()
+            .name("viewr-update-prepare".into())
+            .spawn(move || {
+                let result = verify_before_open(&worker_path, &worker_asset)
+                    .and_then(|()| crate::macos_update::prepare(&worker_path, &version));
+                let event = WorkerEvent::ApplicationPrepared {
+                    id,
+                    release: worker_release,
+                    asset: worker_asset,
+                    result,
+                };
+                if let Err(error) = sender.send(event)
+                    && let WorkerEvent::ApplicationPrepared {
+                        result: Ok(prepared),
+                        ..
+                    } = error.0
+                {
+                    crate::macos_update::discard(prepared);
+                }
+                ctx.request_repaint();
+            });
+        if let Err(error) = spawn {
+            self.state = UpdateState::Failed {
+                message: format!("could not start application preparation: {error}"),
+                retry: Retry::Download(Box::new(DownloadRetry { release, asset })),
+            };
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn start_application_helper(
+        &mut self,
+        release: Release,
+        asset: ReleaseAsset,
+        mut prepared: crate::macos_update::PreparedUpdate,
+    ) {
+        let id = self.next_request_id();
+        self.state = UpdateState::StartingApplication {
+            id,
+            release: release.clone(),
+        };
+        let sender = self.sender.clone();
+        let ctx = self.ctx.clone();
+        let spawn = std::thread::Builder::new()
+            .name("viewr-update-start-helper".into())
+            .spawn(move || {
+                let result = crate::macos_update::spawn(&mut prepared);
+                if result.is_err() {
+                    crate::macos_update::discard(prepared);
+                }
+                let _ = sender.send(WorkerEvent::ApplicationStarted {
+                    id,
+                    release,
+                    asset,
+                    result,
+                });
+                ctx.request_repaint();
+            });
+        if let Err(error) = spawn {
+            self.state = UpdateState::Failed {
+                message: format!("could not start the application update helper: {error}"),
+                retry: Retry::None,
+            };
+        }
+    }
+
     fn handle_event(&mut self, event: WorkerEvent) {
         match event {
             WorkerEvent::CheckFinished {
@@ -1932,6 +2372,20 @@ impl UpdateManager {
                     return;
                 }
                 match result {
+                    Ok(path) if asset.kind == PackageKind::Application => {
+                        #[cfg(target_os = "macos")]
+                        self.start_application_preparation(release, asset, path);
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            let _ = path;
+                            self.state = UpdateState::Failed {
+                                message:
+                                    "application self-updates are unsupported on this platform"
+                                        .into(),
+                                retry: Retry::Download(Box::new(DownloadRetry { release, asset })),
+                            };
+                        }
+                    }
                     Ok(path) => {
                         self.state = UpdateState::Ready {
                             release,
@@ -1947,6 +2401,67 @@ impl UpdateManager {
                     }
                 }
                 self.dialog_open = true;
+            }
+            #[cfg(target_os = "macos")]
+            WorkerEvent::ApplicationPrepared {
+                id,
+                release,
+                asset,
+                result,
+            } => {
+                if !matches!(
+                    self.state,
+                    UpdateState::PreparingApplication {
+                        id: active,
+                        ..
+                    } if active == id
+                ) {
+                    if let Ok(prepared) = result {
+                        crate::macos_update::discard(prepared);
+                    }
+                    return;
+                }
+                match result {
+                    Ok(prepared) => self.start_application_helper(release, asset, prepared),
+                    Err(error) => {
+                        self.state = UpdateState::Failed {
+                            message: error.to_string(),
+                            retry: Retry::Download(Box::new(DownloadRetry { release, asset })),
+                        };
+                        self.dialog_open = true;
+                    }
+                }
+            }
+            #[cfg(target_os = "macos")]
+            WorkerEvent::ApplicationStarted {
+                id,
+                release,
+                asset,
+                result,
+            } => {
+                if !matches!(
+                    self.state,
+                    UpdateState::StartingApplication { id: active, .. } if active == id
+                ) {
+                    if result.is_ok() {
+                        self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        self.state = UpdateState::ApplyingApplication { release };
+                        self.dialog_open = true;
+                        self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    Err(error) => {
+                        self.state = UpdateState::Failed {
+                            message: error.to_string(),
+                            retry: Retry::Download(Box::new(DownloadRetry { release, asset })),
+                        };
+                        self.dialog_open = true;
+                    }
+                }
             }
             WorkerEvent::InstallerVerified {
                 id,
@@ -2046,7 +2561,7 @@ impl UpdateManager {
                     .id_salt("viewr-update-notes")
                     .max_height(260.0)
                     .show(ui, |ui| {
-                        ui.add(egui::Label::new(release.notes.as_str()).wrap());
+                        show_release_notes(ui, &release.notes);
                     });
                 ui.add_space(10.0);
                 if let Delivery::ReleasePageOnly { reason } = &release.delivery {
@@ -2054,10 +2569,14 @@ impl UpdateManager {
                 }
                 let mut action = UpdateAction::None;
                 ui.horizontal_wrapped(|ui| {
-                    if matches!(release.delivery, Delivery::Download(_))
-                        && ui.button("Download now").clicked()
-                    {
-                        action = UpdateAction::Download;
+                    if let Delivery::Download(asset) = &release.delivery {
+                        let label = match asset.kind {
+                            PackageKind::Application => "Update and restart",
+                            PackageKind::Installer | PackageKind::Portable => "Download now",
+                        };
+                        if ui.button(label).clicked() {
+                            action = UpdateAction::Download;
+                        }
                     }
                     if ui.button("View release").clicked() {
                         action = UpdateAction::ViewRelease;
@@ -2096,6 +2615,27 @@ impl UpdateManager {
                 );
                 UpdateAction::None
             }
+            UpdateState::PreparingApplication { .. } => {
+                ui.heading("Preparing update");
+                ui.spinner();
+                ui.label("Viewr is verifying and staging the new application before restarting.");
+                UpdateAction::None
+            }
+            UpdateState::StartingApplication { .. } => {
+                ui.heading("Starting update");
+                ui.spinner();
+                ui.label("Viewr is starting its verified update helper.");
+                UpdateAction::None
+            }
+            UpdateState::ApplyingApplication { release } => {
+                ui.heading("Restarting Viewr");
+                ui.spinner();
+                ui.label(format!(
+                    "Viewr {} will open as soon as the application update is complete.",
+                    release.version
+                ));
+                UpdateAction::None
+            }
             UpdateState::Ready {
                 release,
                 asset,
@@ -2107,20 +2647,26 @@ impl UpdateManager {
                     asset.name
                 ));
                 ui.add_space(8.0);
-                if asset.kind == PackageKind::Installer {
-                    ui.label(
-                        egui::RichText::new(
-                            "Preview warning: this installer is not yet code-signed. Opening it hands control to your operating system; installation still requires your confirmation.",
-                        )
-                        .color(egui::Color32::YELLOW),
-                    );
-                    ui.label(
-                        "Close every Viewr window before completing the upgrade, then reopen Viewr.",
-                    );
-                } else {
-                    ui.label(
-                        "This copy of Viewr is portable. The downloaded archive will not replace the running app automatically.",
-                    );
+                match asset.kind {
+                    PackageKind::Application => {
+                        ui.label("The application update is ready to be installed and restarted.");
+                    }
+                    PackageKind::Installer => {
+                        ui.label(
+                            egui::RichText::new(
+                                "Preview warning: this installer is not yet code-signed. Opening it hands control to your operating system; installation still requires your confirmation.",
+                            )
+                            .color(egui::Color32::YELLOW),
+                        );
+                        ui.label(
+                            "Close every Viewr window before completing the upgrade, then reopen Viewr.",
+                        );
+                    }
+                    PackageKind::Portable => {
+                        ui.label(
+                            "This copy of Viewr is portable. The downloaded archive will not replace the running app automatically.",
+                        );
+                    }
                 }
                 ui.add_space(10.0);
                 let mut action = UpdateAction::None;
@@ -2129,7 +2675,7 @@ impl UpdateManager {
                     {
                         action = UpdateAction::OpenInstaller;
                     }
-                    if ui.button("Show file").clicked() {
+                    if asset.kind != PackageKind::Application && ui.button("Show file").clicked() {
                         action = UpdateAction::RevealFile;
                     }
                     if ui.button("View release").clicked() {
@@ -2330,6 +2876,9 @@ fn release_in_state(state: &UpdateState) -> Option<&Release> {
         UpdateState::Available { release }
         | UpdateState::Deferred { release }
         | UpdateState::Downloading { release, .. }
+        | UpdateState::PreparingApplication { release, .. }
+        | UpdateState::StartingApplication { release, .. }
+        | UpdateState::ApplyingApplication { release }
         | UpdateState::Ready { release, .. }
         | UpdateState::VerifyingInstaller { release, .. }
         | UpdateState::InstallerOpened { release, .. } => Some(release),
@@ -2424,6 +2973,7 @@ mod tests {
         assert_eq!(
             platform_assets("macos", "aarch64"),
             Some(PlatformAssets {
+                application: Some("viewr-macos-arm64.tar.gz"),
                 installer: "viewr-macos-arm64.pkg",
                 portable: "viewr-macos-arm64.tar.gz",
             })
@@ -2431,6 +2981,7 @@ mod tests {
         assert_eq!(
             platform_assets("windows", "x86_64"),
             Some(PlatformAssets {
+                application: None,
                 installer: "viewr-windows-x64.msi",
                 portable: "viewr-windows-x64.zip",
             })
@@ -2438,12 +2989,43 @@ mod tests {
         assert_eq!(
             platform_assets("linux", "x86_64"),
             Some(PlatformAssets {
+                application: None,
                 installer: "viewr-linux-x64.deb",
                 portable: "viewr-linux-x64.tar.gz",
             })
         );
         assert_eq!(platform_assets("macos", "x86_64"), None);
         assert_eq!(platform_assets("freebsd", "x86_64"), None);
+    }
+
+    #[test]
+    fn macos_always_selects_the_self_updating_application_archive() {
+        for native_install in [false, true] {
+            assert_eq!(
+                delivery_spec_for("macos", "aarch64", native_install),
+                Some(("viewr-macos-arm64.tar.gz", PackageKind::Application))
+            );
+        }
+    }
+
+    #[test]
+    fn other_platforms_preserve_installer_and_portable_delivery() {
+        assert_eq!(
+            delivery_spec_for("windows", "x86_64", true),
+            Some(("viewr-windows-x64.msi", PackageKind::Installer))
+        );
+        assert_eq!(
+            delivery_spec_for("windows", "x86_64", false),
+            Some(("viewr-windows-x64.zip", PackageKind::Portable))
+        );
+        assert_eq!(
+            delivery_spec_for("linux", "x86_64", true),
+            Some(("viewr-linux-x64.deb", PackageKind::Installer))
+        );
+        assert_eq!(
+            delivery_spec_for("linux", "x86_64", false),
+            Some(("viewr-linux-x64.tar.gz", PackageKind::Portable))
+        );
     }
 
     #[test]
@@ -2618,6 +3200,152 @@ mod tests {
             sanitized_notes(Some(&"x".repeat(MAX_RELEASE_NOTES_BYTES + 10))).len()
                 <= MAX_RELEASE_NOTES_BYTES
         );
+    }
+
+    #[test]
+    fn release_notes_parse_release_please_markdown_without_exposing_urls() {
+        let notes = "## [0.4.0](https://github.com/hunterchen7/viewr/compare/v0.3.0...v0.4.0) (2026-08-02)\n\n### Features\n\n* add an information strip ([#24](https://github.com/hunterchen7/viewr/pull/24))\n* fill the cache adaptively ([#26](https://github.com/hunterchen7/viewr/pull/26))\n\n### Bug Fixes\n\n* keep overflow draggable ([650b8f6](https://github.com/hunterchen7/viewr/commit/650b8f6))";
+
+        let blocks = parse_release_notes(notes);
+
+        assert_eq!(blocks.len(), 6);
+        assert!(matches!(
+            &blocks[0],
+            ReleaseNoteBlock::Heading { level: 2, spans }
+                if spans == &vec![
+                    ReleaseNoteSpan::Link {
+                        label: "0.4.0".into(),
+                        url: "https://github.com/hunterchen7/viewr/compare/v0.3.0...v0.4.0".into(),
+                    },
+                    ReleaseNoteSpan::Text(" (2026-08-02)".into()),
+                ]
+        ));
+        assert!(matches!(
+            &blocks[1],
+            ReleaseNoteBlock::Heading { level: 3, spans }
+                if spans == &vec![ReleaseNoteSpan::Text("Features".into())]
+        ));
+        assert!(matches!(&blocks[2], ReleaseNoteBlock::Bullet(_)));
+        assert!(matches!(&blocks[3], ReleaseNoteBlock::Bullet(_)));
+        assert!(matches!(
+            &blocks[4],
+            ReleaseNoteBlock::Heading { level: 3, spans }
+                if spans == &vec![ReleaseNoteSpan::Text("Bug Fixes".into())]
+        ));
+        assert!(matches!(&blocks[5], ReleaseNoteBlock::Bullet(_)));
+
+        let visible = blocks
+            .iter()
+            .flat_map(ReleaseNoteBlock::spans)
+            .map(ReleaseNoteSpan::label)
+            .collect::<String>();
+        assert!(visible.contains("0.4.0 (2026-08-02)"));
+        assert!(visible.contains("add an information strip (#24)"));
+        assert!(!visible.contains("https://"));
+        assert!(!visible.contains("##"));
+        assert!(!visible.contains("* "));
+    }
+
+    #[test]
+    fn release_notes_keep_malformed_or_untrusted_links_as_plain_text() {
+        let blocks = parse_release_notes(
+            "A [broken](not a url), [unsafe](javascript:alert(1)), and [external](https://example.com/path) link.\n\nPlain paragraph.",
+        );
+
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks.iter().all(|block| {
+            block
+                .spans()
+                .all(|span| matches!(span, ReleaseNoteSpan::Text(_)))
+        }));
+        let visible = blocks
+            .iter()
+            .flat_map(ReleaseNoteBlock::spans)
+            .map(ReleaseNoteSpan::label)
+            .collect::<String>();
+        assert_eq!(
+            visible,
+            "A [broken](not a url), [unsafe](javascript:alert(1)), and [external](https://example.com/path) link.Plain paragraph."
+        );
+    }
+
+    #[test]
+    fn release_notes_render_release_please_strong_scopes_without_markers() {
+        let blocks = parse_release_notes(
+            "* **ci:** keep update archives verified ([#42](https://github.com/hunterchen7/viewr/pull/42))",
+        );
+
+        assert!(matches!(
+            &blocks[0],
+            ReleaseNoteBlock::Bullet(spans)
+                if spans == &vec![
+                    ReleaseNoteSpan::Strong("ci:".into()),
+                    ReleaseNoteSpan::Text(" keep update archives verified (".into()),
+                    ReleaseNoteSpan::Link {
+                        label: "#42".into(),
+                        url: "https://github.com/hunterchen7/viewr/pull/42".into(),
+                    },
+                    ReleaseNoteSpan::Text(")".into()),
+                ]
+        ));
+    }
+
+    #[test]
+    fn release_note_layout_breaks_long_tokens_inside_the_available_width() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 1200.0));
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let notes = format!(
+            "### Fixes\n\n* {} ([very-long-link-label-{}](https://github.com/hunterchen7/viewr/pull/42))",
+            "unbroken".repeat(128),
+            "x".repeat(128),
+        );
+        let mut rendered = egui::Rect::NOTHING;
+        let blocks = parse_release_notes(&notes);
+
+        let _ = ctx.run_ui(input, |ui| {
+            ui.set_max_width(300.0);
+            rendered = ui.scope(|ui| show_release_notes(ui, &blocks)).response.rect;
+        });
+
+        assert!(rendered.is_finite());
+        assert!(rendered.right() <= 300.5, "rendered rect was {rendered:?}");
+        assert!(rendered.height() > 40.0, "long tokens did not wrap");
+    }
+
+    #[test]
+    fn release_note_parser_bounds_adversarial_brackets_lines_and_spans() {
+        let malformed = format!("{}]", "[".repeat(MAX_RELEASE_NOTES_BYTES - 1));
+        let spans = parse_release_note_spans(&malformed);
+        assert!(spans.len() <= MAX_RELEASE_NOTE_SPANS);
+        let emphasized = parse_release_note_spans(&"**x** ".repeat(MAX_RELEASE_NOTE_SPANS * 100));
+        assert!(emphasized.len() <= MAX_RELEASE_NOTE_SPANS);
+
+        let many_lines = "line\n".repeat(MAX_RELEASE_NOTE_BLOCKS * 100);
+        let blocks = parse_release_notes(&many_lines);
+        assert_eq!(blocks.len(), MAX_RELEASE_NOTE_BLOCKS);
+        assert!(matches!(
+            blocks.last(),
+            Some(ReleaseNoteBlock::Paragraph(spans))
+                if spans.iter().any(|span| span.label().contains("release page"))
+        ));
+    }
+
+    #[test]
+    fn release_note_wrapping_prefers_word_boundaries() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            let job = release_note_job(
+                ui,
+                "ordinary words should wrap at spaces",
+                ReleaseNoteStyle::Body,
+                false,
+            );
+            assert!(!job.wrap.break_anywhere);
+        });
     }
 
     #[test]
@@ -2985,7 +3713,7 @@ mod tests {
         };
         let release = Release {
             version: Version::parse("0.2.0").unwrap(),
-            notes: String::new(),
+            notes: Arc::from([]),
             delivery: Delivery::Download(asset.clone()),
         };
         let destination = store.destination(&release, &asset);
@@ -3098,7 +3826,7 @@ mod tests {
         };
         let release = Release {
             version: Version::parse("0.2.0").unwrap(),
-            notes: String::new(),
+            notes: Arc::from([]),
             delivery: Delivery::Download(asset.clone()),
         };
         manager.state = UpdateState::VerifyingInstaller {
@@ -3116,6 +3844,45 @@ mod tests {
         assert!(matches!(
             manager.state,
             UpdateState::VerifyingInstaller { id: 7, .. }
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stale_application_preparation_cannot_disrupt_the_active_update() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = UpdateStore::new(
+            directory.path().join("config"),
+            directory.path().join("cache"),
+        )
+        .unwrap();
+        let mut manager = UpdateManager::with_store(egui::Context::default(), Ok(store));
+        let asset = ReleaseAsset {
+            name: "viewr-macos-arm64.tar.gz",
+            url: "https://github.com/hunterchen7/viewr/releases/download/v0.2.0/viewr-macos-arm64.tar.gz"
+                .into(),
+            size: 1,
+            sha256: [0; 32],
+            kind: PackageKind::Application,
+        };
+        let release = Release {
+            version: Version::parse("0.2.0").unwrap(),
+            notes: Arc::from([]),
+            delivery: Delivery::Download(asset.clone()),
+        };
+        manager.state = UpdateState::PreparingApplication {
+            id: 7,
+            release: release.clone(),
+        };
+        manager.handle_event(WorkerEvent::ApplicationPrepared {
+            id: 6,
+            release,
+            asset,
+            result: Err(UpdateError::InvalidRelease("stale failure".into())),
+        });
+        assert!(matches!(
+            manager.state,
+            UpdateState::PreparingApplication { id: 7, .. }
         ));
     }
 

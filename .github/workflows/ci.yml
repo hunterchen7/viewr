@@ -244,23 +244,45 @@ jobs:
         if: ${{ !cancelled() && runner.os != 'Windows' && steps.build_viewr.outcome == 'success' }}
         shell: bash
         run: |
-          scripts/package-portable-archive.sh \
-            --platform "${{ matrix.portable_platform }}" \
-            --binary "target/${{ matrix.target }}/release/viewr" \
-            --output "dist/${{ matrix.archive }}"
-          scripts/validate-portable-archive.sh \
-            --platform "${{ matrix.portable_platform }}" \
-            --archive "dist/${{ matrix.archive }}" \
-            --expected-binary "target/${{ matrix.target }}/release/viewr"
+          platform="${{ matrix.portable_platform }}"
+          binary="target/${{ matrix.target }}/release/viewr"
+          archive="dist/${{ matrix.archive }}"
           reproducible_dir="$RUNNER_TEMP/viewr-portable-repro"
           mkdir -p "$reproducible_dir"
-          scripts/package-portable-archive.sh \
-            --platform "${{ matrix.portable_platform }}" \
-            --binary "target/${{ matrix.target }}/release/viewr" \
-            --output "$reproducible_dir/${{ matrix.archive }}"
-          cmp \
-            "dist/${{ matrix.archive }}" \
-            "$reproducible_dir/${{ matrix.archive }}"
+          reproducible_archive="$reproducible_dir/${{ matrix.archive }}"
+          if [[ "$platform" == "macos-arm64" ]]; then
+            app="$RUNNER_TEMP/viewr-portable-app/Viewr.app"
+            reproducible_app="$RUNNER_TEMP/viewr-portable-repro-app/Viewr.app"
+            scripts/build-macos-app.sh "$binary" "$app"
+            scripts/package-portable-archive.sh \
+              --platform "$platform" \
+              --app "$app" \
+              --output "$archive"
+            scripts/validate-portable-archive.sh \
+              --platform "$platform" \
+              --archive "$archive" \
+              --expected-app "$app"
+            scripts/test-macos-app-archive.sh "$app" "$archive"
+            scripts/build-macos-app.sh "$binary" "$reproducible_app"
+            scripts/package-portable-archive.sh \
+              --platform "$platform" \
+              --app "$reproducible_app" \
+              --output "$reproducible_archive"
+          else
+            scripts/package-portable-archive.sh \
+              --platform "$platform" \
+              --binary "$binary" \
+              --output "$archive"
+            scripts/validate-portable-archive.sh \
+              --platform "$platform" \
+              --archive "$archive" \
+              --expected-binary "$binary"
+            scripts/package-portable-archive.sh \
+              --platform "$platform" \
+              --binary "$binary" \
+              --output "$reproducible_archive"
+          fi
+          cmp "$archive" "$reproducible_archive"
       - name: Build and validate Windows portable archive
         if: ${{ !cancelled() && runner.os == 'Windows' && steps.build_viewr.outcome == 'success' }}
         shell: powershell
@@ -358,7 +380,7 @@ jobs:
         shell: bash
         run: |
           scripts/package-macos-pkg.sh \
-            target/${{ matrix.target }}/release/viewr \
+            --app "$RUNNER_TEMP/viewr-portable-app/Viewr.app" \
             dist/viewr-macos-arm64.pkg
           scripts/validate-macos-pkg.sh \
             --test-open-events \

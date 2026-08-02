@@ -1,5 +1,60 @@
 import AppKit
+import Darwin
 import Foundation
+
+private let launcherSelfTestArgument = "--viewr-launcher-self-test"
+
+private func writeSelfTestMessage(_ message: String, to handle: FileHandle) {
+    handle.write(Data((message + "\n").utf8))
+}
+
+private func runLauncherSelfTest() -> Int32 {
+    guard let launcher = Bundle.main.executableURL else {
+        writeSelfTestMessage(
+            "viewr-launcher self-test failed",
+            to: .standardError
+        )
+        return 1
+    }
+
+    let viewer = launcher.deletingLastPathComponent()
+        .appendingPathComponent("viewr-bin", isDirectory: false)
+    guard FileManager.default.isExecutableFile(atPath: viewer.path) else {
+        writeSelfTestMessage(
+            "viewr-launcher self-test failed",
+            to: .standardError
+        )
+        return 1
+    }
+
+    guard Bundle.main.bundleIdentifier == "com.hunterchen.viewr",
+          let executable = Bundle.main.object(
+              forInfoDictionaryKey: "CFBundleExecutable"
+          ) as? String,
+          executable == "ViewrLauncher",
+          let version = Bundle.main.object(
+              forInfoDictionaryKey: "CFBundleShortVersionString"
+          ) as? String,
+          !version.isEmpty,
+          !version.contains("\n"),
+          !version.contains("\r")
+    else {
+        writeSelfTestMessage(
+            "viewr-launcher self-test failed",
+            to: .standardError
+        )
+        return 1
+    }
+
+    writeSelfTestMessage("viewr-launcher \(version)", to: .standardOutput)
+    return 0
+}
+
+if CommandLine.arguments.count == 2,
+   CommandLine.arguments[1] == launcherSelfTestArgument
+{
+    exit(runLauncherSelfTest())
+}
 
 final class ViewrAppDelegate: NSObject, NSApplicationDelegate {
     private var children: [ObjectIdentifier: Process] = [:]

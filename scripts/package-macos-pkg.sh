@@ -4,15 +4,18 @@ set -euo pipefail
 usage() {
     cat <<'EOF'
 Usage: scripts/package-macos-pkg.sh VIEWR_BINARY OUTPUT_PKG
+       scripts/package-macos-pkg.sh --app VIEWR_APP OUTPUT_PKG
 
-Build an arm64 Viewr.app and a macOS installer package.
+Build a macOS installer from the reusable Viewr.app bundle.
+Use --app to reuse an app that build-macos-app.sh already created.
 
 Optional environment variables:
   VIEWR_VERSION                         Override the workspace package version.
   VIEWR_RELEASE_TAG                     Assert that this tag is v<version>.
   VIEWR_MACOS_APP_SIGN_IDENTITY         Sign app executables and bundle with
                                          this codesign identity. The default is
-                                         an ad-hoc signature.
+                                         an ad-hoc signature. This value applies
+                                         only to the binary input form.
   VIEWR_MACOS_INSTALLER_SIGN_IDENTITY   Sign the product archive with this
                                          installer identity. The default
                                          package is unsigned.
@@ -29,35 +32,49 @@ fail() {
     exit 1
 }
 
-[[ $# -eq 2 ]] || {
-    usage >&2
-    exit 64
-}
-
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 
-binary_arg="$1"
-[[ -f "$binary_arg" ]] || fail "viewer binary does not exist: $binary_arg"
-binary_dir="$(cd "$(dirname "$binary_arg")" && pwd)"
-viewer_binary="$binary_dir/$(basename "$binary_arg")"
-product_requirements="$repo_root/packaging/macos/ProductRequirements.plist"
+viewer_binary=""
+input_app=""
+if [[ $# -eq 3 && "$1" == "--app" ]]; then
+    app_arg="$2"
+    [[ -d "$app_arg" && ! -L "$app_arg" ]] ||
+        fail "app is not a regular directory: $app_arg"
+    app_dir="$(cd "$(dirname "$app_arg")" && pwd)"
+    input_app="$app_dir/$(basename "$app_arg")"
+    output_arg="$3"
+elif [[ $# -eq 2 ]]; then
+    binary_arg="$1"
+    [[ -f "$binary_arg" && ! -L "$binary_arg" && -x "$binary_arg" ]] ||
+        fail "viewer binary is not a regular executable file: $binary_arg"
+    binary_dir="$(cd "$(dirname "$binary_arg")" && pwd)"
+    viewer_binary="$binary_dir/$(basename "$binary_arg")"
+    output_arg="$2"
+else
+    usage >&2
+    exit 64
+fi
 
-output_arg="$2"
+product_requirements="$repo_root/packaging/macos/ProductRequirements.plist"
+package_scripts="$repo_root/packaging/macos/scripts"
+component_properties="$repo_root/packaging/macos/Components.plist"
+
 /bin/mkdir -p "$(dirname "$output_arg")"
 output_dir="$(cd "$(dirname "$output_arg")" && pwd)"
 output_pkg="$output_dir/$(basename "$output_arg")"
 
-for command in codesign lipo pkgbuild plutil productbuild shasum vtool xattr xcrun; do
+for command in ditto pkgbuild plutil productbuild; do
     command -v "$command" >/dev/null || fail "required command is unavailable: $command"
 done
 [[ -f "$product_requirements" ]] ||
     fail "product requirements do not exist: $product_requirements"
+[[ -f "$component_properties" && ! -L "$component_properties" ]] ||
+    fail "installer component properties do not exist"
+[[ -x "$package_scripts/postinstall" && ! -L "$package_scripts/postinstall" ]] ||
+    fail "installer postinstall script is missing or not executable"
 plutil -lint "$product_requirements" >/dev/null
-
-architectures="$(lipo -archs "$viewer_binary")"
-[[ "$architectures" == "arm64" ]] ||
-    fail "viewer binary must contain only arm64 code (found: $architectures)"
+plutil -lint "$component_properties" >/dev/null
 
 workspace_version="$(
     awk -F'"' '/^version = "/ { print $2; exit }' "$repo_root/Cargo.toml"
@@ -79,74 +96,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
-app="$work_dir/Viewr.app"
-macos_dir="$app/Contents/MacOS"
-resources_dir="$app/Contents/Resources"
-/bin/mkdir -p "$macos_dir" "$resources_dir"
-
-/bin/cp "$repo_root/packaging/macos/Info.plist.in" "$app/Contents/Info.plist"
-/usr/libexec/PlistBuddy \
-    -c "Set :CFBundleShortVersionString $version" \
-    -c "Set :CFBundleVersion $version" \
-    "$app/Contents/Info.plist"
-plutil -lint "$app/Contents/Info.plist" >/dev/null
-
-sdk_path="$(xcrun --sdk macosx --show-sdk-path)"
-xcrun --sdk macosx swiftc \
-    -module-cache-path "$work_dir/swift-module-cache" \
-    -target arm64-apple-macos11.0 \
-    -sdk "$sdk_path" \
-    -O \
-    -whole-module-optimization \
-    "$repo_root/packaging/macos/ViewrLauncher.swift" \
-    -o "$macos_dir/ViewrLauncher"
-
-/bin/cp "$viewer_binary" "$macos_dir/viewr-bin"
-/bin/chmod 0755 "$macos_dir/ViewrLauncher" "$macos_dir/viewr-bin"
-/usr/bin/printf 'APPL????' >"$app/Contents/PkgInfo"
-
-/bin/cp "$repo_root/LICENSE" "$resources_dir/LICENSE.txt"
-/bin/cp \
-    "$repo_root/packaging/THIRD-PARTY-NOTICES.txt" \
-    "$resources_dir/THIRD-PARTY-NOTICES.txt"
-/bin/cp \
-    "$repo_root/packaging/THIRD-PARTY-LICENSES.txt" \
-    "$resources_dir/THIRD-PARTY-LICENSES.txt"
-/bin/cp \
-    "$repo_root/packaging/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html" \
-    "$resources_dir/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html"
-/bin/cp "$repo_root/packaging/SOURCE-BUILD.md" "$resources_dir/SOURCE-BUILD.md"
-
-rawler_license="${RAWLER_LICENSE_PATH:-$repo_root/packaging/licenses/rawler-0.7.2-LICENSE}"
-[[ -f "$rawler_license" && -r "$rawler_license" ]] ||
-    fail "rawler 0.7.2 LICENSE is not readable: $rawler_license"
-expected_rawler_license_sha256="c1228ae47a5ada0464e9cc2f1c253e2437432866570b9ac6244bceb4d75c0f10"
-actual_rawler_license_sha256="$(shasum -a 256 "$rawler_license" | awk '{ print $1 }')"
-[[ "$actual_rawler_license_sha256" == "$expected_rawler_license_sha256" ]] ||
-    fail "rawler 0.7.2 LICENSE has unexpected SHA-256: $actual_rawler_license_sha256"
-/bin/cp "$rawler_license" "$resources_dir/rawler-LICENSE.txt"
-/bin/chmod 0644 "$app/Contents/Info.plist" "$app/Contents/PkgInfo" "$resources_dir"/*
-xattr -cr "$app"
-
-app_identity="${VIEWR_MACOS_APP_SIGN_IDENTITY:--}"
-if [[ "$app_identity" == "-" ]]; then
-    codesign_args=(--force --sign - --timestamp=none)
+if [[ -n "$input_app" ]]; then
+    app="$input_app"
+    VIEWR_VERSION="$version" "$repo_root/scripts/validate-macos-app.sh" "$app"
 else
-    codesign_args=(--force --sign "$app_identity" --options runtime --timestamp)
+    app="$work_dir/Viewr.app"
+    "$repo_root/scripts/build-macos-app.sh" "$viewer_binary" "$app"
 fi
 
-codesign "${codesign_args[@]}" "$macos_dir/viewr-bin"
-codesign "${codesign_args[@]}" "$macos_dir/ViewrLauncher"
-codesign "${codesign_args[@]}" "$app"
-codesign --verify --deep --strict --verbose=2 "$app"
-
-launcher_minos="$(vtool -show-build "$macos_dir/ViewrLauncher" | awk '/minos/ { print $2; exit }')"
-[[ "$launcher_minos" == "11.0" ]] ||
-    fail "launcher minimum macOS version is $launcher_minos, expected 11.0"
-
 component_pkg="$work_dir/Viewr-component.pkg"
+payload_root="$work_dir/payload-root"
+/bin/mkdir -p "$payload_root"
+/usr/bin/ditto "$app" "$payload_root/Viewr.app"
 pkgbuild \
-    --component "$app" \
+    --root "$payload_root" \
+    --component-plist "$component_properties" \
+    --scripts "$package_scripts" \
     --install-location /Applications \
     --identifier com.hunterchen.viewr.pkg \
     --version "$version" \
