@@ -62,6 +62,7 @@ pub(crate) enum CheckSource {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PackageKind {
+    Application,
     Installer,
     Portable,
 }
@@ -69,6 +70,7 @@ pub(crate) enum PackageKind {
 impl PackageKind {
     pub(crate) fn noun(self) -> &'static str {
         match self {
+            Self::Application => "application update",
             Self::Installer => "installer",
             Self::Portable => "portable update",
         }
@@ -114,6 +116,7 @@ pub(crate) enum CheckOutcome {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PlatformAssets {
+    application: Option<&'static str>,
     installer: &'static str,
     portable: &'static str,
 }
@@ -121,14 +124,17 @@ struct PlatformAssets {
 fn platform_assets(target_os: &str, target_arch: &str) -> Option<PlatformAssets> {
     match (target_os, target_arch) {
         ("macos", "aarch64") => Some(PlatformAssets {
+            application: Some("viewr-macos-arm64.tar.gz"),
             installer: "viewr-macos-arm64.pkg",
             portable: "viewr-macos-arm64.tar.gz",
         }),
         ("windows", "x86_64") => Some(PlatformAssets {
+            application: None,
             installer: "viewr-windows-x64.msi",
             portable: "viewr-windows-x64.zip",
         }),
         ("linux", "x86_64") => Some(PlatformAssets {
+            application: None,
             installer: "viewr-linux-x64.deb",
             portable: "viewr-linux-x64.tar.gz",
         }),
@@ -137,14 +143,30 @@ fn platform_assets(target_os: &str, target_arch: &str) -> Option<PlatformAssets>
 }
 
 fn current_delivery_spec() -> Option<(&'static str, PackageKind)> {
-    let assets = platform_assets(std::env::consts::OS, std::env::consts::ARCH)?;
-    let kind = if native_install_detected() {
+    delivery_spec_for(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        native_install_detected(),
+    )
+}
+
+fn delivery_spec_for(
+    target_os: &str,
+    target_arch: &str,
+    native_install: bool,
+) -> Option<(&'static str, PackageKind)> {
+    let assets = platform_assets(target_os, target_arch)?;
+    if let Some(application) = assets.application {
+        return Some((application, PackageKind::Application));
+    }
+    let kind = if native_install {
         PackageKind::Installer
     } else {
         PackageKind::Portable
     };
     Some((
         match kind {
+            PackageKind::Application => unreachable!("handled above"),
             PackageKind::Installer => assets.installer,
             PackageKind::Portable => assets.portable,
         },
@@ -302,6 +324,7 @@ enum ReleaseNoteSpan {
 }
 
 impl ReleaseNoteSpan {
+    #[cfg(test)]
     fn label(&self) -> &str {
         match self {
             Self::Text(text) | Self::Strong(text) => text,
@@ -321,6 +344,7 @@ enum ReleaseNoteBlock {
 }
 
 impl ReleaseNoteBlock {
+    #[cfg(test)]
     fn spans(&self) -> std::slice::Iter<'_, ReleaseNoteSpan> {
         match self {
             Self::Heading { spans, .. } | Self::Bullet(spans) | Self::Paragraph(spans) => {
@@ -1121,7 +1145,7 @@ fn check_due(previous: Option<u64>, now: u64, minimum_age: u64) -> bool {
     })
 }
 
-fn open_lock_file(path: &Path) -> io::Result<File> {
+pub(crate) fn open_lock_file(path: &Path) -> io::Result<File> {
     if path
         .symlink_metadata()
         .is_ok_and(|metadata| metadata.file_type().is_symlink())
@@ -1145,7 +1169,7 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-fn ensure_private_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn ensure_private_directory(path: &Path) -> io::Result<()> {
     match path.symlink_metadata() {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(io::Error::new(
@@ -1566,6 +1590,13 @@ enum UpdateState {
         asset: ReleaseAsset,
         progress: Arc<AtomicU64>,
     },
+    PreparingApplication {
+        id: u64,
+        release: Release,
+    },
+    ApplyingApplication {
+        release: Release,
+    },
     Ready {
         release: Release,
         asset: ReleaseAsset,
@@ -1610,6 +1641,13 @@ enum WorkerEvent {
         release: Release,
         asset: ReleaseAsset,
         result: Result<PathBuf, UpdateError>,
+    },
+    #[cfg(target_os = "macos")]
+    ApplicationPrepared {
+        id: u64,
+        release: Release,
+        asset: ReleaseAsset,
+        result: Result<crate::macos_update::PreparedUpdate, UpdateError>,
     },
     InstallerVerified {
         id: u64,
@@ -1757,6 +1795,8 @@ pub(crate) struct UpdateManager {
     automatic_due_at: Option<Instant>,
     preference_refresh_due_at: Instant,
     dialog_open: bool,
+    #[cfg(target_os = "macos")]
+    shutdown_lock: Option<File>,
 }
 
 impl UpdateManager {
@@ -1790,6 +1830,8 @@ impl UpdateManager {
             automatic_due_at,
             preference_refresh_due_at: Instant::now(),
             dialog_open: false,
+            #[cfg(target_os = "macos")]
+            shutdown_lock: None,
         }
     }
 
@@ -1913,6 +1955,8 @@ impl UpdateManager {
             UpdateState::Available { .. }
                 | UpdateState::Deferred { .. }
                 | UpdateState::Downloading { .. }
+                | UpdateState::PreparingApplication { .. }
+                | UpdateState::ApplyingApplication { .. }
                 | UpdateState::Ready { .. }
                 | UpdateState::VerifyingInstaller { .. }
                 | UpdateState::InstallerOpened { .. }
@@ -1946,6 +1990,12 @@ impl UpdateManager {
                 asset.kind.noun(),
                 download_percent(progress.load(Ordering::Relaxed), asset.size)
             ),
+            UpdateState::PreparingApplication { release, .. } => {
+                format!("Preparing Viewr {}", release.version)
+            }
+            UpdateState::ApplyingApplication { release } => {
+                format!("Restarting into Viewr {}", release.version)
+            }
             UpdateState::Ready { release, .. } => {
                 format!("Viewr {} is ready", release.version)
             }
@@ -1972,6 +2022,8 @@ impl UpdateManager {
             self.state,
             UpdateState::Checking { .. }
                 | UpdateState::Downloading { .. }
+                | UpdateState::PreparingApplication { .. }
+                | UpdateState::ApplyingApplication { .. }
                 | UpdateState::VerifyingInstaller { .. }
         ) {
             return;
@@ -2102,6 +2154,46 @@ impl UpdateManager {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn start_application_preparation(
+        &mut self,
+        release: Release,
+        asset: ReleaseAsset,
+        path: PathBuf,
+    ) {
+        let id = self.next_request_id();
+        self.state = UpdateState::PreparingApplication {
+            id,
+            release: release.clone(),
+        };
+        self.dialog_open = true;
+        let sender = self.sender.clone();
+        let ctx = self.ctx.clone();
+        let worker_release = release.clone();
+        let worker_asset = asset.clone();
+        let worker_path = path.clone();
+        let version = release.version.clone();
+        let spawn = std::thread::Builder::new()
+            .name("viewr-update-prepare".into())
+            .spawn(move || {
+                let result = verify_before_open(&worker_path, &worker_asset)
+                    .and_then(|()| crate::macos_update::prepare(&worker_path, &version));
+                let _ = sender.send(WorkerEvent::ApplicationPrepared {
+                    id,
+                    release: worker_release,
+                    asset: worker_asset,
+                    result,
+                });
+                ctx.request_repaint();
+            });
+        if let Err(error) = spawn {
+            self.state = UpdateState::Failed {
+                message: format!("could not start application preparation: {error}"),
+                retry: Retry::Download(Box::new(DownloadRetry { release, asset })),
+            };
+        }
+    }
+
     fn handle_event(&mut self, event: WorkerEvent) {
         match event {
             WorkerEvent::CheckFinished {
@@ -2181,6 +2273,19 @@ impl UpdateManager {
                     return;
                 }
                 match result {
+                    Ok(path) if asset.kind == PackageKind::Application => {
+                        #[cfg(target_os = "macos")]
+                        self.start_application_preparation(release, asset, path);
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            self.state = UpdateState::Failed {
+                                message:
+                                    "application self-updates are unsupported on this platform"
+                                        .into(),
+                                retry: Retry::Download(Box::new(DownloadRetry { release, asset })),
+                            };
+                        }
+                    }
                     Ok(path) => {
                         self.state = UpdateState::Ready {
                             release,
@@ -2196,6 +2301,51 @@ impl UpdateManager {
                     }
                 }
                 self.dialog_open = true;
+            }
+            #[cfg(target_os = "macos")]
+            WorkerEvent::ApplicationPrepared {
+                id,
+                release,
+                asset,
+                result,
+            } => {
+                if !matches!(
+                    self.state,
+                    UpdateState::PreparingApplication {
+                        id: active,
+                        ..
+                    } if active == id
+                ) {
+                    if let Ok(prepared) = result {
+                        crate::macos_update::discard(prepared);
+                    }
+                    return;
+                }
+                match result {
+                    Ok(prepared) => match crate::macos_update::spawn(&prepared) {
+                        Ok(lock) => {
+                            self.shutdown_lock = Some(lock);
+                            self.state = UpdateState::ApplyingApplication { release };
+                            self.dialog_open = true;
+                            self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        Err(error) => {
+                            crate::macos_update::discard(prepared);
+                            self.state = UpdateState::Failed {
+                                message: error.to_string(),
+                                retry: Retry::Download(Box::new(DownloadRetry { release, asset })),
+                            };
+                            self.dialog_open = true;
+                        }
+                    },
+                    Err(error) => {
+                        self.state = UpdateState::Failed {
+                            message: error.to_string(),
+                            retry: Retry::Download(Box::new(DownloadRetry { release, asset })),
+                        };
+                        self.dialog_open = true;
+                    }
+                }
             }
             WorkerEvent::InstallerVerified {
                 id,
@@ -2303,10 +2453,14 @@ impl UpdateManager {
                 }
                 let mut action = UpdateAction::None;
                 ui.horizontal_wrapped(|ui| {
-                    if matches!(release.delivery, Delivery::Download(_))
-                        && ui.button("Download now").clicked()
-                    {
-                        action = UpdateAction::Download;
+                    if let Delivery::Download(asset) = &release.delivery {
+                        let label = match asset.kind {
+                            PackageKind::Application => "Update and restart",
+                            PackageKind::Installer | PackageKind::Portable => "Download now",
+                        };
+                        if ui.button(label).clicked() {
+                            action = UpdateAction::Download;
+                        }
                     }
                     if ui.button("View release").clicked() {
                         action = UpdateAction::ViewRelease;
@@ -2345,6 +2499,21 @@ impl UpdateManager {
                 );
                 UpdateAction::None
             }
+            UpdateState::PreparingApplication { .. } => {
+                ui.heading("Preparing update");
+                ui.spinner();
+                ui.label("Viewr is verifying and staging the new application before restarting.");
+                UpdateAction::None
+            }
+            UpdateState::ApplyingApplication { release } => {
+                ui.heading("Restarting Viewr");
+                ui.spinner();
+                ui.label(format!(
+                    "Viewr {} will open as soon as the application update is complete.",
+                    release.version
+                ));
+                UpdateAction::None
+            }
             UpdateState::Ready {
                 release,
                 asset,
@@ -2356,20 +2525,26 @@ impl UpdateManager {
                     asset.name
                 ));
                 ui.add_space(8.0);
-                if asset.kind == PackageKind::Installer {
-                    ui.label(
-                        egui::RichText::new(
-                            "Preview warning: this installer is not yet code-signed. Opening it hands control to your operating system; installation still requires your confirmation.",
-                        )
-                        .color(egui::Color32::YELLOW),
-                    );
-                    ui.label(
-                        "Close every Viewr window before completing the upgrade, then reopen Viewr.",
-                    );
-                } else {
-                    ui.label(
-                        "This copy of Viewr is portable. The downloaded archive will not replace the running app automatically.",
-                    );
+                match asset.kind {
+                    PackageKind::Application => {
+                        ui.label("The application update is ready to be installed and restarted.");
+                    }
+                    PackageKind::Installer => {
+                        ui.label(
+                            egui::RichText::new(
+                                "Preview warning: this installer is not yet code-signed. Opening it hands control to your operating system; installation still requires your confirmation.",
+                            )
+                            .color(egui::Color32::YELLOW),
+                        );
+                        ui.label(
+                            "Close every Viewr window before completing the upgrade, then reopen Viewr.",
+                        );
+                    }
+                    PackageKind::Portable => {
+                        ui.label(
+                            "This copy of Viewr is portable. The downloaded archive will not replace the running app automatically.",
+                        );
+                    }
                 }
                 ui.add_space(10.0);
                 let mut action = UpdateAction::None;
@@ -2378,7 +2553,7 @@ impl UpdateManager {
                     {
                         action = UpdateAction::OpenInstaller;
                     }
-                    if ui.button("Show file").clicked() {
+                    if asset.kind != PackageKind::Application && ui.button("Show file").clicked() {
                         action = UpdateAction::RevealFile;
                     }
                     if ui.button("View release").clicked() {
@@ -2579,6 +2754,8 @@ fn release_in_state(state: &UpdateState) -> Option<&Release> {
         UpdateState::Available { release }
         | UpdateState::Deferred { release }
         | UpdateState::Downloading { release, .. }
+        | UpdateState::PreparingApplication { release, .. }
+        | UpdateState::ApplyingApplication { release }
         | UpdateState::Ready { release, .. }
         | UpdateState::VerifyingInstaller { release, .. }
         | UpdateState::InstallerOpened { release, .. } => Some(release),
@@ -2673,6 +2850,7 @@ mod tests {
         assert_eq!(
             platform_assets("macos", "aarch64"),
             Some(PlatformAssets {
+                application: Some("viewr-macos-arm64.tar.gz"),
                 installer: "viewr-macos-arm64.pkg",
                 portable: "viewr-macos-arm64.tar.gz",
             })
@@ -2680,6 +2858,7 @@ mod tests {
         assert_eq!(
             platform_assets("windows", "x86_64"),
             Some(PlatformAssets {
+                application: None,
                 installer: "viewr-windows-x64.msi",
                 portable: "viewr-windows-x64.zip",
             })
@@ -2687,12 +2866,43 @@ mod tests {
         assert_eq!(
             platform_assets("linux", "x86_64"),
             Some(PlatformAssets {
+                application: None,
                 installer: "viewr-linux-x64.deb",
                 portable: "viewr-linux-x64.tar.gz",
             })
         );
         assert_eq!(platform_assets("macos", "x86_64"), None);
         assert_eq!(platform_assets("freebsd", "x86_64"), None);
+    }
+
+    #[test]
+    fn macos_always_selects_the_self_updating_application_archive() {
+        for native_install in [false, true] {
+            assert_eq!(
+                delivery_spec_for("macos", "aarch64", native_install),
+                Some(("viewr-macos-arm64.tar.gz", PackageKind::Application))
+            );
+        }
+    }
+
+    #[test]
+    fn other_platforms_preserve_installer_and_portable_delivery() {
+        assert_eq!(
+            delivery_spec_for("windows", "x86_64", true),
+            Some(("viewr-windows-x64.msi", PackageKind::Installer))
+        );
+        assert_eq!(
+            delivery_spec_for("windows", "x86_64", false),
+            Some(("viewr-windows-x64.zip", PackageKind::Portable))
+        );
+        assert_eq!(
+            delivery_spec_for("linux", "x86_64", true),
+            Some(("viewr-linux-x64.deb", PackageKind::Installer))
+        );
+        assert_eq!(
+            delivery_spec_for("linux", "x86_64", false),
+            Some(("viewr-linux-x64.tar.gz", PackageKind::Portable))
+        );
     }
 
     #[test]
@@ -3478,6 +3688,45 @@ mod tests {
         assert!(matches!(
             manager.state,
             UpdateState::VerifyingInstaller { id: 7, .. }
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stale_application_preparation_cannot_disrupt_the_active_update() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = UpdateStore::new(
+            directory.path().join("config"),
+            directory.path().join("cache"),
+        )
+        .unwrap();
+        let mut manager = UpdateManager::with_store(egui::Context::default(), Ok(store));
+        let asset = ReleaseAsset {
+            name: "viewr-macos-arm64.tar.gz",
+            url: "https://github.com/hunterchen7/viewr/releases/download/v0.2.0/viewr-macos-arm64.tar.gz"
+                .into(),
+            size: 1,
+            sha256: [0; 32],
+            kind: PackageKind::Application,
+        };
+        let release = Release {
+            version: Version::parse("0.2.0").unwrap(),
+            notes: String::new(),
+            delivery: Delivery::Download(asset.clone()),
+        };
+        manager.state = UpdateState::PreparingApplication {
+            id: 7,
+            release: release.clone(),
+        };
+        manager.handle_event(WorkerEvent::ApplicationPrepared {
+            id: 6,
+            release,
+            asset,
+            result: Err(UpdateError::InvalidRelease("stale failure".into())),
+        });
+        assert!(matches!(
+            manager.state,
+            UpdateState::PreparingApplication { id: 7, .. }
         ));
     }
 

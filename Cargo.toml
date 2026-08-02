@@ -45,6 +45,8 @@ ureq = { version = "2.12.1", default-features = false, features = ["tls"] }
 url = "2"
 criterion = { version = "0.8", features = ["html_reports"] }
 chrono = "0.4.45"
+flate2 = "1"
+tar = "0.4"
 
 [profile.release]
 lto = "thin"
