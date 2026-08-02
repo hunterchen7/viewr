@@ -40,7 +40,7 @@ pkg_arg="$1"
 pkg_dir="$(cd "$(dirname "$pkg_arg")" && pwd)"
 pkg="$pkg_dir/$(basename "$pkg_arg")"
 
-for command in codesign lipo pkgutil plutil shasum vtool xcrun xmllint; do
+for command in codesign pkgutil plutil xcrun xmllint; do
     command -v "$command" >/dev/null || fail "required command is unavailable: $command"
 done
 
@@ -243,107 +243,7 @@ extracted="$work_dir/extracted"
 /usr/bin/ditto -x "$payload" "$extracted"
 app="$extracted/Viewr.app"
 [[ -d "$app" ]] || fail "payload does not install Viewr.app at /Applications"
-
-info="$app/Contents/Info.plist"
-plist_value() {
-    plutil -extract "$1" raw -o - "$info"
-}
-
-[[ "$(plist_value CFBundleIdentifier)" == "com.hunterchen.viewr" ]] ||
-    fail "unexpected bundle identifier"
-[[ "$(plist_value CFBundleExecutable)" == "ViewrLauncher" ]] ||
-    fail "unexpected bundle executable"
-[[ "$(plist_value CFBundleShortVersionString)" == "$expected_version" ]] ||
-    fail "unexpected short version"
-[[ "$(plist_value CFBundleVersion)" == "$expected_version" ]] ||
-    fail "unexpected bundle version"
-[[ "$(plist_value LSMinimumSystemVersion)" == "11.0" ]] ||
-    fail "bundle minimum macOS version is not 11.0"
-if plutil -extract LSUIElement raw -o - "$info" >/dev/null 2>&1; then
-    fail "bundle-wide LSUIElement would hide the spawned viewer from the Dock"
-fi
-[[ "$(plist_value CFBundleDocumentTypes.0.CFBundleTypeRole)" == "Viewer" ]] ||
-    fail "ARW document role is not Viewer"
-[[ "$(plist_value CFBundleDocumentTypes.0.LSHandlerRank)" == "Alternate" ]] ||
-    fail "ARW handler rank is not Alternate"
-[[ "$(plist_value CFBundleDocumentTypes.0.LSItemContentTypes.0)" == \
-    "com.sony.arw-raw-image" ]] ||
-    fail "document type does not use the exact Sony ARW UTI"
-[[ "$(plist_value UTImportedTypeDeclarations.0.UTTypeIdentifier)" == \
-    "com.sony.arw-raw-image" ]] ||
-    fail "imported type does not declare the exact Sony ARW UTI"
-[[ "$(plist_value UTImportedTypeDeclarations.0.UTTypeConformsTo.0)" == \
-    "public.camera-raw-image" ]] ||
-    fail "Sony ARW UTI does not conform to public.camera-raw-image"
-[[ "$(/usr/libexec/PlistBuddy -c \
-    'Print :UTImportedTypeDeclarations:0:UTTypeTagSpecification:public.filename-extension:0' \
-    "$info")" == \
-    "arw" ]] ||
-    fail "Sony ARW UTI does not declare the arw extension"
-[[ "$(/usr/libexec/PlistBuddy -c \
-    'Print :UTImportedTypeDeclarations:0:UTTypeTagSpecification:public.mime-type' \
-    "$info")" == \
-    "image/x-sony-arw" ]] ||
-    fail "Sony ARW UTI does not declare image/x-sony-arw"
-
-launcher="$app/Contents/MacOS/ViewrLauncher"
-viewer="$app/Contents/MacOS/viewr-bin"
-macos_files="$(
-    find "$app/Contents/MacOS" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; |
-        LC_ALL=C sort
-)"
-expected_macos_files="$(printf 'ViewrLauncher\nviewr-bin')"
-[[ "$macos_files" == "$expected_macos_files" ]] ||
-    fail "bundle contains unexpected executable payload files"
-for executable in "$launcher" "$viewer"; do
-    [[ -x "$executable" ]] || fail "payload executable is not executable: $executable"
-    [[ "$(lipo -archs "$executable")" == "arm64" ]] ||
-        fail "payload executable is not arm64-only: $executable"
-    minos="$(vtool -show-build "$executable" | awk '/minos/ { print $2; exit }')"
-    [[ "$minos" == "11.0" ]] ||
-        fail "payload executable requires macOS $minos instead of 11.0: $executable"
-done
-codesign --verify --deep --strict --verbose=2 "$app"
-
-for resource in \
-    "$app/Contents/Resources/LICENSE.txt" \
-    "$app/Contents/Resources/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html" \
-    "$app/Contents/Resources/THIRD-PARTY-LICENSES.txt" \
-    "$app/Contents/Resources/THIRD-PARTY-NOTICES.txt" \
-    "$app/Contents/Resources/SOURCE-BUILD.md" \
-    "$app/Contents/Resources/rawler-LICENSE.txt"; do
-    [[ -s "$resource" ]] || fail "license resource is empty: $resource"
-done
-/usr/bin/cmp -s "$repo_root/LICENSE" "$app/Contents/Resources/LICENSE.txt" ||
-    fail "bundled Viewr LICENSE differs from the repository LICENSE"
-/usr/bin/cmp -s \
-    "$repo_root/packaging/THIRD-PARTY-LICENSES.txt" \
-    "$app/Contents/Resources/THIRD-PARTY-LICENSES.txt" ||
-    fail "bundled third-party licenses differ from the generated inventory"
-/usr/bin/cmp -s \
-    "$repo_root/packaging/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html" \
-    "$app/Contents/Resources/RUST-1.96-STANDARD-LIBRARY-COPYRIGHT.html" ||
-    fail "bundled Rust standard-library notices differ from the pinned copy"
-/usr/bin/cmp -s \
-    "$repo_root/packaging/THIRD-PARTY-NOTICES.txt" \
-    "$app/Contents/Resources/THIRD-PARTY-NOTICES.txt" ||
-    fail "bundled third-party notice differs from the repository notice"
-/usr/bin/cmp -s \
-    "$repo_root/packaging/SOURCE-BUILD.md" \
-    "$app/Contents/Resources/SOURCE-BUILD.md" ||
-    fail "bundled source-build instructions differ from the repository copy"
-grep -F "rawler 0.7.2" "$app/Contents/Resources/THIRD-PARTY-NOTICES.txt" >/dev/null ||
-    fail "third-party notice does not identify rawler 0.7.2"
-
-rawler_license="${RAWLER_LICENSE_PATH:-$repo_root/packaging/licenses/rawler-0.7.2-LICENSE}"
-[[ -f "$rawler_license" && -r "$rawler_license" ]] ||
-    fail "rawler 0.7.2 LICENSE is not readable: $rawler_license"
-expected_rawler_license_sha256="c1228ae47a5ada0464e9cc2f1c253e2437432866570b9ac6244bceb4d75c0f10"
-actual_rawler_license_sha256="$(shasum -a 256 "$rawler_license" | awk '{ print $1 }')"
-[[ "$actual_rawler_license_sha256" == "$expected_rawler_license_sha256" ]] ||
-    fail "rawler 0.7.2 LICENSE has unexpected SHA-256: $actual_rawler_license_sha256"
-/usr/bin/cmp -s "$rawler_license" "$app/Contents/Resources/rawler-LICENSE.txt" ||
-    fail "bundled rawler LICENSE differs from rawler 0.7.2"
+VIEWR_VERSION="$expected_version" "$repo_root/scripts/validate-macos-app.sh" "$app"
 
 if [[ "$test_open_events" == "1" ]]; then
     command -v open >/dev/null || fail "open command is unavailable"
