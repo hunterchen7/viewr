@@ -151,6 +151,15 @@ cargo about generate \
 # Match the platform-independent output produced by the generation script.
 LC_ALL=C perl -pi -e 's/\r\n?/\n/g' "$generated_licenses"
 
+# Mirror generate-third-party-licenses.sh: cargo-about excludes the in-tree
+# path-dependency rawler fork, whose LGPL-2.1 entries must stay inventoried.
+LC_ALL=C perl -0pi -e '
+  s/^(rayon [0-9])/rawler 0.7.2\nLicense: LGPL-2.1\nSource: https:\/\/github.com\/hunterchen7\/dnglab\n$1/m
+    or die "missing rayon overview anchor for the rawler license entry";
+  s/(GNU Lesser General Public License v2\.1 only\n\nUsed by:\n)/$1- rawler 0.7.2\n/
+    or die "missing LGPL used-by anchor for the rawler license entry";
+' "$generated_licenses"
+
 if ! cmp -s "$generated_licenses" packaging/THIRD-PARTY-LICENSES.txt; then
     echo "error: packaging/THIRD-PARTY-LICENSES.txt is stale" >&2
     diff -u packaging/THIRD-PARTY-LICENSES.txt "$generated_licenses" || true

@@ -44,6 +44,21 @@ source_root="$stage_root/viewr-$version"
 mkdir -p "$source_root/.cargo"
 
 git -C "$repo_root" archive HEAD | tar -xf - -C "$source_root"
+# git archive records submodules as bare gitlinks, so the in-tree rawler fork
+# is staged explicitly. The guard rejects a checkout whose submodule drifted
+# from the recorded rev or was never initialized, so an archive can never
+# silently ship the wrong (or no) rawler source.
+recorded_rawler_rev="$(git -C "$repo_root" rev-parse HEAD:thirdparty/dnglab)"
+checked_out_rawler_rev="$(git -C "$repo_root/thirdparty/dnglab" rev-parse HEAD 2>/dev/null || true)"
+if [[ "$checked_out_rawler_rev" != "$recorded_rawler_rev" ]]; then
+  echo "thirdparty/dnglab checkout ($checked_out_rawler_rev) does not match the recorded submodule rev ($recorded_rawler_rev); run 'git submodule update --init'" >&2
+  exit 1
+fi
+# The fork lives outside vendor/ so cargo's directory-source replacement
+# never scans it; staging once before vendoring lets cargo resolve the
+# workspace's rawler patch target.
+mkdir -p "$source_root/thirdparty/dnglab"
+git -C "$repo_root/thirdparty/dnglab" archive HEAD | tar -xf - -C "$source_root/thirdparty/dnglab"
 (
   cd "$source_root"
   cargo vendor \

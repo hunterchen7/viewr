@@ -72,3 +72,12 @@ opt-level = 0
 
 [profile.test.package."*"]
 opt-level = 0
+
+# Redirect the pinned crates.io rawler to the in-tree fork submodule
+# (hunterchen7/dnglab, branch viewr-ppg-fusion-0.7.2). The branch is based on
+# the v0.7.2 tag — byte-identical to the crates.io source — plus the fused
+# PPG R/B interpolation pass: bit-identical develops (pinned by the private
+# corpus hash comparison) with one fewer full-frame traversal, ~20-25% faster
+# Full develop at 33 MP. See docs/browsing-loading-optimization-2026-08-01.md.
+[patch.crates-io]
+rawler = { path = "thirdparty/dnglab/rawler" }
