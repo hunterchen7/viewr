@@ -15,6 +15,7 @@ mod image_info;
 mod loupe;
 #[cfg(target_os = "macos")]
 mod macos_update;
+mod pixels;
 mod progressive_texture;
 mod rating_groups;
 mod settings;

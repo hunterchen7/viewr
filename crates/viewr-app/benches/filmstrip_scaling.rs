@@ -11,6 +11,9 @@ use viewr_core::types::PixelBuf;
 #[path = "../src/filmstrip.rs"]
 mod filmstrip;
 #[allow(dead_code, unused_imports)]
+#[path = "../src/pixels.rs"]
+mod pixels;
+#[allow(dead_code, unused_imports)]
 #[path = "../src/progressive_texture.rs"]
 mod progressive_texture;
 #[allow(dead_code, unused_imports)]
@@ -233,10 +236,22 @@ fn experimental_visible_tiles(
 fn bench_full_texture_first_visible(c: &mut Criterion) {
     const WIDTH: u32 = 6_000;
     const HEIGHT: u32 = 4_000;
+    // The all-127 fill keeps a translucent alpha, exercising the exact
+    // per-pixel premultiply fallback. Production photo pixels are opaque, so
+    // the paired opaque source measures the representative bulk-copy path.
     let source = PixelBuf {
         width: WIDTH,
         height: HEIGHT,
         rgba: vec![127; WIDTH as usize * HEIGHT as usize * 4],
+    };
+    let opaque_source = {
+        let mut rgba = source.rgba.clone();
+        rgba.iter_mut().skip(3).step_by(4).for_each(|a| *a = 255);
+        PixelBuf {
+            width: WIDTH,
+            height: HEIGHT,
+            rgba,
+        }
     };
     let visible_uv = egui::Rect::from_center_size(egui::pos2(0.5, 0.5), egui::vec2(0.25, 0.2375));
     let order = progressive_texture::priority_order(WIDTH, HEIGHT, visible_uv);
@@ -269,6 +284,21 @@ fn bench_full_texture_first_visible(c: &mut Criterion) {
             for &tile in &visible_tiles {
                 black_box(
                     progressive_texture::color_image(black_box(&source), black_box(tile))
+                        .expect("valid benchmark tile"),
+                );
+            }
+        });
+    });
+    group.bench_function("production_full_24mp_opaque", |b| {
+        b.iter(|| {
+            black_box(pixels::to_color_image(black_box(&opaque_source)));
+        });
+    });
+    group.bench_function("progressive_visible_four_tiles_opaque", |b| {
+        b.iter(|| {
+            for &tile in &visible_tiles {
+                black_box(
+                    progressive_texture::color_image(black_box(&opaque_source), black_box(tile))
                         .expect("valid benchmark tile"),
                 );
             }

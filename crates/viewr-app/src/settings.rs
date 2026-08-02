@@ -313,6 +313,19 @@ impl SettingsState {
                         .add(egui::Slider::new(&mut config.disk_gb, 2.0..=200.0).fixed_decimals(0))
                         .changed();
                     ui.end_row();
+                    ui.label("Clear on exit");
+                    changed |= ui
+                        .checkbox(
+                            &mut config.clear_disk_cache_on_exit,
+                            "Delete cached develops when the app closes",
+                        )
+                        .on_hover_text(
+                            "Leaves no cache on disk while viewr is closed. \
+                             Reopening a folder then re-develops every image \
+                             instead of loading cached JPEGs.",
+                        )
+                        .changed();
+                    ui.end_row();
                     ui.label("JPEG quality");
                     changed |= ui
                         .add(

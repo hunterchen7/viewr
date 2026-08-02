@@ -84,13 +84,25 @@ pub fn thumb_and_meta(path: &Path, max_edge: u32) -> Result<ThumbResult, DecodeE
                 .ok_or(DecodeError::NoThumb)?,
         },
     };
-    let rgba = dyn_img.to_rgba8();
-    let buf = PixelBuf {
-        width: rgba.width(),
-        height: rgba.height(),
-        rgba: rgba.into_raw(),
+    // Camera previews decode as RGB8. Convolve those in their native layout
+    // and expand only the small result to RGBA, skipping a full-resolution
+    // RGBA expansion pass; output bytes are identical (resize::tests pins
+    // the equivalence).
+    let small = match dyn_img {
+        image::DynamicImage::ImageRgb8(rgb) => {
+            let (width, height) = rgb.dimensions();
+            resize::downscale_rgb8_to_rgba_fit(width, height, rgb.into_raw(), max_edge)?
+        }
+        other => {
+            let rgba = other.into_rgba8();
+            let buf = PixelBuf {
+                width: rgba.width(),
+                height: rgba.height(),
+                rgba: rgba.into_raw(),
+            };
+            resize::downscale_to_fit(buf, max_edge)?
+        }
     };
-    let small = resize::downscale_to_fit(buf, max_edge)?;
     let thumb = resize::apply_orient(small, meta.orient);
     Ok(ThumbResult { thumb, meta })
 }

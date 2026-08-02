@@ -23,12 +23,13 @@ use viewr_core::library::{
     Library, RatingLoad, load_ratings_with_owners, rating_owner_keys, try_load_ratings_with_owners,
 };
 use viewr_core::meta::FileMeta;
-use viewr_core::types::{PixelBuf, Tier};
+use viewr_core::types::Tier;
 
 use crate::config::{Action, Config, ScrollMode, TierIndicator};
 use crate::filmstrip;
 use crate::image_info;
 use crate::loupe::{self, LoupeResponse, Zoom};
+use crate::pixels::to_color_image;
 use crate::progressive_texture::{self, TileCoord};
 use crate::rating_groups::{build_owner_members, install_rating_for_members};
 use crate::settings::SettingsState;
@@ -70,7 +71,16 @@ pub fn run(dir: &Path, select: Option<&Path>) -> Result<()> {
         options,
         Box::new(move |cc| {
             crate::color::pin_srgb_colorspace(cc);
+            // Build the shared develop transfer table before the first image
+            // job needs it, off the UI thread.
+            std::thread::spawn(viewr_core::develop::warm_gamma_lut);
             let mut app = App::empty(cc);
+            if app.config.clear_disk_cache_on_exit {
+                // Crash leftovers: a clean exit already purged, so this is
+                // normally a no-op scan. Runs before the engine can start
+                // warming from (or writing to) the cache.
+                purge_disk_cache();
+            }
             app.open_folder(&dir, select.as_deref())
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             Ok(Box::new(app))
@@ -1118,12 +1128,14 @@ impl App {
     }
 
     fn cache_state(session: &Session, index: usize) -> Option<CacheState> {
-        let cache = &session.cache;
-        if cache.has_rgba((index, Tier::Full)) {
+        // One lock acquisition per cell; the border and mark indicators call
+        // this for every visible thumbnail on every painted frame.
+        let (full_rgba, browse_rgba, any_jpeg) = session.cache.image_residency(index);
+        if full_rgba {
             Some(CacheState::Full)
-        } else if cache.has_rgba((index, Tier::Browse)) {
+        } else if browse_rgba {
             Some(CacheState::Browse)
-        } else if cache.has_jpeg((index, Tier::Browse)) || cache.has_jpeg((index, Tier::Full)) {
+        } else if any_jpeg {
             Some(CacheState::Compressed)
         } else {
             None
@@ -1199,7 +1211,25 @@ fn cache_state_stroke_color(state: CacheState) -> egui::Color32 {
     }
 }
 
+/// Deletes every disk-cache develop through the hardened GC traversal.
+fn purge_disk_cache() {
+    if let Some(cache) = DiskCache::open_default(0) {
+        cache.purge();
+    }
+}
+
 impl eframe::App for App {
+    fn on_exit(&mut self) {
+        if !self.config.clear_disk_cache_on_exit {
+            return;
+        }
+        // Stop the engine's writers first so the purge does not race fresh
+        // cache objects, then delete synchronously: exit blocks briefly on
+        // file removal instead of leaving the cache behind.
+        self.session = None;
+        purge_disk_cache();
+    }
+
     fn persist_egui_memory(&self) -> bool {
         // NativeOptions persists the root window. App preferences and panel
         // sizes use viewr.toml; transient widget state must not reopen dialogs
@@ -1808,10 +1838,6 @@ impl App {
         }
         self.handle_keys(rect, None);
     }
-}
-
-fn to_color_image(buf: &PixelBuf) -> egui::ColorImage {
-    egui::ColorImage::from_rgba_unmultiplied([buf.width as usize, buf.height as usize], &buf.rgba)
 }
 
 #[cfg(test)]

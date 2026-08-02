@@ -1596,6 +1596,40 @@ fn bench_ram_cache(c: &mut Criterion) {
         });
     });
 
+    // A navigation replan classifies every plan target by residency. Compare
+    // the batched single-lock snapshot against the per-target has_* probes it
+    // replaced (kept as a reference).
+    let plan_keys: Vec<(usize, Tier)> = (0..200)
+        .map(|index| {
+            (
+                index,
+                if index % 2 == 0 {
+                    Tier::Browse
+                } else {
+                    Tier::Full
+                },
+            )
+        })
+        .collect();
+    group.throughput(Throughput::Elements(plan_keys.len() as u64));
+    group.bench_function("plan_probe_batched_200", |b| {
+        b.iter(|| black_box(cache.probe_residency(black_box(&plan_keys).iter())));
+    });
+    group.bench_function("plan_probe_individual_200", |b| {
+        b.iter(|| {
+            let probes: Vec<(bool, bool)> = plan_keys
+                .iter()
+                .map(|&key| {
+                    (
+                        cache.has_rgba(black_box(key)),
+                        cache.has_jpeg(black_box(key)),
+                    )
+                })
+                .collect();
+            black_box(probes)
+        });
+    });
+
     // Reuse the payload and cycle over one bounded synthetic folder so this
     // isolates LRU/hash-map churn rather than allocation or an impossible
     // unbounded stream of new folder indices. Every insert evicts one entry.
@@ -1843,6 +1877,15 @@ fn bench_xmp(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(element_xmp.len() as u64));
     group.bench_function("parse_element_late", |b| {
         b.iter(|| black_box(parse_rating(black_box(element_xmp.as_str()))));
+    });
+
+    // Foreign sidecars without any rating skip the full parse via the
+    // substring prefilter.
+    let unrated_xmp = attribute_xmp.replace(" xmp:Rating=\"3\"", "");
+    assert!(!unrated_xmp.contains("Rating"));
+    group.throughput(Throughput::Bytes(unrated_xmp.len() as u64));
+    group.bench_function("parse_no_rating", |b| {
+        b.iter(|| black_box(parse_rating(black_box(unrated_xmp.as_str()))));
     });
 
     group.throughput(Throughput::Bytes(attribute_xmp.len() as u64));

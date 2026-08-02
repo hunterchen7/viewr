@@ -253,6 +253,17 @@ impl DiskCache {
         atomic_write::replace(&path, bytes)
     }
 
+    /// Deletes every cache object and stale temporary file.
+    ///
+    /// Equivalent to a garbage collection with a zero-byte budget, so it
+    /// reuses the hardened traversal: only viewr-named objects inside the
+    /// shard layout are deleted, symlinks are not followed, and foreign
+    /// files are left alone. Objects written concurrently can survive; the
+    /// clear-on-exit preference re-runs this at the next startup.
+    pub fn purge(&self) -> u64 {
+        self.gc(0)
+    }
+
     /// Enforces the byte budget supplied to [`open_default`](Self::open_default).
     ///
     /// Returns the number of object bytes successfully deleted. Filesystem
@@ -538,6 +549,30 @@ mod tests {
             DiskCache::key(&entry, Tier::Browse),
             legacy.finalize().to_hex().to_string()
         );
+    }
+
+    #[test]
+    fn purge_deletes_every_object_but_spares_foreign_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open_at(dir.path().to_owned());
+        let keys: Vec<String> = (0..3)
+            .map(|i| DiskCache::key(&entry(20 + i, 1), Tier::Browse))
+            .collect();
+        for key in &keys {
+            cache.put(key, &[0u8; 500]).unwrap();
+            assert!(cache.has(key));
+        }
+        let foreign = dir.path().join("not-a-cache-object.txt");
+        std::fs::write(&foreign, b"keep").unwrap();
+
+        assert_eq!(cache.purge(), 1500);
+        for key in &keys {
+            assert!(!cache.has(key), "{key} survived the purge");
+        }
+        assert!(foreign.exists(), "foreign file must not be deleted");
+        // A purged cache accepts new objects immediately.
+        cache.put(&keys[0], &[0u8; 100]).unwrap();
+        assert!(cache.has(&keys[0]));
     }
 
     #[test]

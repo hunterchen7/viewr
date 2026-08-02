@@ -99,6 +99,10 @@ pub fn read_rating(path: &Path) -> Option<u8> {
 /// float-to-integer conversion. If several semantic ratings exist, the first
 /// one in document order wins.
 pub fn parse_rating(xml: &str) -> Option<u8> {
+    // XML cannot escape element or attribute names, so any semantic rating
+    // carries the literal local name. Sidecars without the substring (foreign
+    // unrated files) return the same `None` without a full parse.
+    memchr::memmem::find(xml.as_bytes(), b"Rating")?;
     let mut reader = NsReader::from_str(xml);
     reader.config_mut().trim_text(false);
     let mut rating = None;
@@ -654,6 +658,19 @@ mod tests {
     #[test]
     fn parses_attribute_form() {
         assert_eq!(parse_rating(LR_STYLE), Some(2));
+    }
+
+    #[test]
+    fn documents_without_the_rating_name_return_none() {
+        // The substring prefilter must return the same `None` the full parse
+        // produces for rating-free sidecars, including malformed ones.
+        let well_formed = r#"<rdf:Description
+            xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+            xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+            crs:Exposure2012="+0.35"/>"#;
+        assert_eq!(parse_rating(well_formed), None);
+        assert_eq!(parse_rating("<unclosed"), None);
+        assert_eq!(parse_rating(""), None);
     }
 
     #[test]

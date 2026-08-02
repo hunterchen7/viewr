@@ -569,6 +569,16 @@ impl JobQueue {
         }
     }
 
+    /// Whether an interactive-lane job for `id` is currently queued.
+    ///
+    /// Advisory only: the answer can change as soon as the lock drops. The
+    /// decode share uses it to decide whether a finished decode is worth
+    /// cloning for a not-yet-started peer; a stale answer costs one mosaic
+    /// clone or one duplicate decode, never correctness.
+    fn has_queued(&self, id: JobId) -> bool {
+        self.state.lock().unwrap().queued.contains_key(&id)
+    }
+
     /// Replace the interactive job set. In-flight interactive jobs no longer
     /// wanted are cancelled; in-flight jobs still wanted keep running (not
     /// duplicated). A real navigation change can also cancel active
@@ -1046,6 +1056,242 @@ impl NavigationOrder {
     }
 }
 
+/// Decoded CFA mosaic and metadata shared between paired develop jobs.
+struct SharedRaw {
+    raw: rawler::RawImage,
+    metadata: rawler::decoders::RawMetadata,
+}
+
+enum RawShareState<T> {
+    /// A leader is decoding; `waiters` followers sleep on the condvar.
+    InFlight { waiters: usize },
+    /// The leader's decode, cloned for exactly one follower.
+    Ready(Arc<T>),
+    /// The leader failed or unwound; followers run their own decode.
+    Failed,
+}
+
+struct RawShareEntry<T> {
+    index: usize,
+    /// Distinguishes successive entries for one index so a woken follower
+    /// never adjusts the waiter count of an entry it did not register on.
+    generation: u64,
+    state: RawShareState<T>,
+    /// Publication time of a `Ready` payload; stale payloads are pruned so a
+    /// cancelled peer cannot pin a mosaic (or serve a replaced file's decode)
+    /// for the rest of the session.
+    published: Option<std::time::Instant>,
+}
+
+/// Cross-worker share of one in-progress or just-finished CFA decode.
+///
+/// While zoomed, one navigation schedules a Browse and a Full develop of the
+/// same image, and each previously re-opened and entropy-decoded the identical
+/// RAW (~61 ms for a 33 MP compressed ARW versus ~3 ms for a mosaic clone).
+/// The first develop to arrive leads and decodes; a concurrent peer waits and
+/// receives the mosaic, and a peer that is still queued receives it through a
+/// short-lived `Ready` entry. Without a queued or waiting peer nothing is
+/// retained, so Fit-mode browsing pays only a map probe.
+///
+/// The share never blocks progress: waiting re-checks the follower's cancel
+/// token, and a failed or panicking leader marks its entry `Failed` through
+/// the guard's `Drop`, waking followers into their own decode. At most
+/// [`RAW_SHARE_MAX_READY`] decoded mosaics are retained outside the pixel
+/// cache budgets, and only until their peer consumes them or a newer decode
+/// replaces them.
+///
+/// A shared mosaic can be up to one decode older than the file on disk. The
+/// same window exists today between two racing decodes of a replaced file,
+/// and render identity already accepts scan-time size+mtime as cache
+/// identity.
+struct RawDecodeShare<T = SharedRaw> {
+    state: Mutex<RawShareSlots<T>>,
+    ready: Condvar,
+}
+
+struct RawShareSlots<T> {
+    entries: Vec<RawShareEntry<T>>,
+    next_generation: u64,
+}
+
+/// Retained `Ready` payloads. One covers the tight Browse→Full pairing; the
+/// bound exists so an abandoned entry cannot accumulate mosaics.
+const RAW_SHARE_MAX_READY: usize = 1;
+
+/// Follower wake-up interval for cancellation checks while a leader decodes.
+const RAW_SHARE_WAIT_STEP: Duration = Duration::from_millis(25);
+
+/// A published mosaic not consumed within this window is dropped on the next
+/// share activity: the paired peer normally consumes within milliseconds, and
+/// pruning bounds both retained memory and how old a reused decode can be.
+const RAW_SHARE_READY_TTL: Duration = Duration::from_secs(10);
+
+enum RawShareJoin<'share, T> {
+    /// Caller decodes and must publish or dismiss through the guard.
+    Lead(RawShareLead<'share, T>),
+    /// Another worker's decode, cloned or moved out for this caller.
+    Shared(Arc<T>),
+    /// Decode independently: waiting was cancelled or the leader failed.
+    OwnDecode,
+}
+
+struct RawShareLead<'share, T> {
+    share: &'share RawDecodeShare<T>,
+    index: usize,
+    generation: u64,
+    /// Cleared by `publish`/`dismiss`; `Drop` then marks the entry failed so
+    /// a panicking or erroring leader can never strand waiting followers.
+    armed: bool,
+}
+
+impl<T> RawDecodeShare<T> {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(RawShareSlots {
+                entries: Vec::new(),
+                next_generation: 0,
+            }),
+            ready: Condvar::new(),
+        }
+    }
+
+    /// Joins the decode for `index`, waiting for an in-flight leader unless
+    /// `token` cancels first.
+    fn join(&self, index: usize, token: &CancelToken) -> RawShareJoin<'_, T> {
+        let mut state = self.state.lock().unwrap();
+        state.entries.retain(|entry| {
+            entry
+                .published
+                .is_none_or(|published| published.elapsed() <= RAW_SHARE_READY_TTL)
+        });
+        loop {
+            let Some(position) = state.entries.iter().position(|entry| entry.index == index) else {
+                let generation = state.next_generation;
+                state.next_generation += 1;
+                state.entries.push(RawShareEntry {
+                    index,
+                    generation,
+                    state: RawShareState::InFlight { waiters: 0 },
+                    published: None,
+                });
+                return RawShareJoin::Lead(RawShareLead {
+                    share: self,
+                    index,
+                    generation,
+                    armed: true,
+                });
+            };
+            let generation = state.entries[position].generation;
+            match &mut state.entries[position].state {
+                RawShareState::InFlight { waiters } => {
+                    if token.cancelled() {
+                        return RawShareJoin::OwnDecode;
+                    }
+                    *waiters += 1;
+                    let (next, _) = self.ready.wait_timeout(state, RAW_SHARE_WAIT_STEP).unwrap();
+                    state = next;
+                    // Decrement only the entry this follower registered on: a
+                    // dismissed entry can be replaced by a new generation for
+                    // the same index while the follower sleeps.
+                    if let Some(entry) = state
+                        .entries
+                        .iter_mut()
+                        .find(|entry| entry.index == index && entry.generation == generation)
+                        && let RawShareState::InFlight { waiters } = &mut entry.state
+                    {
+                        *waiters -= 1;
+                    }
+                    // Re-inspect: the leader may have published, failed, or
+                    // been consumed; the entry may also be gone entirely.
+                }
+                RawShareState::Ready(_) => {
+                    let entry = state.entries.remove(position);
+                    let RawShareState::Ready(shared) = entry.state else {
+                        unreachable!("matched Ready above");
+                    };
+                    return RawShareJoin::Shared(shared);
+                }
+                RawShareState::Failed => {
+                    state.entries.remove(position);
+                    return RawShareJoin::OwnDecode;
+                }
+            }
+        }
+    }
+}
+
+impl<T> RawShareLead<'_, T> {
+    /// Whether a follower is currently waiting on this decode.
+    fn has_waiters(&self) -> bool {
+        let state = self.share.state.lock().unwrap();
+        state.entries.iter().any(|entry| {
+            entry.index == self.index
+                && entry.generation == self.generation
+                && matches!(entry.state, RawShareState::InFlight { waiters } if waiters > 0)
+        })
+    }
+
+    /// Publishes the decode for one waiting or queued peer.
+    fn publish(mut self, shared: Arc<T>) {
+        let mut state = self.share.state.lock().unwrap();
+        if let Some(entry) = state
+            .entries
+            .iter_mut()
+            .find(|entry| entry.index == self.index && entry.generation == self.generation)
+        {
+            entry.state = RawShareState::Ready(shared);
+            entry.published = Some(std::time::Instant::now());
+        }
+        // Bound retained mosaics: drop the oldest surplus Ready payloads.
+        let mut ready = state
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.state, RawShareState::Ready(_)))
+            .count();
+        state.entries.retain(|entry| {
+            if ready > RAW_SHARE_MAX_READY && matches!(entry.state, RawShareState::Ready(_)) {
+                ready -= 1;
+                false
+            } else {
+                true
+            }
+        });
+        drop(state);
+        self.armed = false;
+        self.share.ready.notify_all();
+    }
+
+    /// Removes the entry without publishing (no peer interest).
+    fn dismiss(mut self) {
+        let mut state = self.share.state.lock().unwrap();
+        state
+            .entries
+            .retain(|entry| entry.index != self.index || entry.generation != self.generation);
+        drop(state);
+        self.armed = false;
+        self.share.ready.notify_all();
+    }
+}
+
+impl<T> Drop for RawShareLead<'_, T> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // The leader errored or is unwinding: fail the entry so followers
+        // stop waiting and decode on their own.
+        if let Ok(mut state) = self.share.state.lock()
+            && let Some(entry) = state
+                .entries
+                .iter_mut()
+                .find(|entry| entry.index == self.index && entry.generation == self.generation)
+        {
+            entry.state = RawShareState::Failed;
+        }
+        self.share.ready.notify_all();
+    }
+}
+
 struct Shared {
     entries: Arc<Vec<FolderEntry>>,
     cache: Arc<RamCache>,
@@ -1068,6 +1314,8 @@ struct Shared {
     jpeg_quality: u8,
     /// Display order and its last navigation generation.
     navigation: Mutex<NavigationOrder>,
+    /// Decode handoff between paired Browse/Full develops of one image.
+    raw_share: RawDecodeShare,
 }
 
 /// Construction options for an image-processing [`Engine`].
@@ -1297,6 +1545,7 @@ impl Engine {
                 persistence_known_present: Mutex::new(HashSet::new()),
                 jpeg_quality: options.jpeg_quality,
                 navigation: Mutex::new(NavigationOrder::default()),
+                raw_share: RawDecodeShare::new(),
             }),
             workers: Vec::with_capacity(HEAVY_WORKERS + LIGHT_WORKERS),
             persistence_worker: None,
@@ -1401,20 +1650,25 @@ impl Engine {
                 .filter(|target| target.tier == Tier::Full)
                 .map(|target| (target.index, Tier::Full)),
         );
+        // One residency snapshot for the whole target list: per-target probes
+        // would take the cache mutex up to twice per target on this UI-thread
+        // path while workers publish results through the same lock. The plan
+        // stays advisory either way — workers re-check residency at claim.
+        let keys: Vec<JobId> = targets
+            .iter()
+            .map(|target| (target.index, target.tier))
+            .collect();
+        let residency = cache.probe_residency(keys.iter());
+        let persistence_known_present = self.shared.persistence_known_present.lock().unwrap();
         let mut plan: Vec<(JobId, u8, u32, Action)> = Vec::with_capacity(targets.len());
-        for target in targets {
+        for (target, (has_rgba, has_jpeg)) in targets.into_iter().zip(residency) {
             let id = (target.index, target.tier);
             match target.kind {
                 PlanKind::Display => {
-                    if cache.has_rgba(id) {
+                    if has_rgba {
                         if target.tier == Tier::Full
-                            && !cache.has_jpeg(id)
-                            && !self
-                                .shared
-                                .persistence_known_present
-                                .lock()
-                                .unwrap()
-                                .contains(&id)
+                            && !has_jpeg
+                            && !persistence_known_present.contains(&id)
                         {
                             plan.push((id, 3, target.effective_distance, Action::PersistResident));
                         }
@@ -1423,7 +1677,7 @@ impl Engine {
                     // A configured disk cache is probed by the worker during
                     // rehydrate. Navigation must not issue filesystem calls
                     // for every candidate on the UI thread.
-                    let action = if cache.has_jpeg(id) || disk.is_some() {
+                    let action = if has_jpeg || disk.is_some() {
                         Action::Rehydrate
                     } else {
                         Action::Develop(match target.tier {
@@ -1434,7 +1688,7 @@ impl Engine {
                     plan.push((id, target.class, target.effective_distance, action));
                 }
                 PlanKind::Prefetch => {
-                    if !cache.has_rgba(id) {
+                    if !has_rgba {
                         plan.push((
                             id,
                             target.class,
@@ -1449,6 +1703,7 @@ impl Engine {
                 }
             }
         }
+        drop(persistence_known_present);
 
         self.shared.heavy.set_plan(plan, navigation_changed);
         if disk.is_some() {
@@ -2081,22 +2336,65 @@ fn run_develop(
     if token.cancelled() {
         return DevelopCompletion::Cancelled;
     }
-    let decoded = match decode::load(path) {
-        Ok(d) => d,
-        Err(e) => {
-            fail(e.to_string());
-            return if token.cancelled() {
-                DevelopCompletion::Cancelled
-            } else {
-                DevelopCompletion::Finished
+    // Join the per-image decode share: the peer-tier develop of the same
+    // image reuses this decode instead of re-opening and entropy-decoding
+    // the identical RAW.
+    let join = shared.raw_share.join(index, token);
+    let (raw, meta) = match join {
+        RawShareJoin::Shared(shared_raw) => {
+            let meta = FileMeta::from_metadata(&shared_raw.metadata);
+            // The publisher cloned for exactly one follower, so sole
+            // ownership is the common case and the mosaic moves out.
+            let raw = match Arc::try_unwrap(shared_raw) {
+                Ok(owned) => owned.raw,
+                Err(shared_raw) => shared_raw.raw.clone(),
             };
+            (raw, meta)
+        }
+        other => {
+            let lead = match other {
+                RawShareJoin::Lead(lead) => Some(lead),
+                _ => None,
+            };
+            let decoded = match decode::load(path) {
+                Ok(d) => d,
+                Err(e) => {
+                    // A held lead marks the share entry failed on drop.
+                    drop(lead);
+                    fail(e.to_string());
+                    return if token.cancelled() {
+                        DevelopCompletion::Cancelled
+                    } else {
+                        DevelopCompletion::Finished
+                    };
+                }
+            };
+            if let Some(lead) = lead {
+                let peer = (
+                    index,
+                    match tier {
+                        Tier::Full => Tier::Browse,
+                        _ => Tier::Full,
+                    },
+                );
+                // Clone the mosaic only when a peer is waiting or queued;
+                // Fit-mode browsing (no Full jobs) publishes nothing.
+                if lead.has_waiters() || shared.heavy.has_queued(peer) {
+                    lead.publish(Arc::new(SharedRaw {
+                        raw: decoded.raw.clone(),
+                        metadata: decoded.metadata.clone(),
+                    }));
+                } else {
+                    lead.dismiss();
+                }
+            }
+            (decoded.raw, FileMeta::from_metadata(&decoded.metadata))
         }
     };
-    let meta = FileMeta::from_metadata(&decoded.metadata);
     if token.cancelled() {
         return DevelopCompletion::Cancelled;
     }
-    let (buf, _) = match develop(decoded.raw, quality) {
+    let (buf, _) = match develop(raw, quality) {
         Ok(r) => r,
         Err(e) => {
             fail(e.to_string());
@@ -2474,6 +2772,164 @@ mod tests {
     use super::*;
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn raw_share_leader_publishes_to_a_waiting_follower() {
+        let share: RawDecodeShare<u32> = RawDecodeShare::new();
+        let token = CancelToken::default();
+        let RawShareJoin::Lead(lead) = share.join(7, &token) else {
+            panic!("first join must lead");
+        };
+
+        std::thread::scope(|scope| {
+            let follower = scope.spawn(|| {
+                let token = CancelToken::default();
+                share.join(7, &token)
+            });
+            // Wait until the follower registers, then publish for it.
+            while !lead.has_waiters() {
+                std::thread::yield_now();
+            }
+            lead.publish(Arc::new(41));
+            match follower.join().expect("follower thread") {
+                RawShareJoin::Shared(value) => assert_eq!(*value, 41),
+                _ => panic!("follower must receive the published decode"),
+            }
+        });
+        // Consumption removed the entry: the next join leads again.
+        assert!(matches!(share.join(7, &token), RawShareJoin::Lead(_)));
+    }
+
+    #[test]
+    fn raw_share_ready_survives_for_a_queued_peer_and_is_consumed_once() {
+        let share: RawDecodeShare<u32> = RawDecodeShare::new();
+        let token = CancelToken::default();
+        let RawShareJoin::Lead(lead) = share.join(3, &token) else {
+            panic!("first join must lead");
+        };
+        lead.publish(Arc::new(9));
+
+        match share.join(3, &token) {
+            RawShareJoin::Shared(value) => assert_eq!(*value, 9),
+            _ => panic!("queued peer must consume the Ready entry"),
+        }
+        assert!(matches!(share.join(3, &token), RawShareJoin::Lead(_)));
+    }
+
+    #[test]
+    fn raw_share_dismissed_and_failed_leaders_release_followers() {
+        let share: RawDecodeShare<u32> = RawDecodeShare::new();
+        let token = CancelToken::default();
+
+        let RawShareJoin::Lead(lead) = share.join(1, &token) else {
+            panic!("lead");
+        };
+        lead.dismiss();
+        assert!(matches!(share.join(1, &token), RawShareJoin::Lead(_)));
+
+        let RawShareJoin::Lead(lead) = share.join(2, &token) else {
+            panic!("lead");
+        };
+        std::thread::scope(|scope| {
+            let follower = scope.spawn(|| {
+                let token = CancelToken::default();
+                share.join(2, &token)
+            });
+            while !lead.has_waiters() {
+                std::thread::yield_now();
+            }
+            // Dropping without publish models a decode error or panic.
+            drop(lead);
+            assert!(matches!(
+                follower.join().expect("follower thread"),
+                RawShareJoin::OwnDecode
+            ));
+        });
+    }
+
+    #[test]
+    fn raw_share_follower_survives_entry_regeneration_while_sleeping() {
+        // A follower sleeping on a dismissed entry must not adjust the
+        // waiter count of a new same-index entry (previously an underflow).
+        for _ in 0..50 {
+            let share: RawDecodeShare<u32> = RawDecodeShare::new();
+            let token = CancelToken::default();
+            let RawShareJoin::Lead(lead) = share.join(4, &token) else {
+                panic!("lead");
+            };
+            std::thread::scope(|scope| {
+                let follower = scope.spawn(|| {
+                    let token = CancelToken::default();
+                    share.join(4, &token)
+                });
+                while !lead.has_waiters() {
+                    std::thread::yield_now();
+                }
+                lead.dismiss();
+                // Regenerate the index with a fresh leader while the
+                // follower may still be inside its wait window. The woken
+                // follower can re-lead first; join with a cancelled token so
+                // this thread never sleeps on a lead the follower cannot
+                // drive before it is joined below.
+                let second_token = CancelToken::default();
+                second_token.cancel();
+                match share.join(4, &second_token) {
+                    RawShareJoin::Lead(second) => second.publish(Arc::new(77)),
+                    RawShareJoin::OwnDecode => {}
+                    RawShareJoin::Shared(_) => panic!("nothing was published yet"),
+                }
+                match follower.join().expect("follower thread") {
+                    RawShareJoin::Shared(value) => assert_eq!(*value, 77),
+                    RawShareJoin::OwnDecode => {}
+                    RawShareJoin::Lead(lead) => lead.dismiss(),
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn raw_share_cancelled_follower_stops_waiting() {
+        let share: RawDecodeShare<u32> = RawDecodeShare::new();
+        let token = CancelToken::default();
+        let _lead = match share.join(5, &token) {
+            RawShareJoin::Lead(lead) => lead,
+            _ => panic!("lead"),
+        };
+
+        let cancelled = CancelToken::default();
+        cancelled.cancel();
+        assert!(matches!(share.join(5, &cancelled), RawShareJoin::OwnDecode));
+    }
+
+    #[test]
+    fn raw_share_bounds_retained_ready_payloads() {
+        let share: RawDecodeShare<u32> = RawDecodeShare::new();
+        let token = CancelToken::default();
+
+        let RawShareJoin::Lead(first) = share.join(10, &token) else {
+            panic!("lead");
+        };
+        first.publish(Arc::new(10));
+        let RawShareJoin::Lead(second) = share.join(11, &token) else {
+            panic!("lead");
+        };
+        second.publish(Arc::new(11));
+
+        let ready = share
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.state, RawShareState::Ready(_)))
+            .count();
+        assert_eq!(ready, RAW_SHARE_MAX_READY);
+
+        // Stale Ready payloads are pruned on the next join.
+        share.state.lock().unwrap().entries[0].published =
+            Some(std::time::Instant::now() - RAW_SHARE_READY_TTL - Duration::from_secs(1));
+        assert!(matches!(share.join(11, &token), RawShareJoin::Lead(_)));
+    }
 
     fn test_processing_pool() -> rayon::ThreadPool {
         build_processing_pool(NonZeroUsize::new(1).unwrap()).unwrap()
@@ -3007,6 +3463,7 @@ mod tests {
             persistence_known_present: Mutex::new(HashSet::new()),
             jpeg_quality: CACHE_JPEG_QUALITY,
             navigation: Mutex::new(NavigationOrder::default()),
+            raw_share: RawDecodeShare::new(),
         };
 
         publish_claimed(
@@ -3278,6 +3735,7 @@ mod tests {
             persistence_known_present: Mutex::new(HashSet::new()),
             jpeg_quality,
             navigation: Mutex::new(NavigationOrder::default()),
+            raw_share: RawDecodeShare::new(),
         })
     }
 
@@ -4393,6 +4851,7 @@ mod tests {
             persistence_known_present: Mutex::new(HashSet::new()),
             jpeg_quality: CACHE_JPEG_QUALITY,
             navigation: Mutex::new(NavigationOrder::default()),
+            raw_share: RawDecodeShare::new(),
         };
 
         run_warm_develop(
@@ -4808,6 +5267,7 @@ mod tests {
             persistence_known_present: Mutex::new(HashSet::new()),
             jpeg_quality: CACHE_JPEG_QUALITY,
             navigation: Mutex::new(NavigationOrder::default()),
+            raw_share: RawDecodeShare::new(),
         };
 
         run_rehydrate(

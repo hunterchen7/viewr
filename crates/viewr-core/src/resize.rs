@@ -1,9 +1,19 @@
 //! SIMD downscaling and orientation rotation for PixelBuf.
 
+use std::cell::RefCell;
+
 use fast_image_resize as fir;
 use rayon::prelude::*;
 
 use crate::types::{Orient, PixelBuf};
+
+thread_local! {
+    /// Reused per-thread resizer. `fir::Resizer` owns internal convolution
+    /// scratch buffers that a fresh instance reallocates on every resize; the
+    /// buffers are the only state it keeps between calls, so reuse cannot
+    /// change output.
+    static RESIZER: RefCell<fir::Resizer> = RefCell::new(fir::Resizer::new());
+}
 
 #[derive(Debug, thiserror::Error)]
 /// Failure while constructing or resizing an RGBA image.
@@ -22,14 +32,71 @@ pub enum ResizeError {
 /// When resizing is required, returns [`ResizeError::Fir`] if source RGBA
 /// storage is malformed or the resize operation fails.
 pub fn downscale_to_fit(buf: PixelBuf, max_edge: u32) -> Result<PixelBuf, ResizeError> {
-    let long = buf.width.max(buf.height);
+    match fit_dimensions(buf.width, buf.height, max_edge) {
+        None => Ok(buf),
+        Some((dst_w, dst_h)) => resize_exact(buf, dst_w, dst_h),
+    }
+}
+
+/// Downscales tightly packed RGB8 to fit `max_edge` and expands the result to
+/// RGBA8.
+///
+/// Convolving in the native three-channel layout skips a full-resolution RGBA
+/// expansion and filters 25% fewer bytes; only the small result is expanded.
+/// Output is byte-identical to expanding to RGBA first and calling
+/// [`downscale_to_fit`]: channels convolve independently, and a constant
+/// opaque alpha plane resizes to itself (both pinned by tests).
+///
+/// # Errors
+///
+/// When resizing is required, returns [`ResizeError::Fir`] if RGB storage
+/// does not match the dimensions or the resize operation fails.
+pub fn downscale_rgb8_to_rgba_fit(
+    width: u32,
+    height: u32,
+    rgb: Vec<u8>,
+    max_edge: u32,
+) -> Result<PixelBuf, ResizeError> {
+    let Some((dst_w, dst_h)) = fit_dimensions(width, height, max_edge) else {
+        return Ok(expand_rgb8(width, height, &rgb));
+    };
+    let src = fir::images::Image::from_vec_u8(width, height, rgb, fir::PixelType::U8x3)
+        .map_err(|e| ResizeError::Fir(e.to_string()))?;
+    let mut dst = fir::images::Image::new(dst_w, dst_h, fir::PixelType::U8x3);
+    let options = fir::ResizeOptions::new()
+        .resize_alg(fir::ResizeAlg::Convolution(fir::FilterType::CatmullRom))
+        .use_alpha(false);
+    RESIZER
+        .with(|resizer| resizer.borrow_mut().resize(&src, &mut dst, &options))
+        .map_err(|e| ResizeError::Fir(e.to_string()))?;
+    Ok(expand_rgb8(dst_w, dst_h, dst.buffer()))
+}
+
+/// Downscale geometry shared by every fit entry point: `None` when the image
+/// already fits.
+fn fit_dimensions(width: u32, height: u32, max_edge: u32) -> Option<(u32, u32)> {
+    let long = width.max(height);
     if long <= max_edge {
-        return Ok(buf);
+        return None;
     }
     let scale = max_edge as f64 / long as f64;
-    let dst_w = ((buf.width as f64 * scale).round() as u32).max(1);
-    let dst_h = ((buf.height as f64 * scale).round() as u32).max(1);
-    resize_exact(buf, dst_w, dst_h)
+    Some((
+        ((width as f64 * scale).round() as u32).max(1),
+        ((height as f64 * scale).round() as u32).max(1),
+    ))
+}
+
+fn expand_rgb8(width: u32, height: u32, rgb: &[u8]) -> PixelBuf {
+    let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
+    rgba.extend(
+        rgb.chunks_exact(3)
+            .flat_map(|px| [px[0], px[1], px[2], 255]),
+    );
+    PixelBuf {
+        width,
+        height,
+        rgba,
+    }
 }
 
 /// Resizes an RGBA8 buffer to exact dimensions with a Catmull-Rom filter.
@@ -50,8 +117,8 @@ pub fn resize_exact(buf: PixelBuf, dst_w: u32, dst_h: u32) -> Result<PixelBuf, R
     let options = fir::ResizeOptions::new()
         .resize_alg(fir::ResizeAlg::Convolution(fir::FilterType::CatmullRom))
         .use_alpha(false);
-    fir::Resizer::new()
-        .resize(&src, &mut dst, &options)
+    RESIZER
+        .with(|resizer| resizer.borrow_mut().resize(&src, &mut dst, &options))
         .map_err(|e| ResizeError::Fir(e.to_string()))?;
     Ok(PixelBuf {
         width: dst_w,
@@ -190,6 +257,50 @@ mod tests {
     }
 
     #[test]
+    fn rgb_downscale_matches_rgba_downscale_exactly() {
+        for (w, h, max_edge) in [
+            (1_616u32, 1_080u32, 360u32),
+            (1_617, 1_081, 360),
+            (640, 480, 359),
+            (240, 160, 512), // fits: expansion-only path
+            (5, 3, 2),
+        ] {
+            let mut state = 0x1234_5678u32;
+            let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+            for _ in 0..w * h {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                rgb.extend_from_slice(&[
+                    (state >> 8) as u8,
+                    (state >> 16) as u8,
+                    (state >> 24) as u8,
+                ]);
+            }
+            let rgba: Vec<u8> = rgb
+                .chunks_exact(3)
+                .flat_map(|px| [px[0], px[1], px[2], 255])
+                .collect();
+
+            let via_rgba = downscale_to_fit(
+                PixelBuf {
+                    width: w,
+                    height: h,
+                    rgba,
+                },
+                max_edge,
+            )
+            .unwrap();
+            let via_rgb = downscale_rgb8_to_rgba_fit(w, h, rgb, max_edge).unwrap();
+
+            assert_eq!(
+                (via_rgb.width, via_rgb.height),
+                (via_rgba.width, via_rgba.height)
+            );
+            assert!(via_rgba.rgba.chunks_exact(4).all(|px| px[3] == 255));
+            assert_eq!(via_rgb.rgba, via_rgba.rgba, "{w}x{h} fit {max_edge}");
+        }
+    }
+
+    #[test]
     fn rotate_90_cw() {
         // 2x1: [A B] → 1x2: [A] over [B]? For 90 CW, top row becomes right
         // column: A(0,0)→(0,0)? Actual: (x,y)→(h-1-y, x): A(0,0)→(0,0), B(1,0)→(0,1).
@@ -228,6 +339,47 @@ mod tests {
         let r270 = apply_orient(source, Orient::R270);
         assert_eq!((r270.width, r270.height), (2, 3));
         assert_eq!(labels(&r270), vec![3, 6, 2, 5, 1, 4]);
+    }
+
+    #[test]
+    fn banded_parallel_rotation_matches_the_serial_reference() {
+        // Wide enough to cross the 256*256 threshold that selects the banded
+        // Rayon path, with non-multiple-of-16 dimensions so the final band is
+        // partial in both orientations.
+        let width = 331u32;
+        let height = 203u32;
+        let mut state = 0xDEAD_BEEFu32;
+        let rgba: Vec<u8> = (0..width * height * 4)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect();
+        let source = PixelBuf {
+            width,
+            height,
+            rgba,
+        };
+        assert!((width * height) >= 256 * 256);
+
+        for orient in [Orient::R90, Orient::R270] {
+            let (sw, sh) = (width as usize, height as usize);
+            let mut expected = vec![0u8; source.rgba.len()];
+            for (yd, row) in expected.chunks_exact_mut(sh * 4).enumerate() {
+                for (xd, out) in row.chunks_exact_mut(4).enumerate() {
+                    let (xs, ys) = match orient {
+                        Orient::R90 => (yd, sh - 1 - xd),
+                        _ => (sw - 1 - yd, xd),
+                    };
+                    let i = (ys * sw + xs) * 4;
+                    out.copy_from_slice(&source.rgba[i..i + 4]);
+                }
+            }
+
+            let rotated = apply_orient(source.clone(), orient);
+            assert_eq!((rotated.width, rotated.height), (height, width));
+            assert_eq!(rotated.rgba, expected, "{orient:?}");
+        }
     }
 
     #[test]

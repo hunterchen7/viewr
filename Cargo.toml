@@ -18,6 +18,9 @@ thiserror = "2"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 fast_image_resize = "6"
 anyhow = "1"
+# Color32 already derives Pod/Zeroable in this build (ecolor's bytemuck
+# feature); the direct dependency only adds the safe cast helpers.
+bytemuck = "1"
 eframe = { version = "0.35", features = ["persistence"] }
 rfd = "0.15"
 objc2 = "0.6"
