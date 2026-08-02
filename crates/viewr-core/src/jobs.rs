@@ -1073,7 +1073,14 @@ enum RawShareState<T> {
 
 struct RawShareEntry<T> {
     index: usize,
+    /// Distinguishes successive entries for one index so a woken follower
+    /// never adjusts the waiter count of an entry it did not register on.
+    generation: u64,
     state: RawShareState<T>,
+    /// Publication time of a `Ready` payload; stale payloads are pruned so a
+    /// cancelled peer cannot pin a mosaic (or serve a replaced file's decode)
+    /// for the rest of the session.
+    published: Option<std::time::Instant>,
 }
 
 /// Cross-worker share of one in-progress or just-finished CFA decode.
@@ -1098,8 +1105,13 @@ struct RawShareEntry<T> {
 /// and render identity already accepts scan-time size+mtime as cache
 /// identity.
 struct RawDecodeShare<T = SharedRaw> {
-    state: Mutex<Vec<RawShareEntry<T>>>,
+    state: Mutex<RawShareSlots<T>>,
     ready: Condvar,
+}
+
+struct RawShareSlots<T> {
+    entries: Vec<RawShareEntry<T>>,
+    next_generation: u64,
 }
 
 /// Retained `Ready` payloads. One covers the tight Browse→Full pairing; the
@@ -1108,6 +1120,11 @@ const RAW_SHARE_MAX_READY: usize = 1;
 
 /// Follower wake-up interval for cancellation checks while a leader decodes.
 const RAW_SHARE_WAIT_STEP: Duration = Duration::from_millis(25);
+
+/// A published mosaic not consumed within this window is dropped on the next
+/// share activity: the paired peer normally consumes within milliseconds, and
+/// pruning bounds both retained memory and how old a reused decode can be.
+const RAW_SHARE_READY_TTL: Duration = Duration::from_secs(10);
 
 enum RawShareJoin<'share, T> {
     /// Caller decodes and must publish or dismiss through the guard.
@@ -1121,6 +1138,7 @@ enum RawShareJoin<'share, T> {
 struct RawShareLead<'share, T> {
     share: &'share RawDecodeShare<T>,
     index: usize,
+    generation: u64,
     /// Cleared by `publish`/`dismiss`; `Drop` then marks the entry failed so
     /// a panicking or erroring leader can never strand waiting followers.
     armed: bool,
@@ -1129,7 +1147,10 @@ struct RawShareLead<'share, T> {
 impl<T> RawDecodeShare<T> {
     fn new() -> Self {
         Self {
-            state: Mutex::new(Vec::new()),
+            state: Mutex::new(RawShareSlots {
+                entries: Vec::new(),
+                next_generation: 0,
+            }),
             ready: Condvar::new(),
         }
     }
@@ -1138,19 +1159,30 @@ impl<T> RawDecodeShare<T> {
     /// `token` cancels first.
     fn join(&self, index: usize, token: &CancelToken) -> RawShareJoin<'_, T> {
         let mut state = self.state.lock().unwrap();
+        state.entries.retain(|entry| {
+            entry
+                .published
+                .is_none_or(|published| published.elapsed() <= RAW_SHARE_READY_TTL)
+        });
         loop {
-            let Some(position) = state.iter().position(|entry| entry.index == index) else {
-                state.push(RawShareEntry {
+            let Some(position) = state.entries.iter().position(|entry| entry.index == index) else {
+                let generation = state.next_generation;
+                state.next_generation += 1;
+                state.entries.push(RawShareEntry {
                     index,
+                    generation,
                     state: RawShareState::InFlight { waiters: 0 },
+                    published: None,
                 });
                 return RawShareJoin::Lead(RawShareLead {
                     share: self,
                     index,
+                    generation,
                     armed: true,
                 });
             };
-            match &mut state[position].state {
+            let generation = state.entries[position].generation;
+            match &mut state.entries[position].state {
                 RawShareState::InFlight { waiters } => {
                     if token.cancelled() {
                         return RawShareJoin::OwnDecode;
@@ -1158,7 +1190,13 @@ impl<T> RawDecodeShare<T> {
                     *waiters += 1;
                     let (next, _) = self.ready.wait_timeout(state, RAW_SHARE_WAIT_STEP).unwrap();
                     state = next;
-                    if let Some(entry) = state.iter_mut().find(|entry| entry.index == index)
+                    // Decrement only the entry this follower registered on: a
+                    // dismissed entry can be replaced by a new generation for
+                    // the same index while the follower sleeps.
+                    if let Some(entry) = state
+                        .entries
+                        .iter_mut()
+                        .find(|entry| entry.index == index && entry.generation == generation)
                         && let RawShareState::InFlight { waiters } = &mut entry.state
                     {
                         *waiters -= 1;
@@ -1167,14 +1205,14 @@ impl<T> RawDecodeShare<T> {
                     // been consumed; the entry may also be gone entirely.
                 }
                 RawShareState::Ready(_) => {
-                    let entry = state.remove(position);
+                    let entry = state.entries.remove(position);
                     let RawShareState::Ready(shared) = entry.state else {
                         unreachable!("matched Ready above");
                     };
                     return RawShareJoin::Shared(shared);
                 }
                 RawShareState::Failed => {
-                    state.remove(position);
+                    state.entries.remove(position);
                     return RawShareJoin::OwnDecode;
                 }
             }
@@ -1186,8 +1224,9 @@ impl<T> RawShareLead<'_, T> {
     /// Whether a follower is currently waiting on this decode.
     fn has_waiters(&self) -> bool {
         let state = self.share.state.lock().unwrap();
-        state.iter().any(|entry| {
+        state.entries.iter().any(|entry| {
             entry.index == self.index
+                && entry.generation == self.generation
                 && matches!(entry.state, RawShareState::InFlight { waiters } if waiters > 0)
         })
     }
@@ -1195,15 +1234,21 @@ impl<T> RawShareLead<'_, T> {
     /// Publishes the decode for one waiting or queued peer.
     fn publish(mut self, shared: Arc<T>) {
         let mut state = self.share.state.lock().unwrap();
-        if let Some(entry) = state.iter_mut().find(|entry| entry.index == self.index) {
+        if let Some(entry) = state
+            .entries
+            .iter_mut()
+            .find(|entry| entry.index == self.index && entry.generation == self.generation)
+        {
             entry.state = RawShareState::Ready(shared);
+            entry.published = Some(std::time::Instant::now());
         }
         // Bound retained mosaics: drop the oldest surplus Ready payloads.
         let mut ready = state
+            .entries
             .iter()
             .filter(|entry| matches!(entry.state, RawShareState::Ready(_)))
             .count();
-        state.retain(|entry| {
+        state.entries.retain(|entry| {
             if ready > RAW_SHARE_MAX_READY && matches!(entry.state, RawShareState::Ready(_)) {
                 ready -= 1;
                 false
@@ -1219,7 +1264,9 @@ impl<T> RawShareLead<'_, T> {
     /// Removes the entry without publishing (no peer interest).
     fn dismiss(mut self) {
         let mut state = self.share.state.lock().unwrap();
-        state.retain(|entry| entry.index != self.index);
+        state
+            .entries
+            .retain(|entry| entry.index != self.index || entry.generation != self.generation);
         drop(state);
         self.armed = false;
         self.share.ready.notify_all();
@@ -1234,7 +1281,10 @@ impl<T> Drop for RawShareLead<'_, T> {
         // The leader errored or is unwinding: fail the entry so followers
         // stop waiting and decode on their own.
         if let Ok(mut state) = self.share.state.lock()
-            && let Some(entry) = state.iter_mut().find(|entry| entry.index == self.index)
+            && let Some(entry) = state
+                .entries
+                .iter_mut()
+                .find(|entry| entry.index == self.index && entry.generation == self.generation)
         {
             entry.state = RawShareState::Failed;
         }
@@ -2798,6 +2848,40 @@ mod tests {
     }
 
     #[test]
+    fn raw_share_follower_survives_entry_regeneration_while_sleeping() {
+        // A follower sleeping on a dismissed entry must not adjust the
+        // waiter count of a new same-index entry (previously an underflow).
+        for _ in 0..50 {
+            let share: RawDecodeShare<u32> = RawDecodeShare::new();
+            let token = CancelToken::default();
+            let RawShareJoin::Lead(lead) = share.join(4, &token) else {
+                panic!("lead");
+            };
+            std::thread::scope(|scope| {
+                let follower = scope.spawn(|| {
+                    let token = CancelToken::default();
+                    share.join(4, &token)
+                });
+                while !lead.has_waiters() {
+                    std::thread::yield_now();
+                }
+                lead.dismiss();
+                // Regenerate the index with a fresh leader while the
+                // follower may still be inside its wait window.
+                let RawShareJoin::Lead(second) = share.join(4, &token) else {
+                    panic!("second lead");
+                };
+                second.publish(Arc::new(77));
+                match follower.join().expect("follower thread") {
+                    RawShareJoin::Shared(value) => assert_eq!(*value, 77),
+                    RawShareJoin::OwnDecode => {}
+                    RawShareJoin::Lead(lead) => lead.dismiss(),
+                }
+            });
+        }
+    }
+
+    #[test]
     fn raw_share_cancelled_follower_stops_waiting() {
         let share: RawDecodeShare<u32> = RawDecodeShare::new();
         let token = CancelToken::default();
@@ -2829,10 +2913,16 @@ mod tests {
             .state
             .lock()
             .unwrap()
+            .entries
             .iter()
             .filter(|entry| matches!(entry.state, RawShareState::Ready(_)))
             .count();
         assert_eq!(ready, RAW_SHARE_MAX_READY);
+
+        // Stale Ready payloads are pruned on the next join.
+        share.state.lock().unwrap().entries[0].published =
+            Some(std::time::Instant::now() - RAW_SHARE_READY_TTL - Duration::from_secs(1));
+        assert!(matches!(share.join(11, &token), RawShareJoin::Lead(_)));
     }
 
     fn test_processing_pool() -> rayon::ThreadPool {
