@@ -294,6 +294,185 @@ fn sanitized_notes(body: Option<&str>) -> String {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReleaseNoteSpan {
+    Text(String),
+    Link { label: String, url: String },
+}
+
+impl ReleaseNoteSpan {
+    fn label(&self) -> &str {
+        match self {
+            Self::Text(text) => text,
+            Self::Link { label, .. } => label,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReleaseNoteBlock {
+    Heading {
+        level: u8,
+        spans: Vec<ReleaseNoteSpan>,
+    },
+    Bullet(Vec<ReleaseNoteSpan>),
+    Paragraph(Vec<ReleaseNoteSpan>),
+}
+
+impl ReleaseNoteBlock {
+    fn spans(&self) -> std::slice::Iter<'_, ReleaseNoteSpan> {
+        match self {
+            Self::Heading { spans, .. } | Self::Bullet(spans) | Self::Paragraph(spans) => {
+                spans.iter()
+            }
+        }
+    }
+}
+
+fn parse_release_notes(notes: &str) -> Vec<ReleaseNoteBlock> {
+    notes
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            let heading_marks = line.bytes().take_while(|byte| *byte == b'#').count();
+            if (1..=6).contains(&heading_marks) && line.as_bytes().get(heading_marks) == Some(&b' ')
+            {
+                return Some(ReleaseNoteBlock::Heading {
+                    level: heading_marks as u8,
+                    spans: parse_release_note_spans(line[heading_marks + 1..].trim()),
+                });
+            }
+            if let Some(bullet) = line.strip_prefix("* ").or_else(|| line.strip_prefix("- ")) {
+                return Some(ReleaseNoteBlock::Bullet(parse_release_note_spans(
+                    bullet.trim(),
+                )));
+            }
+            Some(ReleaseNoteBlock::Paragraph(parse_release_note_spans(line)))
+        })
+        .collect()
+}
+
+fn parse_release_note_spans(line: &str) -> Vec<ReleaseNoteSpan> {
+    let mut spans = Vec::new();
+    let mut emitted = 0;
+    let mut scan = 0;
+    while scan < line.len() {
+        let Some(open_offset) = line[scan..].find('[') else {
+            break;
+        };
+        let open = scan + open_offset;
+        let Some(close_offset) = line[open + 1..].find(']') else {
+            break;
+        };
+        let close = open + 1 + close_offset;
+        let url_start = close + 1;
+        if line.as_bytes().get(url_start) != Some(&b'(') {
+            scan = open + 1;
+            continue;
+        }
+        let url_start = url_start + 1;
+        let Some(url_end_offset) = line[url_start..].find(')') else {
+            break;
+        };
+        let url_end = url_start + url_end_offset;
+        let label = &line[open + 1..close];
+        let url = &line[url_start..url_end];
+        let trusted = !label.is_empty()
+            && Url::parse(url).is_ok_and(|url| {
+                url.scheme() == "https"
+                    && url.port_or_known_default() == Some(443)
+                    && url.username().is_empty()
+                    && url.password().is_none()
+            });
+        if !trusted {
+            scan = open + 1;
+            continue;
+        }
+        if emitted < open {
+            spans.push(ReleaseNoteSpan::Text(line[emitted..open].to_owned()));
+        }
+        spans.push(ReleaseNoteSpan::Link {
+            label: label.to_owned(),
+            url: url.to_owned(),
+        });
+        emitted = url_end + 1;
+        scan = emitted;
+    }
+    if emitted < line.len() {
+        spans.push(ReleaseNoteSpan::Text(line[emitted..].to_owned()));
+    }
+    if spans.is_empty() {
+        spans.push(ReleaseNoteSpan::Text(String::new()));
+    }
+    spans
+}
+
+#[derive(Clone, Copy)]
+enum ReleaseNoteStyle {
+    Heading(u8),
+    Body,
+}
+
+fn release_note_text(text: &str, style: ReleaseNoteStyle) -> egui::RichText {
+    let text = egui::RichText::new(text);
+    match style {
+        ReleaseNoteStyle::Heading(1 | 2) => text.strong().size(15.0),
+        ReleaseNoteStyle::Heading(_) => text.strong().size(13.0),
+        ReleaseNoteStyle::Body => text,
+    }
+}
+
+fn show_release_note_spans(
+    ui: &mut egui::Ui,
+    spans: &[ReleaseNoteSpan],
+    style: ReleaseNoteStyle,
+    bullet: bool,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        if bullet {
+            ui.label(release_note_text("•\u{a0}", style));
+        }
+        for span in spans {
+            match span {
+                ReleaseNoteSpan::Text(text) => {
+                    for chunk in text.split_inclusive(' ') {
+                        ui.label(release_note_text(chunk, style));
+                    }
+                }
+                ReleaseNoteSpan::Link { label, url } => {
+                    ui.hyperlink_to(release_note_text(label, style), url);
+                }
+            }
+        }
+    });
+}
+
+fn show_release_notes(ui: &mut egui::Ui, notes: &str) {
+    for (index, block) in parse_release_notes(notes).iter().enumerate() {
+        if index > 0 {
+            ui.add_space(match block {
+                ReleaseNoteBlock::Heading { .. } => 6.0,
+                ReleaseNoteBlock::Bullet(_) | ReleaseNoteBlock::Paragraph(_) => 2.0,
+            });
+        }
+        match block {
+            ReleaseNoteBlock::Heading { level, spans } => {
+                show_release_note_spans(ui, spans, ReleaseNoteStyle::Heading(*level), false);
+            }
+            ReleaseNoteBlock::Bullet(spans) => {
+                show_release_note_spans(ui, spans, ReleaseNoteStyle::Body, true);
+            }
+            ReleaseNoteBlock::Paragraph(spans) => {
+                show_release_note_spans(ui, spans, ReleaseNoteStyle::Body, false);
+            }
+        }
+    }
+}
+
 fn parse_release(
     bytes: &[u8],
     running: &Version,
@@ -2046,7 +2225,7 @@ impl UpdateManager {
                     .id_salt("viewr-update-notes")
                     .max_height(260.0)
                     .show(ui, |ui| {
-                        ui.add(egui::Label::new(release.notes.as_str()).wrap());
+                        show_release_notes(ui, &release.notes);
                     });
                 ui.add_space(10.0);
                 if let Delivery::ReleasePageOnly { reason } = &release.delivery {
@@ -2617,6 +2796,73 @@ mod tests {
         assert!(
             sanitized_notes(Some(&"x".repeat(MAX_RELEASE_NOTES_BYTES + 10))).len()
                 <= MAX_RELEASE_NOTES_BYTES
+        );
+    }
+
+    #[test]
+    fn release_notes_parse_release_please_markdown_without_exposing_urls() {
+        let notes = "## [0.4.0](https://github.com/hunterchen7/viewr/compare/v0.3.0...v0.4.0) (2026-08-02)\n\n### Features\n\n* add an information strip ([#24](https://github.com/hunterchen7/viewr/pull/24))\n* fill the cache adaptively ([#26](https://github.com/hunterchen7/viewr/pull/26))\n\n### Bug Fixes\n\n* keep overflow draggable ([650b8f6](https://github.com/hunterchen7/viewr/commit/650b8f6))";
+
+        let blocks = parse_release_notes(notes);
+
+        assert_eq!(blocks.len(), 6);
+        assert!(matches!(
+            &blocks[0],
+            ReleaseNoteBlock::Heading { level: 2, spans }
+                if spans == &vec![
+                    ReleaseNoteSpan::Link {
+                        label: "0.4.0".into(),
+                        url: "https://github.com/hunterchen7/viewr/compare/v0.3.0...v0.4.0".into(),
+                    },
+                    ReleaseNoteSpan::Text(" (2026-08-02)".into()),
+                ]
+        ));
+        assert!(matches!(
+            &blocks[1],
+            ReleaseNoteBlock::Heading { level: 3, spans }
+                if spans == &vec![ReleaseNoteSpan::Text("Features".into())]
+        ));
+        assert!(matches!(&blocks[2], ReleaseNoteBlock::Bullet(_)));
+        assert!(matches!(&blocks[3], ReleaseNoteBlock::Bullet(_)));
+        assert!(matches!(
+            &blocks[4],
+            ReleaseNoteBlock::Heading { level: 3, spans }
+                if spans == &vec![ReleaseNoteSpan::Text("Bug Fixes".into())]
+        ));
+        assert!(matches!(&blocks[5], ReleaseNoteBlock::Bullet(_)));
+
+        let visible = blocks
+            .iter()
+            .flat_map(ReleaseNoteBlock::spans)
+            .map(ReleaseNoteSpan::label)
+            .collect::<String>();
+        assert!(visible.contains("0.4.0 (2026-08-02)"));
+        assert!(visible.contains("add an information strip (#24)"));
+        assert!(!visible.contains("https://"));
+        assert!(!visible.contains("##"));
+        assert!(!visible.contains("* "));
+    }
+
+    #[test]
+    fn release_notes_keep_malformed_or_untrusted_links_as_plain_text() {
+        let blocks = parse_release_notes(
+            "A [broken](not a url) link and [unsafe](javascript:alert(1)) link.\n\nPlain paragraph.",
+        );
+
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks.iter().all(|block| {
+            block
+                .spans()
+                .all(|span| matches!(span, ReleaseNoteSpan::Text(_)))
+        }));
+        let visible = blocks
+            .iter()
+            .flat_map(ReleaseNoteBlock::spans)
+            .map(ReleaseNoteSpan::label)
+            .collect::<String>();
+        assert_eq!(
+            visible,
+            "A [broken](not a url) link and [unsafe](javascript:alert(1)) link.Plain paragraph."
         );
     }
 
