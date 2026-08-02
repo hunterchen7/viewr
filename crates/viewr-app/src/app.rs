@@ -1796,12 +1796,15 @@ impl App {
         }
         self.manage_thumbnail_textures(&demanded_thumbs);
         self.scroll_to_current = false;
-        if let Some(i) = clicked {
-            self.select(i);
-        }
         if open_loupe {
             self.mode = Mode::Loupe;
-            self.replan();
+        }
+        if let Some(i) = clicked {
+            let selection_changed = i != self.current;
+            self.select(i);
+            if open_loupe && !selection_changed {
+                self.replan();
+            }
         }
         self.handle_keys(rect, None);
     }

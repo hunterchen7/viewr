@@ -32,7 +32,10 @@ use crate::folder::{FolderEntry, outward_order};
 use crate::meta::FileMeta;
 #[cfg(feature = "benchmarks")]
 use crate::planning::build_plan_targets;
-use crate::planning::{FullPrefetchBudget, PlanKind, build_plan_targets_with_full_prefetch};
+use crate::planning::{
+    BrowsePrefetchBudget, FullPrefetchBudget, NavigationPrefetchBudgets, PlanKind,
+    build_plan_targets_with_normalized_prefetch,
+};
 use crate::resize::apply_orient;
 use crate::types::{PixelBuf, Tier};
 
@@ -158,8 +161,8 @@ pub struct NavState {
     pub direction: i8,
     /// Whether the current view needs Full-tier renders.
     ///
-    /// Full resolution is always preloaded for the current and adjacent
-    /// images; this flag raises the current Full render's priority.
+    /// Full resolution fills its adaptive RAM working set in every mode. This
+    /// flag raises the current Full render's priority.
     pub zoomed: bool,
 }
 
@@ -178,6 +181,8 @@ enum Action {
     /// Populate only the adaptive Full RGBA working set. Existing RAM/disk
     /// JPEGs may be rehydrated, but a RAW miss is not encoded or persisted.
     PrefetchFull,
+    /// Persist a resident Full buffer after it becomes required display work.
+    PersistResident,
     /// Develop only to fill ring 2 + disk (P3 folder warm): no RGBA
     /// insert, no event — keeps far images from thrashing ring 1.
     WarmDevelop(Quality),
@@ -192,9 +197,6 @@ impl Action {
                 (
                     Self::PrefetchFull,
                     Self::Develop(Quality::Full) | Self::Rehydrate
-                ) | (
-                    Self::Develop(Quality::Full) | Self::Rehydrate,
-                    Self::PrefetchFull
                 )
             )
     }
@@ -270,6 +272,10 @@ enum JobCompletion {
     /// the job until that lane next frees capacity instead of immediately
     /// developing the RAW again.
     DeferBackground { required_bytes: usize },
+    /// A live optional Full attempt produced no resident pixels. Suppress the
+    /// same speculative target until navigation changes or foreground demand
+    /// explicitly promotes it.
+    SuppressSpeculative,
 }
 
 struct DeferredJob {
@@ -303,6 +309,10 @@ struct QueueState {
     /// a tight RAW-develop/reject loop under backpressure.
     background_deferred: VecDeque<DeferredJob>,
     background_initialized: bool,
+    /// Optional Full targets that failed during the current navigation wave.
+    /// This prevents unrelated readiness events from repeatedly reopening the
+    /// same unreadable source.
+    speculative_failures: HashSet<JobId>,
     epoch: u64,
     seq: u64,
     closed: bool,
@@ -311,6 +321,7 @@ struct QueueState {
 struct JobQueue {
     state: Mutex<QueueState>,
     cond: Condvar,
+    parallel_background_lanes: bool,
 }
 
 #[derive(Clone)]
@@ -547,9 +558,14 @@ impl PersistenceQueue {
 
 impl JobQueue {
     fn new() -> Self {
+        Self::new_with_parallel_background_lanes(true)
+    }
+
+    fn new_with_parallel_background_lanes(parallel_background_lanes: bool) -> Self {
         Self {
             state: Mutex::new(QueueState::default()),
             cond: Condvar::new(),
+            parallel_background_lanes,
         }
     }
 
@@ -558,10 +574,24 @@ impl JobQueue {
     /// duplicated). A real navigation change can also cancel active
     /// background generations so newly interactive work reaches a worker at
     /// the next cancellation point.
-    fn set_plan(&self, plan: Vec<(JobId, u8, u32, Action)>, cancel_background: bool) {
+    fn set_plan(&self, mut plan: Vec<(JobId, u8, u32, Action)>, navigation_changed: bool) {
         let mut state = self.state.lock().unwrap();
         if state.closed {
             return;
+        }
+        if navigation_changed {
+            state.speculative_failures.clear();
+        } else {
+            // Required display demand must retry immediately even if the same
+            // image failed as optional work earlier in this navigation wave.
+            for (id, _, _, action) in &plan {
+                if !action.is_speculative_full() {
+                    state.speculative_failures.remove(id);
+                }
+            }
+            plan.retain(|(id, _, _, action)| {
+                !action.is_speculative_full() || !state.speculative_failures.contains(id)
+            });
         }
         state.epoch += 1;
         let epoch = state.epoch;
@@ -579,7 +609,7 @@ impl JobQueue {
                 },
             );
         }
-        if cancel_background {
+        if navigation_changed && !plan.is_empty() {
             for running in state.background_in_flight.values() {
                 running.token.cancel();
             }
@@ -720,7 +750,10 @@ impl JobQueue {
     }
 
     /// Claims the highest-priority runnable job without waiting.
-    fn try_claim_locked(state: &mut QueueState) -> Option<(JobId, Action, Arc<CancelToken>)> {
+    fn try_claim_locked(
+        state: &mut QueueState,
+        parallel_background_lanes: bool,
+    ) -> Option<(JobId, Action, Arc<CancelToken>)> {
         let urgent_len = state.urgent.len();
         for _ in 0..urgent_len {
             let (id, action) = state
@@ -745,10 +778,10 @@ impl JobQueue {
             return Some(Self::claim(state, id, action));
         }
 
-        let speculative_full_active = state
-            .in_flight
-            .values()
-            .any(|running| running.action.is_speculative_full());
+        let speculative_full_active = state.in_flight.iter().any(|(id, running)| {
+            running.action.is_speculative_full()
+                || (id.1 == Tier::Full && running.token.cancelled())
+        });
         let mut blocked = Vec::new();
         let mut selected = None;
         while let Some(job) = state.heap.pop() {
@@ -757,6 +790,9 @@ impl JobQueue {
             }
             if state.in_flight.contains_key(&job.id)
                 || (job.action.is_speculative_full() && speculative_full_active)
+                || (job.action.is_speculative_full()
+                    && !parallel_background_lanes
+                    && !state.background_in_flight.is_empty())
             {
                 blocked.push(job);
                 continue;
@@ -773,7 +809,9 @@ impl JobQueue {
         // Persistent folder warming is strictly below both replaceable lanes
         // and owns at most one worker. A speculative Full job may use one more,
         // leaving at least one heavy dispatcher ready for foreground work.
-        if !state.background_in_flight.is_empty() {
+        if !state.background_in_flight.is_empty()
+            || (!parallel_background_lanes && speculative_full_active)
+        {
             return None;
         }
         let background_len = state.background.len();
@@ -806,7 +844,7 @@ impl JobQueue {
             if state.closed {
                 return None;
             }
-            if let Some(job) = Self::try_claim_locked(&mut state) {
+            if let Some(job) = Self::try_claim_locked(&mut state, self.parallel_background_lanes) {
                 return Some(job);
             }
             state = self.cond.wait(state).unwrap();
@@ -817,7 +855,7 @@ impl JobQueue {
     fn try_pop(&self) -> Option<(JobId, Action, Arc<CancelToken>)> {
         let mut state = self.state.lock().unwrap();
         (!state.closed)
-            .then(|| Self::try_claim_locked(&mut state))
+            .then(|| Self::try_claim_locked(&mut state, self.parallel_background_lanes))
             .flatten()
     }
 
@@ -866,6 +904,15 @@ impl JobQueue {
             .in_flight
             .get(&id)
             .is_some_and(|current| Arc::ptr_eq(&current.token, token) && !token.cancelled());
+        if publishable && completion == JobCompletion::SuppressSpeculative {
+            debug_assert!(
+                state
+                    .in_flight
+                    .get(&id)
+                    .is_some_and(|current| current.action.is_speculative_full())
+            );
+            state.speculative_failures.insert(id);
+        }
         let published = if publishable {
             publication.is_some_and(|(events, event)| {
                 // As in `enqueue_current_event`, enqueue before releasing
@@ -893,6 +940,7 @@ impl JobQueue {
                             required_bytes,
                         });
                     }
+                    JobCompletion::SuppressSpeculative => {}
                 }
             }
         }
@@ -959,6 +1007,8 @@ impl JobQueue {
 struct NavigationOrder {
     /// Display order after filtering. Empty means identity order.
     indices: Vec<usize>,
+    /// Folder index to filtered position, built once when a filter changes.
+    positions: HashMap<usize, usize>,
     /// The last normalized state planned against `indices`. Keeping both
     /// values under one mutex makes a sequence change atomically invalidate
     /// the cancellation generation.
@@ -972,8 +1022,26 @@ impl NavigationOrder {
         changed
     }
 
-    fn replace_indices(&mut self, indices: Vec<usize>) {
-        self.indices = indices;
+    fn current_position(&self, current: usize) -> usize {
+        if self.indices.is_empty() {
+            current
+        } else {
+            self.positions.get(&current).copied().unwrap_or_default()
+        }
+    }
+
+    fn replace_indices(&mut self, len: usize, indices: Vec<usize>) {
+        self.indices.clear();
+        self.indices.reserve(indices.len());
+        self.positions.clear();
+        self.positions.reserve(indices.len());
+        for index in indices {
+            if index < len && !self.positions.contains_key(&index) {
+                let position = self.indices.len();
+                self.positions.insert(index, position);
+                self.indices.push(index);
+            }
+        }
         self.last_nav = None;
     }
 }
@@ -994,6 +1062,9 @@ struct Shared {
     heavy: JobQueue,
     light: JobQueue,
     persistence: PersistenceQueue,
+    /// Full RGBA entries whose matching disk object was validated without
+    /// installing JPEG bytes in RAM.
+    persistence_satisfied: Mutex<HashSet<JobId>>,
     jpeg_quality: u8,
     /// Display order and its last navigation generation.
     navigation: Mutex<NavigationOrder>,
@@ -1085,7 +1156,12 @@ fn spawn_engine_threads(
     Ok(())
 }
 
-fn navigation_pins(len: usize, current: usize, sequence: &[usize]) -> Vec<JobId> {
+fn navigation_pins(
+    len: usize,
+    current: usize,
+    current_position: usize,
+    sequence: &[usize],
+) -> Vec<JobId> {
     if len == 0 {
         return Vec::new();
     }
@@ -1093,10 +1169,7 @@ fn navigation_pins(len: usize, current: usize, sequence: &[usize]) -> Vec<JobId>
     let indices: Vec<usize> = if sequence.is_empty() {
         (current.saturating_sub(1)..=(current + 1).min(len - 1)).collect()
     } else {
-        let position = sequence
-            .iter()
-            .position(|&index| index == current)
-            .unwrap_or_default();
+        let position = current_position.min(sequence.len() - 1);
         let first = position.saturating_sub(1);
         let last = (position + 1).min(sequence.len() - 1);
         let mut indices: Vec<_> = sequence[first..=last]
@@ -1204,6 +1277,9 @@ impl Engine {
             .map(build_processing_pool)
             .transpose()
             .expect("failed to spawn image-processing worker pool");
+        let parallel_background_lanes = options
+            .worker_threads
+            .is_none_or(|threads| threads.get() >= HEAVY_WORKERS);
         // Construct the owner before spawning. If any later spawn panics via
         // `expect`, `Engine::drop` closes both queues and joins every handle
         // already installed by `spawn_engine_threads`.
@@ -1215,9 +1291,10 @@ impl Engine {
                 events,
                 notify,
                 processing_pool,
-                heavy: JobQueue::new(),
+                heavy: JobQueue::new_with_parallel_background_lanes(parallel_background_lanes),
                 light: JobQueue::new(),
                 persistence: PersistenceQueue::new(),
+                persistence_satisfied: Mutex::new(HashSet::new()),
                 jpeg_quality: options.jpeg_quality,
                 navigation: Mutex::new(NavigationOrder::default()),
             }),
@@ -1278,31 +1355,42 @@ impl Engine {
         };
         let current = nav.current;
         let cache = &self.shared.cache;
-        let full_snapshot = cache.full_prefetch_snapshot();
-        let full_budget = FullPrefetchBudget::from_observations(
-            full_snapshot.budget_bytes,
-            full_snapshot.fallback_bytes,
-            full_snapshot.exact_full_bytes,
+        // Keep navigation generation, cache admission, and queue replacement
+        // in one serialized transaction. Engine is Sync, so concurrent API
+        // callers must not interleave policy A with queue plan B. Taking the
+        // snapshots inside this transaction also keeps a waiting navigate call
+        // from extending the copy-on-write observation window.
+        let mut navigation = self.shared.navigation.lock().unwrap();
+        let navigation_changed = navigation.update_navigation(nav);
+        let current_position = navigation.current_position(current);
+        let (full_snapshot, browse_snapshot) = cache.prefetch_snapshots();
+        let prefetch_budgets = NavigationPrefetchBudgets::new(
+            FullPrefetchBudget::from_observations(
+                full_snapshot.budget_bytes,
+                full_snapshot.fallback_bytes,
+                full_snapshot.per_index_bytes,
+            ),
+            BrowsePrefetchBudget::from_observations(
+                browse_snapshot.budget_bytes,
+                browse_snapshot.fallback_bytes,
+                browse_snapshot.per_index_bytes,
+            ),
         );
 
         let disk = &self.shared.disk;
-        let (pins, targets, navigation_changed) = {
-            let mut navigation = self.shared.navigation.lock().unwrap();
-            let navigation_changed = navigation.update_navigation(nav);
-            (
-                navigation_pins(len, current, &navigation.indices),
-                build_plan_targets_with_full_prefetch(
-                    len,
-                    current,
-                    nav.direction,
-                    nav.zoomed,
-                    &navigation.indices,
-                    &full_budget,
-                    false,
-                ),
-                navigation_changed,
-            )
-        };
+        let pins = navigation_pins(len, current, current_position, &navigation.indices);
+        let targets = build_plan_targets_with_normalized_prefetch(
+            len,
+            current,
+            nav.direction,
+            nav.zoomed,
+            (&navigation.indices, current_position),
+            &prefetch_budgets,
+            false,
+        );
+        // A worker can now record another exact size without cloning the
+        // planner's copy-on-write observation map.
+        drop(prefetch_budgets);
         // Filtered navigation pins visible neighbors rather than unrelated raw
         // indices. Installing the desired Full keys under that same cache lock
         // also evicts stale speculative buffers and rejects late completions.
@@ -1319,6 +1407,17 @@ impl Engine {
             match target.kind {
                 PlanKind::Display => {
                     if cache.has_rgba(id) {
+                        if target.tier == Tier::Full
+                            && !cache.has_jpeg(id)
+                            && !self
+                                .shared
+                                .persistence_satisfied
+                                .lock()
+                                .unwrap()
+                                .contains(&id)
+                        {
+                            plan.push((id, 3, target.effective_distance, Action::PersistResident));
+                        }
                         continue;
                     }
                     // A configured disk cache is probed by the worker during
@@ -1351,24 +1450,24 @@ impl Engine {
             }
         }
 
-        let cancel_background = navigation_changed && !plan.is_empty();
-        self.shared.heavy.set_plan(plan, cancel_background);
+        self.shared.heavy.set_plan(plan, navigation_changed);
         if disk.is_some() {
             self.shared
                 .heavy
                 .initialize_background(|| background_warm_jobs(len, current));
         }
+        drop(navigation);
     }
 
     /// Sets the display order followed by navigation and pinning.
     ///
-    /// An empty vector restores identity order. Out-of-range entries are
-    /// ignored by planning, but callers should normally provide unique valid
-    /// indices. Call [`navigate`](Self::navigate) afterwards to apply the new
-    /// order.
+    /// An empty vector restores identity order. This call removes out-of-range
+    /// entries and later duplicates once; later navigation replans reuse the
+    /// normalized order. Call [`navigate`](Self::navigate) afterwards to apply
+    /// the new order.
     pub fn set_sequence(&self, sequence: Vec<usize>) {
         let mut navigation = self.shared.navigation.lock().unwrap();
-        navigation.replace_indices(sequence);
+        navigation.replace_indices(self.shared.entries.len(), sequence);
     }
 
     /// Replace the thumbnail viewport demand lane. It is intentionally
@@ -1443,7 +1542,9 @@ impl BenchmarkMetadataQueue {
 pub struct BenchmarkNavigationQueue {
     queue: JobQueue,
     len: usize,
-    full_budget: FullPrefetchBudget,
+    budgets: NavigationPrefetchBudgets,
+    sequence: Vec<usize>,
+    positions: HashMap<usize, usize>,
 }
 
 #[cfg(feature = "benchmarks")]
@@ -1453,24 +1554,44 @@ impl BenchmarkNavigationQueue {
         Self {
             queue: JobQueue::new(),
             len,
-            full_budget: FullPrefetchBudget::new(
-                1024 * 1024 * 1024,
-                128 * 1024 * 1024,
-                HashMap::new(),
+            budgets: NavigationPrefetchBudgets::new(
+                FullPrefetchBudget::new(1024 * 1024 * 1024, 128 * 1024 * 1024, HashMap::new()),
+                BrowsePrefetchBudget::new(1024 * 1024 * 1024, 32 * 1024 * 1024, HashMap::new()),
             ),
+            sequence: Vec::new(),
+            positions: HashMap::new(),
+        }
+    }
+
+    /// Normalizes and installs a filtered production navigation sequence once.
+    pub fn set_sequence(&mut self, sequence: Vec<usize>) {
+        self.sequence.clear();
+        self.sequence.reserve(sequence.len());
+        self.positions.clear();
+        self.positions.reserve(sequence.len());
+        for index in sequence {
+            if index < self.len && !self.positions.contains_key(&index) {
+                self.positions.insert(index, self.sequence.len());
+                self.sequence.push(index);
+            }
         }
     }
 
     /// Replans one production adaptive fit-mode navigation and returns the
     /// queued target count.
     pub fn navigate(&self, current: usize) -> usize {
-        let plan = build_plan_targets_with_full_prefetch(
+        let current_position = if self.sequence.is_empty() {
+            current
+        } else {
+            self.positions.get(&current).copied().unwrap_or_default()
+        };
+        let plan = build_plan_targets_with_normalized_prefetch(
             self.len,
             current,
             1,
             false,
-            &[],
-            &self.full_budget,
+            (&self.sequence, current_position),
+            &self.budgets,
             false,
         )
         .into_iter()
@@ -1570,11 +1691,20 @@ fn execute_claimed_job(
     let (completion, panic_payload) =
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
             Ok(completion) => (completion, None),
-            Err(payload) => (JobCompletion::Complete, Some(payload)),
+            Err(payload) => (
+                if action.is_speculative_full() {
+                    JobCompletion::SuppressSpeculative
+                } else {
+                    JobCompletion::Complete
+                },
+                Some(payload),
+            ),
         };
     let deferred_bytes = match completion {
         JobCompletion::DeferBackground { required_bytes } => Some(required_bytes),
-        JobCompletion::Complete | JobCompletion::RetryBackground => None,
+        JobCompletion::Complete
+        | JobCompletion::RetryBackground
+        | JobCompletion::SuppressSpeculative => None,
     };
     let panic_event = panic_payload
         .as_deref()
@@ -1608,6 +1738,7 @@ fn worker_panic_event(
         Action::Thumb | Action::Develop(_) | Action::PrefetchFull | Action::Rehydrate => {
             Some(Event::ImageFailed { index, tier, error })
         }
+        Action::PersistResident => None,
         // Folder-wide warming is intentionally invisible to the event/UI
         // channel. The panic hook still records the contained panic.
         Action::WarmDevelop(_) => None,
@@ -1725,6 +1856,20 @@ fn run_job(
 ) -> JobCompletion {
     let (index, tier) = id;
     let emit = |event| publish_claimed(shared, queue, id, token, event);
+    if matches!(
+        action,
+        Action::Develop(_) | Action::PrefetchFull | Action::Rehydrate
+    ) && shared.cache.has_rgba(id)
+    {
+        // A cancelled generation can finish between the replacement plan's
+        // cache probe and this claim (A→B→A). Reuse its admitted pixels rather
+        // than decoding the same file again, and publish under the live token.
+        emit(Event::ImageReady { index, tier });
+        if tier == Tier::Full && !action.is_speculative_full() {
+            run_persist_resident(shared, index, tier, token);
+        }
+        return JobCompletion::Complete;
+    }
     match action {
         Action::Metadata => run_metadata(shared, index, token, &emit),
         Action::Thumb => run_thumb(shared, index, &emit),
@@ -1734,7 +1879,11 @@ fn run_job(
         Action::PrefetchFull => {
             debug_assert_eq!(tier, Tier::Full);
             run_rehydrate(shared, index, tier, token, DevelopMode::Prefetch, &emit);
+            if !token.cancelled() && !shared.cache.has_rgba(id) {
+                return JobCompletion::SuppressSpeculative;
+            }
         }
+        Action::PersistResident => run_persist_resident(shared, index, tier, token),
         Action::Develop(quality) => {
             let _ = run_develop(
                 shared,
@@ -1958,6 +2107,9 @@ fn run_develop(
             };
         }
     };
+    if token.cancelled() {
+        return DevelopCompletion::Cancelled;
+    }
     let buf = Arc::new(apply_orient(buf, meta.orient));
 
     // Cancellation is checked after every non-interruptible stage. Full-ring
@@ -1967,7 +2119,10 @@ fn run_develop(
         return DevelopCompletion::Cancelled;
     }
     if mode != DevelopMode::Warm {
-        if !shared.cache.insert_rgba((index, tier), buf.clone()) {
+        if !shared
+            .cache
+            .insert_rgba_if_desired((index, tier), buf.clone())
+        {
             return DevelopCompletion::Finished;
         }
         emit(Event::ImageReady { index, tier });
@@ -2045,10 +2200,55 @@ fn run_rehydrate(
             if let Err(error) = disk.remove(&key) {
                 eprintln!("failed to remove corrupt disk cache object: {error}");
             }
+            shared.persistence_satisfied.lock().unwrap().remove(&id);
+        } else {
+            // A previous resident promotion may have validated this key. If
+            // disk cleanup removed it later, let the next successful RAW
+            // fallback enqueue persistence again.
+            shared.persistence_satisfied.lock().unwrap().remove(&id);
         }
     }
 
     develop_cache_miss(shared, index, tier, token, mode, emit);
+}
+
+fn run_persist_resident(shared: &Shared, index: usize, tier: Tier, token: &CancelToken) {
+    let id = (index, tier);
+    if token.cancelled()
+        || shared.cache.has_jpeg(id)
+        || shared.persistence_satisfied.lock().unwrap().contains(&id)
+    {
+        return;
+    }
+    if let Some(disk) = &shared.disk
+        && disk.has(&DiskCache::key_with_jpeg_quality(
+            &shared.entries[index],
+            tier,
+            shared.jpeg_quality,
+        ))
+    {
+        shared.persistence_satisfied.lock().unwrap().insert(id);
+        return;
+    }
+    let Some(pixels) = shared.cache.get_rgba(id) else {
+        return;
+    };
+    if token.cancelled() {
+        return;
+    }
+    let retained_bytes = pixels.byte_len();
+    if shared.persistence.enqueue(PersistenceRequest {
+        id,
+        pixels,
+        insert_ram: true,
+        warm_completion: false,
+    }) == PersistenceEnqueue::Oversized
+    {
+        eprintln!(
+            "disk cache persistence skipped: {retained_bytes} byte buffer exceeds the {} byte pending budget",
+            shared.persistence.pending_budget_bytes
+        );
+    }
 }
 
 fn install_rehydrated(
@@ -2059,7 +2259,11 @@ fn install_rehydrated(
     token: &CancelToken,
     emit: &dyn Fn(Event),
 ) -> bool {
-    if token.cancelled() || !shared.cache.insert_rgba((index, tier), Arc::new(buf)) {
+    if token.cancelled()
+        || !shared
+            .cache
+            .insert_rgba_if_desired((index, tier), Arc::new(buf))
+    {
         return false;
     }
     emit(Event::ImageReady { index, tier });
@@ -2796,6 +3000,7 @@ mod tests {
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             persistence: PersistenceQueue::new(),
+            persistence_satisfied: Mutex::new(HashSet::new()),
             jpeg_quality: CACHE_JPEG_QUALITY,
             navigation: Mutex::new(NavigationOrder::default()),
         };
@@ -3066,6 +3271,7 @@ mod tests {
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             persistence: PersistenceQueue::with_budget(pending_budget_bytes),
+            persistence_satisfied: Mutex::new(HashSet::new()),
             jpeg_quality,
             navigation: Mutex::new(NavigationOrder::default()),
         })
@@ -3126,6 +3332,105 @@ mod tests {
 
         assert!(!cache.has_rgba((0, Tier::Full)));
         assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resident_full_promotion_enqueues_persistence_without_redeveloping() {
+        let cache = Arc::new(RamCache::new(RamCacheBudgets::new(0, 0, 64, 64)));
+        cache.set_navigation_policy([], [(0, Tier::Full)]);
+        cache.insert_rgba((0, Tier::Full), Arc::new(patterned_buf(2, 2)));
+        let shared = persistence_shared(vec![entry("promoted.arw", 100)], cache, None, 64);
+
+        run_persist_resident(&shared, 0, Tier::Full, &CancelToken::default());
+
+        let state = shared.persistence.state.lock().unwrap();
+        assert_eq!(state.pending.len(), 1);
+        assert!(state.pending.contains_key(&(0, Tier::Full)));
+    }
+
+    #[test]
+    fn validated_disk_persistence_is_reused_until_rehydrate_finds_it_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw_entry = entry(dir.path().join("promoted.arw"), 100);
+        let disk = DiskCache::open_at(dir.path().join("cache"));
+        let key = DiskCache::key(&raw_entry, Tier::Full);
+        disk.put(&key, b"existing object").unwrap();
+        let cache = Arc::new(RamCache::new(RamCacheBudgets::new(0, 0, 64, 64)));
+        cache.set_navigation_policy([], [(0, Tier::Full)]);
+        cache.insert_rgba((0, Tier::Full), Arc::new(patterned_buf(2, 2)));
+        let shared = persistence_shared(vec![raw_entry], cache, Some(disk.clone()), 64);
+
+        run_persist_resident(&shared, 0, Tier::Full, &CancelToken::default());
+        assert!(
+            shared
+                .persistence_satisfied
+                .lock()
+                .unwrap()
+                .contains(&(0, Tier::Full))
+        );
+        disk.remove(&key).unwrap();
+        run_persist_resident(&shared, 0, Tier::Full, &CancelToken::default());
+
+        assert!(shared.persistence.state.lock().unwrap().pending.is_empty());
+
+        // Losing the validated object must become recoverable once the Full
+        // pixels leave RAM and a later rehydrate observes the disk miss.
+        shared.cache.set_navigation_policy([], []);
+        shared.cache.set_navigation_policy([], [(0, Tier::Full)]);
+        run_rehydrate(
+            &shared,
+            0,
+            Tier::Full,
+            &CancelToken::default(),
+            DevelopMode::Display,
+            &|_| {},
+        );
+        assert!(
+            !shared
+                .persistence_satisfied
+                .lock()
+                .unwrap()
+                .contains(&(0, Tier::Full))
+        );
+
+        shared
+            .cache
+            .insert_rgba((0, Tier::Full), Arc::new(patterned_buf(2, 2)));
+        run_persist_resident(&shared, 0, Tier::Full, &CancelToken::default());
+        assert!(
+            shared
+                .persistence
+                .state
+                .lock()
+                .unwrap()
+                .pending
+                .contains_key(&(0, Tier::Full))
+        );
+    }
+
+    #[test]
+    fn replacement_generation_reuses_pixels_from_a_late_cancelled_completion() {
+        let cache = Arc::new(RamCache::new(RamCacheBudgets::new(0, 0, 64, 64)));
+        cache.set_navigation_policy([], [(0, Tier::Full)]);
+        cache.insert_rgba((0, Tier::Full), Arc::new(patterned_buf(2, 2)));
+        let shared = persistence_shared(
+            vec![entry("intentionally-missing.arw", 100)],
+            cache,
+            None,
+            64,
+        );
+        let id = (0, Tier::Full);
+        shared
+            .heavy
+            .set_plan(vec![(id, 0, 0, Action::Develop(Quality::Full))], true);
+        let (_, action, token) = shared.heavy.pop().unwrap();
+
+        assert_eq!(
+            run_job(&shared, &shared.heavy, id, action, &token),
+            JobCompletion::Complete
+        );
+        assert_eq!(shared.persistence.state.lock().unwrap().pending.len(), 1);
+        shared.heavy.finish(id, &token);
     }
 
     #[test]
@@ -3222,7 +3527,7 @@ mod tests {
 
     #[test]
     fn navigation_pins_preserve_full_for_current_and_near_window() {
-        let pins = navigation_pins(5, 2, &[]);
+        let pins = navigation_pins(5, 2, 2, &[]);
         assert_eq!(pins.len(), 9);
         let full: Vec<_> = pins
             .iter()
@@ -3234,7 +3539,7 @@ mod tests {
 
     #[test]
     fn filtered_pins_follow_visible_neighbors() {
-        let pins = navigation_pins(10, 4, &[1, 4, 8]);
+        let pins = navigation_pins(10, 4, 1, &[1, 4, 8]);
         let browse: Vec<_> = pins
             .iter()
             .filter(|(_, tier)| *tier == Tier::Browse)
@@ -3274,9 +3579,86 @@ mod tests {
         assert!(order.update_navigation(nav));
         assert!(!order.update_navigation(nav));
 
-        order.replace_indices(vec![1, 4, 8]);
+        order.replace_indices(10, vec![1, 4, 8]);
         assert_eq!(order.indices, [1, 4, 8]);
         assert!(order.update_navigation(nav));
+    }
+
+    #[test]
+    fn navigation_order_normalizes_filtered_indices_once() {
+        let mut order = NavigationOrder::default();
+        order.replace_indices(10, vec![usize::MAX, 4, 5, 5, 6, usize::MAX - 1]);
+
+        assert_eq!(order.indices, [4, 5, 6]);
+        assert_eq!(order.current_position(5), 1);
+        let pins = navigation_pins(10, 5, order.current_position(5), &order.indices);
+        let full: Vec<_> = pins
+            .into_iter()
+            .filter(|(_, tier)| *tier == Tier::Full)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(full, [4, 5, 6]);
+    }
+
+    #[test]
+    fn byte_bounded_browse_wave_reaches_a_resident_fixed_point() {
+        let cache = RamCache::new(RamCacheBudgets::new(0, 400, 700, 0));
+        let mut final_targets = Vec::new();
+        for _ in 0..3 {
+            let (full_snapshot, browse_snapshot) = cache.prefetch_snapshots();
+            let budgets = NavigationPrefetchBudgets::new(
+                FullPrefetchBudget::from_observations(
+                    full_snapshot.budget_bytes,
+                    full_snapshot.fallback_bytes,
+                    full_snapshot.per_index_bytes,
+                ),
+                BrowsePrefetchBudget::from_observations(
+                    browse_snapshot.budget_bytes,
+                    browse_snapshot.fallback_bytes,
+                    browse_snapshot.per_index_bytes,
+                ),
+            );
+            final_targets = build_plan_targets_with_normalized_prefetch(
+                100,
+                50,
+                1,
+                false,
+                (&[], 50),
+                &budgets,
+                false,
+            );
+            cache.set_navigation_policy(
+                [],
+                final_targets
+                    .iter()
+                    .filter(|target| target.tier == Tier::Full)
+                    .map(|target| (target.index, Tier::Full)),
+            );
+            for target in final_targets
+                .iter()
+                .filter(|target| target.tier == Tier::Browse)
+            {
+                if !cache.has_rgba((target.index, Tier::Browse)) {
+                    cache.insert_rgba(
+                        (target.index, Tier::Browse),
+                        Arc::new(PixelBuf {
+                            width: 1,
+                            height: 1,
+                            rgba: vec![0; 100],
+                        }),
+                    );
+                }
+            }
+        }
+
+        let browse: Vec<_> = final_targets
+            .iter()
+            .filter(|target| target.tier == Tier::Browse)
+            .map(|target| (target.index, Tier::Browse))
+            .collect();
+        assert_eq!(browse.len(), 4);
+        assert!(browse.iter().all(|key| cache.has_rgba(*key)));
+        assert_eq!(cache.stats().browse_rgba_bytes, 400);
     }
 
     #[test]
@@ -3798,6 +4180,47 @@ mod tests {
     }
 
     #[test]
+    fn failed_speculative_full_is_suppressed_until_foreground_demand() {
+        let q = JobQueue::new();
+        let failed = (7, Tier::Full);
+        q.set_plan(vec![(failed, 5, 1, Action::PrefetchFull)], true);
+        let (_, _, failed_token) = q.pop().unwrap();
+        q.finish_with(failed, &failed_token, JobCompletion::SuppressSpeculative);
+
+        let foreground = (8, Tier::Browse);
+        q.set_plan(
+            vec![
+                (failed, 5, 1, Action::PrefetchFull),
+                (foreground, 0, 0, Action::Develop(Quality::Browse)),
+            ],
+            false,
+        );
+        let (claimed, _, foreground_token) = q.try_pop().unwrap();
+        assert_eq!(claimed, foreground);
+        assert!(q.try_pop().is_none());
+        q.finish(foreground, &foreground_token);
+
+        q.set_plan(vec![(failed, 0, 0, Action::Develop(Quality::Full))], false);
+        let (retried, action, retry_token) = q.try_pop().unwrap();
+        assert_eq!((retried, action), (failed, Action::Develop(Quality::Full)));
+        q.finish(retried, &retry_token);
+    }
+
+    #[test]
+    fn navigation_change_retries_a_failed_speculative_full_target() {
+        let q = JobQueue::new();
+        let failed = (7, Tier::Full);
+        q.set_plan(vec![(failed, 5, 1, Action::PrefetchFull)], true);
+        let (_, _, failed_token) = q.pop().unwrap();
+        q.finish_with(failed, &failed_token, JobCompletion::SuppressSpeculative);
+
+        q.set_plan(vec![(failed, 5, 1, Action::PrefetchFull)], true);
+        let (retried, action, retry_token) = q.try_pop().unwrap();
+        assert_eq!((retried, action), (failed, Action::PrefetchFull));
+        q.finish(retried, &retry_token);
+    }
+
+    #[test]
     fn folder_warming_uses_at_most_one_worker() {
         let q = JobQueue::new();
         assert!(q.initialize_background(|| {
@@ -3828,6 +4251,49 @@ mod tests {
         assert!(!token.cancelled());
         assert!(q.try_pop().is_none());
         q.finish(id, &token);
+    }
+
+    #[test]
+    fn demoted_full_work_exits_before_optional_full_replacement() {
+        let q = JobQueue::new();
+        let demoted = (7, Tier::Full);
+        let other = (8, Tier::Full);
+        q.set_plan(vec![(demoted, 0, 0, Action::Develop(Quality::Full))], true);
+        let (_, _, display_token) = q.pop().unwrap();
+
+        q.set_plan(
+            vec![
+                (demoted, 5, 1, Action::PrefetchFull),
+                (other, 5, 2, Action::PrefetchFull),
+            ],
+            true,
+        );
+        assert!(display_token.cancelled());
+        assert!(q.try_pop().is_none());
+
+        q.finish(demoted, &display_token);
+        let (claimed, action, replacement_token) = q.try_pop().unwrap();
+        assert!(matches!(claimed, id if id == demoted || id == other));
+        assert_eq!(action, Action::PrefetchFull);
+        assert!(q.try_pop().is_none());
+        q.finish(claimed, &replacement_token);
+    }
+
+    #[test]
+    fn small_processing_pool_serializes_optional_full_and_folder_warm_lanes() {
+        let q = JobQueue::new_with_parallel_background_lanes(false);
+        q.initialize_background(|| [((9, Tier::Browse), Action::WarmDevelop(Quality::Browse))]);
+        q.set_plan(vec![((7, Tier::Full), 5, 1, Action::PrefetchFull)], false);
+
+        let (full, _, full_token) = q.pop().unwrap();
+        assert_eq!(full, (7, Tier::Full));
+        assert!(q.try_pop().is_none());
+        q.finish(full, &full_token);
+
+        let (warm_id, warm_action, warm_token) = q.try_pop().unwrap();
+        assert_eq!(warm_id, (9, Tier::Browse));
+        assert_eq!(warm_action, Action::WarmDevelop(Quality::Browse));
+        q.finish(warm_id, &warm_token);
     }
 
     #[test]
@@ -3920,6 +4386,7 @@ mod tests {
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             persistence: PersistenceQueue::new(),
+            persistence_satisfied: Mutex::new(HashSet::new()),
             jpeg_quality: CACHE_JPEG_QUALITY,
             navigation: Mutex::new(NavigationOrder::default()),
         };
@@ -4300,7 +4767,7 @@ mod tests {
         assert!(!disk.has(&default_key));
         assert!(disk.has(&selected_key));
         assert!(!cache.has_jpeg((0, Tier::Browse)));
-        cache.set_pins([(0, Tier::Browse)]);
+        cache.set_navigation_policy([(0, Tier::Browse)], []);
 
         run_rehydrate(
             &shared,
@@ -4334,6 +4801,7 @@ mod tests {
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             persistence: PersistenceQueue::new(),
+            persistence_satisfied: Mutex::new(HashSet::new()),
             jpeg_quality: CACHE_JPEG_QUALITY,
             navigation: Mutex::new(NavigationOrder::default()),
         };

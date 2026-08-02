@@ -19,7 +19,8 @@ use viewr_core::jobs::{
 };
 use viewr_core::library::{benchmark_load_ratings_legacy_full_scan, try_load_ratings_with_owners};
 use viewr_core::planning::{
-    FullPrefetchBudget, build_plan_targets, build_plan_targets_with_full_prefetch,
+    BrowsePrefetchBudget, FullPrefetchBudget, NavigationPrefetchBudgets, build_plan_targets,
+    build_plan_targets_with_full_prefetch,
 };
 use viewr_core::resize::{apply_orient, downscale_to_fit, resize_exact};
 use viewr_core::types::{Orient, PixelBuf, Tier};
@@ -85,8 +86,10 @@ fn bench_navigation_plan(c: &mut Criterion) {
     group.sample_size(20);
     group.warm_up_time(Duration::from_millis(300));
     group.measurement_time(Duration::from_millis(1_500));
-    let adaptive_budget =
-        FullPrefetchBudget::new(1024 * 1024 * 1024, 128 * 1024 * 1024, Default::default());
+    let adaptive_budgets = NavigationPrefetchBudgets::new(
+        FullPrefetchBudget::new(1024 * 1024 * 1024, 128 * 1024 * 1024, Default::default()),
+        BrowsePrefetchBudget::new(512 * 1024 * 1024, 32 * 1024 * 1024, Default::default()),
+    );
 
     for len in [100_usize, 1_000, 10_000] {
         group.bench_with_input(BenchmarkId::new("identity", len), &len, |b, &len| {
@@ -113,7 +116,7 @@ fn bench_navigation_plan(c: &mut Criterion) {
                         black_box(1),
                         black_box(false),
                         black_box(&[]),
-                        black_box(&adaptive_budget),
+                        black_box(&adaptive_budgets),
                         black_box(false),
                     ))
                 });
@@ -175,7 +178,7 @@ fn bench_navigation_plan(c: &mut Criterion) {
         let current = sparse[sparse.len() / 2];
         group.bench_with_input(
             BenchmarkId::new("ten_percent_filter", len),
-            &(current, sparse),
+            &(current, sparse.clone()),
             |b, (current, sparse)| {
                 b.iter(|| {
                     black_box(build_plan_targets(
@@ -186,6 +189,38 @@ fn bench_navigation_plan(c: &mut Criterion) {
                         black_box(sparse),
                         black_box(false),
                     ))
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("adaptive_ten_percent_filter_public", len),
+            &(current, sparse.clone()),
+            |b, (current, sparse)| {
+                b.iter(|| {
+                    black_box(build_plan_targets_with_full_prefetch(
+                        black_box(len),
+                        black_box(*current),
+                        black_box(-1),
+                        black_box(true),
+                        black_box(sparse),
+                        black_box(&adaptive_budgets),
+                        black_box(false),
+                    ))
+                });
+            },
+        );
+
+        let mut filtered_queue = BenchmarkNavigationQueue::new(len);
+        filtered_queue.set_sequence(sparse.clone());
+        assert!(filtered_queue.navigate(current) > 0);
+        let mut filtered_position = sparse.len() / 2;
+        group.bench_with_input(
+            BenchmarkId::new("adaptive_filtered_queue_sync", len),
+            &sparse,
+            |b, sparse| {
+                b.iter(|| {
+                    filtered_position = (filtered_position + 1) % sparse.len();
+                    black_box(filtered_queue.navigate(black_box(sparse[filtered_position])))
                 });
             },
         );
@@ -1561,8 +1596,9 @@ fn bench_ram_cache(c: &mut Criterion) {
         });
     });
 
-    // Reuse the payload so this isolates LRU/hash-map churn rather than buffer
-    // allocation. Every insert has a fresh key and evicts one resident entry.
+    // Reuse the payload and cycle over one bounded synthetic folder so this
+    // isolates LRU/hash-map churn rather than allocation or an impossible
+    // unbounded stream of new folder indices. Every insert evicts one entry.
     let churn = RamCache::new(RamCacheBudgets::new(0, rgba_bytes * 8, 0, 0));
     for index in 0..8 {
         churn.insert_rgba((index, Tier::Browse), Arc::clone(&rgba));
@@ -1571,7 +1607,7 @@ fn bench_ram_cache(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
     group.bench_function("rgba_insert_with_eviction", |b| {
         b.iter(|| {
-            let key = (next_key, Tier::Browse);
+            let key = (next_key % 9, Tier::Browse);
             next_key = next_key.wrapping_add(1);
             churn.insert_rgba(black_box(key), Arc::clone(black_box(&rgba)));
         });
@@ -1613,6 +1649,106 @@ fn bench_ram_cache_eviction_scaling(c: &mut Criterion) {
         );
     }
 
+    group.finish();
+}
+
+fn bench_full_cache_policy(c: &mut Criterion) {
+    let payload = || {
+        Arc::new(PixelBuf {
+            width: 1,
+            height: 1,
+            rgba: vec![0; 4],
+        })
+    };
+    let cache = RamCache::new(RamCacheBudgets::new(0, 0, 8 * 4, 0));
+    let first: Vec<_> = (0..8).map(|index| (index, Tier::Full)).collect();
+    let second: Vec<_> = (8..16).map(|index| (index, Tier::Full)).collect();
+    cache.set_navigation_policy([], first.iter().copied());
+    for &key in &first {
+        cache.insert_rgba(key, payload());
+    }
+
+    let snapshot_cache = RamCache::new(RamCacheBudgets::new(0, 0, 10_000 * 4, 0));
+    let snapshot_keys: Vec<_> = (0..10_000).map(|index| (index, Tier::Full)).collect();
+    snapshot_cache.set_navigation_policy([], snapshot_keys.iter().copied());
+    for &key in &snapshot_keys {
+        snapshot_cache.insert_rgba((key.0, Tier::Browse), payload());
+        snapshot_cache.insert_rgba(key, payload());
+    }
+
+    let mut group = c.benchmark_group("full_cache_policy");
+    group.sample_size(30);
+    group.warm_up_time(Duration::from_millis(300));
+    group.measurement_time(Duration::from_millis(1_500));
+
+    let mut use_second = true;
+    group.throughput(Throughput::Elements(8));
+    group.bench_function("replace_and_refill_eight_unique_entries", |b| {
+        b.iter(|| {
+            let desired = if use_second { &second } else { &first };
+            cache.set_navigation_policy([], desired.iter().copied());
+            for &key in desired {
+                cache.insert_rgba(black_box(key), black_box(payload()));
+            }
+            use_second = !use_second;
+        });
+    });
+
+    const EVICTION_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+    group.throughput(Throughput::Bytes((8 * EVICTION_PAYLOAD_BYTES) as u64));
+    group.bench_function("evict_eight_unique_16mib_final_owners", |b| {
+        b.iter_batched(
+            || {
+                let cache = RamCache::new(RamCacheBudgets::new(
+                    0,
+                    0,
+                    (8 * EVICTION_PAYLOAD_BYTES) as u64,
+                    0,
+                ));
+                let resident: Vec<_> = (0..8).map(|index| (index, Tier::Full)).collect();
+                cache.set_navigation_policy([], resident.iter().copied());
+                for key in resident {
+                    cache.insert_rgba(
+                        key,
+                        Arc::new(PixelBuf {
+                            width: 1,
+                            height: 1,
+                            rgba: vec![0; EVICTION_PAYLOAD_BYTES],
+                        }),
+                    );
+                }
+                let replacement: Vec<_> = (8..16).map(|index| (index, Tier::Full)).collect();
+                (cache, replacement)
+            },
+            |(cache, replacement)| {
+                cache.set_navigation_policy([], replacement);
+                black_box(cache.stats())
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("snapshot_10000_observations", |b| {
+        b.iter(|| black_box(snapshot_cache.full_prefetch_snapshot()));
+    });
+    let mut larger_observation = false;
+    group.bench_function("live_snapshots_changed_browse_observation_10000", |b| {
+        b.iter(|| {
+            let snapshots = snapshot_cache.prefetch_snapshots();
+            let bytes = if larger_observation { 8 } else { 4 };
+            snapshot_cache.insert_rgba(
+                (10_000, Tier::Browse),
+                Arc::new(PixelBuf {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![0; bytes],
+                }),
+            );
+            larger_observation = !larger_observation;
+            black_box(snapshots)
+        });
+    });
     group.finish();
 }
 
@@ -1871,6 +2007,7 @@ criterion_group! {
         bench_jpeg,
         bench_ram_cache,
         bench_ram_cache_eviction_scaling,
+        bench_full_cache_policy,
         bench_xmp,
         bench_disk_cache_key,
         bench_disk_cache_gc_scan,

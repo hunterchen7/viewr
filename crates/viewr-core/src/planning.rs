@@ -39,7 +39,7 @@ pub enum PlanKind {
 pub struct FullPrefetchBudget {
     budget_bytes: u64,
     fallback_bytes: u64,
-    exact_full_bytes: Arc<HashMap<usize, u64>>,
+    per_index_bytes: Arc<HashMap<usize, u64>>,
 }
 
 impl FullPrefetchBudget {
@@ -48,7 +48,7 @@ impl FullPrefetchBudget {
         Self {
             budget_bytes,
             fallback_bytes: fallback_bytes.max(1),
-            exact_full_bytes: Arc::new(known_bytes),
+            per_index_bytes: Arc::new(known_bytes),
         }
     }
 
@@ -57,21 +57,75 @@ impl FullPrefetchBudget {
     pub fn from_observations(
         budget_bytes: u64,
         fallback_bytes: u64,
-        exact_full_bytes: Arc<HashMap<usize, u64>>,
+        per_index_bytes: Arc<HashMap<usize, u64>>,
     ) -> Self {
         Self {
             budget_bytes,
             fallback_bytes: fallback_bytes.max(1),
-            exact_full_bytes,
+            per_index_bytes,
         }
     }
 
     fn bytes_for(&self, index: usize) -> u64 {
-        self.exact_full_bytes
+        self.per_index_bytes
             .get(&index)
             .copied()
             .unwrap_or(self.fallback_bytes)
             .max(1)
+    }
+}
+
+#[derive(Debug, Clone)]
+/// Byte estimates used to cap the decoded Browse navigation wave.
+///
+/// The current image and immediate visible neighbors remain mandatory. Farther
+/// Browse targets form a priority prefix that cannot exceed `budget_bytes`.
+pub struct BrowsePrefetchBudget {
+    budget_bytes: u64,
+    fallback_bytes: u64,
+    per_index_bytes: Arc<HashMap<usize, u64>>,
+}
+
+impl BrowsePrefetchBudget {
+    /// Creates a Browse budget and per-folder size estimates.
+    pub fn new(budget_bytes: u64, fallback_bytes: u64, known_bytes: HashMap<usize, u64>) -> Self {
+        Self::from_observations(budget_bytes, fallback_bytes, Arc::new(known_bytes))
+    }
+
+    /// Creates a budget from shared cache observations without cloning them on
+    /// every navigation.
+    pub fn from_observations(
+        budget_bytes: u64,
+        fallback_bytes: u64,
+        per_index_bytes: Arc<HashMap<usize, u64>>,
+    ) -> Self {
+        Self {
+            budget_bytes,
+            fallback_bytes: fallback_bytes.max(1),
+            per_index_bytes,
+        }
+    }
+
+    fn bytes_for(&self, index: usize) -> u64 {
+        self.per_index_bytes
+            .get(&index)
+            .copied()
+            .unwrap_or(self.fallback_bytes)
+            .max(1)
+    }
+}
+
+#[derive(Debug, Clone)]
+/// Browse and Full byte budgets for one adaptive navigation plan.
+pub struct NavigationPrefetchBudgets {
+    full: FullPrefetchBudget,
+    browse: BrowsePrefetchBudget,
+}
+
+impl NavigationPrefetchBudgets {
+    /// Combines independently measured Full and Browse cache budgets.
+    pub fn new(full: FullPrefetchBudget, browse: BrowsePrefetchBudget) -> Self {
+        Self { full, browse }
     }
 }
 
@@ -96,7 +150,8 @@ pub struct PlanTarget {
     /// Entries behind the navigation direction count three times farther than
     /// entries ahead.
     pub effective_distance: u32,
-    /// Whether the render is for display or background warming.
+    /// Whether the render is required for display, speculative Full prefetch,
+    /// or persistent background warming.
     pub kind: PlanKind,
 }
 
@@ -231,30 +286,71 @@ pub fn build_plan_targets(
 /// Build the production navigation wave with an adaptive Full-resolution
 /// working set.
 ///
-/// The Browse wave remains bounded by [`BROWSE_WINDOW`]. Full candidates begin
+/// The Browse wave remains bounded by `BROWSE_WINDOW`. Full candidates begin
 /// with the current image and both immediate visible neighbors, then grow in a
 /// forward-biased 3:1 wave until the next candidate would cross the byte
 /// budget. Optional Full work is lower priority than the complete interactive
 /// Browse wave and is identified as [`PlanKind::Prefetch`].
+///
+/// A filtered `sequence` ignores out-of-range entries and later duplicates
+/// while preserving the first occurrence.
 pub fn build_plan_targets_with_full_prefetch(
     len: usize,
     current: usize,
     direction: i8,
     zoomed: bool,
     sequence: &[usize],
-    full_budget: &FullPrefetchBudget,
+    budgets: &NavigationPrefetchBudgets,
     include_warm: bool,
 ) -> Vec<PlanTarget> {
     if len == 0 {
         return Vec::new();
     }
     let current = current.min(len - 1);
-    let full = adaptive_full_selections(len, current, direction, sequence, full_budget);
-    let required_full: HashMap<_, _> = full
-        .iter()
-        .filter(|selection| selection.required)
-        .map(|selection| (selection.index, selection.effective_distance))
-        .collect();
+    let normalized_sequence =
+        (!sequence.is_empty()).then(|| normalize_filtered_sequence(len, sequence));
+    let sequence = normalized_sequence.as_deref().unwrap_or(sequence);
+    let current_position = current_position(current, sequence);
+    build_plan_targets_with_normalized_prefetch(
+        len,
+        current,
+        direction,
+        zoomed,
+        (sequence, current_position),
+        budgets,
+        include_warm,
+    )
+}
+
+/// Production variant for a sequence normalized once by the owning engine.
+pub(crate) fn build_plan_targets_with_normalized_prefetch(
+    len: usize,
+    current: usize,
+    direction: i8,
+    zoomed: bool,
+    order: (&[usize], usize),
+    budgets: &NavigationPrefetchBudgets,
+    include_warm: bool,
+) -> Vec<PlanTarget> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let current = current.min(len - 1);
+    let (sequence, current_position) = order;
+    let ordered_len = if sequence.is_empty() {
+        len
+    } else {
+        sequence.len()
+    };
+    let current_position = current_position.min(ordered_len.saturating_sub(1));
+    let full = adaptive_full_selections(
+        len,
+        current,
+        current_position,
+        direction,
+        sequence,
+        &budgets.full,
+    );
     let mut targets = Vec::with_capacity(if include_warm {
         len.saturating_add(full.len()).saturating_add(2)
     } else {
@@ -275,62 +371,59 @@ pub fn build_plan_targets_with_full_prefetch(
         kind: PlanKind::Display,
     });
 
-    let current_position = current_position(current, sequence);
-    let mut add_browse_neighbor = |position: usize, index: usize| {
-        if index == current || index >= len {
-            return;
+    let index_at = |position: usize| {
+        if sequence.is_empty() {
+            position
+        } else {
+            sequence[position]
         }
-        let (distance, effective_distance) =
-            weighted_distance(position, current_position, direction);
-        if distance <= FULL_NEIGHBOR_WINDOW {
+    };
+    for position in current_position.saturating_sub(1)
+        ..=(current_position + 1).min(ordered_len.saturating_sub(1))
+    {
+        let index = index_at(position);
+        if index == current {
+            continue;
+        }
+        let (_, effective_distance) = weighted_distance(position, current_position, direction);
+        targets.push(PlanTarget {
+            index,
+            tier: Tier::Browse,
+            class: 2,
+            effective_distance,
+            kind: PlanKind::Display,
+        });
+        if full
+            .iter()
+            .any(|selection| selection.required && selection.index == index)
+        {
             targets.push(PlanTarget {
                 index,
-                tier: Tier::Browse,
+                tier: Tier::Full,
                 class: 2,
                 effective_distance,
                 kind: PlanKind::Display,
             });
-            if required_full.contains_key(&index) {
-                targets.push(PlanTarget {
-                    index,
-                    tier: Tier::Full,
-                    class: 2,
-                    effective_distance,
-                    kind: PlanKind::Display,
-                });
-            }
-        } else if effective_distance <= BROWSE_WINDOW {
-            targets.push(PlanTarget {
-                index,
-                tier: Tier::Browse,
-                class: 4,
-                effective_distance,
-                kind: PlanKind::Display,
-            });
-        }
-    };
-    let (positions_before, positions_after) = if direction >= 0 {
-        ((BROWSE_WINDOW / 3) as usize, BROWSE_WINDOW as usize)
-    } else {
-        (BROWSE_WINDOW as usize, (BROWSE_WINDOW / 3) as usize)
-    };
-    if sequence.is_empty() {
-        let first = current_position.saturating_sub(positions_before);
-        let last = current_position
-            .saturating_add(positions_after)
-            .min(len - 1);
-        for index in first..=last {
-            add_browse_neighbor(index, index);
-        }
-    } else if !sequence.is_empty() {
-        let first = current_position.saturating_sub(positions_before);
-        let last = current_position
-            .saturating_add(positions_after)
-            .min(sequence.len() - 1);
-        for (offset, &index) in sequence[first..=last].iter().enumerate() {
-            add_browse_neighbor(first + offset, index);
         }
     }
+    targets.extend(
+        adaptive_browse_selections(
+            len,
+            current,
+            current_position,
+            direction,
+            sequence,
+            &budgets.browse,
+        )
+        .into_iter()
+        .map(|(index, effective_distance)| PlanTarget {
+            index,
+            tier: Tier::Browse,
+            class: 4,
+            effective_distance,
+            kind: PlanKind::Display,
+        }),
+    );
 
     targets.extend(
         full.into_iter()
@@ -371,9 +464,98 @@ pub fn build_plan_targets_with_full_prefetch(
     targets
 }
 
+fn adaptive_browse_selections(
+    len: usize,
+    current: usize,
+    current_position: usize,
+    direction: i8,
+    sequence: &[usize],
+    budget: &BrowsePrefetchBudget,
+) -> Vec<(usize, u32)> {
+    let ordered_len = if sequence.is_empty() {
+        len
+    } else {
+        sequence.len()
+    };
+    let current_position = current_position.min(ordered_len.saturating_sub(1));
+    let index_at = |position: usize| {
+        if sequence.is_empty() {
+            position
+        } else {
+            sequence[position]
+        }
+    };
+    let mut used_bytes = budget.bytes_for(current);
+    for position in current_position.saturating_sub(1)
+        ..=(current_position + 1).min(ordered_len.saturating_sub(1))
+    {
+        let index = index_at(position);
+        if index != current {
+            used_bytes = used_bytes.saturating_add(budget.bytes_for(index));
+        }
+    }
+
+    let estimated_slots = budget
+        .budget_bytes
+        .checked_div(budget.fallback_bytes)
+        .unwrap_or_default()
+        .min((BROWSE_WINDOW + 1) as u64) as usize;
+    let mut selected = Vec::with_capacity(estimated_slots.saturating_sub(3));
+    let forward = direction >= 0;
+    let mut ahead_distance = 2_usize;
+    let mut behind_distance = 2_usize;
+    loop {
+        let ahead_position = if forward {
+            current_position.checked_add(ahead_distance)
+        } else {
+            current_position.checked_sub(ahead_distance)
+        }
+        .filter(|position| *position < ordered_len);
+        let behind_position = if forward {
+            current_position.checked_sub(behind_distance)
+        } else {
+            current_position.checked_add(behind_distance)
+        }
+        .filter(|position| *position < ordered_len);
+        let choose_ahead = match (ahead_position, behind_position) {
+            (None, None) => break,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (Some(_), Some(_)) => ahead_distance <= behind_distance.saturating_mul(3),
+        };
+        let (position, effective_distance) = if choose_ahead {
+            let position = ahead_position.expect("ahead candidate was selected");
+            let effective_distance = ahead_distance.min(u32::MAX as usize) as u32;
+            ahead_distance = ahead_distance.saturating_add(1);
+            (position, effective_distance)
+        } else {
+            let position = behind_position.expect("behind candidate was selected");
+            let effective_distance =
+                (behind_distance.min(u32::MAX as usize) as u32).saturating_mul(3);
+            behind_distance = behind_distance.saturating_add(1);
+            (position, effective_distance)
+        };
+        if effective_distance > BROWSE_WINDOW {
+            break;
+        }
+        let index = index_at(position);
+        let bytes = budget.bytes_for(index);
+        let Some(next_bytes) = used_bytes.checked_add(bytes) else {
+            break;
+        };
+        if next_bytes > budget.budget_bytes {
+            break;
+        }
+        used_bytes = next_bytes;
+        selected.push((index, effective_distance));
+    }
+    selected
+}
+
 fn adaptive_full_selections(
     len: usize,
     current: usize,
+    current_position: usize,
     direction: i8,
     sequence: &[usize],
     budget: &FullPrefetchBudget,
@@ -383,7 +565,7 @@ fn adaptive_full_selections(
     } else {
         sequence.len()
     };
-    let current_position = current_position(current, sequence).min(ordered_len.saturating_sub(1));
+    let current_position = current_position.min(ordered_len.saturating_sub(1));
     let index_at = |position: usize| {
         if sequence.is_empty() {
             position
@@ -391,11 +573,17 @@ fn adaptive_full_selections(
             sequence[position]
         }
     };
-    let mut selected = Vec::new();
-    let mut seen = HashSet::new();
+    let estimated_slots = budget
+        .budget_bytes
+        .checked_div(budget.fallback_bytes)
+        .unwrap_or_default()
+        .min(ordered_len as u64) as usize;
+    let estimated_slots = estimated_slots.min(1_024);
+    let selection_capacity = estimated_slots.saturating_add(3);
+    let mut selected = Vec::with_capacity(selection_capacity);
     let mut used_bytes = 0_u64;
     let mut add_required = |index: usize, effective_distance: u32| {
-        if index < len && seen.insert(index) {
+        if index < len {
             used_bytes = used_bytes.saturating_add(budget.bytes_for(index));
             selected.push(FullSelection {
                 index,
@@ -408,13 +596,18 @@ fn adaptive_full_selections(
     for position in current_position.saturating_sub(1)
         ..=(current_position + 1).min(ordered_len.saturating_sub(1))
     {
+        let index = index_at(position);
+        if index == current {
+            continue;
+        }
         let (_, effective_distance) = weighted_distance(position, current_position, direction);
-        add_required(index_at(position), effective_distance);
+        add_required(index, effective_distance);
     }
 
     let forward = direction >= 0;
-    let mut ahead_distance = 1_usize;
-    let mut behind_distance = 1_usize;
+    // Distance one is already part of the mandatory working set.
+    let mut ahead_distance = 2_usize;
+    let mut behind_distance = 2_usize;
     loop {
         let ahead_position = if forward {
             current_position.checked_add(ahead_distance)
@@ -447,7 +640,7 @@ fn adaptive_full_selections(
             (position, effective_distance)
         };
         let index = index_at(position);
-        if index >= len || !seen.insert(index) {
+        if index >= len {
             continue;
         }
         let bytes = budget.bytes_for(index);
@@ -478,6 +671,17 @@ fn current_position(current: usize, sequence: &[usize]) -> usize {
     }
 }
 
+fn normalize_filtered_sequence(len: usize, sequence: &[usize]) -> Vec<usize> {
+    let mut seen = HashSet::with_capacity(sequence.len());
+    let mut normalized = Vec::with_capacity(sequence.len());
+    for &index in sequence {
+        if index < len && seen.insert(index) {
+            normalized.push(index);
+        }
+    }
+    normalized
+}
+
 fn weighted_distance(position: usize, current_position: usize, direction: i8) -> (u32, u32) {
     let ahead = (position > current_position) == (direction >= 0);
     let distance = position.abs_diff(current_position).min(u32::MAX as usize) as u32;
@@ -492,6 +696,10 @@ fn weighted_distance(position: usize, current_position: usize, direction: i8) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn navigation_budgets(full: FullPrefetchBudget) -> NavigationPrefetchBudgets {
+        NavigationPrefetchBudgets::new(full, BrowsePrefetchBudget::new(u64::MAX, 1, HashMap::new()))
+    }
 
     /// Straightforward full scan retained in tests as a semantic oracle for
     /// the bounded interactive scan used in production.
@@ -748,7 +956,7 @@ mod tests {
 
     #[test]
     fn adaptive_full_prefetch_fills_a_directional_prefix_to_its_byte_budget() {
-        let budget = FullPrefetchBudget::new(700, 100, HashMap::new());
+        let budget = navigation_budgets(FullPrefetchBudget::new(700, 100, HashMap::new()));
         let targets = build_plan_targets_with_full_prefetch(100, 50, 1, false, &[], &budget, false);
         let full: Vec<_> = targets
             .iter()
@@ -771,9 +979,30 @@ mod tests {
     }
 
     #[test]
+    fn browse_wave_is_capped_to_a_convergent_byte_prefix() {
+        let budgets = NavigationPrefetchBudgets::new(
+            FullPrefetchBudget::new(700, 100, HashMap::new()),
+            BrowsePrefetchBudget::new(400, 100, HashMap::new()),
+        );
+        let targets =
+            build_plan_targets_with_full_prefetch(100, 50, 1, false, &[], &budgets, false);
+        let browse: Vec<_> = targets
+            .iter()
+            .filter(|target| target.tier == Tier::Browse)
+            .map(|target| (target.index, target.effective_distance))
+            .collect();
+
+        assert_eq!(browse.len(), 4);
+        assert!(browse.contains(&(50, 0)));
+        assert!(browse.contains(&(49, 3)));
+        assert!(browse.contains(&(51, 1)));
+        assert!(browse.contains(&(52, 2)));
+    }
+
+    #[test]
     fn mandatory_full_targets_survive_a_budget_shortfall_without_extras() {
         let known = HashMap::from([(49, 200), (50, 200), (51, 200)]);
-        let budget = FullPrefetchBudget::new(500, 100, known);
+        let budget = navigation_budgets(FullPrefetchBudget::new(500, 100, known));
         let targets = build_plan_targets_with_full_prefetch(100, 50, 1, false, &[], &budget, false);
         let full: Vec<_> = targets
             .iter()
@@ -794,7 +1023,7 @@ mod tests {
     #[test]
     fn adaptive_full_prefetch_does_not_skip_a_nearer_nonfitting_candidate() {
         let known = HashMap::from([(49, 100), (50, 100), (51, 100), (52, 300), (53, 50)]);
-        let budget = FullPrefetchBudget::new(550, 100, known);
+        let budget = navigation_budgets(FullPrefetchBudget::new(550, 100, known));
         let targets = build_plan_targets_with_full_prefetch(100, 50, 1, false, &[], &budget, false);
 
         assert!(targets.iter().all(|target| {
@@ -804,7 +1033,7 @@ mod tests {
 
     #[test]
     fn adaptive_full_prefetch_follows_filtered_order_in_both_directions() {
-        let budget = FullPrefetchBudget::new(500, 100, HashMap::new());
+        let budget = navigation_budgets(FullPrefetchBudget::new(500, 100, HashMap::new()));
         let targets = build_plan_targets_with_full_prefetch(
             10,
             4,
@@ -830,5 +1059,106 @@ mod tests {
                 (9, PlanKind::Prefetch, 3),
             ]
         );
+    }
+
+    #[test]
+    fn adaptive_full_count_scales_across_representative_sensor_sizes() {
+        for megapixels in [12_u64, 24, 33, 61] {
+            let full_bytes = megapixels * 1_000_000 * 4;
+            for budget_bytes in [512_000_000_u64, 2_000_000_000, 4_000_000_000] {
+                let budget = navigation_budgets(FullPrefetchBudget::new(
+                    budget_bytes,
+                    full_bytes,
+                    HashMap::new(),
+                ));
+                let targets =
+                    build_plan_targets_with_full_prefetch(100, 50, 1, false, &[], &budget, false);
+                let actual = targets
+                    .iter()
+                    .filter(|target| target.tier == Tier::Full)
+                    .count();
+                let expected = (budget_bytes / full_bytes) as usize;
+                assert_eq!(
+                    actual,
+                    expected.clamp(3, 100),
+                    "{megapixels} MP with a {budget_bytes} byte Full budget"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn filtered_duplicate_indices_do_not_consume_full_budget_twice() {
+        let budget = navigation_budgets(FullPrefetchBudget::new(400, 100, HashMap::new()));
+        let targets = build_plan_targets_with_full_prefetch(
+            10,
+            5,
+            1,
+            false,
+            &[4, 5, 5, 6, 7],
+            &budget,
+            false,
+        );
+        let full: Vec<_> = targets
+            .iter()
+            .filter(|target| target.tier == Tier::Full)
+            .map(|target| (target.index, target.kind))
+            .collect();
+
+        assert_eq!(
+            full,
+            [
+                (5, PlanKind::Display),
+                (4, PlanKind::Display),
+                (6, PlanKind::Display),
+                (7, PlanKind::Prefetch),
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_filtered_indices_do_not_displace_visible_full_neighbors() {
+        let budget = navigation_budgets(FullPrefetchBudget::new(400, 100, HashMap::new()));
+        let targets = build_plan_targets_with_full_prefetch(
+            10,
+            5,
+            1,
+            false,
+            &[usize::MAX, 4, 5, 5, usize::MAX - 1, 6, 7],
+            &budget,
+            false,
+        );
+        let full: Vec<_> = targets
+            .iter()
+            .filter(|target| target.tier == Tier::Full)
+            .map(|target| (target.index, target.kind))
+            .collect();
+
+        assert_eq!(
+            full,
+            [
+                (5, PlanKind::Display),
+                (4, PlanKind::Display),
+                (6, PlanKind::Display),
+                (7, PlanKind::Prefetch),
+            ]
+        );
+    }
+
+    #[test]
+    fn all_invalid_filtered_indices_normalize_to_identity_order() {
+        let budget = navigation_budgets(FullPrefetchBudget::new(400, 100, HashMap::new()));
+        let identity = build_plan_targets_with_full_prefetch(10, 5, 1, false, &[], &budget, false);
+        let invalid = build_plan_targets_with_full_prefetch(
+            10,
+            5,
+            1,
+            false,
+            &[usize::MAX, usize::MAX - 1],
+            &budget,
+            false,
+        );
+
+        assert_eq!(invalid, identity);
     }
 }
