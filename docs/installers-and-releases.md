@@ -98,7 +98,7 @@ installs an app update or opens an operating-system installer.
 Select **Update and restart** to apply a macOS update. Viewr downloads an exact
 archive with one top-level `Viewr.app` bundle. It checks the release digest,
 archive paths, entry types, expanded size, bundle identity, version, arm64
-binary, and code signature.
+binaries, launcher self-test, and code signature.
 
 Viewr stages the new bundle beside its destination. It then starts a helper
 from the staged bundle and closes the current app. The helper waits for the
@@ -108,11 +108,15 @@ app, and starts the new version.
 The helper keeps the previous bundle until the new version starts. It restores
 the previous bundle if validation, registration, or restart fails.
 
-Viewr replaces the current bundle when its parent directory is writable. If
-that directory is not writable, Viewr installs the update at
-`~/Applications/Viewr.app`. This fallback does not require an administrator
-password. The original system-wide bundle remains available for manual
-recovery.
+Viewr replaces the current bundle only when its parent directory is writable.
+If that directory is not writable, Viewr stops and asks the user to move the
+app once; it does not create a second installation at another path.
+
+The first replacement of a root-owned package install keeps the old bundle at
+the fixed sibling path `.Viewr-system-recovery.app`. Viewr unregisters this
+recovery copy and never creates another retained backup. After the canonical
+bundle is user-owned, later updates use a temporary backup and delete it after
+the new version starts successfully.
 
 ### Installer handoff
 

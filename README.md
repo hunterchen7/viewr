@@ -127,9 +127,12 @@ release notes and supports **Update and restart** on macOS, or **Download now**
 on Windows and Linux. It also supports **Later** and **Skip this version**.
 Viewr verifies the exact package size and GitHub SHA-256 digest before it uses a
 download. A macOS `Viewr.app` stages the verified app archive, closes, replaces
-the bundle, and restarts. When its current directory is not writable, Viewr
-installs the update in `~/Applications/Viewr.app`. The macOS `.pkg` remains an
-initial-install and recovery fallback. Installed Windows and Linux copies open
+the same bundle, and restarts. It refuses the update if the current directory
+is not writable, so it never silently creates a second installation. The first
+successful replacement of a root-owned package install keeps one fixed,
+unregistered recovery bundle beside the app; later user-owned updates remove
+their temporary backup normally. The macOS `.pkg` remains an initial-install
+and recovery fallback. Installed Windows and Linux copies open
 their native installers. Portable Windows and Linux copies download the
 matching archive. Installer handoff requires user confirmation because the
 current preview packages are not platform-signed.
