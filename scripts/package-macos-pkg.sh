@@ -68,8 +68,8 @@ for command in pkgbuild plutil productbuild; do
 done
 [[ -f "$product_requirements" ]] ||
     fail "product requirements do not exist: $product_requirements"
-[[ -x "$package_scripts/preinstall" && ! -L "$package_scripts/preinstall" ]] ||
-    fail "installer preinstall script is missing or not executable"
+[[ -x "$package_scripts/postinstall" && ! -L "$package_scripts/postinstall" ]] ||
+    fail "installer postinstall script is missing or not executable"
 plutil -lint "$product_requirements" >/dev/null
 
 workspace_version="$(

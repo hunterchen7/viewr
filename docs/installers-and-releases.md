@@ -117,7 +117,7 @@ the fixed sibling path `.Viewr-system-recovery.app`. Viewr unregisters this
 recovery copy and never creates another retained backup. After the canonical
 bundle is user-owned, later updates use a temporary backup and delete it after
 the new version starts successfully. Reinstalling the recovery package removes
-the fixed recovery copy in its reviewed root preinstall script, so a later
+the fixed recovery copy in its reviewed root postinstall script, so a later
 direct update can reserve that path again.
 
 ### Installer handoff

@@ -230,16 +230,16 @@ package_attribute() {
 [[ "$(
     xmllint \
         --xpath \
-        'count(/pkg-info/scripts/preinstall[@file="./preinstall"])' \
+        'count(/pkg-info/scripts/postinstall[@file="./postinstall"])' \
         "$package_info"
 )" == "1" ]] ||
-    fail "installer does not declare the recovery-cleanup preinstall script"
-preinstall="$(dirname "$package_info")/Scripts/preinstall"
-[[ -f "$preinstall" && ! -L "$preinstall" ]] ||
+    fail "installer does not declare the recovery-cleanup postinstall script"
+postinstall="$(dirname "$package_info")/Scripts/postinstall"
+[[ -f "$postinstall" && ! -L "$postinstall" ]] ||
     fail "installer recovery-cleanup script is missing"
-/usr/bin/cmp -s "$repo_root/packaging/macos/scripts/preinstall" "$preinstall" ||
+/usr/bin/cmp -s "$repo_root/packaging/macos/scripts/postinstall" "$postinstall" ||
     fail "installer recovery-cleanup script differs from the reviewed source"
-[[ "$(/usr/bin/stat -f '%Lp' "$preinstall")" == "755" ]] ||
+[[ "$(/usr/bin/stat -f '%Lp' "$postinstall")" == "755" ]] ||
     fail "installer recovery-cleanup script mode is not 0755"
 [[ "$(
     xmllint \
