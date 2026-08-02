@@ -23,12 +23,13 @@ use viewr_core::library::{
     Library, RatingLoad, load_ratings_with_owners, rating_owner_keys, try_load_ratings_with_owners,
 };
 use viewr_core::meta::FileMeta;
-use viewr_core::types::{PixelBuf, Tier};
+use viewr_core::types::Tier;
 
 use crate::config::{Action, Config, ScrollMode, TierIndicator};
 use crate::filmstrip;
 use crate::image_info;
 use crate::loupe::{self, LoupeResponse, Zoom};
+use crate::pixels::to_color_image;
 use crate::progressive_texture::{self, TileCoord};
 use crate::rating_groups::{build_owner_members, install_rating_for_members};
 use crate::settings::SettingsState;
@@ -1808,10 +1809,6 @@ impl App {
         }
         self.handle_keys(rect, None);
     }
-}
-
-fn to_color_image(buf: &PixelBuf) -> egui::ColorImage {
-    egui::ColorImage::from_rgba_unmultiplied([buf.width as usize, buf.height as usize], &buf.rgba)
 }
 
 #[cfg(test)]

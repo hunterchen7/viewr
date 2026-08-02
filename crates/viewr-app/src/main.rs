@@ -13,6 +13,7 @@ mod config;
 mod filmstrip;
 mod image_info;
 mod loupe;
+mod pixels;
 mod progressive_texture;
 mod rating_groups;
 mod settings;

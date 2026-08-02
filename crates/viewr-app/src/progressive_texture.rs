@@ -186,11 +186,7 @@ pub(crate) fn color_image(buf: &PixelBuf, tile: TileCoord) -> Option<egui::Color
             .checked_mul(source_stride)?
             .checked_add(first_x)?;
         let row = buf.rgba.get(row_start..row_start.checked_add(row_bytes)?)?;
-        pixels.extend(
-            row.chunks_exact(4).map(|rgba| {
-                egui::Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3])
-            }),
-        );
+        crate::pixels::extend_from_rgba(&mut pixels, row);
     }
     Some(egui::ColorImage::new(
         [

@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 viewr-core.workspace = true
 anyhow.workspace = true
+bytemuck.workspace = true
 eframe.workspace = true
 rfd.workspace = true
 serde.workspace = true
