@@ -297,13 +297,14 @@ fn sanitized_notes(body: Option<&str>) -> String {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ReleaseNoteSpan {
     Text(String),
+    Strong(String),
     Link { label: String, url: String },
 }
 
 impl ReleaseNoteSpan {
     fn label(&self) -> &str {
         match self {
-            Self::Text(text) => text,
+            Self::Text(text) | Self::Strong(text) => text,
             Self::Link { label, .. } => label,
         }
     }
@@ -386,6 +387,8 @@ fn parse_release_note_spans(line: &str) -> Vec<ReleaseNoteSpan> {
                     && url.port_or_known_default() == Some(443)
                     && url.username().is_empty()
                     && url.password().is_none()
+                    && url.host_str() == Some("github.com")
+                    && url.path().starts_with("/hunterchen7/viewr/")
             });
         if !trusted {
             scan = open + 1;
@@ -404,10 +407,49 @@ fn parse_release_note_spans(line: &str) -> Vec<ReleaseNoteSpan> {
     if emitted < line.len() {
         spans.push(ReleaseNoteSpan::Text(line[emitted..].to_owned()));
     }
-    if spans.is_empty() {
-        spans.push(ReleaseNoteSpan::Text(String::new()));
+    parse_release_note_emphasis(spans)
+}
+
+fn parse_release_note_emphasis(spans: Vec<ReleaseNoteSpan>) -> Vec<ReleaseNoteSpan> {
+    let mut output = Vec::with_capacity(spans.len());
+    for span in spans {
+        let ReleaseNoteSpan::Text(text) = span else {
+            output.push(span);
+            continue;
+        };
+        let mut emitted = 0;
+        let mut scan = 0;
+        while scan < text.len() {
+            let Some(open_offset) = text[scan..].find("**") else {
+                break;
+            };
+            let open = scan + open_offset;
+            let content_start = open + 2;
+            let Some(close_offset) = text[content_start..].find("**") else {
+                break;
+            };
+            let close = content_start + close_offset;
+            if close == content_start {
+                scan = content_start;
+                continue;
+            }
+            if emitted < open {
+                output.push(ReleaseNoteSpan::Text(text[emitted..open].to_owned()));
+            }
+            output.push(ReleaseNoteSpan::Strong(
+                text[content_start..close].to_owned(),
+            ));
+            emitted = close + 2;
+            scan = emitted;
+        }
+        if emitted < text.len() {
+            output.push(ReleaseNoteSpan::Text(text[emitted..].to_owned()));
+        }
     }
-    spans
+    if output.is_empty() {
+        output.push(ReleaseNoteSpan::Text(String::new()));
+    }
+    output
 }
 
 #[derive(Clone, Copy)]
@@ -416,13 +458,48 @@ enum ReleaseNoteStyle {
     Body,
 }
 
-fn release_note_text(text: &str, style: ReleaseNoteStyle) -> egui::RichText {
+fn release_note_text(text: &str, style: ReleaseNoteStyle, strong: bool) -> egui::RichText {
     let text = egui::RichText::new(text);
-    match style {
+    let text = match style {
         ReleaseNoteStyle::Heading(1 | 2) => text.strong().size(15.0),
         ReleaseNoteStyle::Heading(_) => text.strong().size(13.0),
         ReleaseNoteStyle::Body => text,
-    }
+    };
+    if strong { text.strong() } else { text }
+}
+
+fn release_note_job(
+    ui: &egui::Ui,
+    text: &str,
+    style: ReleaseNoteStyle,
+    strong: bool,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    release_note_text(text, style, strong).append_to(
+        &mut job,
+        ui.style(),
+        egui::FontSelection::Default,
+        egui::Align::Center,
+    );
+    job.wrap.break_anywhere = true;
+    job
+}
+
+fn show_release_note_inline(ui: &mut egui::Ui, spans: &[ReleaseNoteSpan], style: ReleaseNoteStyle) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        for span in spans {
+            match span {
+                ReleaseNoteSpan::Text(text) | ReleaseNoteSpan::Strong(text) => {
+                    let strong = matches!(span, ReleaseNoteSpan::Strong(_));
+                    ui.add(egui::Label::new(release_note_job(ui, text, style, strong)).wrap());
+                }
+                ReleaseNoteSpan::Link { label, url } => {
+                    ui.hyperlink_to(release_note_job(ui, label, style, false), url);
+                }
+            }
+        }
+    });
 }
 
 fn show_release_note_spans(
@@ -431,24 +508,17 @@ fn show_release_note_spans(
     style: ReleaseNoteStyle,
     bullet: bool,
 ) {
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        if bullet {
-            ui.label(release_note_text("•\u{a0}", style));
-        }
-        for span in spans {
-            match span {
-                ReleaseNoteSpan::Text(text) => {
-                    for chunk in text.split_inclusive(' ') {
-                        ui.label(release_note_text(chunk, style));
-                    }
-                }
-                ReleaseNoteSpan::Link { label, url } => {
-                    ui.hyperlink_to(release_note_text(label, style), url);
-                }
-            }
-        }
-    });
+    if bullet {
+        ui.horizontal_top(|ui| {
+            ui.label(release_note_text("•", style, false));
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                show_release_note_inline(ui, spans, style);
+            });
+        });
+    } else {
+        show_release_note_inline(ui, spans, style);
+    }
 }
 
 fn show_release_notes(ui: &mut egui::Ui, notes: &str) {
@@ -2846,7 +2916,7 @@ mod tests {
     #[test]
     fn release_notes_keep_malformed_or_untrusted_links_as_plain_text() {
         let blocks = parse_release_notes(
-            "A [broken](not a url) link and [unsafe](javascript:alert(1)) link.\n\nPlain paragraph.",
+            "A [broken](not a url), [unsafe](javascript:alert(1)), and [external](https://example.com/path) link.\n\nPlain paragraph.",
         );
 
         assert_eq!(blocks.len(), 2);
@@ -2862,8 +2932,54 @@ mod tests {
             .collect::<String>();
         assert_eq!(
             visible,
-            "A [broken](not a url) link and [unsafe](javascript:alert(1)) link.Plain paragraph."
+            "A [broken](not a url), [unsafe](javascript:alert(1)), and [external](https://example.com/path) link.Plain paragraph."
         );
+    }
+
+    #[test]
+    fn release_notes_render_release_please_strong_scopes_without_markers() {
+        let blocks = parse_release_notes(
+            "* **ci:** keep update archives verified ([#42](https://github.com/hunterchen7/viewr/pull/42))",
+        );
+
+        assert!(matches!(
+            &blocks[0],
+            ReleaseNoteBlock::Bullet(spans)
+                if spans == &vec![
+                    ReleaseNoteSpan::Strong("ci:".into()),
+                    ReleaseNoteSpan::Text(" keep update archives verified (".into()),
+                    ReleaseNoteSpan::Link {
+                        label: "#42".into(),
+                        url: "https://github.com/hunterchen7/viewr/pull/42".into(),
+                    },
+                    ReleaseNoteSpan::Text(")".into()),
+                ]
+        ));
+    }
+
+    #[test]
+    fn release_note_layout_breaks_long_tokens_inside_the_available_width() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 1200.0));
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        let notes = format!(
+            "### Fixes\n\n* {} ([very-long-link-label-{}](https://github.com/hunterchen7/viewr/pull/42))",
+            "unbroken".repeat(128),
+            "x".repeat(128),
+        );
+        let mut rendered = egui::Rect::NOTHING;
+
+        let _ = ctx.run_ui(input, |ui| {
+            ui.set_max_width(300.0);
+            rendered = ui.scope(|ui| show_release_notes(ui, &notes)).response.rect;
+        });
+
+        assert!(rendered.is_finite());
+        assert!(rendered.right() <= 300.5, "rendered rect was {rendered:?}");
+        assert!(rendered.height() > 40.0, "long tokens did not wrap");
     }
 
     #[test]
