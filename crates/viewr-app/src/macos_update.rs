@@ -5,9 +5,11 @@
 //! the helper from replacing the bundle until the graphical process exits.
 
 use std::collections::HashSet;
+use std::ffi::{CString, OsString, c_char, c_int};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write as _};
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -24,7 +26,8 @@ const BUNDLE_IDENTIFIER: &str = "com.hunterchen.viewr";
 const MAX_ARCHIVE_ENTRIES: usize = 4096;
 const MAX_EXPANDED_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_PLAN_BYTES: u64 = 64 * 1024;
-const HELPER_STARTUP_PROBE_DELAY: Duration = Duration::from_millis(250);
+const HELPER_READY_TIMEOUT: Duration = Duration::from_secs(2);
+const HELPER_READY_POLL: Duration = Duration::from_millis(10);
 const LAUNCH_PROBE_DELAY: Duration = Duration::from_millis(750);
 const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
 
@@ -34,7 +37,9 @@ pub(crate) struct PreparedUpdate {
     plan_path: PathBuf,
     lock_path: PathBuf,
     log_path: PathBuf,
+    ready_path: PathBuf,
     staging_root: PathBuf,
+    armed: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -46,7 +51,7 @@ struct UpdatePlan {
     backup_bundle: PathBuf,
     staging_root: PathBuf,
     lock_path: PathBuf,
-    relaunch_arguments: Vec<String>,
+    relaunch_arguments: Vec<Vec<u8>>,
 }
 
 pub(crate) fn prepare(
@@ -64,6 +69,11 @@ pub(crate) fn prepare(
         UpdateError::InvalidRelease("the application update target has no parent".into())
     })?;
     ensure_real_directory(target_parent)?;
+    if target_bundle.symlink_metadata().is_ok() && !tree_owned_by_current_user(&target_bundle)? {
+        return Err(UpdateError::InvalidRelease(
+            "the application update target is not owned by the current user".into(),
+        ));
+    }
 
     let staging = tempfile::Builder::new()
         .prefix(".Viewr-update-")
@@ -90,10 +100,11 @@ pub(crate) fn prepare(
     let plan_path = staging.path().join("update-plan.json");
     let lock_path = staging.path().join("parent.lock");
     let log_path = staging.path().join("apply.log");
+    let ready_path = staging.path().join("helper.ready");
     create_private_file(&lock_path, b"")?;
     let relaunch_arguments = std::env::args_os()
         .skip(1)
-        .map(|argument| argument.to_string_lossy().into_owned())
+        .map(|argument| argument.as_bytes().to_vec())
         .collect();
     let plan = UpdatePlan {
         expected_version: version.to_string(),
@@ -106,6 +117,11 @@ pub(crate) fn prepare(
         relaunch_arguments,
     };
     let bytes = serde_json::to_vec(&plan)?;
+    if bytes.len() as u64 > MAX_PLAN_BYTES {
+        return Err(UpdateError::InvalidRelease(
+            "the prepared update plan exceeds its size limit".into(),
+        ));
+    }
     create_private_file(&plan_path, &bytes)?;
     sync_directory(staging.path())?;
 
@@ -117,21 +133,30 @@ pub(crate) fn prepare(
         plan_path,
         lock_path,
         log_path,
+        ready_path,
         staging_root,
+        armed: false,
     })
 }
 
 pub(crate) fn discard(prepared: PreparedUpdate) {
-    if prepared
-        .staging_root
-        .file_name()
-        .is_some_and(|name| name.to_string_lossy().starts_with(".Viewr-update-"))
-    {
-        let _ = std::fs::remove_dir_all(prepared.staging_root);
+    drop(prepared);
+}
+
+impl Drop for PreparedUpdate {
+    fn drop(&mut self) {
+        if !self.armed
+            && self
+                .staging_root
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".Viewr-update-"))
+        {
+            let _ = std::fs::remove_dir_all(&self.staging_root);
+        }
     }
 }
 
-pub(crate) fn spawn(prepared: &PreparedUpdate) -> Result<(), UpdateError> {
+pub(crate) fn spawn(prepared: &mut PreparedUpdate) -> Result<(), UpdateError> {
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -150,11 +175,22 @@ pub(crate) fn spawn(prepared: &PreparedUpdate) -> Result<(), UpdateError> {
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(stderr))
         .spawn()?;
-    thread::sleep(HELPER_STARTUP_PROBE_DELAY);
-    if let Some(status) = child.try_wait()? {
-        return Err(UpdateError::InvalidRelease(format!(
-            "the application update helper exited during startup ({status})"
-        )));
+    let deadline = std::time::Instant::now() + HELPER_READY_TIMEOUT;
+    loop {
+        if prepared.ready_path.is_file() {
+            break;
+        }
+        if let Some(status) = child.try_wait()? {
+            return Err(UpdateError::InvalidRelease(format!(
+                "the application update helper exited during startup ({status})"
+            )));
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(UpdateError::Busy("preparing the application update"));
+        }
+        thread::sleep(HELPER_READY_POLL);
     }
 
     // The helper must remain blocked until every field and worker owned by
@@ -162,6 +198,7 @@ pub(crate) fn spawn(prepared: &PreparedUpdate) -> Result<(), UpdateError> {
     // intentionally leaking this one descriptor makes the OS process lifetime
     // the unambiguous gate. The OS closes it when the process exits.
     std::mem::forget(lock);
+    prepared.armed = true;
     Ok(())
 }
 
@@ -173,6 +210,8 @@ pub(crate) fn apply(plan_path: &Path) -> Result<(), UpdateError> {
         .read(true)
         .write(true)
         .open(&plan.lock_path)?;
+    create_private_file(&plan.staging_root.join("helper.ready"), b"ready")?;
+    sync_directory(&plan.staging_root)?;
     lock.lock()?;
 
     let result = apply_after_parent_exit(&plan);
@@ -232,19 +271,22 @@ fn apply_transaction(plan: &UpdatePlan, version: &Version) -> Result<(), UpdateE
     }
 
     if had_target {
-        std::fs::rename(&plan.target_bundle, &plan.backup_bundle)?;
-    }
-    if let Err(error) = std::fs::rename(&plan.staged_bundle, &plan.target_bundle) {
-        if had_target {
-            let _ = std::fs::rename(&plan.backup_bundle, &plan.target_bundle);
+        atomic_swap(&plan.target_bundle, &plan.staged_bundle)?;
+        if let Err(error) = std::fs::rename(&plan.staged_bundle, &plan.backup_bundle) {
+            let _ = atomic_swap(&plan.target_bundle, &plan.staged_bundle);
+            return Err(error.into());
         }
-        return Err(error.into());
+    } else {
+        std::fs::rename(&plan.staged_bundle, &plan.target_bundle)?;
     }
-    sync_directory(
+    if let Err(error) = sync_directory(
         plan.target_bundle
             .parent()
             .expect("validated target has a parent"),
-    )?;
+    ) {
+        rollback(plan, had_target);
+        return Err(error.into());
+    }
 
     let installed =
         validate_app_bundle(&plan.target_bundle, version).and_then(|()| register_application(plan));
@@ -273,10 +315,13 @@ fn log_cleanup_error(label: &str, result: Result<(), UpdateError>) {
 
 fn rollback(plan: &UpdatePlan, had_target: bool) {
     let failed_bundle = plan.staging_root.join("failed-Viewr.app");
-    let _ = std::fs::rename(&plan.target_bundle, &failed_bundle);
     if had_target {
-        let _ = std::fs::rename(&plan.backup_bundle, &plan.target_bundle);
+        if atomic_swap(&plan.target_bundle, &plan.backup_bundle).is_ok() {
+            let _ = std::fs::rename(&plan.backup_bundle, &failed_bundle);
+        }
         let _ = run_checked(Command::new(LSREGISTER).arg("-f").arg(&plan.target_bundle));
+    } else {
+        let _ = std::fs::rename(&plan.target_bundle, &failed_bundle);
     }
     if plan.previous_bundle != plan.target_bundle {
         let _ = run_checked(
@@ -290,17 +335,37 @@ fn rollback(plan: &UpdatePlan, had_target: bool) {
     }
 }
 
+fn atomic_swap(left: &Path, right: &Path) -> io::Result<()> {
+    const RENAME_SWAP: u32 = 0x0000_0002;
+    unsafe extern "C" {
+        fn renamex_np(from: *const c_char, to: *const c_char, flags: u32) -> c_int;
+    }
+
+    let left = CString::new(left.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let right = CString::new(right.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // SAFETY: both pointers reference live, NUL-terminated path buffers for
+    // the duration of the call. `renamex_np` does not retain either pointer.
+    let result = unsafe { renamex_np(left.as_ptr(), right.as_ptr(), RENAME_SWAP) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 fn relaunch(plan: &UpdatePlan) -> Result<Child, UpdateError> {
     relaunch_bundle(&plan.target_bundle, &plan.relaunch_arguments)
 }
 
-fn relaunch_bundle(bundle: &Path, arguments: &[String]) -> Result<Child, UpdateError> {
+fn relaunch_bundle(bundle: &Path, arguments: &[Vec<u8>]) -> Result<Child, UpdateError> {
     let executable = bundle.join("Contents/MacOS/viewr-bin");
     let mut command = Command::new(executable);
     if arguments.is_empty() {
         command.arg("--pick-folder");
     } else {
-        command.args(arguments);
+        command.args(arguments.iter().cloned().map(OsString::from_vec));
     }
     command
         .stdin(Stdio::null())
@@ -387,7 +452,7 @@ fn update_target(previous_bundle: &Path) -> Result<PathBuf, UpdateError> {
     let parent = previous_bundle.parent().ok_or_else(|| {
         UpdateError::InvalidRelease("the current application bundle has no parent".into())
     })?;
-    if directory_is_writable(parent) {
+    if directory_is_writable(parent) && tree_owned_by_current_user(previous_bundle)? {
         return Ok(previous_bundle.to_owned());
     }
     let applications = dirs::home_dir()
@@ -395,6 +460,43 @@ fn update_target(previous_bundle: &Path) -> Result<PathBuf, UpdateError> {
         .join("Applications");
     ensure_user_applications_directory(&applications)?;
     Ok(applications.join(APP_NAME))
+}
+
+fn tree_owned_by_current_user(path: &Path) -> Result<bool, UpdateError> {
+    let mut visited = 0;
+    tree_owned_by_current_user_inner(path, &mut visited)
+}
+
+fn tree_owned_by_current_user_inner(path: &Path, visited: &mut usize) -> Result<bool, UpdateError> {
+    *visited = visited.saturating_add(1);
+    if *visited > MAX_ARCHIVE_ENTRIES {
+        return Err(UpdateError::InvalidRelease(
+            "the current application contains too many files".into(),
+        ));
+    }
+    let metadata = path.symlink_metadata()?;
+    if metadata.file_type().is_symlink() || metadata.uid() != current_euid() {
+        return Ok(false);
+    }
+    if !metadata.is_dir() {
+        return Ok(true);
+    }
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        if !tree_owned_by_current_user_inner(&entry.path(), visited)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+unsafe extern "C" {
+    fn geteuid() -> u32;
+}
+
+fn current_euid() -> u32 {
+    // SAFETY: `geteuid` takes no arguments and has no preconditions.
+    unsafe { geteuid() }
 }
 
 fn directory_is_writable(path: &Path) -> bool {
@@ -542,9 +644,11 @@ fn validate_app_bundle(bundle: &Path, version: &Version) -> Result<(), UpdateErr
     verify_no_links(bundle, 0)?;
 
     let identifier = plist_value(&info, "CFBundleIdentifier")?;
+    let executable = plist_value(&info, "CFBundleExecutable")?;
     let short_version = plist_value(&info, "CFBundleShortVersionString")?;
     let bundle_version = plist_value(&info, "CFBundleVersion")?;
     if identifier != BUNDLE_IDENTIFIER
+        || executable != "ViewrLauncher"
         || short_version != version.to_string()
         || bundle_version != version.to_string()
     {
@@ -553,14 +657,6 @@ fn validate_app_bundle(bundle: &Path, version: &Version) -> Result<(), UpdateErr
         ));
     }
 
-    let output = Command::new(&viewer).arg("--version").output()?;
-    if !output.status.success()
-        || String::from_utf8_lossy(&output.stdout).trim() != format!("viewr {version}")
-    {
-        return Err(UpdateError::InvalidRelease(
-            "the application update binary reports the wrong version".into(),
-        ));
-    }
     let architecture = Command::new("/usr/bin/lipo")
         .arg("-archs")
         .arg(&viewer)
@@ -578,7 +674,17 @@ fn validate_app_bundle(bundle: &Path, version: &Version) -> Result<(), UpdateErr
             .arg("--deep")
             .arg("--strict")
             .arg(bundle),
-    )
+    )?;
+
+    let output = Command::new(&viewer).arg("--version").output()?;
+    if !output.status.success()
+        || String::from_utf8_lossy(&output.stdout).trim() != format!("viewr {version}")
+    {
+        return Err(UpdateError::InvalidRelease(
+            "the application update binary reports the wrong version".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn plist_value(path: &Path, key: &str) -> Result<String, UpdateError> {
@@ -785,11 +891,50 @@ mod tests {
             backup_bundle: PathBuf::from("/Users/me/Applications/.Viewr-backup-quote'$;[].app"),
             staging_root: root.clone(),
             lock_path: root.join("parent.lock"),
-            relaunch_arguments: vec!["/Users/me/photos quote'$;[]".into()],
+            relaunch_arguments: vec![
+                b"/Users/me/photos quote'$;[]".to_vec(),
+                vec![b'/', b't', b'm', b'p', b'/', 0xff],
+            ],
         };
         let bytes = serde_json::to_vec(&plan).unwrap();
         let decoded: UpdatePlan = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(decoded.target_bundle, plan.target_bundle);
         assert_eq!(decoded.relaunch_arguments, plan.relaunch_arguments);
+    }
+
+    #[test]
+    fn atomic_swap_never_removes_either_path() {
+        let root = tempfile::tempdir().unwrap();
+        let left = root.path().join("left");
+        let right = root.path().join("right");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        std::fs::write(left.join("value"), b"left").unwrap();
+        std::fs::write(right.join("value"), b"right").unwrap();
+
+        atomic_swap(&left, &right).unwrap();
+
+        assert_eq!(std::fs::read(left.join("value")).unwrap(), b"right");
+        assert_eq!(std::fs::read(right.join("value")).unwrap(), b"left");
+    }
+
+    #[test]
+    fn unarmed_prepared_updates_clean_their_private_staging_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let staging = root.path().join(".Viewr-update-test");
+        std::fs::create_dir(&staging).unwrap();
+        let prepared = PreparedUpdate {
+            helper_path: staging.join("helper"),
+            plan_path: staging.join("update-plan.json"),
+            lock_path: staging.join("parent.lock"),
+            log_path: staging.join("apply.log"),
+            ready_path: staging.join("helper.ready"),
+            staging_root: staging.clone(),
+            armed: false,
+        };
+
+        drop(prepared);
+
+        assert!(!staging.exists());
     }
 }
