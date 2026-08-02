@@ -129,18 +129,23 @@ The suite measures these workloads:
   quality, plus RAM-cache hits and eviction scaling. The suite measures Full
   working-set replacement, constant-time size snapshots, copy-on-write
   observation updates with live snapshots, and release of large final owners.
+  A 200-target residency classification compares the batched single-lock
+  snapshot with the per-target probe reference it replaced.
   A dark-gradient regression compares production quality against the legacy
   Full-cache setting. Decode throughput uses compressed input bytes; latency
   remains the primary comparison. The `jpeg_decode_serial` and
   `jpeg_encode_plain` groups keep the whole-buffer serial decode and the
   markerless encode measurable beside the production restart-marker split.
-- XMP parsing, XMP updates, and disk-cache key generation.
+- XMP parsing, XMP updates, and disk-cache key generation. A rating-free
+  sidecar case measures the substring prefilter's early return.
 - Warm, under-budget cache-GC scans for up to 10,000 objects.
   This case does not sort or delete cache objects.
 - Loupe filmstrip widget scaling at 10,000 and 50,000 images.
 - Full-resolution texture conversion for a 24-megapixel image, compared with
   visible-region-first conversion at 512-, 1024-, and 2048-pixel tile sizes.
   This measures CPU image preparation, not backend GPU transfer time.
+  Paired opaque-source cases measure the production bulk-copy conversion;
+  the translucent originals keep the exact per-pixel fallback measurable.
 - Thumbnail texture-LRU maintenance for 200 touches among 773 residents.
 - Shared-owner group construction and rating installation through a prefilled
   rating map at 1,000, 10,000, and 100,000 entries. The installation primitive
