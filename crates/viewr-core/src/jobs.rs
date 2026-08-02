@@ -2867,11 +2867,17 @@ mod tests {
                 }
                 lead.dismiss();
                 // Regenerate the index with a fresh leader while the
-                // follower may still be inside its wait window.
-                let RawShareJoin::Lead(second) = share.join(4, &token) else {
-                    panic!("second lead");
-                };
-                second.publish(Arc::new(77));
+                // follower may still be inside its wait window. The woken
+                // follower can re-lead first; join with a cancelled token so
+                // this thread never sleeps on a lead the follower cannot
+                // drive before it is joined below.
+                let second_token = CancelToken::default();
+                second_token.cancel();
+                match share.join(4, &second_token) {
+                    RawShareJoin::Lead(second) => second.publish(Arc::new(77)),
+                    RawShareJoin::OwnDecode => {}
+                    RawShareJoin::Shared(_) => panic!("nothing was published yet"),
+                }
                 match follower.join().expect("follower thread") {
                     RawShareJoin::Shared(value) => assert_eq!(*value, 77),
                     RawShareJoin::OwnDecode => {}
