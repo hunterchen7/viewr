@@ -532,13 +532,20 @@ pub fn scan(dir: &Path) -> io::Result<Vec<FolderEntry>> {
         .filter_map(Result::ok)
         .filter_map(|e| {
             let entry_path = e.path();
+            // ASCII-case comparison accepts the same names as the previous
+            // Unicode lowercase-then-match: no non-ASCII sequence lowercases
+            // to "arw" or "dng", and the check is allocation-free for every
+            // non-RAW directory entry.
+            let ext = entry_path.extension()?;
+            if !RAW_EXTENSIONS
+                .iter()
+                .any(|raw| ext.eq_ignore_ascii_case(raw))
+            {
+                return None;
+            }
             let name = e.file_name().to_string_lossy().into_owned();
             // Skip dotfiles and AppleDouble ("._foo.ARW") droppings on SD cards.
             if name.starts_with('.') {
-                return None;
-            }
-            let ext = entry_path.extension()?.to_string_lossy().to_lowercase();
-            if !RAW_EXTENSIONS.contains(&ext.as_str()) {
                 return None;
             }
             // `DirEntry::metadata` preserves the established behavior of
@@ -561,7 +568,9 @@ pub fn scan(dir: &Path) -> io::Result<Vec<FolderEntry>> {
             })
         })
         .collect();
-    entries.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+    // Names are unique within one directory, so an unstable sort produces
+    // the identical order without the merge sort's temporary allocation.
+    entries.sort_unstable_by(|a, b| a.file_name.cmp(&b.file_name));
     Ok(entries)
 }
 
