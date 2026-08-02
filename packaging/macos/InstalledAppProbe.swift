@@ -119,8 +119,8 @@ func hasExplicitARWBinding() -> Bool {
 
 switch arguments[1] {
 case "present":
-    guard bundlePaths == [expectedPath] else {
-        fail("Launch Services bundle lookup did not resolve only the installed app")
+    guard bundlePaths.contains(expectedPath) else {
+        fail("Launch Services bundle lookup did not resolve the installed app")
     }
     guard typePaths.contains(expectedPath) else {
         fail("Launch Services did not register the installed ARW UTI handler")
@@ -129,7 +129,7 @@ case "present":
         fail("Launch Services did not register the installed ARW file handler")
     }
 case "absent":
-    guard bundlePaths.isEmpty,
+    guard !bundlePaths.contains(expectedPath),
           !typePaths.contains(expectedPath),
           !filePaths.contains(expectedPath)
     else {

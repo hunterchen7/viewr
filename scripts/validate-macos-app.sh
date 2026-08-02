@@ -119,6 +119,13 @@ launcher_reported_version="$(
 )" || fail "app launcher self-test failed"
 [[ "$launcher_reported_version" == "viewr-launcher $expected_version" ]] ||
     fail "app launcher reports '$launcher_reported_version', expected 'viewr-launcher $expected_version'"
+launch_services="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+[[ -x "$launch_services" ]] ||
+    fail "Launch Services registration tool is unavailable"
+# Executing a bundle executable can make Launch Services notice its containing
+# app. Remove that transient registration when possible. Validation must not
+# fail when the app was never registered and `lsregister -u` reports -10814.
+"$launch_services" -u "$app" >/dev/null 2>&1 || true
 
 expected_data_files=(
     "$app/Contents/Info.plist"

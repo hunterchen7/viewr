@@ -131,10 +131,11 @@ the same bundle, and restarts. It refuses the update if the current directory
 is not writable, so it never silently creates a second installation. The first
 successful replacement of a root-owned package install keeps one fixed,
 unregistered recovery bundle beside the app; later user-owned updates remove
-their temporary backup normally. The macOS `.pkg` remains an initial-install
-and recovery fallback. Installed Windows and Linux copies open
-their native installers. Portable Windows and Linux copies download the
-matching archive. Installer handoff requires user confirmation because the
+their temporary backup normally. Reinstalling the recovery `.pkg` removes that
+fixed recovery copy before it installs the canonical app. The macOS `.pkg`
+remains an initial-install and recovery fallback. Installed Windows and Linux
+copies open their native installers. Portable Windows and Linux copies download
+the matching archive. Installer handoff requires user confirmation because the
 current preview packages are not platform-signed.
 
 To build from source, run:

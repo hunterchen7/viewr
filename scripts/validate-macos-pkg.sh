@@ -230,6 +230,20 @@ package_attribute() {
 [[ "$(
     xmllint \
         --xpath \
+        'count(/pkg-info/scripts/preinstall[@file="./preinstall"])' \
+        "$package_info"
+)" == "1" ]] ||
+    fail "installer does not declare the recovery-cleanup preinstall script"
+preinstall="$(dirname "$package_info")/Scripts/preinstall"
+[[ -f "$preinstall" && ! -L "$preinstall" ]] ||
+    fail "installer recovery-cleanup script is missing"
+/usr/bin/cmp -s "$repo_root/packaging/macos/scripts/preinstall" "$preinstall" ||
+    fail "installer recovery-cleanup script differs from the reviewed source"
+[[ "$(/usr/bin/stat -f '%Lp' "$preinstall")" == "755" ]] ||
+    fail "installer recovery-cleanup script mode is not 0755"
+[[ "$(
+    xmllint \
+        --xpath \
         'count(/pkg-info/upgrade-bundle/bundle[@id="com.hunterchen.viewr"])' \
         "$package_info"
 )" == "1" ]] ||

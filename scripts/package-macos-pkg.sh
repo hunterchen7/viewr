@@ -57,6 +57,7 @@ else
 fi
 
 product_requirements="$repo_root/packaging/macos/ProductRequirements.plist"
+package_scripts="$repo_root/packaging/macos/scripts"
 
 /bin/mkdir -p "$(dirname "$output_arg")"
 output_dir="$(cd "$(dirname "$output_arg")" && pwd)"
@@ -67,6 +68,8 @@ for command in pkgbuild plutil productbuild; do
 done
 [[ -f "$product_requirements" ]] ||
     fail "product requirements do not exist: $product_requirements"
+[[ -x "$package_scripts/preinstall" && ! -L "$package_scripts/preinstall" ]] ||
+    fail "installer preinstall script is missing or not executable"
 plutil -lint "$product_requirements" >/dev/null
 
 workspace_version="$(
@@ -100,6 +103,7 @@ fi
 component_pkg="$work_dir/Viewr-component.pkg"
 pkgbuild \
     --component "$app" \
+    --scripts "$package_scripts" \
     --install-location /Applications \
     --identifier com.hunterchen.viewr.pkg \
     --version "$version" \
