@@ -38,7 +38,7 @@ app_arg="$1"
 app_dir="$(cd "$(dirname "$app_arg")" && pwd)"
 app="$app_dir/Viewr.app"
 
-for command in awk basename cat cmp codesign find grep lipo plutil shasum sort stat vtool; do
+for command in awk basename cat cmp codesign cp find grep lipo mktemp plutil rm shasum sort stat vtool; do
     command -v "$command" >/dev/null || fail "required command is unavailable: $command"
 done
 
@@ -46,6 +46,14 @@ workspace_version="$(
     awk -F'"' '/^version = "/ { print $2; exit }' "$repo_root/Cargo.toml"
 )"
 expected_version="${VIEWR_VERSION:-$workspace_version}"
+
+work_dir="$(mktemp -d "${TMPDIR:-/tmp}/viewr-app-validation.XXXXXXXX")"
+cleanup() {
+    if [[ -n "${work_dir:-}" && -d "$work_dir" ]]; then
+        rm -rf -- "$work_dir"
+    fi
+}
+trap cleanup EXIT
 
 expected_layout="$(cat <<'EOF' | sort
 Viewr.app
@@ -164,6 +172,18 @@ fi
     'Print :UTImportedTypeDeclarations:0:UTTypeTagSpecification:public.mime-type' \
     "$info")" == "image/x-sony-arw" ]] ||
     fail "Sony ARW UTI does not declare image/x-sony-arw"
+
+expected_info="$work_dir/expected-Info.plist"
+normalized_info="$work_dir/actual-Info.plist"
+cp "$repo_root/packaging/macos/Info.plist.in" "$expected_info"
+/usr/libexec/PlistBuddy \
+    -c "Set :CFBundleShortVersionString $expected_version" \
+    -c "Set :CFBundleVersion $expected_version" \
+    "$expected_info"
+plutil -convert binary1 "$expected_info"
+plutil -convert binary1 -o "$normalized_info" "$info"
+cmp -s "$expected_info" "$normalized_info" ||
+    fail "app metadata differs from the exact versioned Info.plist template"
 
 codesign --verify --deep --strict --verbose=2 "$app"
 
