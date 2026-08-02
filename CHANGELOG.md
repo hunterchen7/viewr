@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.4.0](https://github.com/hunterchen7/viewr/compare/v0.3.0...v0.4.0) (2026-08-02)
+
+
+### Features
+
+* add a configurable image information strip with selectable fields and top or bottom placement ([#24](https://github.com/hunterchen7/viewr/pull/24))
+* fill the Full-resolution RAM cache adaptively with byte-budgeted, direction-biased prefetch beyond adjacent images ([#26](https://github.com/hunterchen7/viewr/pull/26))
+
+
+### Bug Fixes
+
+* harden adaptive prefetch scheduling ([2cff689](https://github.com/hunterchen7/viewr/commit/2cff689b4ebf97bd4a94b8ace98cdf1d69eec04c))
+* keep image info overflow draggable ([650b8f6](https://github.com/hunterchen7/viewr/commit/650b8f67e0a7c20a709ef20bbf051ce3425cd115))
+
+
+### Performance Improvements
+
+* release evicted cache owners after unlock ([cfac26d](https://github.com/hunterchen7/viewr/commit/cfac26da114c14a689a61062654184534d20c26d))
+
 ## [0.3.0](https://github.com/hunterchen7/viewr/compare/v0.1.1...v0.3.0) (2026-07-29)
 
 This is the first public release after v0.1.1. The v0.2.0 draft was not
