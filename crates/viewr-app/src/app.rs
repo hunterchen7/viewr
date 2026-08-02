@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use eframe::egui::{self, vec2};
 use viewr_core::cache_disk::DiskCache;
-use viewr_core::cache_ram::RamCache;
+use viewr_core::cache_ram::{RamCache, RamCacheBudgets};
 use viewr_core::db::{Db, default_db_path};
 use viewr_core::folder::{FolderEntry, normalize_physical_path, scan};
 use viewr_core::jobs::{Engine, EngineOptions, Event, NavState};
@@ -50,12 +50,15 @@ const RATING_DB_REFRESH_MAX_POLL: Duration = Duration::from_secs(5);
 
 type RatingRefreshResult = std::result::Result<RatingLoad, String>;
 
-fn ram_cache_budgets(total: u64) -> (u64, u64, u64) {
+fn ram_cache_budgets(total: u64) -> RamCacheBudgets {
     let thumbs = THUMB_BUDGET.min(total / 2);
     let developed = total - thumbs;
-    let rgba = developed / 3 * 2 + (developed % 3) * 2 / 3;
-    let jpeg = developed - rgba;
-    (thumbs, rgba, jpeg)
+    let fifth = developed / 5;
+    let remainder = developed % 5;
+    let full = fifth * 3 + remainder.min(3);
+    let browse = fifth + remainder.saturating_sub(3).min(1);
+    let jpeg = developed - full - browse;
+    RamCacheBudgets::new(thumbs, browse, full, jpeg)
 }
 
 pub fn run(dir: &Path, select: Option<&Path>) -> Result<()> {
@@ -90,6 +93,22 @@ fn native_options() -> eframe::NativeOptions {
 enum Mode {
     Loupe,
     Grid,
+}
+
+fn full_resolution_is_urgent(mode: Mode, zoom: Zoom) -> bool {
+    mode == Mode::Loupe && !matches!(zoom, Zoom::Fit)
+}
+
+fn image_failure_is_visible(
+    current: usize,
+    mode: Mode,
+    zoom: Zoom,
+    failed_index: usize,
+    failed_tier: Tier,
+) -> bool {
+    failed_index == current
+        && (failed_tier == Tier::Browse
+            || (failed_tier == Tier::Full && full_resolution_is_urgent(mode, zoom)))
 }
 
 fn top_bar_title(
@@ -368,8 +387,7 @@ impl App {
             .unwrap_or(0);
         let entries = Arc::new(entries);
         let ram_bytes = (self.config.ram_gb as f64 * 1e9) as u64;
-        let (thumb_bytes, rgba_bytes, jpeg_bytes) = ram_cache_budgets(ram_bytes);
-        let cache = Arc::new(RamCache::new(thumb_bytes, rgba_bytes, jpeg_bytes));
+        let cache = Arc::new(RamCache::new(ram_cache_budgets(ram_bytes)));
         let disk = DiskCache::open_default((self.config.disk_gb as f64 * 1e9) as u64);
         let rating_ctx = self.ctx.clone();
         let library = Library::start_with_database_ready_notify(Arc::new(move || {
@@ -506,7 +524,7 @@ impl App {
             session.engine.navigate(NavState {
                 current: self.current,
                 direction: self.direction,
-                zoomed: !matches!(self.zoom, Zoom::Fit),
+                zoomed: full_resolution_is_urgent(self.mode, self.zoom),
             });
         }
     }
@@ -595,6 +613,8 @@ impl App {
 
     fn drain_events(&mut self) {
         let current = self.current;
+        let mode = self.mode;
+        let zoom = self.zoom;
         let Some(session) = &mut self.session else {
             return;
         };
@@ -641,7 +661,7 @@ impl App {
                         session
                             .thumb_retry_after
                             .insert(index, Instant::now() + THUMB_FAILURE_RETRY_AFTER);
-                    } else if index == current && tier != Tier::Thumb {
+                    } else if image_failure_is_visible(current, mode, zoom, index, tier) {
                         self.status = Status::Error(format!("error: {error}"));
                     } else {
                         eprintln!("job failed {index}/{tier:?}: {error}");
@@ -1075,6 +1095,7 @@ impl App {
                 Mode::Grid => Mode::Loupe,
             };
             self.scroll_to_current = true;
+            self.replan();
         }
         if k.info {
             self.show_metadata = !self.show_metadata;
@@ -1604,6 +1625,7 @@ impl App {
             })
         });
         let mut standin = false; // zoomed onto a lower tier than Full
+        let full_was_urgent = full_resolution_is_urgent(self.mode, self.zoom);
         match best {
             Some((tier, tex, logical)) => {
                 img_size = Some(logical);
@@ -1619,7 +1641,6 @@ impl App {
                 }
                 if let Some(pos) = response.double_clicked_at {
                     loupe::toggle_100(&mut self.zoom, loupe_rect, logical, pos);
-                    self.replan();
                 }
             }
             None => {
@@ -1644,6 +1665,9 @@ impl App {
                     });
                 }
             }
+        }
+        if full_was_urgent != full_resolution_is_urgent(self.mode, self.zoom) {
+            self.replan();
         }
 
         // Never let a low-res stand-in masquerade as full res while
@@ -1772,11 +1796,15 @@ impl App {
         }
         self.manage_thumbnail_textures(&demanded_thumbs);
         self.scroll_to_current = false;
-        if let Some(i) = clicked {
-            self.select(i);
-        }
         if open_loupe {
             self.mode = Mode::Loupe;
+        }
+        if let Some(i) = clicked {
+            let selection_changed = i != self.current;
+            self.select(i);
+            if open_loupe && !selection_changed {
+                self.replan();
+            }
         }
         self.handle_keys(rect, None);
     }
@@ -1796,6 +1824,61 @@ mod tests {
         assert!(options.persist_window);
         assert_eq!(options.viewport.app_id.as_deref(), Some("viewr"));
         assert_eq!(options.viewport.inner_size, Some(vec2(1500.0, 950.0)));
+    }
+
+    #[test]
+    fn full_resolution_urgency_requires_a_zoomed_loupe() {
+        let anchored = Zoom::Anchored {
+            scale: 1.0,
+            center: egui::vec2(0.5, 0.5),
+        };
+        assert!(!full_resolution_is_urgent(Mode::Loupe, Zoom::Fit));
+        assert!(full_resolution_is_urgent(Mode::Loupe, anchored));
+        assert!(!full_resolution_is_urgent(Mode::Grid, Zoom::Fit));
+        assert!(!full_resolution_is_urgent(Mode::Grid, anchored));
+    }
+
+    #[test]
+    fn speculative_full_failures_do_not_replace_visible_status() {
+        let anchored = Zoom::Anchored {
+            scale: 1.0,
+            center: egui::vec2(0.5, 0.5),
+        };
+        assert!(image_failure_is_visible(
+            7,
+            Mode::Loupe,
+            Zoom::Fit,
+            7,
+            Tier::Browse
+        ));
+        assert!(!image_failure_is_visible(
+            7,
+            Mode::Loupe,
+            Zoom::Fit,
+            7,
+            Tier::Full
+        ));
+        assert!(image_failure_is_visible(
+            7,
+            Mode::Loupe,
+            anchored,
+            7,
+            Tier::Full
+        ));
+        assert!(!image_failure_is_visible(
+            7,
+            Mode::Loupe,
+            anchored,
+            8,
+            Tier::Full
+        ));
+        assert!(!image_failure_is_visible(
+            7,
+            Mode::Grid,
+            anchored,
+            7,
+            Tier::Full
+        ));
     }
 
     #[test]
@@ -2037,18 +2120,40 @@ mod tests {
     }
 
     #[test]
-    fn configured_ram_budget_includes_all_three_cache_rings() {
+    fn configured_ram_budget_includes_all_four_cache_rings() {
         for total in [0, 1, 3, 1_000_000_000, 64_000_000_000, u64::MAX] {
-            let (thumbs, rgba, jpeg) = ram_cache_budgets(total);
-            assert_eq!(thumbs + rgba + jpeg, total);
-            assert!(thumbs <= THUMB_BUDGET);
-            assert!(thumbs <= total / 2);
-            assert!(rgba >= jpeg || total <= 1);
+            let budgets = ram_cache_budgets(total);
+            assert_eq!(
+                budgets.thumb_rgba_bytes
+                    + budgets.browse_rgba_bytes
+                    + budgets.full_rgba_bytes
+                    + budgets.jpeg_bytes,
+                total
+            );
+            assert!(budgets.thumb_rgba_bytes <= THUMB_BUDGET);
+            assert!(budgets.thumb_rgba_bytes <= total / 2);
+            assert!(budgets.full_rgba_bytes >= budgets.browse_rgba_bytes);
+            assert!(budgets.full_rgba_bytes >= budgets.jpeg_bytes);
         }
 
-        let (thumbs, rgba, jpeg) = ram_cache_budgets(1_000_000_000);
-        assert_eq!(thumbs, THUMB_BUDGET);
-        assert_eq!(rgba + jpeg, 1_000_000_000 - THUMB_BUDGET);
+        let budgets = ram_cache_budgets(1_000_000_000);
+        assert_eq!(budgets.thumb_rgba_bytes, THUMB_BUDGET);
+        assert_eq!(
+            budgets.browse_rgba_bytes + budgets.full_rgba_bytes + budgets.jpeg_bytes,
+            1_000_000_000 - THUMB_BUDGET
+        );
+        assert!(
+            budgets
+                .full_rgba_bytes
+                .abs_diff((1_000_000_000 - THUMB_BUDGET) / 5 * 3)
+                <= 3
+        );
+
+        let default_budgets = ram_cache_budgets(4_500_000_000);
+        assert_eq!(default_budgets.thumb_rgba_bytes, 402_653_184);
+        assert_eq!(default_budgets.full_rgba_bytes, 2_458_408_090);
+        assert_eq!(default_budgets.browse_rgba_bytes, 819_469_363);
+        assert_eq!(default_budgets.jpeg_bytes, 819_469_363);
     }
 
     #[test]

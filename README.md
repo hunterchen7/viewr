@@ -10,15 +10,18 @@ ratings live in Lightroom-compatible `.xmp` sidecars.
 
 Work is demand-driven. The visible thumbnail viewport has a replaceable
 priority lane, while main-image development follows a bounded outward wave
-from the current image with a ~3:1 forward bias. When disk caching is enabled,
-idle workers make a best-effort persistent pass to warm Browse renders across
-the folder. Metadata is scanned separately, without decoding every embedded
-preview. Preferences can leave processing concurrency on the tuned Automatic
-mode or set a fixed logical-thread cap. A fixed cap covers RAW development,
-resizing, cache decode, and cache JPEG encoding, including source and cache
-reads performed by those image jobs. Lightweight interface, metadata scanning,
-ratings, updates, and disk-cache persistence and maintenance threads remain
-separate.
+from the current image with a ~3:1 forward bias. Byte estimates limit both the
+Browse wave and the larger Full working set. The scheduler admits at most one
+speculative Full job and one folder-wide Browse warm job at a time. Fixed
+one-thread and two-thread processing limits serialize those two background
+lanes. Foreground work has higher queue priority and cancels obsolete
+background work at supported checkpoints. This policy reserves dispatcher
+capacity, not a CPU core: a decoder or nested Rayon task can still use the
+configured processing pool. Metadata is scanned separately without a preview
+decode. Preferences can use Automatic processing concurrency or a fixed
+logical-thread limit. A fixed limit covers RAW development, resizing, cache
+decode, cache JPEG encoding, and related reads. Lightweight interface,
+metadata, rating, update, and cache service threads remain separate.
 
 Residency uses hard accounting limits and soft targets:
 
@@ -28,10 +31,13 @@ Residency uses hard accounting limits and soft targets:
    Browse texture remains underneath until each tile is ready. The viewport
    thumbnail LRU holds at most 256 MiB of logical RGBA bytes. The backend
    allocation can differ. Each frame uploads a maximum of eight new thumbnails.
-2. **Decoded RGBA in RAM** — exact LRU with a target byte budget for instant
-   display. Viewr preloads and pins Full renders for the current image and its
-   immediate visible neighbors. Pinned images can keep a ring above its target
-   until Viewr removes the pins.
+2. **Decoded RGBA in RAM** — separate exact-LRU rings hold Browse and Full
+   pixels. After the thumbnail allocation, the current experimental policy
+   assigns 60% of remaining capacity to Full RGBA, 20% to Browse RGBA, and 20%
+   to JPEG bytes. The Full planner grows a direction-biased priority prefix
+   toward its byte target. Current and adjacent Full renders stay mandatory. A
+   navigation change immediately removes stale optional Full renders. The
+   mandatory set can keep a ring above its target.
 3. **JPEG bytes in RAM** — memoized develops with a target byte budget. Their
    compression ratio is content-dependent; the texture-heavy benchmark is
    about 6× smaller than RGBA. Cache JPEGs default to quality 97 with 4:4:4
@@ -42,12 +48,12 @@ Residency uses hard accounting limits and soft targets:
    write, and files are never written inside photo folders.
 
 Both develop tiers use real RAW data. Browse uses a half-resolution superpixel
-demosaic. Full uses a full-resolution PPG demosaic. Fit mode schedules and pins
-Full renders for the current image and its immediate visible neighbors. Viewr
-does not upload Full pixels to the GPU until zoom needs them. Visible-region
-tiling starts after the Full CPU render completes; the underlying PPG RAW
-demosaic remains a whole-render operation. The main view can show an embedded
-thumbnail while the Browse render is not ready.
+demosaic. Full uses a full-resolution PPG demosaic. Fit mode schedules the
+complete Full working set. Speculative Full RAW misses remain RAM-only until
+the image becomes required. Viewr does not upload adjacent Full pixels to the
+GPU. Visible-region tiling starts when zoom needs the current Full render. The
+PPG RAW demosaic remains a whole-render operation. The main view can show an
+embedded thumbnail while the Browse render is not ready.
 
 The display pipeline applies the camera white balance and color matrix. It then
 applies a small exposure lift, highlight roll-off, sRGB transfer, and tone
@@ -165,6 +171,7 @@ package validation, default-viewer steps, and release architecture.
   obsolete journal write. Do not relaunch or downgrade to 0.1.x for folders or
   databases already used by 0.2.x.
 - [Testing and benchmark procedures](docs/testing-and-benchmarking.md).
+- [Adaptive Full-prefetch design and measurements](docs/adaptive-full-prefetch-2026-08-01.md).
 - [Performance and adversarial audit](docs/performance-adversarial-pass-2026-07-21.md).
 - [Design and implementation notes](docs/m0-notes.md).
 
