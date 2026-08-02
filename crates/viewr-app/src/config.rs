@@ -232,6 +232,10 @@ pub struct Config {
     /// JPEG quality for Browse and Full cache objects. Applies on the next
     /// folder open.
     pub jpeg_quality: u8,
+    /// Deletes every cached develop when the app exits (and clears crash
+    /// leftovers at startup). Trades fast folder reopens for zero disk
+    /// residue while the app is closed.
+    pub clear_disk_cache_on_exit: bool,
     /// Logical CPU workers for RAW/image processing. Automatic is represented
     /// separately from fixed values so a configuration stays portable.
     pub processing_threads: ProcessingThreadLimit,
@@ -297,6 +301,7 @@ struct RawCache {
     ram_gb: f32,
     disk_gb: f32,
     jpeg_quality: i16,
+    clear_on_exit: bool,
 }
 impl Default for RawCache {
     fn default() -> Self {
@@ -304,6 +309,7 @@ impl Default for RawCache {
             ram_gb: 4.5,
             disk_gb: 20.0,
             jpeg_quality: i16::from(CACHE_JPEG_QUALITY),
+            clear_on_exit: false,
         }
     }
 }
@@ -458,6 +464,7 @@ impl Config {
                 )
                 .try_into()
                 .expect("clamped JPEG quality fits in u8"),
+            clear_disk_cache_on_exit: raw.cache.clear_on_exit,
             processing_threads: normalize_worker_thread_limit(raw.performance.worker_threads),
             binds,
         }
@@ -525,7 +532,7 @@ impl Config {
              # hand-edits are read at startup but comments are not kept.\n\n[input]\n",
         );
         out.push_str(&format!(
-            "scroll = \"{}\"\nvertical_scroll_filmstrip = {}\n\n[ui]\ntier_indicator = \"{}\"\nshow_loading = {}\nshow_performance = {}\nfilmstrip_height = {:.0}\ngrid_cell = {:.0}\n\n[ui.image_info]\nenabled = {}\nposition = \"{}\"\nfile_name = {}\ncaptured = {}\nmodified = {}\ncamera = {}\nlens = {}\niso = {}\nshutter = {}\naperture = {}\nfocal_length = {}\nfile_size = {}\n\n[performance]\nworker_threads = {}\n\n[cache]\nram_gb = {:.1}\ndisk_gb = {:.1}\njpeg_quality = {}\n\n[binds]\n",
+            "scroll = \"{}\"\nvertical_scroll_filmstrip = {}\n\n[ui]\ntier_indicator = \"{}\"\nshow_loading = {}\nshow_performance = {}\nfilmstrip_height = {:.0}\ngrid_cell = {:.0}\n\n[ui.image_info]\nenabled = {}\nposition = \"{}\"\nfile_name = {}\ncaptured = {}\nmodified = {}\ncamera = {}\nlens = {}\niso = {}\nshutter = {}\naperture = {}\nfocal_length = {}\nfile_size = {}\n\n[performance]\nworker_threads = {}\n\n[cache]\nram_gb = {:.1}\ndisk_gb = {:.1}\njpeg_quality = {}\nclear_on_exit = {}\n\n[binds]\n",
             match self.scroll {
                 ScrollMode::Pan => "pan",
                 ScrollMode::Zoom => "zoom",
@@ -552,6 +559,7 @@ impl Config {
             self.ram_gb,
             self.disk_gb,
             self.jpeg_quality,
+            self.clear_disk_cache_on_exit,
         ));
         for &(name, _, action) in ACTIONS {
             let labels: Vec<String> = self
@@ -718,6 +726,18 @@ jpeg_quality = 97
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_on_exit_round_trips_and_defaults_off() {
+        let default = Config::from_raw(RawConfig::default());
+        assert!(!default.clear_disk_cache_on_exit);
+        assert!(default.serialized().contains("clear_on_exit = false"));
+
+        let mut enabled = default;
+        enabled.clear_disk_cache_on_exit = true;
+        let reparsed: RawConfig = toml::from_str(&enabled.serialized()).unwrap();
+        assert!(Config::from_raw(reparsed).clear_disk_cache_on_exit);
+    }
 
     #[test]
     fn parses_modified_binds() {

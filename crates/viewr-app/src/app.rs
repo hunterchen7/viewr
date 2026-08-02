@@ -75,6 +75,12 @@ pub fn run(dir: &Path, select: Option<&Path>) -> Result<()> {
             // job needs it, off the UI thread.
             std::thread::spawn(viewr_core::develop::warm_gamma_lut);
             let mut app = App::empty(cc);
+            if app.config.clear_disk_cache_on_exit {
+                // Crash leftovers: a clean exit already purged, so this is
+                // normally a no-op scan. Runs before the engine can start
+                // warming from (or writing to) the cache.
+                purge_disk_cache();
+            }
             app.open_folder(&dir, select.as_deref())
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             Ok(Box::new(app))
@@ -1205,7 +1211,25 @@ fn cache_state_stroke_color(state: CacheState) -> egui::Color32 {
     }
 }
 
+/// Deletes every disk-cache develop through the hardened GC traversal.
+fn purge_disk_cache() {
+    if let Some(cache) = DiskCache::open_default(0) {
+        cache.purge();
+    }
+}
+
 impl eframe::App for App {
+    fn on_exit(&mut self) {
+        if !self.config.clear_disk_cache_on_exit {
+            return;
+        }
+        // Stop the engine's writers first so the purge does not race fresh
+        // cache objects, then delete synchronously: exit blocks briefly on
+        // file removal instead of leaving the cache behind.
+        self.session = None;
+        purge_disk_cache();
+    }
+
     fn persist_egui_memory(&self) -> bool {
         // NativeOptions persists the root window. App preferences and panel
         // sizes use viewr.toml; transient widget state must not reopen dialogs
