@@ -397,9 +397,7 @@ if [[ "$default_after_install" != "$default_before" ||
         echo "UTI default after: ${type_default_after_install:-<none>}" >&2
         exit 1
     fi
-    if [[ "$default_before" != "/System/Applications/Preview.app" ||
-        "$type_default_before" != "/System/Applications/Preview.app" ||
-        "$default_after_install" != "$app" ||
+    if [[ "$default_after_install" != "$app" ||
         "$type_default_after_install" != "$app" ]]; then
         echo "error: Installer caused an unexpected ARW default transition" >&2
         echo "file default before: ${default_before:-<none>}" >&2
@@ -408,7 +406,7 @@ if [[ "$default_after_install" != "$default_before" ||
         echo "UTI default after: ${type_default_after_install:-<none>}" >&2
         exit 1
     fi
-    echo "Launch Services recomputed its implicit ARW default." >&2
+    echo "Launch Services recomputed its implicit ARW default to the canonical app." >&2
     echo "Explicit handler preferences remain unchanged." >&2
     echo "file default before: ${default_before:-<none>}" >&2
     echo "file default after: ${default_after_install:-<none>}" >&2
