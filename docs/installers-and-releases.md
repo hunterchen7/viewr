@@ -174,8 +174,12 @@ Run these commands on an Apple Silicon Mac with macOS 12 or later:
 
 ```bash
 cargo build --release --locked --target aarch64-apple-darwin -p viewr --bin viewr
-scripts/package-macos-pkg.sh \
+macos_app_root="$(mktemp -d)"
+scripts/build-macos-app.sh \
   target/aarch64-apple-darwin/release/viewr \
+  "$macos_app_root/Viewr.app"
+scripts/package-macos-pkg.sh \
+  --app "$macos_app_root/Viewr.app" \
   dist/viewr-macos-arm64.pkg
 scripts/validate-macos-pkg.sh \
   --test-open-events \
@@ -196,8 +200,11 @@ preferences. It uses the ARW file to test Finder-equivalent default routing.
 It verifies that the file contents do not change. It then removes the app and
 receipt.
 
-`package-macos-pkg.sh` uses `build-macos-app.sh` to build the app bundle.
-`validate-macos-pkg.sh` uses `validate-macos-app.sh` to check that bundle. The
+Use the same built app as the input for the installer and direct-update
+archive. `package-macos-pkg.sh` also accepts the arm64 binary directly when an
+app does not exist. In that form, it calls `build-macos-app.sh`.
+
+`validate-macos-pkg.sh` uses `validate-macos-app.sh` to check the bundle. The
 installer and direct-update archive therefore use one app structure.
 
 Use a valid Sony ARW file for `VIEWR_TEST_RAW`. CI downloads the pinned

@@ -380,7 +380,7 @@ jobs:
         shell: bash
         run: |
           scripts/package-macos-pkg.sh \
-            target/${{ matrix.target }}/release/viewr \
+            --app "$RUNNER_TEMP/viewr-portable-app/Viewr.app" \
             dist/viewr-macos-arm64.pkg
           scripts/validate-macos-pkg.sh \
             --test-open-events \
