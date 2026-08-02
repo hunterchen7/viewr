@@ -44,6 +44,10 @@ source_root="$stage_root/viewr-$version"
 mkdir -p "$source_root/.cargo"
 
 git -C "$repo_root" archive HEAD | tar -xf - -C "$source_root"
+# git archive records submodules as bare gitlinks; stage the in-tree rawler
+# fork so the archive builds without network access.
+mkdir -p "$source_root/vendor/dnglab"
+git -C "$repo_root/vendor/dnglab" archive HEAD | tar -xf - -C "$source_root/vendor/dnglab"
 (
   cd "$source_root"
   cargo vendor \

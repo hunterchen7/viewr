@@ -80,7 +80,7 @@ required=(
   "$top_level/vendor/jpeg-encoder-0.6.1/LICENSE-APACHE"
   "$top_level/vendor/jpeg-encoder-0.6.1/LICENSE-MIT"
   "$top_level/vendor/jpeg-rusturbo-0.9.2/NOTICE.md"
-  "$top_level/vendor/rawler-0.7.2/LICENSE"
+  "$top_level/vendor/dnglab/rawler/LICENSE"
   "$top_level/vendor/turbojpeg-sys-1.2.0/libjpeg-turbo/LICENSE.md"
   "$top_level/vendor/turbojpeg-sys-1.2.0/libjpeg-turbo/README.ijg"
 )
@@ -148,9 +148,9 @@ if grep -Fq "$work_dir" "$source_root/.cargo/config.toml"; then
   exit 1
 fi
 if [[ "$(
-  sha256sum "$source_root/vendor/rawler-0.7.2/LICENSE" | awk '{print $1}'
+  sha256sum "$source_root/vendor/dnglab/rawler/LICENSE" | awk '{print $1}'
 )" != "4bb33cc4cd956b56b779b501f18cae46a9e26f8c8500cca86ed758b8bc5e1788" ]]; then
-  echo "vendored rawler 0.7.2 license does not match the package source" >&2
+  echo "in-tree rawler fork license does not match the expected LGPL text" >&2
   exit 1
 fi
 jpeg_rusturbo_notice="$source_root/vendor/jpeg-rusturbo-${JPEG_RUSTURBO_VERSION}/NOTICE.md"
