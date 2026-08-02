@@ -50,6 +50,17 @@ cargo about generate \
 # them so macOS and Linux generate the same byte-for-byte inventory.
 LC_ALL=C perl -pi -e 's/\r\n?/\n/g' "$generated_licenses"
 
+# cargo-about excludes path-dependency crates, but the in-tree rawler fork
+# (vendor/dnglab, bit-identical performance fusion of upstream 0.7.2) still
+# ships under LGPL-2.1 and must stay in the inventory. Re-insert its overview
+# entry (alphabetically before rayon) and its LGPL used-by attribution.
+LC_ALL=C perl -0pi -e '
+  s/^(rayon [0-9])/rawler 0.7.2\nLicense: LGPL-2.1\nSource: https:\/\/github.com\/hunterchen7\/dnglab\n$1/m
+    or die "missing rayon overview anchor for the rawler license entry";
+  s/(GNU Lesser General Public License v2\.1 only\n\nUsed by:\n)/$1- rawler 0.7.2\n/
+    or die "missing LGPL used-by anchor for the rawler license entry";
+' "$generated_licenses"
+
 rust_sysroot="$(rustc --print sysroot)"
 rust_copyright_source="${rust_sysroot}/share/doc/rust/COPYRIGHT-library.html"
 if [[ ! -f "$rust_copyright_source" ]]; then

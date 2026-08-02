@@ -44,10 +44,6 @@ source_root="$stage_root/viewr-$version"
 mkdir -p "$source_root/.cargo"
 
 git -C "$repo_root" archive HEAD | tar -xf - -C "$source_root"
-# git archive records submodules as bare gitlinks; stage the in-tree rawler
-# fork so the archive builds without network access.
-mkdir -p "$source_root/vendor/dnglab"
-git -C "$repo_root/vendor/dnglab" archive HEAD | tar -xf - -C "$source_root/vendor/dnglab"
 (
   cd "$source_root"
   cargo vendor \
@@ -56,6 +52,19 @@ git -C "$repo_root/vendor/dnglab" archive HEAD | tar -xf - -C "$source_root/vend
     --sync tools/jpeg-bakeoff/Cargo.toml \
     vendor >.cargo/config.toml
 )
+# git archive records submodules as bare gitlinks, and cargo vendor rewrites
+# the vendor directory, so the in-tree rawler fork is staged afterwards. The
+# guard rejects a checkout whose submodule drifted from the recorded rev or
+# was never initialized, so an archive can never silently ship the wrong (or
+# no) rawler source.
+recorded_rawler_rev="$(git -C "$repo_root" rev-parse HEAD:vendor/dnglab)"
+checked_out_rawler_rev="$(git -C "$repo_root/vendor/dnglab" rev-parse HEAD 2>/dev/null || true)"
+if [[ "$checked_out_rawler_rev" != "$recorded_rawler_rev" ]]; then
+  echo "vendor/dnglab checkout ($checked_out_rawler_rev) does not match the recorded submodule rev ($recorded_rawler_rev); run 'git submodule update --init'" >&2
+  exit 1
+fi
+mkdir -p "$source_root/vendor/dnglab"
+git -C "$repo_root/vendor/dnglab" archive HEAD | tar -xf - -C "$source_root/vendor/dnglab"
 
 if touch -h -d "@$source_date_epoch" "$source_root" 2>/dev/null; then
   find "$source_root" -exec touch -h -d "@$source_date_epoch" {} +

@@ -42,7 +42,7 @@ jobs:
         if: ${{ steps.release.outputs.prs_created == 'true' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-            submodules: true
+          submodules: true
           ref: ${{ steps.release_pr.outputs.branch }}
       - name: Install Rust
         if: ${{ steps.release.outputs.prs_created == 'true' }}

@@ -55,13 +55,13 @@ jobs:
       - name: Check out current release tools
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-            submodules: true
+          submodules: true
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Check out immutable release source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-            submodules: true
+          submodules: true
           ref: refs/tags/${{ inputs.release_tag }}
           path: release-source
           persist-credentials: false
@@ -381,13 +381,13 @@ jobs:
       - name: Check out current release tools
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-            submodules: true
+          submodules: true
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Check out immutable release source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-            submodules: true
+          submodules: true
           ref: ${{ needs.gate.outputs.release_sha }}
           path: release-source
           persist-credentials: false
