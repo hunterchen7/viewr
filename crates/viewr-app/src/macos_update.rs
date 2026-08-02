@@ -24,6 +24,7 @@ const BUNDLE_IDENTIFIER: &str = "com.hunterchen.viewr";
 const MAX_ARCHIVE_ENTRIES: usize = 4096;
 const MAX_EXPANDED_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_PLAN_BYTES: u64 = 64 * 1024;
+const HELPER_STARTUP_PROBE_DELAY: Duration = Duration::from_millis(250);
 const LAUNCH_PROBE_DELAY: Duration = Duration::from_millis(750);
 const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
 
@@ -130,7 +131,7 @@ pub(crate) fn discard(prepared: PreparedUpdate) {
     }
 }
 
-pub(crate) fn spawn(prepared: &PreparedUpdate) -> Result<File, UpdateError> {
+pub(crate) fn spawn(prepared: &PreparedUpdate) -> Result<(), UpdateError> {
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -142,14 +143,26 @@ pub(crate) fn spawn(prepared: &PreparedUpdate) -> Result<File, UpdateError> {
         .mode(0o600)
         .open(&prepared.log_path)?;
     let stderr = log.try_clone()?;
-    Command::new(&prepared.helper_path)
+    let mut child = Command::new(&prepared.helper_path)
         .arg("--apply-macos-update")
         .arg(&prepared.plan_path)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(stderr))
         .spawn()?;
-    Ok(lock)
+    thread::sleep(HELPER_STARTUP_PROBE_DELAY);
+    if let Some(status) = child.try_wait()? {
+        return Err(UpdateError::InvalidRelease(format!(
+            "the application update helper exited during startup ({status})"
+        )));
+    }
+
+    // The helper must remain blocked until every field and worker owned by
+    // this process has finished dropping. Static storage would work too, but
+    // intentionally leaking this one descriptor makes the OS process lifetime
+    // the unambiguous gate. The OS closes it when the process exits.
+    std::mem::forget(lock);
+    Ok(())
 }
 
 pub(crate) fn apply(plan_path: &Path) -> Result<(), UpdateError> {
@@ -162,17 +175,31 @@ pub(crate) fn apply(plan_path: &Path) -> Result<(), UpdateError> {
         .open(&plan.lock_path)?;
     lock.lock()?;
 
+    let result = apply_after_parent_exit(&plan);
+    if let Err(error) = result {
+        let recovery = relaunch_bundle(&plan.previous_bundle, &plan.relaunch_arguments);
+        return match recovery {
+            Ok(_) => Err(error),
+            Err(recovery_error) => Err(UpdateError::InvalidRelease(format!(
+                "{error}; the previous Viewr app could not be reopened: {recovery_error}"
+            ))),
+        };
+    }
+    Ok(())
+}
+
+fn apply_after_parent_exit(plan: &UpdatePlan) -> Result<(), UpdateError> {
     let version = Version::parse(&plan.expected_version).map_err(|_| {
         UpdateError::InvalidRelease("the prepared update version is invalid".into())
     })?;
     validate_app_bundle(&plan.staged_bundle, &version)?;
     if validate_app_bundle(&plan.target_bundle, &version).is_ok() {
-        register_application(&plan)?;
-        probe_relaunch(&plan)?;
-        remove_staging_root(&plan)?;
+        register_application(plan)?;
+        probe_relaunch(plan)?;
+        log_cleanup_error("staging directory", remove_staging_root(plan));
         return Ok(());
     }
-    apply_transaction(&plan, &version)
+    apply_transaction(plan, &version)
 }
 
 fn lock_application_updates() -> Result<File, UpdateError> {
@@ -232,10 +259,16 @@ fn apply_transaction(plan: &UpdatePlan, version: &Version) -> Result<(), UpdateE
     }
 
     if had_target {
-        remove_verified_backup(plan)?;
+        log_cleanup_error("previous app backup", remove_verified_backup(plan));
     }
-    remove_staging_root(plan)?;
+    log_cleanup_error("staging directory", remove_staging_root(plan));
     Ok(())
+}
+
+fn log_cleanup_error(label: &str, result: Result<(), UpdateError>) {
+    if let Err(error) = result {
+        eprintln!("the update succeeded but could not remove its {label}: {error}");
+    }
 }
 
 fn rollback(plan: &UpdatePlan, had_target: bool) {
@@ -258,12 +291,16 @@ fn rollback(plan: &UpdatePlan, had_target: bool) {
 }
 
 fn relaunch(plan: &UpdatePlan) -> Result<Child, UpdateError> {
-    let executable = plan.target_bundle.join("Contents/MacOS/viewr-bin");
+    relaunch_bundle(&plan.target_bundle, &plan.relaunch_arguments)
+}
+
+fn relaunch_bundle(bundle: &Path, arguments: &[String]) -> Result<Child, UpdateError> {
+    let executable = bundle.join("Contents/MacOS/viewr-bin");
     let mut command = Command::new(executable);
-    if plan.relaunch_arguments.is_empty() {
+    if arguments.is_empty() {
         command.arg("--pick-folder");
     } else {
-        command.args(&plan.relaunch_arguments);
+        command.args(arguments);
     }
     command
         .stdin(Stdio::null())

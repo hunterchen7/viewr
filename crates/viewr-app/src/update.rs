@@ -1795,8 +1795,6 @@ pub(crate) struct UpdateManager {
     automatic_due_at: Option<Instant>,
     preference_refresh_due_at: Instant,
     dialog_open: bool,
-    #[cfg(target_os = "macos")]
-    shutdown_lock: Option<File>,
 }
 
 impl UpdateManager {
@@ -1830,8 +1828,6 @@ impl UpdateManager {
             automatic_due_at,
             preference_refresh_due_at: Instant::now(),
             dialog_open: false,
-            #[cfg(target_os = "macos")]
-            shutdown_lock: None,
         }
     }
 
@@ -2323,8 +2319,7 @@ impl UpdateManager {
                 }
                 match result {
                     Ok(prepared) => match crate::macos_update::spawn(&prepared) {
-                        Ok(lock) => {
-                            self.shutdown_lock = Some(lock);
+                        Ok(()) => {
                             self.state = UpdateState::ApplyingApplication { release };
                             self.dialog_open = true;
                             self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
