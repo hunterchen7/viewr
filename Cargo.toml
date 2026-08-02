@@ -80,4 +80,4 @@ opt-level = 0
 # corpus hash comparison) with one fewer full-frame traversal, ~20-25% faster
 # Full develop at 33 MP. See docs/browsing-loading-optimization-2026-08-01.md.
 [patch.crates-io]
-rawler = { path = "vendor/dnglab/rawler" }
+rawler = { path = "thirdparty/dnglab/rawler" }

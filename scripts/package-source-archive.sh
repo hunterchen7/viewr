@@ -48,20 +48,17 @@ git -C "$repo_root" archive HEAD | tar -xf - -C "$source_root"
 # is staged explicitly. The guard rejects a checkout whose submodule drifted
 # from the recorded rev or was never initialized, so an archive can never
 # silently ship the wrong (or no) rawler source.
-recorded_rawler_rev="$(git -C "$repo_root" rev-parse HEAD:vendor/dnglab)"
-checked_out_rawler_rev="$(git -C "$repo_root/vendor/dnglab" rev-parse HEAD 2>/dev/null || true)"
+recorded_rawler_rev="$(git -C "$repo_root" rev-parse HEAD:thirdparty/dnglab)"
+checked_out_rawler_rev="$(git -C "$repo_root/thirdparty/dnglab" rev-parse HEAD 2>/dev/null || true)"
 if [[ "$checked_out_rawler_rev" != "$recorded_rawler_rev" ]]; then
-  echo "vendor/dnglab checkout ($checked_out_rawler_rev) does not match the recorded submodule rev ($recorded_rawler_rev); run 'git submodule update --init'" >&2
+  echo "thirdparty/dnglab checkout ($checked_out_rawler_rev) does not match the recorded submodule rev ($recorded_rawler_rev); run 'git submodule update --init'" >&2
   exit 1
 fi
-stage_rawler_fork() {
-  mkdir -p "$source_root/vendor/dnglab"
-  git -C "$repo_root/vendor/dnglab" archive HEAD | tar -xf - -C "$source_root/vendor/dnglab"
-}
-# cargo vendor must see the workspace's rawler patch target to resolve the
-# lockfile, then rewrites the vendor directory and deletes it — so the fork
-# is staged before vendoring and staged again afterwards.
-stage_rawler_fork
+# The fork lives outside vendor/ so cargo's directory-source replacement
+# never scans it; staging once before vendoring lets cargo resolve the
+# workspace's rawler patch target.
+mkdir -p "$source_root/thirdparty/dnglab"
+git -C "$repo_root/thirdparty/dnglab" archive HEAD | tar -xf - -C "$source_root/thirdparty/dnglab"
 (
   cd "$source_root"
   cargo vendor \
@@ -70,7 +67,6 @@ stage_rawler_fork
     --sync tools/jpeg-bakeoff/Cargo.toml \
     vendor >.cargo/config.toml
 )
-stage_rawler_fork
 
 if touch -h -d "@$source_date_epoch" "$source_root" 2>/dev/null; then
   find "$source_root" -exec touch -h -d "@$source_date_epoch" {} +

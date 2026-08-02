@@ -51,7 +51,7 @@ cargo about generate \
 LC_ALL=C perl -pi -e 's/\r\n?/\n/g' "$generated_licenses"
 
 # cargo-about excludes path-dependency crates, but the in-tree rawler fork
-# (vendor/dnglab, bit-identical performance fusion of upstream 0.7.2) still
+# (thirdparty/dnglab, bit-identical performance fusion of upstream 0.7.2) still
 # ships under LGPL-2.1 and must stay in the inventory. Re-insert its overview
 # entry (alphabetically before rayon) and its LGPL used-by attribution.
 LC_ALL=C perl -0pi -e '

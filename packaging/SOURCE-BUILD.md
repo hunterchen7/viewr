@@ -18,10 +18,10 @@ The executable is in `target/release`. On Windows, the file name is
 `viewr.exe`.
 
 The rawler library that Viewr builds is the in-tree fork at
-`vendor/dnglab/rawler`. `Cargo.toml` already patches the crates.io
+`thirdparty/dnglab/rawler`. `Cargo.toml` already patches the crates.io
 dependency to that path, so its files are directly editable:
 
-1. Edit files in `vendor/dnglab/rawler`.
+1. Edit files in `thirdparty/dnglab/rawler`.
 2. Run `cargo build --release --locked --offline`.
 
 Do not edit other `vendor/` directories. Cargo verifies those against

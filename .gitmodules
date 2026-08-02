@@ -1,4 +1,4 @@
-[submodule "vendor/dnglab"]
-	path = vendor/dnglab
+[submodule "thirdparty/dnglab"]
+	path = thirdparty/dnglab
 	url = https://github.com/hunterchen7/dnglab
 	branch = viewr-ppg-fusion-0.7.2
