@@ -110,6 +110,10 @@ for executable in "$launcher" "$viewer"; do
     [[ "$minos" == "11.0" ]] ||
         fail "app executable requires macOS $minos instead of 11.0: $executable"
 done
+reported_version="$("$viewer" --version 2>/dev/null)" ||
+    fail "app viewer does not report its version"
+[[ "$reported_version" == "viewr $expected_version" ]] ||
+    fail "app viewer reports '$reported_version', expected 'viewr $expected_version'"
 
 expected_data_files=(
     "$app/Contents/Info.plist"

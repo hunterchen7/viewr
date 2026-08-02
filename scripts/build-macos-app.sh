@@ -66,6 +66,10 @@ version="${VIEWR_VERSION:-$workspace_version}"
 if [[ -n "${VIEWR_RELEASE_TAG:-}" && "$VIEWR_RELEASE_TAG" != "v$version" ]]; then
     fail "release tag $VIEWR_RELEASE_TAG does not match workspace version v$version"
 fi
+reported_version="$("$viewer_binary" --version 2>/dev/null)" ||
+    fail "viewer binary does not report its version"
+[[ "$reported_version" == "viewr $version" ]] ||
+    fail "viewer binary reports '$reported_version', expected 'viewr $version'"
 
 work_dir="$(mktemp -d "$output_dir/.viewr-macos-app.XXXXXX")"
 work_dir="$(cd "$work_dir" && pwd -P)"
