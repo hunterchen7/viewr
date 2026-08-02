@@ -22,22 +22,40 @@
 //! pool:
 //!
 //! ```
-//! use viewr_core::planning::{PlanKind, build_plan_targets};
+//! use std::collections::HashMap;
+//! use viewr_core::planning::{
+//!     BrowsePrefetchBudget, FullPrefetchBudget, NavigationPrefetchBudgets, PlanKind,
+//!     build_plan_targets_with_full_prefetch,
+//! };
 //! use viewr_core::types::Tier;
 //!
-//! let targets = build_plan_targets(100, 50, 1, false, &[], false);
+//! let budgets = NavigationPrefetchBudgets::new(
+//!     FullPrefetchBudget::new(700, 100, HashMap::new()),
+//!     BrowsePrefetchBudget::new(3_300, 100, HashMap::new()),
+//! );
+//! let targets = build_plan_targets_with_full_prefetch(
+//!     100,
+//!     50,
+//!     1,
+//!     false,
+//!     &[],
+//!     &budgets,
+//!     false,
+//! );
 //! assert!(targets.iter().any(|target| {
 //!     target.index == 50
 //!         && target.tier == Tier::Browse
 //!         && target.kind == PlanKind::Display
 //! }));
-//! // Fit mode preloads Full for the current image and its immediate neighbors.
+//! // Fit mode requires current and adjacent Full renders. Optional Full work
+//! // then grows toward the byte budget.
 //! let full_indices: Vec<_> = targets
 //!     .iter()
 //!     .filter(|target| target.tier == Tier::Full)
 //!     .map(|target| target.index)
 //!     .collect();
-//! assert_eq!(full_indices, [50, 49, 51]);
+//! assert_eq!(full_indices, [50, 49, 51, 52, 53, 54, 55]);
+//! assert!(targets.iter().any(|target| target.kind == PlanKind::Prefetch));
 //! ```
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]

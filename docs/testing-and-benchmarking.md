@@ -85,14 +85,16 @@ Use a filter when you work on one subsystem:
 ```sh
 cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- navigation_plan
 cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- jpeg
+cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- full_cache_policy
 ```
 
 The suite measures these workloads:
 
-- Navigation planning and production priority-queue synchronization for 100,
-  1,000, and 10,000 images, plus the former folder-wide planner as an
-  explicitly labeled reference. The queue benchmark excludes decoder threads
-  and filesystem cache probes.
+- Fixed and adaptive navigation planning for 100, 1,000, and 10,000 images.
+  The suite also measures production queue synchronization and the prior fixed
+  Full-window policy. Filtered cases separate the public defensive
+  normalization path from the engine's normalize-once path. The queue
+  benchmark excludes decoder threads and cache file probes.
 - Folder-open metadata queue construction for up to 100,000 entries. Queue
   destruction is excluded from the timed interval.
 - Warm, in-memory, all-hit SQLite point lookup and complete folder-startup
@@ -124,12 +126,14 @@ The suite measures these workloads:
 - Resize of a deterministic 12.2-megapixel image, plus rotation at 12.2 and
   32.7 megapixels.
 - JPEG encoding and decoding at the production Browse and Full dimensions and
-  quality, plus RAM-cache hits and eviction scaling. A dark-gradient regression
-  compares production quality against the legacy Full-cache setting. Decode
-  throughput uses compressed input bytes; latency remains the primary
-  comparison. The `jpeg_decode_serial` and `jpeg_encode_plain` groups keep the
-  whole-buffer serial decode and the markerless encode measurable beside the
-  production restart-marker split.
+  quality, plus RAM-cache hits and eviction scaling. The suite measures Full
+  working-set replacement, constant-time size snapshots, copy-on-write
+  observation updates with live snapshots, and release of large final owners.
+  A dark-gradient regression compares production quality against the legacy
+  Full-cache setting. Decode throughput uses compressed input bytes; latency
+  remains the primary comparison. The `jpeg_decode_serial` and
+  `jpeg_encode_plain` groups keep the whole-buffer serial decode and the
+  markerless encode measurable beside the production restart-marker split.
 - XMP parsing, XMP updates, and disk-cache key generation.
 - Warm, under-budget cache-GC scans for up to 10,000 objects.
   This case does not sort or delete cache objects.
@@ -155,6 +159,8 @@ See [the cache JPEG-quality experiment](jpeg-quality-2026-07-27.md) for the
 dark-gradient quality, storage, and latency tradeoff.
 See [the parallel cache-decode experiment](jpeg-parallel-decode-2026-07-28.md)
 for the restart-marker split decode and its rejected variants.
+See [the adaptive Full-prefetch experiment](adaptive-full-prefetch-2026-08-01.md)
+for the RAM policy, scheduler limits, and local benchmark results.
 
 ## Unsafe image-path checks
 
