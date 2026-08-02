@@ -625,6 +625,22 @@ impl RamCache {
             .collect()
     }
 
+    /// Reports which display payloads exist for one image index under one
+    /// lock acquisition, without changing LRU recency:
+    /// `(full RGBA, browse RGBA, any JPEG)`.
+    ///
+    /// Equivalent to four `has_*` probes; per-frame tier indicators use this
+    /// to take the cache mutex once per cell instead of up to four times.
+    pub fn image_residency(&self, index: usize) -> (bool, bool, bool) {
+        let inner = self.inner.lock().unwrap();
+        (
+            inner.full_rgba.contains(&(index, Tier::Full)),
+            inner.browse_rgba.contains(&(index, Tier::Browse)),
+            inner.jpeg.contains(&(index, Tier::Browse))
+                || inner.jpeg.contains(&(index, Tier::Full)),
+        )
+    }
+
     /// Inserts or replaces a decoded RGBA entry and enforces its ring budget.
     ///
     /// Payload size is the buffer's actual [`PixelBuf::byte_len`], even if its
@@ -859,6 +875,49 @@ mod tests {
             browse_bytes,
             jpeg_bytes,
         ))
+    }
+
+    #[test]
+    fn batched_residency_probes_match_individual_probes() {
+        let cache = RamCache::new(RamCacheBudgets::new(1_000, 1_000, 1_000, 1_000));
+        cache.set_navigation_policy([], [(2, Tier::Full)]);
+        cache.insert_rgba((0, Tier::Browse), buf(40));
+        cache.insert_rgba((1, Tier::Thumb), buf(40));
+        cache.insert_rgba((2, Tier::Full), buf(40));
+        cache.insert_jpeg((0, Tier::Browse), Arc::new(vec![0; 40]));
+        cache.insert_jpeg((3, Tier::Full), Arc::new(vec![0; 40]));
+
+        let keys = [
+            (0, Tier::Browse),
+            (1, Tier::Thumb),
+            (2, Tier::Full),
+            (3, Tier::Full),
+            (4, Tier::Browse),
+        ];
+        let batched = cache.probe_residency(keys.iter());
+        for (key, (rgba, jpeg)) in keys.iter().zip(batched) {
+            assert_eq!(rgba, cache.has_rgba(*key), "{key:?} rgba");
+            assert_eq!(jpeg, cache.has_jpeg(*key), "{key:?} jpeg");
+        }
+
+        for index in 0..5 {
+            let (full_rgba, browse_rgba, any_jpeg) = cache.image_residency(index);
+            assert_eq!(
+                full_rgba,
+                cache.has_rgba((index, Tier::Full)),
+                "{index} full"
+            );
+            assert_eq!(
+                browse_rgba,
+                cache.has_rgba((index, Tier::Browse)),
+                "{index} browse"
+            );
+            assert_eq!(
+                any_jpeg,
+                cache.has_jpeg((index, Tier::Browse)) || cache.has_jpeg((index, Tier::Full)),
+                "{index} jpeg"
+            );
+        }
     }
 
     #[test]

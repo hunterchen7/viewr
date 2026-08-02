@@ -1122,12 +1122,14 @@ impl App {
     }
 
     fn cache_state(session: &Session, index: usize) -> Option<CacheState> {
-        let cache = &session.cache;
-        if cache.has_rgba((index, Tier::Full)) {
+        // One lock acquisition per cell; the border and mark indicators call
+        // this for every visible thumbnail on every painted frame.
+        let (full_rgba, browse_rgba, any_jpeg) = session.cache.image_residency(index);
+        if full_rgba {
             Some(CacheState::Full)
-        } else if cache.has_rgba((index, Tier::Browse)) {
+        } else if browse_rgba {
             Some(CacheState::Browse)
-        } else if cache.has_jpeg((index, Tier::Browse)) || cache.has_jpeg((index, Tier::Full)) {
+        } else if any_jpeg {
             Some(CacheState::Compressed)
         } else {
             None
