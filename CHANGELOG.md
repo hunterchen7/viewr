@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.5.0](https://github.com/hunterchen7/viewr/compare/v0.4.0...v0.5.0) (2026-08-02)
+
+
+### Features
+
+* update macOS app directly ([4508c6e](https://github.com/hunterchen7/viewr/commit/4508c6e8df78e8c4fc80a4f2621d7696a393f0e2))
+* update the installed app directly ([f5c0e6a](https://github.com/hunterchen7/viewr/commit/f5c0e6a4cc022e39040a9658c1a86325ca260ceb))
+
+
+### Bug Fixes
+
+* close updater recovery races ([88e980a](https://github.com/hunterchen7/viewr/commit/88e980a27b4aa6b4432bd4d22a23ef7b8249c546))
+* consume direct-update paths on other platforms ([d72600a](https://github.com/hunterchen7/viewr/commit/d72600ab9579760175f0f51c06dc6a9f22a8ed4d))
+* harden direct update transaction ([52d09a4](https://github.com/hunterchen7/viewr/commit/52d09a4ae7314f90ad956fcbec6c783c15079e07))
+* harden update note layout ([c43d74e](https://github.com/hunterchen7/viewr/commit/c43d74e62e9efea5e81dfdfeb766ce2aed80a975))
+* hold updater gate until process exit ([dd61a6c](https://github.com/hunterchen7/viewr/commit/dd61a6c5e1e37a428456f8527bf273595af57a77))
+* make macOS updates recoverable ([af7c78f](https://github.com/hunterchen7/viewr/commit/af7c78fc37c51284e71cfb47d5e0810c6e835fd7))
+* pin macOS package install location ([dc4299c](https://github.com/hunterchen7/viewr/commit/dc4299c37c1ece032b96758dbc3fdbbf748805ad))
+* preserve macOS package recovery lifecycle ([0e31ebc](https://github.com/hunterchen7/viewr/commit/0e31ebc1d3a8ff652402615deafcc53dc3085a90))
+* render update notes as readable markdown ([6e04161](https://github.com/hunterchen7/viewr/commit/6e0416137119b624cf48b569358069ddd981e4c1))
+* retain recovery until package install completes ([c598a83](https://github.com/hunterchen7/viewr/commit/c598a835543456faca3a60de99478e530609dad0))
+* wait for updater parent before recovery ([f70bb60](https://github.com/hunterchen7/viewr/commit/f70bb60e46361cf3347fa81d9c6713661307b258))
+
 ## [0.4.0](https://github.com/hunterchen7/viewr/compare/v0.3.0...v0.4.0) (2026-08-02)
 
 
