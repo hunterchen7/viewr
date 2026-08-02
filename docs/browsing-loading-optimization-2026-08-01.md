@@ -106,6 +106,31 @@ the name String is built only for RAW entries. The final sort is now
 `sort_unstable_by`; names are unique within a directory, so order is
 unchanged.
 
+### Shared CFA decode between paired Browse/Full develops
+
+While zoomed, one navigation schedules a Browse and a Full develop of the
+same image, and each job re-opened and entropy-decoded the identical RAW —
+~61 ms per decode on the 33 MP corpus, twice per image. The earlier
+rejection of sharing was measured on a 20 MP fixture with a ~7 ms decode;
+at 33 MP the duplicate work dominates zoom-to-sharp latency, so the
+decision was revisited with a minimal design. The first develop leads and
+decodes; a concurrent peer waits (cancellation-checked) and receives the
+mosaic, usually moved out without a copy; a still-queued peer receives a
+published clone (~3 ms) only when peer interest exists. Fit mode schedules
+no Full jobs and pays only a map probe. A failed or panicking leader
+releases followers into their own decode through the guard's `Drop`. At
+most one decoded mosaic is retained outside the cache budgets. Pixels are
+identical; state-machine tests cover publish, dismiss, failure, cancelled
+waiting, and the retention bound.
+
+### Optional disk-cache purge on exit (feature)
+
+A new Cache preference (`[cache] clear_on_exit`, default off) deletes every
+cached develop at exit and clears crash leftovers at startup, leaving no
+cache on disk while the app is closed. `DiskCache::purge` reuses the
+hardened zero-budget GC traversal. The folder-reopen cost is documented in
+the preference's hover text.
+
 ### Banded-rotation exactness test (coverage only)
 
 The Rayon-banded quarter-turn path had no exact-output test; only small
@@ -115,6 +140,10 @@ reference.
 
 ## Rejected in this pass
 
+- **JPEG split-decode chunk retuning.** `CHUNKS_PER_WORKER` values 3 and
+  12 were measured against the production 6 on the synthetic 8 MP and
+  33 MP cache objects; both were slower (3: +16%/+33%; 12: far worse).
+  The documented value stands.
 - **Restructured rotation band loop.** Pixel-array casts with contiguous
   source runs were prototyped against the new exactness test. Paired runs
   on the shared machine could not demonstrate a win — the 33 MP cases
@@ -152,14 +181,9 @@ below), Rayon worker caps, batched SQLite `IN` rating queries.
    frame, then runs four full-frame passes; passes three and four are
    fusable and the border pass is serial. The route stays: measured
    optimization in rawler, then a pinned update with exact pixel comparisons.
-2. **Decoded-RAW sharing between Browse and Full.** The prior rejection was
-   measured on a 20 MP fixture (~7.3 ms decode). The 33 MP corpus decodes in
-   ~61 ms, so the duplicate entropy decode now costs ~10× the number the
-   rejection was based on. Worth re-evaluating with current cancellation
-   constraints.
-3. **Metadata-only rawler source without whole-file readahead** (upstream
+2. **Metadata-only rawler source without whole-file readahead** (upstream
    API) for the folder-open metadata wave.
-4. **Persistence encode/write pipelining** for warm-lane throughput.
+3. **Persistence encode/write pipelining** for warm-lane throughput.
 
 ## Verification
 
