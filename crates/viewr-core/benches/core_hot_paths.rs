@@ -1735,7 +1735,7 @@ fn bench_full_cache_policy(c: &mut Criterion) {
         rgba: vec![0; EVICTION_PAYLOAD_BYTES],
     });
     group.bench_function("insert_evicts_one_16mib_final_owner", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || {
                 let cache = RamCache::new(RamCacheBudgets::new(
                     0,
