@@ -71,6 +71,9 @@ pub fn run(dir: &Path, select: Option<&Path>) -> Result<()> {
         options,
         Box::new(move |cc| {
             crate::color::pin_srgb_colorspace(cc);
+            // Build the shared develop transfer table before the first image
+            // job needs it, off the UI thread.
+            std::thread::spawn(viewr_core::develop::warm_gamma_lut);
             let mut app = App::empty(cc);
             app.open_folder(&dir, select.as_deref())
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;

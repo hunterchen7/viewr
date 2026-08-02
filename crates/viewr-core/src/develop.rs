@@ -524,6 +524,16 @@ fn analytical_gamma_tone_pack(v: f32) -> u8 {
     (base_curve(gamma.clamp(0.0, 1.0)) * 255.0 + 0.5) as u8
 }
 
+/// Precomputes the shared gamma/tone lookup table.
+///
+/// The table is otherwise built lazily inside the first develop's timed gamma
+/// stage; warming it during application startup moves those transcendental
+/// evaluations off the first image's critical path. Safe to call from any
+/// thread, any number of times.
+pub fn warm_gamma_lut() {
+    let _ = gamma_tone_lut();
+}
+
 fn gamma_tone_lut() -> &'static [u8; GAMMA_LUT_LEN] {
     GAMMA_TONE_LUT.get_or_init(|| {
         let mut table = Box::new([0; GAMMA_LUT_LEN]);
