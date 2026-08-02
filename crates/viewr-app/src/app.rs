@@ -2148,6 +2148,12 @@ mod tests {
                 .abs_diff((1_000_000_000 - THUMB_BUDGET) / 5 * 3)
                 <= 3
         );
+
+        let default_budgets = ram_cache_budgets(4_500_000_000);
+        assert_eq!(default_budgets.thumb_rgba_bytes, 402_653_184);
+        assert_eq!(default_budgets.full_rgba_bytes, 2_458_408_090);
+        assert_eq!(default_budgets.browse_rgba_bytes, 819_469_363);
+        assert_eq!(default_budgets.jpeg_bytes, 819_469_363);
     }
 
     #[test]
