@@ -5,11 +5,8 @@
 
 ### Features
 
-* add adaptive full-resolution cache planning ([48824ea](https://github.com/hunterchen7/viewr/commit/48824ea3da8648b1d6a458758a9095fb08e9a595))
-* add configurable image information strip ([d720b9d](https://github.com/hunterchen7/viewr/commit/d720b9db2c46559721ea440a2817378b6f9d68ea))
-* add configurable image information strip ([382dd40](https://github.com/hunterchen7/viewr/commit/382dd40b9d35d5d0e5f0842e9bf2413a950c0875))
-* fill full-resolution cache adaptively ([9b71a9e](https://github.com/hunterchen7/viewr/commit/9b71a9e81f2b6b3ba68693d5379be6b0411c0d72))
-* fill full-resolution cache adaptively ([aeeb83e](https://github.com/hunterchen7/viewr/commit/aeeb83ee61115a4ff637ac39dba46a4d728c36b1))
+* add a configurable image information strip with selectable fields and top or bottom placement ([#24](https://github.com/hunterchen7/viewr/pull/24))
+* fill the Full-resolution RAM cache adaptively with byte-budgeted, direction-biased prefetch beyond adjacent images ([#26](https://github.com/hunterchen7/viewr/pull/26))
 
 
 ### Bug Fixes
