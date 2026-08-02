@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.4.0](https://github.com/hunterchen7/viewr/compare/v0.3.0...v0.4.0) (2026-08-02)
+
+
+### Features
+
+* add adaptive full-resolution cache planning ([48824ea](https://github.com/hunterchen7/viewr/commit/48824ea3da8648b1d6a458758a9095fb08e9a595))
+* add configurable image information strip ([d720b9d](https://github.com/hunterchen7/viewr/commit/d720b9db2c46559721ea440a2817378b6f9d68ea))
+* add configurable image information strip ([382dd40](https://github.com/hunterchen7/viewr/commit/382dd40b9d35d5d0e5f0842e9bf2413a950c0875))
+* fill full-resolution cache adaptively ([9b71a9e](https://github.com/hunterchen7/viewr/commit/9b71a9e81f2b6b3ba68693d5379be6b0411c0d72))
+* fill full-resolution cache adaptively ([aeeb83e](https://github.com/hunterchen7/viewr/commit/aeeb83ee61115a4ff637ac39dba46a4d728c36b1))
+
+
+### Bug Fixes
+
+* harden adaptive prefetch scheduling ([2cff689](https://github.com/hunterchen7/viewr/commit/2cff689b4ebf97bd4a94b8ace98cdf1d69eec04c))
+* keep image info overflow draggable ([650b8f6](https://github.com/hunterchen7/viewr/commit/650b8f67e0a7c20a709ef20bbf051ce3425cd115))
+
+
+### Performance Improvements
+
+* release evicted cache owners after unlock ([cfac26d](https://github.com/hunterchen7/viewr/commit/cfac26da114c14a689a61062654184534d20c26d))
+
 ## [0.3.0](https://github.com/hunterchen7/viewr/compare/v0.1.1...v0.3.0) (2026-07-29)
 
 This is the first public release after v0.1.1. The v0.2.0 draft was not
