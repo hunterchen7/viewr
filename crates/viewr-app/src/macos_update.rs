@@ -30,6 +30,7 @@ const MAX_EXPANDED_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_PLAN_BYTES: u64 = 64 * 1024;
 const HELPER_READY_TIMEOUT: Duration = Duration::from_secs(2);
 const HELPER_READY_POLL: Duration = Duration::from_millis(10);
+const PARENT_EXIT_TIMEOUT: Duration = Duration::from_secs(60);
 const LAUNCH_PROBE_DELAY: Duration = Duration::from_millis(750);
 const VALIDATION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_VALIDATION_OUTPUT_BYTES: u64 = 64 * 1024;
@@ -241,6 +242,7 @@ pub(crate) fn spawn(prepared: &mut PreparedUpdate) -> Result<(), UpdateError> {
 }
 
 pub(crate) fn apply(plan_path: &Path) -> Result<(), UpdateError> {
+    let parent_pid = current_parent_pid();
     let plan = read_plan(plan_path)?;
     validate_plan(&plan, plan_path)?;
     let _application_lock = lock_application_updates()?;
@@ -257,7 +259,11 @@ pub(crate) fn apply(plan_path: &Path) -> Result<(), UpdateError> {
         // Readiness is already observable. Keep the same recovery contract as
         // every later failure instead of letting the helper disappear after
         // the GUI has committed to exiting.
-        thread::sleep(LAUNCH_PROBE_DELAY);
+        if !wait_for_parent_exit(parent_pid, PARENT_EXIT_TIMEOUT) {
+            return Err(UpdateError::Busy(
+                "waiting for the previous Viewr process to exit after an update helper error",
+            ));
+        }
         return reopen_after_failure(&plan, before_mutation_failure(&plan, error));
     }
 
@@ -266,6 +272,23 @@ pub(crate) fn apply(plan_path: &Path) -> Result<(), UpdateError> {
         return reopen_after_failure(&plan, failure);
     }
     Ok(())
+}
+
+fn wait_for_parent_exit(parent_pid: u32, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if parent_process_exited(parent_pid, current_parent_pid()) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(HELPER_READY_POLL);
+    }
+}
+
+fn parent_process_exited(expected: u32, current: u32) -> bool {
+    expected != current
 }
 
 fn before_mutation_failure(plan: &UpdatePlan, error: UpdateError) -> ApplyFailure {
@@ -684,11 +707,17 @@ fn tree_owned_by_current_user_inner(path: &Path, visited: &mut usize) -> Result<
 
 unsafe extern "C" {
     fn geteuid() -> u32;
+    fn getppid() -> c_int;
 }
 
 fn current_euid() -> u32 {
     // SAFETY: `geteuid` takes no arguments and has no preconditions.
     unsafe { geteuid() }
+}
+
+fn current_parent_pid() -> u32 {
+    // SAFETY: `getppid` takes no arguments and has no preconditions.
+    unsafe { getppid().try_into().unwrap_or(0) }
 }
 
 fn directory_is_writable(path: &Path) -> bool {
@@ -1276,6 +1305,13 @@ mod tests {
 
         assert_eq!(failure.recovery_bundle, target);
         assert!(failure.rollback_error.is_none());
+    }
+
+    #[test]
+    fn parent_exit_wait_uses_reparenting_instead_of_a_fixed_delay() {
+        assert!(!parent_process_exited(42, 42));
+        assert!(parent_process_exited(42, 1));
+        assert!(parent_process_exited(42, 43));
     }
 
     #[test]
