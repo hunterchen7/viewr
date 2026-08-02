@@ -2,9 +2,9 @@
 
 Viewr supplies one native installer for each release platform.
 
-| Platform | Installer | Portable file |
+| Platform | Initial installer | Portable or direct-update file |
 |---|---|---|
-| macOS 11 or later, Apple Silicon | `viewr-macos-arm64.pkg` | `viewr-macos-arm64.tar.gz` |
+| macOS 11 or later, Apple Silicon | `viewr-macos-arm64.pkg` | `viewr-macos-arm64.tar.gz` (`Viewr.app`) |
 | Windows 10 or later, x64 | `viewr-windows-x64.msi` | `viewr-windows-x64.zip` |
 | Ubuntu 22.04+ or Debian 12+, x64 | `viewr-linux-x64.deb` | `viewr-linux-x64.tar.gz` |
 
@@ -24,10 +24,10 @@ check. The automatic-check preference is also shared by all open processes.
 When one process disables the checks, another process checks the preference
 again before it makes a network request.
 
-The update dialog shows the bounded release text as plain text. The dialog has
-these actions:
+The update dialog shows bounded release notes. The dialog has these actions:
 
-- **Download now** downloads the applicable package.
+- **Update and restart** applies the macOS app update.
+- **Download now** downloads the applicable Windows or Linux package.
 - **Later** closes the dialog for the current process.
 - **Skip this version** stores the exact available version.
 - **View release** opens the fixed GitHub release page.
@@ -37,15 +37,21 @@ normally. A manual check can show a skipped version again.
 
 ### Package selection
 
-Viewr selects an installer only when the current executable has a native
-installer path:
+Viewr selects `viewr-macos-arm64.tar.gz` on Apple Silicon macOS. The current
+executable must be in a bundle named `Viewr.app`. Viewr uses the archive to
+replace that bundle and restart.
 
-- macOS: `/Applications/Viewr.app/Contents/MacOS/viewr-bin`.
+Viewr selects an installer for these native Windows and Linux paths:
+
 - Windows: `Program Files\Viewr\viewr.exe`.
 - Linux: `/usr/bin/viewr`.
 
-For another executable path, Viewr selects the portable archive. Viewr downloads
-the archive but does not replace the current executable.
+For another Windows or Linux executable path, Viewr selects the portable
+archive. Viewr downloads that archive but does not replace the current
+executable.
+
+Use `viewr-macos-arm64.pkg` for the first macOS installation or for recovery.
+The in-app macOS updater does not open this installer.
 
 The package names are a fixed application contract. The updater does not use a
 file name from an HTTP header. The updater constructs the download URL from the
@@ -65,7 +71,7 @@ The updater applies the same checks. It also applies these controls:
 - It publishes the file only after the size and digest match.
 - It adds macOS quarantine data or Windows Internet-zone data.
 - It calculates SHA-256 and checks the download metadata again on a background
-  thread before it opens an installer.
+  thread before it uses the download.
 
 Viewr stores update state in the Viewr configuration directory. Viewr stores
 downloads and cross-process lock files in the Viewr cache directory. The updater
@@ -84,24 +90,50 @@ and the operating-system prompt before you continue.
 
 The GitHub digest detects a changed or incomplete download. The digest and the
 package use the same GitHub release trust boundary. Thus, the digest is not a
-publisher signature. The updater always requires a user action before it opens
-the operating-system installer.
+publisher signature. The updater always requires a user action before it
+installs an app update or opens an operating-system installer.
+
+### Direct macOS update
+
+Select **Update and restart** to apply a macOS update. Viewr downloads an exact
+archive with one top-level `Viewr.app` bundle. It checks the release digest,
+archive paths, entry types, expanded size, bundle identity, version, arm64
+binaries, launcher self-test, and code signature.
+
+Viewr stages the new bundle beside its destination. It then starts a helper
+from the staged bundle and closes the current app. The helper waits for the
+current process to release its lock. It replaces the bundle, registers the new
+app, and starts the new version.
+
+The helper keeps the previous bundle until the new version starts. It restores
+the previous bundle if validation, registration, or restart fails.
+
+Viewr replaces the current bundle only when its parent directory is writable.
+If that directory is not writable, Viewr stops and asks the user to move the
+app once; it does not create a second installation at another path.
+
+The first replacement of a root-owned package install keeps the old bundle at
+the fixed sibling path `.Viewr-system-recovery.app`. Viewr unregisters this
+recovery copy and never creates another retained backup. After the canonical
+bundle is user-owned, later updates use a temporary backup and delete it after
+the new version starts successfully. Reinstalling the recovery package removes
+the fixed recovery copy in its reviewed root postinstall script, so a later
+direct update can reserve that path again.
 
 ### Installer handoff
 
 Viewr opens the package with the applicable operating-system command:
 
-- macOS: `/usr/bin/open PACKAGE.pkg`.
 - Windows: the `msiexec.exe` in the Windows system directory.
 - Linux: `/usr/bin/xdg-open PACKAGE.deb`.
 
 The operating system controls permission prompts and installation. Viewr cannot
-reliably detect completion for all three package types. Thus, Viewr does not
+reliably detect completion for both installer types. Thus, Viewr does not
 claim that it can install and restart automatically.
 
-After the installer opens, close all Viewr windows. Complete the installation.
-Then open Viewr again. A normal Viewr close lets rating and cache workers finish
-their shutdown work.
+After the Windows or Linux installer opens, close all Viewr windows. Complete
+the installation. Then open Viewr again. A normal Viewr close lets rating and
+cache workers finish their shutdown work.
 
 Each installer registers Viewr as an available Sony ARW viewer. No installer
 overwrites an explicit user choice for the default viewer.
@@ -148,8 +180,12 @@ Run these commands on an Apple Silicon Mac with macOS 12 or later:
 
 ```bash
 cargo build --release --locked --target aarch64-apple-darwin -p viewr --bin viewr
-scripts/package-macos-pkg.sh \
+macos_app_root="$(mktemp -d)"
+scripts/build-macos-app.sh \
   target/aarch64-apple-darwin/release/viewr \
+  "$macos_app_root/Viewr.app"
+scripts/package-macos-pkg.sh \
+  --app "$macos_app_root/Viewr.app" \
   dist/viewr-macos-arm64.pkg
 scripts/validate-macos-pkg.sh \
   --test-open-events \
@@ -162,21 +198,31 @@ scripts/test-macos-pkg-install.sh \
 
 The validator checks the package layout, arm64 support, and the macOS 11
 requirement. It also checks bundle data, the ARW declaration, the deployment
-target, signatures, and licenses. The open-event test checks one same-folder
-batch and two later open events. Run the install test only on a disposable Mac.
+target, signatures, licenses, and the absence of bundle relocation rules. The
+package always targets `/Applications/Viewr.app`, even if Launch Services has
+seen another copy of Viewr. The open-event test checks one same-folder batch
+and two later open events. Run the install test only on a disposable Mac.
 The test installs the package in `/Applications`. It checks the receipt,
 payload, permissions, command, Launch Services registration, and handler
 preferences. It uses the ARW file to test Finder-equivalent default routing.
 It verifies that the file contents do not change. It then removes the app and
 receipt.
 
+Use the same built app as the input for the installer and direct-update
+archive. `package-macos-pkg.sh` also accepts the arm64 binary directly when an
+app does not exist. In that form, it calls `build-macos-app.sh`.
+
+`validate-macos-pkg.sh` uses `validate-macos-app.sh` to check the bundle. The
+installer and direct-update archive therefore use one app structure.
+
 Use a valid Sony ARW file for `VIEWR_TEST_RAW`. CI downloads the pinned
 public-domain fixture that the core compatibility tests use.
 
 The install test requires exact preservation of explicit Launch Services
 preferences. On an account without an explicit ARW choice, Launch Services can
-recompute its inferred default while Viewr is installed. The test verifies
-that removal restores the prior effective default.
+recompute its inferred default while temporary test bundles appear and
+disappear. The test verifies that the installer does not change handler
+preferences and that cleanup removes the canonical app registration.
 
 The installer supports macOS 11. The install test requires macOS 12 because it
 uses newer Launch Services inspection APIs.
@@ -277,15 +323,26 @@ default does not change.
 On macOS, run:
 
 ```bash
+portable_app_root="$(mktemp -d)"
+scripts/build-macos-app.sh \
+  target/aarch64-apple-darwin/release/viewr \
+  "$portable_app_root/Viewr.app"
 scripts/package-portable-archive.sh \
   --platform macos-arm64 \
-  --binary target/aarch64-apple-darwin/release/viewr \
+  --app "$portable_app_root/Viewr.app" \
   --output dist/viewr-macos-arm64.tar.gz
 scripts/validate-portable-archive.sh \
   --platform macos-arm64 \
   --archive dist/viewr-macos-arm64.tar.gz \
-  --expected-binary target/aarch64-apple-darwin/release/viewr
+  --expected-app "$portable_app_root/Viewr.app"
+scripts/test-macos-app-archive.sh \
+  "$portable_app_root/Viewr.app" \
+  dist/viewr-macos-arm64.tar.gz
 ```
+
+The macOS archive contains exactly one top-level `Viewr.app` and its required
+contents. Viewr uses this file for direct updates. Users can also extract and
+open the app without the initial installer.
 
 On Linux, use `linux-x64`, `viewr-linux-x64.tar.gz`, and the
 `x86_64-unknown-linux-gnu` binary path with the same two scripts.
@@ -308,9 +365,14 @@ archive under Windows PowerShell 5.1 and PowerShell 7. Repeated builds must be
 byte-identical within each runtime; both runtimes must produce the same exact
 validated file set and contents.
 
-The validators require the exact binary and license file set. They reject
-extra files, changed file contents, and an incorrect binary architecture. The
-tar validator also checks file modes.
+The Linux and Windows validators require the exact binary and license file
+set. They reject extra files, changed file contents, and an incorrect binary
+architecture.
+
+The macOS validator requires the exact app structure, metadata, resources,
+file types, modes, ownership, arm64 deployment targets, and code signature.
+It compares the archived app with the source app. The negative tests reject
+extra files, links, changed metadata, and duplicate archive entries.
 
 ## Build the release source
 

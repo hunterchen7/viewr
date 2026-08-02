@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+recovery_bundle="/Applications/.Viewr-system-recovery.app"
+if [ -e "$recovery_bundle" ] || [ -L "$recovery_bundle" ]; then
+    /bin/rm -rf -- "$recovery_bundle"
+fi
+
+exit 0

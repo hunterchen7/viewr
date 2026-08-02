@@ -52,6 +52,7 @@ macos_major="$(/usr/bin/sw_vers -productVersion | awk -F. '{ print $1 }')"
     fail "the macOS install test requires macOS 12 or later"
 
 app="/Applications/Viewr.app"
+recovery_bundle="/Applications/.Viewr-system-recovery.app"
 receipt="com.hunterchen.viewr.pkg"
 bundle_identifier="com.hunterchen.viewr"
 arw_type="com.sony.arw-raw-image"
@@ -86,6 +87,9 @@ workspace_version="$(
 if [[ -e "$app" || -L "$app" ]]; then
     fail "refusing to replace an existing $app"
 fi
+if [[ -e "$recovery_bundle" || -L "$recovery_bundle" ]]; then
+    fail "refusing to replace an existing $recovery_bundle"
+fi
 if "$pkgutil" --pkg-info "$receipt" >/dev/null 2>&1; then
     fail "refusing to replace an existing $receipt package receipt"
 fi
@@ -96,6 +100,7 @@ temp_base="${TMPDIR:-/tmp}"
 work_dir="$(mktemp -d "${temp_base%/}/viewr-macos-install.XXXXXX")"
 work_dir="$(cd "$work_dir" && pwd -P)"
 install_attempted=0
+recovery_fixture_created=0
 test_completed=0
 
 launch_services_preferences() {
@@ -123,6 +128,11 @@ cleanup() {
     trap - EXIT
     trap '' INT TERM
     cleanup_failed=0
+
+    if [[ "$recovery_fixture_created" == "1" &&
+        ( -e "$recovery_bundle" || -L "$recovery_bundle" ) ]]; then
+        sudo -n /bin/rm -rf -- "$recovery_bundle" || cleanup_failed=1
+    fi
 
     if [[ "$install_attempted" == "1" ]]; then
         if [[ -e "$app" || -L "$app" ]]; then
@@ -180,8 +190,13 @@ cleanup() {
                 "$app" \
                 "$fixture"
         )" || cleanup_failed=1
-        if [[ "${default_after_cleanup:-}" != "$default_before" ||
-            "${type_default_after_cleanup:-}" != "$type_default_before" ]]; then
+        # Launch Services may choose a different temporary Viewr build as its
+        # implicit default after the installed app is unregistered. An explicit
+        # user selection must remain exact; the preferences comparison below
+        # separately proves that the installer did not write a new selection.
+        if [[ "$explicit_binding_before" == "present" &&
+            ( "${default_after_cleanup:-}" != "$default_before" ||
+                "${type_default_after_cleanup:-}" != "$type_default_before" ) ]]; then
             echo "error: cleanup changed the default ARW application" >&2
             echo "file default before: ${default_before:-<none>}" >&2
             echo "file default after: ${default_after_cleanup:-<none>}" >&2
@@ -266,6 +281,9 @@ actual_receipt_files="$work_dir/actual-receipt-files.txt"
     LC_ALL=C sort >"$expected_receipt_files"
 
 install_log="$work_dir/installer.log"
+sudo -n /bin/mkdir -p "$recovery_bundle/Contents"
+sudo -n /usr/bin/touch "$recovery_bundle/Contents/old-package-recovery"
+recovery_fixture_created=1
 install_attempted=1
 if ! sudo -n /usr/sbin/installer \
     -pkg "$pkg" \
@@ -275,8 +293,13 @@ if ! sudo -n /usr/sbin/installer \
     fail "macOS Installer rejected the Viewr package"
 fi
 
-[[ -d "$app" && ! -L "$app" ]] ||
+if [[ ! -d "$app" || -L "$app" ]]; then
+    /bin/cat "$install_log" >&2
     fail "macOS Installer did not create a regular $app"
+fi
+[[ ! -e "$recovery_bundle" && ! -L "$recovery_bundle" ]] ||
+    fail "macOS Installer did not remove the retained recovery bundle"
+recovery_fixture_created=0
 "$pkgutil" --files "$receipt" |
     sed -e 's#^\./##' -e '/^\.$/d' -e 's#/$##' |
     LC_ALL=C sort >"$actual_receipt_files"
@@ -374,9 +397,7 @@ if [[ "$default_after_install" != "$default_before" ||
         echo "UTI default after: ${type_default_after_install:-<none>}" >&2
         exit 1
     fi
-    if [[ "$default_before" != "/System/Applications/Preview.app" ||
-        "$type_default_before" != "/System/Applications/Preview.app" ||
-        "$default_after_install" != "$app" ||
+    if [[ "$default_after_install" != "$app" ||
         "$type_default_after_install" != "$app" ]]; then
         echo "error: Installer caused an unexpected ARW default transition" >&2
         echo "file default before: ${default_before:-<none>}" >&2
@@ -385,7 +406,7 @@ if [[ "$default_after_install" != "$default_before" ||
         echo "UTI default after: ${type_default_after_install:-<none>}" >&2
         exit 1
     fi
-    echo "Launch Services recomputed its implicit ARW default." >&2
+    echo "Launch Services recomputed its implicit ARW default to the canonical app." >&2
     echo "Explicit handler preferences remain unchanged." >&2
     echo "file default before: ${default_before:-<none>}" >&2
     echo "file default after: ${default_after_install:-<none>}" >&2
