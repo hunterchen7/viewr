@@ -105,15 +105,17 @@ documented template on the first run.
 Download one of these files from
 [Releases](https://github.com/hunterchen7/viewr/releases):
 
-- macOS 11 or later, Apple Silicon: `viewr-macos-arm64.pkg`.
+- macOS 11 or later, Apple Silicon: `viewr-macos-arm64.pkg` for the first
+  installation.
 - Windows 10 or later, x64: `viewr-windows-x64.msi`.
 - Ubuntu 22.04 or later, or Debian 12 or later, x64:
   `viewr-linux-x64.deb`.
 
-Portable `.tar.gz` and `.zip` files remain available. The installers register
-Viewr as an ARW viewer without overwriting an explicit default. On a macOS
-account without an explicit ARW choice, Launch Services can infer Viewr as the
-default while it is installed.
+Portable `.tar.gz` and `.zip` files remain available. The macOS archive contains
+one top-level `Viewr.app`. Extract and open that app to use Viewr without the
+installer. The installers register Viewr as an ARW viewer without overwriting
+an explicit default. On a macOS account without an explicit ARW choice, Launch
+Services can infer Viewr as the default while it is installed.
 
 The current release packages are unsigned preview installers. They do not have
 Apple Developer ID or Windows Authenticode signatures. macOS Gatekeeper or
@@ -121,11 +123,16 @@ Windows SmartScreen can show a security prompt. Verify the downloaded artifact
 with its GitHub provenance attestation and `SHA256SUMS` before installation.
 
 Viewr checks stable GitHub releases from **Preferences > Updates**. It shows the
-release notes and supports **Download now**, **Later**, and **Skip this
-version**. Viewr verifies the exact package size and GitHub SHA-256 digest before
-it makes a download available. Installed copies open the native installer.
-Portable copies download the matching archive. The installer handoff requires
-user confirmation because the current preview packages are not platform-signed.
+release notes and supports **Update and restart** on macOS, or **Download now**
+on Windows and Linux. It also supports **Later** and **Skip this version**.
+Viewr verifies the exact package size and GitHub SHA-256 digest before it uses a
+download. A macOS `Viewr.app` stages the verified app archive, closes, replaces
+the bundle, and restarts. When its current directory is not writable, Viewr
+installs the update in `~/Applications/Viewr.app`. The macOS `.pkg` remains an
+initial-install and recovery fallback. Installed Windows and Linux copies open
+their native installers. Portable Windows and Linux copies download the
+matching archive. Installer handoff requires user confirmation because the
+current preview packages are not platform-signed.
 
 To build from source, run:
 
