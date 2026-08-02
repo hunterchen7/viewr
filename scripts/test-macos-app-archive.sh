@@ -48,6 +48,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
+self_test_dir="$work_dir/launcher-self-test"
+mkdir -p "$self_test_dir"
+tar -xzf "$archive" -C "$self_test_dir"
+rm -f -- "$self_test_dir/Viewr.app/Contents/MacOS/viewr-bin"
+if "$self_test_dir/Viewr.app/Contents/MacOS/ViewrLauncher" \
+    --viewr-launcher-self-test >/dev/null 2>&1; then
+    fail "launcher self-test unexpectedly succeeded without viewr-bin"
+fi
+
 make_archive() {
     local source_dir="$1"
     local output="$2"

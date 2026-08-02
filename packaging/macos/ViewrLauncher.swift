@@ -1,5 +1,91 @@
 import AppKit
+import Darwin
 import Foundation
+
+private let launcherSelfTestArgument = "--viewr-launcher-self-test"
+
+private func writeSelfTestMessage(_ message: String, to handle: FileHandle) {
+    handle.write(Data((message + "\n").utf8))
+}
+
+private func runLauncherSelfTest() -> Int32 {
+    guard let launcher = Bundle.main.executableURL else {
+        writeSelfTestMessage(
+            "viewr-launcher self-test failed",
+            to: .standardError
+        )
+        return 1
+    }
+
+    let viewer = launcher.deletingLastPathComponent()
+        .appendingPathComponent("viewr-bin", isDirectory: false)
+    guard FileManager.default.isExecutableFile(atPath: viewer.path) else {
+        writeSelfTestMessage(
+            "viewr-launcher self-test failed",
+            to: .standardError
+        )
+        return 1
+    }
+
+    let output = Pipe()
+    let process = Process()
+    process.executableURL = viewer
+    process.arguments = ["--version"]
+    process.standardInput = FileHandle.nullDevice
+    process.standardOutput = output
+    process.standardError = FileHandle.nullDevice
+
+    do {
+        try process.run()
+        process.waitUntilExit()
+    } catch {
+        writeSelfTestMessage(
+            "viewr-launcher self-test failed",
+            to: .standardError
+        )
+        return 1
+    }
+
+    guard process.terminationReason == .exit,
+          process.terminationStatus == 0,
+          let reported = String(
+              data: output.fileHandleForReading.readDataToEndOfFile(),
+              encoding: .utf8
+          )
+    else {
+        writeSelfTestMessage(
+            "viewr-launcher self-test failed",
+            to: .standardError
+        )
+        return 1
+    }
+
+    let versionOutput = reported.hasSuffix("\n")
+        ? String(reported.dropLast())
+        : reported
+    let prefix = "viewr "
+    guard versionOutput.hasPrefix(prefix),
+          !versionOutput.dropFirst(prefix.count).isEmpty,
+          !versionOutput.contains("\n"),
+          !versionOutput.contains("\r")
+    else {
+        writeSelfTestMessage(
+            "viewr-launcher self-test failed",
+            to: .standardError
+        )
+        return 1
+    }
+
+    let version = String(versionOutput.dropFirst(prefix.count))
+    writeSelfTestMessage("viewr-launcher \(version)", to: .standardOutput)
+    return 0
+}
+
+if CommandLine.arguments.count == 2,
+   CommandLine.arguments[1] == launcherSelfTestArgument
+{
+    exit(runLauncherSelfTest())
+}
 
 final class ViewrAppDelegate: NSObject, NSApplicationDelegate {
     private var children: [ObjectIdentifier: Process] = [:]

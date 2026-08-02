@@ -114,6 +114,11 @@ reported_version="$("$viewer" --version 2>/dev/null)" ||
     fail "app viewer does not report its version"
 [[ "$reported_version" == "viewr $expected_version" ]] ||
     fail "app viewer reports '$reported_version', expected 'viewr $expected_version'"
+launcher_reported_version="$(
+    "$launcher" --viewr-launcher-self-test 2>/dev/null
+)" || fail "app launcher self-test failed"
+[[ "$launcher_reported_version" == "viewr-launcher $expected_version" ]] ||
+    fail "app launcher reports '$launcher_reported_version', expected 'viewr-launcher $expected_version'"
 
 expected_data_files=(
     "$app/Contents/Info.plist"
