@@ -27,6 +27,40 @@ struct Entry<V> {
     pinned: bool,
 }
 
+/// Defers the common single replacement or eviction without allocating. A
+/// rare insert that removes more than one value spills later owners to `rest`.
+struct Removed<V> {
+    first: Option<V>,
+    rest: Vec<V>,
+}
+
+impl<V> Removed<V> {
+    fn new() -> Self {
+        Self {
+            first: None,
+            rest: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, value: V) {
+        if self.first.is_none() {
+            self.first = Some(value);
+        } else {
+            self.rest.push(value);
+        }
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.first.is_none()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        usize::from(self.first.is_some()) + self.rest.len()
+    }
+}
+
 struct ByteLru<V> {
     map: HashMap<Key, usize>,
     entries: Vec<Option<Entry<V>>>,
@@ -110,16 +144,32 @@ impl<V: Clone> ByteLru<V> {
         Some(entry.value)
     }
 
-    fn insert(&mut self, key: Key, value: V, bytes: u64, pinned: bool) {
-        self.insert_and_get_index(key, value, bytes, pinned);
+    fn insert(&mut self, key: Key, value: V, bytes: u64, pinned: bool) -> Removed<V> {
+        let mut removed = Removed::new();
+        self.insert_and_get_index(key, value, bytes, pinned, &mut removed);
+        removed
     }
 
-    fn insert_retained(&mut self, key: Key, value: V, bytes: u64, pinned: bool) -> bool {
-        let index = self.insert_and_get_index(key, value, bytes, pinned);
-        self.entries[index].is_some()
+    fn insert_retained(
+        &mut self,
+        key: Key,
+        value: V,
+        bytes: u64,
+        pinned: bool,
+    ) -> (bool, Removed<V>) {
+        let mut removed = Removed::new();
+        let index = self.insert_and_get_index(key, value, bytes, pinned, &mut removed);
+        (self.entries[index].is_some(), removed)
     }
 
-    fn insert_and_get_index(&mut self, key: Key, value: V, bytes: u64, pinned: bool) -> usize {
+    fn insert_and_get_index(
+        &mut self,
+        key: Key,
+        value: V,
+        bytes: u64,
+        pinned: bool,
+        removed: &mut Removed<V>,
+    ) -> usize {
         self.clock += 1;
         let clock = self.clock;
 
@@ -129,7 +179,7 @@ impl<V: Clone> ByteLru<V> {
             self.bytes -= old_bytes;
             let entry = self.entry_mut(index);
             debug_assert_eq!(entry.pinned, pinned);
-            entry.value = value;
+            removed.push(std::mem::replace(&mut entry.value, value));
             entry.bytes = bytes;
             entry.last_use = clock;
             index
@@ -170,7 +220,12 @@ impl<V: Clone> ByteLru<V> {
             index
         };
         self.bytes += bytes;
-        self.evict_over_budget();
+        while self.bytes > self.budget {
+            let Some(victim) = self.oldest_unpinned else {
+                break;
+            };
+            removed.push(self.remove_unpinned(victim));
+        }
         index
     }
 
@@ -212,6 +267,7 @@ impl<V: Clone> ByteLru<V> {
         }
     }
 
+    #[cfg(test)]
     fn evict_over_budget(&mut self) {
         self.evict_over_budget_into(&mut Vec::new());
     }
@@ -564,13 +620,12 @@ impl RamCache {
         let bytes = buf.byte_len() as u64;
         let mut inner = self.inner.lock().unwrap();
         let pinned = inner.pinned.contains(&key);
-        match key.1 {
+        let (retained, removed_pixels) = match key.1 {
             Tier::Thumb => {
                 if REPORT_RESIDENCY {
                     inner.thumbs.insert_retained(key, buf, bytes, pinned)
                 } else {
-                    inner.thumbs.insert(key, buf, bytes, pinned);
-                    true
+                    (true, inner.thumbs.insert(key, buf, bytes, pinned))
                 }
             }
             Tier::Browse => {
@@ -596,8 +651,7 @@ impl RamCache {
                 if REPORT_RESIDENCY {
                     inner.browse_rgba.insert_retained(key, buf, bytes, pinned)
                 } else {
-                    inner.browse_rgba.insert(key, buf, bytes, pinned);
-                    true
+                    (true, inner.browse_rgba.insert(key, buf, bytes, pinned))
                 }
             }
             Tier::Full => {
@@ -616,11 +670,13 @@ impl RamCache {
                 if REPORT_RESIDENCY {
                     inner.full_rgba.insert_retained(key, buf, bytes, pinned)
                 } else {
-                    inner.full_rgba.insert(key, buf, bytes, pinned);
-                    true
+                    (true, inner.full_rgba.insert(key, buf, bytes, pinned))
                 }
             }
-        }
+        };
+        drop(inner);
+        drop(removed_pixels);
+        retained
     }
 
     /// Inserts or replaces an encoded JPEG entry and enforces the JPEG budget.
@@ -628,7 +684,9 @@ impl RamCache {
         let bytes = bytes_vec.len() as u64;
         let mut inner = self.inner.lock().unwrap();
         let pinned = inner.pinned.contains(&key);
-        inner.jpeg.insert(key, bytes_vec, bytes, pinned);
+        let removed = inner.jpeg.insert(key, bytes_vec, bytes, pinned);
+        drop(inner);
+        drop(removed);
     }
 
     pub(crate) fn remove_jpeg(&self, key: Key) -> Option<Arc<Vec<u8>>> {
@@ -916,6 +974,26 @@ mod tests {
 
             assert_lru_matches_model(&actual, &model, step);
         }
+    }
+
+    #[test]
+    fn lru_insert_returns_evicted_owner_for_caller_scoped_drop() {
+        let mut cache = ByteLru::new(1);
+        let first = Arc::new(17_u8);
+        let first_weak = Arc::downgrade(&first);
+        assert!(
+            cache
+                .insert((0, Tier::Full), Arc::clone(&first), 1, false)
+                .is_empty()
+        );
+        drop(first);
+
+        let removed = cache.insert((1, Tier::Full), Arc::new(23), 1, false);
+        assert_eq!(removed.len(), 1);
+        assert!(first_weak.upgrade().is_some());
+
+        drop(removed);
+        assert!(first_weak.upgrade().is_none());
     }
 
     #[test]

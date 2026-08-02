@@ -1728,6 +1728,43 @@ fn bench_full_cache_policy(c: &mut Criterion) {
         );
     });
 
+    group.throughput(Throughput::Bytes(EVICTION_PAYLOAD_BYTES as u64));
+    let replacement = Arc::new(PixelBuf {
+        width: 1,
+        height: 1,
+        rgba: vec![0; EVICTION_PAYLOAD_BYTES],
+    });
+    group.bench_function("insert_evicts_one_16mib_final_owner", |b| {
+        b.iter_batched(
+            || {
+                let cache = RamCache::new(RamCacheBudgets::new(
+                    0,
+                    0,
+                    (8 * EVICTION_PAYLOAD_BYTES) as u64,
+                    0,
+                ));
+                let working_set: Vec<_> = (0..9).map(|index| (index, Tier::Full)).collect();
+                cache.set_navigation_policy([], working_set);
+                for index in 0..8 {
+                    cache.insert_rgba(
+                        (index, Tier::Full),
+                        Arc::new(PixelBuf {
+                            width: 1,
+                            height: 1,
+                            rgba: vec![0; EVICTION_PAYLOAD_BYTES],
+                        }),
+                    );
+                }
+                cache
+            },
+            |cache| {
+                cache.insert_rgba((8, Tier::Full), Arc::clone(&replacement));
+                black_box(cache.stats())
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
     group.throughput(Throughput::Elements(1));
     group.bench_function("snapshot_10000_observations", |b| {
         b.iter(|| black_box(snapshot_cache.full_prefetch_snapshot()));

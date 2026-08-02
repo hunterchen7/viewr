@@ -1062,9 +1062,9 @@ struct Shared {
     heavy: JobQueue,
     light: JobQueue,
     persistence: PersistenceQueue,
-    /// Full RGBA entries whose matching disk object was validated without
+    /// Full RGBA entries whose matching disk object was observed without
     /// installing JPEG bytes in RAM.
-    persistence_satisfied: Mutex<HashSet<JobId>>,
+    persistence_known_present: Mutex<HashSet<JobId>>,
     jpeg_quality: u8,
     /// Display order and its last navigation generation.
     navigation: Mutex<NavigationOrder>,
@@ -1294,7 +1294,7 @@ impl Engine {
                 heavy: JobQueue::new_with_parallel_background_lanes(parallel_background_lanes),
                 light: JobQueue::new(),
                 persistence: PersistenceQueue::new(),
-                persistence_satisfied: Mutex::new(HashSet::new()),
+                persistence_known_present: Mutex::new(HashSet::new()),
                 jpeg_quality: options.jpeg_quality,
                 navigation: Mutex::new(NavigationOrder::default()),
             }),
@@ -1411,7 +1411,7 @@ impl Engine {
                             && !cache.has_jpeg(id)
                             && !self
                                 .shared
-                                .persistence_satisfied
+                                .persistence_known_present
                                 .lock()
                                 .unwrap()
                                 .contains(&id)
@@ -2200,12 +2200,12 @@ fn run_rehydrate(
             if let Err(error) = disk.remove(&key) {
                 eprintln!("failed to remove corrupt disk cache object: {error}");
             }
-            shared.persistence_satisfied.lock().unwrap().remove(&id);
+            shared.persistence_known_present.lock().unwrap().remove(&id);
         } else {
-            // A previous resident promotion may have validated this key. If
+            // A previous resident promotion may have observed this key. If
             // disk cleanup removed it later, let the next successful RAW
             // fallback enqueue persistence again.
-            shared.persistence_satisfied.lock().unwrap().remove(&id);
+            shared.persistence_known_present.lock().unwrap().remove(&id);
         }
     }
 
@@ -2216,7 +2216,11 @@ fn run_persist_resident(shared: &Shared, index: usize, tier: Tier, token: &Cance
     let id = (index, tier);
     if token.cancelled()
         || shared.cache.has_jpeg(id)
-        || shared.persistence_satisfied.lock().unwrap().contains(&id)
+        || shared
+            .persistence_known_present
+            .lock()
+            .unwrap()
+            .contains(&id)
     {
         return;
     }
@@ -2227,7 +2231,7 @@ fn run_persist_resident(shared: &Shared, index: usize, tier: Tier, token: &Cance
             shared.jpeg_quality,
         ))
     {
-        shared.persistence_satisfied.lock().unwrap().insert(id);
+        shared.persistence_known_present.lock().unwrap().insert(id);
         return;
     }
     let Some(pixels) = shared.cache.get_rgba(id) else {
@@ -3000,7 +3004,7 @@ mod tests {
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             persistence: PersistenceQueue::new(),
-            persistence_satisfied: Mutex::new(HashSet::new()),
+            persistence_known_present: Mutex::new(HashSet::new()),
             jpeg_quality: CACHE_JPEG_QUALITY,
             navigation: Mutex::new(NavigationOrder::default()),
         };
@@ -3271,7 +3275,7 @@ mod tests {
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             persistence: PersistenceQueue::with_budget(pending_budget_bytes),
-            persistence_satisfied: Mutex::new(HashSet::new()),
+            persistence_known_present: Mutex::new(HashSet::new()),
             jpeg_quality,
             navigation: Mutex::new(NavigationOrder::default()),
         })
@@ -3349,7 +3353,7 @@ mod tests {
     }
 
     #[test]
-    fn validated_disk_persistence_is_reused_until_rehydrate_finds_it_missing() {
+    fn known_disk_persistence_is_reused_until_rehydrate_finds_it_missing() {
         let dir = tempfile::tempdir().unwrap();
         let raw_entry = entry(dir.path().join("promoted.arw"), 100);
         let disk = DiskCache::open_at(dir.path().join("cache"));
@@ -3363,7 +3367,7 @@ mod tests {
         run_persist_resident(&shared, 0, Tier::Full, &CancelToken::default());
         assert!(
             shared
-                .persistence_satisfied
+                .persistence_known_present
                 .lock()
                 .unwrap()
                 .contains(&(0, Tier::Full))
@@ -3373,7 +3377,7 @@ mod tests {
 
         assert!(shared.persistence.state.lock().unwrap().pending.is_empty());
 
-        // Losing the validated object must become recoverable once the Full
+        // Losing the observed object must become recoverable once the Full
         // pixels leave RAM and a later rehydrate observes the disk miss.
         shared.cache.set_navigation_policy([], []);
         shared.cache.set_navigation_policy([], [(0, Tier::Full)]);
@@ -3387,7 +3391,7 @@ mod tests {
         );
         assert!(
             !shared
-                .persistence_satisfied
+                .persistence_known_present
                 .lock()
                 .unwrap()
                 .contains(&(0, Tier::Full))
@@ -4386,7 +4390,7 @@ mod tests {
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             persistence: PersistenceQueue::new(),
-            persistence_satisfied: Mutex::new(HashSet::new()),
+            persistence_known_present: Mutex::new(HashSet::new()),
             jpeg_quality: CACHE_JPEG_QUALITY,
             navigation: Mutex::new(NavigationOrder::default()),
         };
@@ -4801,7 +4805,7 @@ mod tests {
             heavy: JobQueue::new(),
             light: JobQueue::new(),
             persistence: PersistenceQueue::new(),
-            persistence_satisfied: Mutex::new(HashSet::new()),
+            persistence_known_present: Mutex::new(HashSet::new()),
             jpeg_quality: CACHE_JPEG_QUALITY,
             navigation: Mutex::new(NavigationOrder::default()),
         };
