@@ -601,6 +601,30 @@ impl RamCache {
         self.inner.lock().unwrap().jpeg.contains(&key)
     }
 
+    /// Reports `(rgba resident, jpeg resident)` for every key under one lock
+    /// acquisition, without changing LRU recency.
+    ///
+    /// Equivalent to calling [`has_rgba`](Self::has_rgba) and
+    /// [`has_jpeg`](Self::has_jpeg) per key, but a navigation replan over
+    /// hundreds of plan targets takes the cache mutex once instead of twice
+    /// per target while decode workers compete for the same lock.
+    pub fn probe_residency<'k>(
+        &self,
+        keys: impl IntoIterator<Item = &'k Key>,
+    ) -> Vec<(bool, bool)> {
+        let inner = self.inner.lock().unwrap();
+        keys.into_iter()
+            .map(|key| {
+                let rgba = match key.1 {
+                    Tier::Thumb => inner.thumbs.contains(key),
+                    Tier::Browse => inner.browse_rgba.contains(key),
+                    Tier::Full => inner.full_rgba.contains(key),
+                };
+                (rgba, inner.jpeg.contains(key))
+            })
+            .collect()
+    }
+
     /// Inserts or replaces a decoded RGBA entry and enforces its ring budget.
     ///
     /// Payload size is the buffer's actual [`PixelBuf::byte_len`], even if its

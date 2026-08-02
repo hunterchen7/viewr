@@ -1401,20 +1401,25 @@ impl Engine {
                 .filter(|target| target.tier == Tier::Full)
                 .map(|target| (target.index, Tier::Full)),
         );
+        // One residency snapshot for the whole target list: per-target probes
+        // would take the cache mutex up to twice per target on this UI-thread
+        // path while workers publish results through the same lock. The plan
+        // stays advisory either way — workers re-check residency at claim.
+        let keys: Vec<JobId> = targets
+            .iter()
+            .map(|target| (target.index, target.tier))
+            .collect();
+        let residency = cache.probe_residency(keys.iter());
+        let persistence_known_present = self.shared.persistence_known_present.lock().unwrap();
         let mut plan: Vec<(JobId, u8, u32, Action)> = Vec::with_capacity(targets.len());
-        for target in targets {
+        for (target, (has_rgba, has_jpeg)) in targets.into_iter().zip(residency) {
             let id = (target.index, target.tier);
             match target.kind {
                 PlanKind::Display => {
-                    if cache.has_rgba(id) {
+                    if has_rgba {
                         if target.tier == Tier::Full
-                            && !cache.has_jpeg(id)
-                            && !self
-                                .shared
-                                .persistence_known_present
-                                .lock()
-                                .unwrap()
-                                .contains(&id)
+                            && !has_jpeg
+                            && !persistence_known_present.contains(&id)
                         {
                             plan.push((id, 3, target.effective_distance, Action::PersistResident));
                         }
@@ -1423,7 +1428,7 @@ impl Engine {
                     // A configured disk cache is probed by the worker during
                     // rehydrate. Navigation must not issue filesystem calls
                     // for every candidate on the UI thread.
-                    let action = if cache.has_jpeg(id) || disk.is_some() {
+                    let action = if has_jpeg || disk.is_some() {
                         Action::Rehydrate
                     } else {
                         Action::Develop(match target.tier {
@@ -1434,7 +1439,7 @@ impl Engine {
                     plan.push((id, target.class, target.effective_distance, action));
                 }
                 PlanKind::Prefetch => {
-                    if !cache.has_rgba(id) {
+                    if !has_rgba {
                         plan.push((
                             id,
                             target.class,
@@ -1449,6 +1454,7 @@ impl Engine {
                 }
             }
         }
+        drop(persistence_known_present);
 
         self.shared.heavy.set_plan(plan, navigation_changed);
         if disk.is_some() {
