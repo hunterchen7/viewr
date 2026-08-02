@@ -2377,6 +2377,7 @@ impl UpdateManager {
                         self.start_application_preparation(release, asset, path);
                         #[cfg(not(target_os = "macos"))]
                         {
+                            let _ = path;
                             self.state = UpdateState::Failed {
                                 message:
                                     "application self-updates are unsupported on this platform"
