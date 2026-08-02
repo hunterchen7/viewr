@@ -1879,6 +1879,15 @@ fn bench_xmp(c: &mut Criterion) {
         b.iter(|| black_box(parse_rating(black_box(element_xmp.as_str()))));
     });
 
+    // Foreign sidecars without any rating skip the full parse via the
+    // substring prefilter.
+    let unrated_xmp = attribute_xmp.replace(" xmp:Rating=\"3\"", "");
+    assert!(!unrated_xmp.contains("Rating"));
+    group.throughput(Throughput::Bytes(unrated_xmp.len() as u64));
+    group.bench_function("parse_no_rating", |b| {
+        b.iter(|| black_box(parse_rating(black_box(unrated_xmp.as_str()))));
+    });
+
     group.throughput(Throughput::Bytes(attribute_xmp.len() as u64));
     group.bench_function("update_attribute", |b| {
         b.iter(|| {
