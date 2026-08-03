@@ -174,11 +174,40 @@ pub(crate) fn color_image(buf: &PixelBuf, tile: TileCoord) -> Option<egui::Color
         return None;
     }
     let sample = sample_rect(buf.width, buf.height, tile)?;
+    extract_sample(buf.width, &buf.rgba, sample)
+}
+
+/// Extracts a tile's sample rectangle from a progressive staging snapshot,
+/// but only once every sampled pixel (core + gutter) has been covered by the
+/// engine's staged rectangles — a partially staged tile would bake stale
+/// zeros into a texture that is never re-uploaded.
+pub(crate) fn color_image_from_staging(
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    covered: &[[u32; 4]],
+    tile: TileCoord,
+) -> Option<egui::ColorImage> {
+    let expected_len = usize::try_from(width)
+        .ok()?
+        .checked_mul(usize::try_from(height).ok()?)?
+        .checked_mul(4)?;
+    if rgba.len() != expected_len {
+        return None;
+    }
+    let sample = sample_rect(width, height, tile)?;
+    if !rect_fully_covered(sample, covered) {
+        return None;
+    }
+    extract_sample(width, rgba, sample)
+}
+
+fn extract_sample(width: u32, rgba: &[u8], sample: PixelRect) -> Option<egui::ColorImage> {
     let pixel_count = usize::try_from(sample.width)
         .ok()?
         .checked_mul(usize::try_from(sample.height).ok()?)?;
     let mut pixels = Vec::with_capacity(pixel_count);
-    let source_stride = usize::try_from(buf.width).ok()?.checked_mul(4)?;
+    let source_stride = usize::try_from(width).ok()?.checked_mul(4)?;
     let row_bytes = usize::try_from(sample.width).ok()?.checked_mul(4)?;
     let first_x = usize::try_from(sample.x).ok()?.checked_mul(4)?;
     for y in sample.y..sample.bottom() {
@@ -186,7 +215,7 @@ pub(crate) fn color_image(buf: &PixelBuf, tile: TileCoord) -> Option<egui::Color
             .ok()?
             .checked_mul(source_stride)?
             .checked_add(first_x)?;
-        let row = buf.rgba.get(row_start..row_start.checked_add(row_bytes)?)?;
+        let row = rgba.get(row_start..row_start.checked_add(row_bytes)?)?;
         crate::pixels::extend_from_rgba(&mut pixels, row);
     }
     Some(egui::ColorImage::new(
@@ -242,6 +271,76 @@ pub(crate) fn color_image_band(band: &FullBand, tile: TileCoord) -> Option<egui:
         ],
         pixels,
     ))
+
+/// Whether `target` is entirely inside the union of `covered` rectangles
+/// (`[x, y, width, height]` each). Subtracts each covered rectangle from a
+/// worklist of uncovered remnants; the union covers `target` exactly when no
+/// remnant survives. The staging list stays short (tens of rects), so the
+/// remnant count stays small.
+pub(crate) fn rect_fully_covered(target: PixelRect, covered: &[[u32; 4]]) -> bool {
+    if target.width == 0 || target.height == 0 {
+        return true;
+    }
+    let mut remaining = vec![target];
+    for &[x, y, width, height] in covered {
+        if width == 0 || height == 0 {
+            continue;
+        }
+        if remaining.is_empty() {
+            break;
+        }
+        let cover = PixelRect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let mut next = Vec::with_capacity(remaining.len() + 3);
+        for rect in remaining {
+            if !rect.intersects(cover) {
+                next.push(rect);
+                continue;
+            }
+            let overlap_top = rect.y.max(cover.y);
+            let overlap_bottom = rect.bottom().min(cover.bottom());
+            let overlap_left = rect.x.max(cover.x);
+            let overlap_right = rect.right().min(cover.right());
+            if rect.y < overlap_top {
+                next.push(PixelRect {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: overlap_top - rect.y,
+                });
+            }
+            if overlap_bottom < rect.bottom() {
+                next.push(PixelRect {
+                    x: rect.x,
+                    y: overlap_bottom,
+                    width: rect.width,
+                    height: rect.bottom() - overlap_bottom,
+                });
+            }
+            if rect.x < overlap_left {
+                next.push(PixelRect {
+                    x: rect.x,
+                    y: overlap_top,
+                    width: overlap_left - rect.x,
+                    height: overlap_bottom - overlap_top,
+                });
+            }
+            if overlap_right < rect.right() {
+                next.push(PixelRect {
+                    x: overlap_right,
+                    y: overlap_top,
+                    width: rect.right() - overlap_right,
+                    height: overlap_bottom - overlap_top,
+                });
+            }
+        }
+        remaining = next;
+    }
+    remaining.is_empty()
 }
 
 pub(crate) fn paint_geometry(
@@ -512,6 +611,117 @@ mod tests {
                 .expect("tile")
                 .intersects(visible_pixels)
         }));
+    }
+
+    #[test]
+    fn coverage_predicate_matches_per_pixel_coverage_for_random_rects() {
+        let mut state = 0xC0FF_EE00_D15E_A5E5_u64;
+        let mut next = move |bound: u32| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as u32) % bound
+        };
+        let (grid_w, grid_h) = (24u32, 18u32);
+        for case in 0..500 {
+            let target = PixelRect {
+                x: next(grid_w - 1),
+                y: next(grid_h - 1),
+                width: 1 + next(8),
+                height: 1 + next(8),
+            };
+            let target = PixelRect {
+                x: target.x,
+                y: target.y,
+                width: target.width.min(grid_w - target.x),
+                height: target.height.min(grid_h - target.y),
+            };
+            let covered: Vec<[u32; 4]> = (0..next(7))
+                .map(|_| {
+                    let x = next(grid_w);
+                    let y = next(grid_h);
+                    [x, y, next(10), next(10)]
+                })
+                .collect();
+
+            let mut expected = true;
+            'outer: for y in target.y..target.bottom() {
+                for x in target.x..target.right() {
+                    let inside_any = covered
+                        .iter()
+                        .any(|&[cx, cy, cw, ch]| x >= cx && x < cx + cw && y >= cy && y < cy + ch);
+                    if !inside_any {
+                        expected = false;
+                        break 'outer;
+                    }
+                }
+            }
+            assert_eq!(
+                rect_fully_covered(target, &covered),
+                expected,
+                "case {case}: target {target:?} covered {covered:?}"
+            );
+        }
+
+        // A tile uploads iff its sample rect is inside the covered union:
+        // exact cover, split cover, and a one-pixel hole.
+        let sample = PixelRect {
+            x: 3,
+            y: 2,
+            width: 6,
+            height: 5,
+        };
+        assert!(rect_fully_covered(sample, &[[3, 2, 6, 5]]));
+        assert!(rect_fully_covered(sample, &[[0, 0, 24, 4], [0, 4, 24, 14]]));
+        assert!(!rect_fully_covered(
+            sample,
+            &[[3, 2, 6, 5 - 1], [3, 6, 5, 1]] // one missing corner pixel
+        ));
+    }
+
+    #[test]
+    fn staging_extraction_requires_full_sample_coverage_and_matches_the_buffer() {
+        let source = synthetic(2_060, 1_100);
+        let tile = TileCoord { col: 1, row: 0 };
+        let sample = sample_rect(source.width, source.height, tile).expect("tile");
+        let from_buf = color_image(&source, tile).expect("cached extraction");
+
+        // Fully covering the sample rect (in two pieces) permits extraction
+        // with bytes identical to the cache-backed path.
+        let split = [
+            [sample.x, sample.y, sample.width, 100],
+            [
+                0,
+                sample.y + 100,
+                source.width,
+                source.height - sample.y - 100,
+            ],
+        ];
+        let staged =
+            color_image_from_staging(source.width, source.height, &source.rgba, &split, tile)
+                .expect("covered staging extraction");
+        assert_eq!(staged.size, from_buf.size);
+        assert_eq!(staged.pixels, from_buf.pixels);
+
+        // The core alone is not enough: the one-pixel gutter is sampled by
+        // the GPU and must be staged too.
+        let core = core_rect(source.width, source.height, tile).expect("core");
+        assert!(
+            color_image_from_staging(
+                source.width,
+                source.height,
+                &source.rgba,
+                &[[core.x, core.y, core.width, core.height]],
+                tile,
+            )
+            .is_none()
+        );
+
+        // Malformed storage is rejected outright.
+        assert!(
+            color_image_from_staging(source.width, source.height, &source.rgba[1..], &split, tile)
+                .is_none()
+        );
     }
 
     #[test]

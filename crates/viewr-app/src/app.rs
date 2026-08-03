@@ -1027,14 +1027,17 @@ impl App {
     /// predicted-visible tiles so zoomed navigation paints sharp on frame
     /// one, then trickles this image's remaining tiles outward.
     ///
-    /// Before the installed Full buffer lands, the provisional decode band
-    /// (published between the rehydrate's decode phases) backs the same
-    /// tiles: same keys, same bytes, so tiles uploaded from the band are
-    /// reused as-is once the full buffer arrives.
+    /// Before the installed Full buffer lands, two provisional sources back
+    /// the same tiles with identical bytes: the engine's progressive staging
+    /// canvas while a develop assembles (tiles upload once their full sample
+    /// rectangle is covered), and the decode band published between a
+    /// rehydrate's phases. Nothing is ever re-uploaded when `ImageReady`
+    /// lands.
     fn progressive_full_overlay(&mut self, ui: &egui::Ui, response: &LoupeResponse) -> bool {
         enum OverlaySource {
             Full(std::sync::Arc<viewr_core::types::PixelBuf>),
             Band(std::sync::Arc<viewr_core::cache_ram::FullBand>),
+            Staging { width: u32, height: u32 },
         }
         if matches!(self.zoom, Zoom::Fit) {
             return false;
@@ -1043,18 +1046,37 @@ impl App {
         let next_ahead =
             next_ahead_index(&self.visible, self.visible_pos(), self.direction, current);
         let ctx = self.ctx.clone();
+        // Publish the viewport every zoomed frame (a cheap store): the next
+        // or in-flight Full develop uses it to develop this region first.
+        if let Some(session) = &self.session {
+            session.engine.set_full_viewport(
+                current,
+                [
+                    response.visible_uv.min.x,
+                    response.visible_uv.min.y,
+                    response.visible_uv.max.x,
+                    response.visible_uv.max.y,
+                ],
+            );
+        }
         let source = {
             let Some(session) = &self.session else {
                 return false;
             };
             if let Some(buf) = session.cache.get_rgba((current, Tier::Full)) {
                 OverlaySource::Full(buf)
+            } else if let Some((width, height)) = session
+                .engine
+                .with_progressive_full(current, |width, height, _, _| (width, height))
+                .filter(|&(width, height)| width > 0 && height > 0)
+            {
+                OverlaySource::Staging { width, height }
             } else if let Some(band) = session.cache.get_full_band(current) {
                 OverlaySource::Band(band)
             } else {
-                // Neither pixels nor a band. Any band-sourced tiles have lost
-                // their backing cache object (corrupt-object fallback): drop
-                // them so the RAW re-development cannot sit behind stale
+                // No pixels, staging, or band. Any band-sourced tiles have
+                // lost their backing cache object (corrupt-object fallback):
+                // drop them so the RAW re-development cannot sit behind stale
                 // JPEG-derived tiles. A single miss can also be a benign
                 // probe race, so draining waits for a second consecutive
                 // miss; recovery repaints are already scheduled either way.
@@ -1079,6 +1101,7 @@ impl App {
         let (image_width, image_height) = match &source {
             OverlaySource::Full(buf) => (buf.width, buf.height),
             OverlaySource::Band(band) => (band.full_width, band.full_height),
+            OverlaySource::Staging { width, height } => (*width, *height),
         };
         let order =
             progressive_texture::priority_order(image_width, image_height, response.visible_uv);
@@ -1106,20 +1129,33 @@ impl App {
         let mut uploaded = 0;
         let mut invalid_storage = false;
         // Extracts one tile from whichever pixel source backs this frame:
-        // the installed Full buffer, or the provisional decode band (whose
-        // covered tiles carry identical bytes). Band-uncovered tiles wait
-        // for the complete frame without counting as invalid storage.
+        // the installed Full buffer, the progressive staging canvas, or the
+        // provisional decode band — covered tiles carry identical bytes in
+        // all three. Uncovered tiles wait without counting as invalid.
         enum TileImage {
             Ready(egui::ColorImage),
             NotCovered,
             Invalid,
         }
-        let extract = |source: &OverlaySource, tile| match source {
+        let extract = |source: &OverlaySource,
+                       engine: &viewr_core::jobs::Engine,
+                       tile| match source {
             OverlaySource::Full(buf) => match progressive_texture::color_image(buf, tile) {
                 Some(image) => TileImage::Ready(image),
                 None => TileImage::Invalid,
             },
             OverlaySource::Band(band) => match progressive_texture::color_image_band(band, tile) {
+                Some(image) => TileImage::Ready(image),
+                None => TileImage::NotCovered,
+            },
+            OverlaySource::Staging { .. } => match engine
+                .with_progressive_full(current, |width, height, rgba, covered| {
+                    progressive_texture::color_image_from_staging(
+                        width, height, rgba, covered, tile,
+                    )
+                })
+                .flatten()
+            {
                 Some(image) => TileImage::Ready(image),
                 None => TileImage::NotCovered,
             },
@@ -1133,7 +1169,7 @@ impl App {
                 if session.full_tiles.contains_key(&key) {
                     continue;
                 }
-                let image = match extract(&source, tile) {
+                let image = match extract(&source, &session.engine, tile) {
                     TileImage::Ready(image) => image,
                     TileImage::NotCovered => continue,
                     TileImage::Invalid => {
@@ -1259,7 +1295,7 @@ impl App {
                 if session.full_tiles.contains_key(&key) {
                     continue;
                 }
-                let image = match extract(&source, tile) {
+                let image = match extract(&source, &session.engine, tile) {
                     TileImage::Ready(image) => image,
                     TileImage::NotCovered => continue,
                     TileImage::Invalid => {
@@ -1283,9 +1319,10 @@ impl App {
                     ctx.request_repaint();
                 }
             }
-            OverlaySource::Band(_) => {
-                // The rest of the frame is still decoding; keep polling for
-                // the installed buffer and the tiles the band cannot back.
+            OverlaySource::Band(_) | OverlaySource::Staging { .. } => {
+                // The rest of the frame is still assembling or decoding;
+                // keep polling for the installed buffer and the tiles a
+                // provisional source cannot back yet.
                 ctx.request_repaint();
             }
         }
