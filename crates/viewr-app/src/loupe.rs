@@ -115,6 +115,16 @@ pub fn show(
     }
 }
 
+/// The image UV rectangle [`show`] would sample for this framing.
+///
+/// Pure and deterministic: exactly the UV rect `layout` computes for the
+/// same inputs, so a caller can predict the visible rows without painting.
+pub(crate) fn visible_uv_for(rect: Rect, img_size: Vec2, zoom: Zoom) -> Rect {
+    let viewport = rect.size();
+    let fit_scale = (viewport.x / img_size.x).min(viewport.y / img_size.y);
+    layout(rect, img_size, zoom, fit_scale).1
+}
+
 /// Toggle between fit and 100% anchored at `anchor_screen` (viewport coords).
 pub fn toggle_100(zoom: &mut Zoom, rect: Rect, img_size: Vec2, anchor_screen: Pos2) {
     let viewport = rect.size();
@@ -321,6 +331,27 @@ mod tests {
             clamp_center(vec2(2.0, 0.1), viewport, image, 1.0),
             vec2(0.8, 0.5),
         );
+    }
+
+    #[test]
+    fn visible_uv_for_matches_the_painted_layout() {
+        let rect = Rect::from_min_size(pos2(10.0, 20.0), vec2(800.0, 600.0));
+        let img = vec2(4000.0, 3000.0);
+        for zoom in [
+            Zoom::Fit,
+            Zoom::Anchored {
+                scale: 1.0,
+                center: vec2(0.5, 0.5),
+            },
+            Zoom::Anchored {
+                scale: 2.0,
+                center: vec2(0.25, 0.7),
+            },
+        ] {
+            let fit_scale = (rect.width() / img.x).min(rect.height() / img.y);
+            let (_, uv) = layout(rect, img, zoom, fit_scale);
+            assert_rect_close(visible_uv_for(rect, img, zoom), uv);
+        }
     }
 
     #[test]

@@ -1,10 +1,11 @@
 //! Visible-region-first tiling for Full-resolution GPU textures.
 
 use eframe::egui;
+use viewr_core::cache_ram::FullBand;
 use viewr_core::types::PixelBuf;
 
 pub(crate) const TILE_EDGE: u32 = 1_024;
-const SAMPLE_GUTTER: u32 = 1;
+pub(crate) const SAMPLE_GUTTER: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct TileCoord {
@@ -197,6 +198,52 @@ pub(crate) fn color_image(buf: &PixelBuf, tile: TileCoord) -> Option<egui::Color
     ))
 }
 
+/// Extracts one tile from a provisional [`FullBand`], or `None` when the
+/// band does not fully cover the tile's sample rectangle (gutter included)
+/// or its storage is inconsistent.
+///
+/// For covered tiles the produced image is byte-identical to
+/// [`color_image`] over the finished full buffer: the band rows are copies
+/// of the same decoded rows, and the sample rectangle is computed against
+/// the same full-image dimensions.
+pub(crate) fn color_image_band(band: &FullBand, tile: TileCoord) -> Option<egui::ColorImage> {
+    if band.buf.width != band.full_width {
+        return None;
+    }
+    let source_stride = usize::try_from(band.full_width).ok()?.checked_mul(4)?;
+    let expected_len = source_stride.checked_mul(usize::try_from(band.buf.height).ok()?)?;
+    if band.buf.rgba.len() != expected_len {
+        return None;
+    }
+    let sample = sample_rect(band.full_width, band.full_height, tile)?;
+    let band_bottom = band.y0.checked_add(band.buf.height)?;
+    if sample.y < band.y0 || sample.bottom() > band_bottom {
+        return None;
+    }
+    let pixel_count = usize::try_from(sample.width)
+        .ok()?
+        .checked_mul(usize::try_from(sample.height).ok()?)?;
+    let mut pixels = Vec::with_capacity(pixel_count);
+    let row_bytes = usize::try_from(sample.width).ok()?.checked_mul(4)?;
+    let first_x = usize::try_from(sample.x).ok()?.checked_mul(4)?;
+    for y in sample.y..sample.bottom() {
+        let local_row = usize::try_from(y - band.y0).ok()?;
+        let row_start = local_row.checked_mul(source_stride)?.checked_add(first_x)?;
+        let row = band
+            .buf
+            .rgba
+            .get(row_start..row_start.checked_add(row_bytes)?)?;
+        crate::pixels::extend_from_rgba(&mut pixels, row);
+    }
+    Some(egui::ColorImage::new(
+        [
+            usize::try_from(sample.width).ok()?,
+            usize::try_from(sample.height).ok()?,
+        ],
+        pixels,
+    ))
+}
+
 pub(crate) fn paint_geometry(
     image_width: u32,
     image_height: u32,
@@ -370,6 +417,70 @@ mod tests {
         let mut malformed = source;
         malformed.rgba.pop();
         assert!(color_image(&malformed, TileCoord { col: 0, row: 0 }).is_none());
+    }
+
+    fn band_of(full: &PixelBuf, y0: u32, height: u32) -> FullBand {
+        let row_bytes = full.width as usize * 4;
+        FullBand {
+            full_width: full.width,
+            full_height: full.height,
+            y0,
+            buf: PixelBuf {
+                width: full.width,
+                height,
+                rgba: full.rgba
+                    [y0 as usize * row_bytes..(y0 + height) as usize * row_bytes]
+                    .to_vec(),
+            },
+        }
+    }
+
+    #[test]
+    fn band_extraction_equals_full_extraction_for_fully_covered_tiles() {
+        let full = synthetic(2_050, 1_100);
+
+        // A top band covering tile row 0 including its bottom sample gutter.
+        let top = band_of(&full, 0, TILE_EDGE + SAMPLE_GUTTER);
+        // A bottom band starting at tile row 1's gutter row.
+        let bottom_y0 = TILE_EDGE - SAMPLE_GUTTER;
+        let bottom = band_of(&full, bottom_y0, full.height - bottom_y0);
+
+        for col in 0..3 {
+            let row0 = TileCoord { col, row: 0 };
+            let row1 = TileCoord { col, row: 1 };
+
+            let from_band = color_image_band(&top, row0).expect("row 0 is fully covered");
+            let from_full = color_image(&full, row0).expect("tile");
+            assert_eq!(from_band.size, from_full.size, "col {col} row 0 size");
+            assert_eq!(from_band.pixels, from_full.pixels, "col {col} row 0 pixels");
+            assert!(
+                color_image_band(&top, row1).is_none(),
+                "col {col}: row 1 samples rows past the top band"
+            );
+
+            let from_band = color_image_band(&bottom, row1).expect("row 1 is fully covered");
+            let from_full = color_image(&full, row1).expect("tile");
+            assert_eq!(from_band.size, from_full.size, "col {col} row 1 size");
+            assert_eq!(from_band.pixels, from_full.pixels, "col {col} row 1 pixels");
+            assert!(
+                color_image_band(&bottom, row0).is_none(),
+                "col {col}: row 0 samples rows above the bottom band"
+            );
+        }
+    }
+
+    #[test]
+    fn band_extraction_rejects_inconsistent_band_storage() {
+        let full = synthetic(2_050, 1_100);
+        let tile = TileCoord { col: 0, row: 0 };
+
+        let mut truncated = band_of(&full, 0, TILE_EDGE + SAMPLE_GUTTER);
+        truncated.buf.rgba.pop();
+        assert!(color_image_band(&truncated, tile).is_none());
+
+        let mut wrong_width = band_of(&full, 0, TILE_EDGE + SAMPLE_GUTTER);
+        wrong_width.buf.width -= 1;
+        assert!(color_image_band(&wrong_width, tile).is_none());
     }
 
     #[test]
