@@ -1730,7 +1730,9 @@ fn bench_full_cache_policy(c: &mut Criterion) {
 
     const EVICTION_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
     group.throughput(Throughput::Bytes((8 * EVICTION_PAYLOAD_BYTES) as u64));
-    group.bench_function("evict_eight_unique_16mib_final_owners", |b| {
+    // A working-set change alone no longer evicts (retention is lazy); the
+    // stale final owners now drop when refilling the ring crosses its budget.
+    group.bench_function("refill_evicts_eight_unique_16mib_final_owners", |b| {
         b.iter_batched(
             || {
                 let cache = RamCache::new(RamCacheBudgets::new(
@@ -1739,11 +1741,11 @@ fn bench_full_cache_policy(c: &mut Criterion) {
                     (8 * EVICTION_PAYLOAD_BYTES) as u64,
                     0,
                 ));
-                let resident: Vec<_> = (0..8).map(|index| (index, Tier::Full)).collect();
-                cache.set_navigation_policy([], resident.iter().copied());
-                for key in resident {
+                let working_set: Vec<_> = (0..16).map(|index| (index, Tier::Full)).collect();
+                cache.set_navigation_policy([], working_set);
+                for index in 0..8 {
                     cache.insert_rgba(
-                        key,
+                        (index, Tier::Full),
                         Arc::new(PixelBuf {
                             width: 1,
                             height: 1,
@@ -1751,11 +1753,24 @@ fn bench_full_cache_policy(c: &mut Criterion) {
                         }),
                     );
                 }
-                let replacement: Vec<_> = (8..16).map(|index| (index, Tier::Full)).collect();
-                (cache, replacement)
+                let replacements: Vec<_> = (8..16)
+                    .map(|index| {
+                        (
+                            (index, Tier::Full),
+                            Arc::new(PixelBuf {
+                                width: 1,
+                                height: 1,
+                                rgba: vec![0; EVICTION_PAYLOAD_BYTES],
+                            }),
+                        )
+                    })
+                    .collect();
+                (cache, replacements)
             },
-            |(cache, replacement)| {
-                cache.set_navigation_policy([], replacement);
+            |(cache, replacements)| {
+                for (key, payload) in replacements {
+                    cache.insert_rgba(key, payload);
+                }
                 black_box(cache.stats())
             },
             BatchSize::LargeInput,

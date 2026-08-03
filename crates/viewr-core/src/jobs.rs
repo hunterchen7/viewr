@@ -1642,7 +1642,9 @@ impl Engine {
         drop(prefetch_budgets);
         // Filtered navigation pins visible neighbors rather than unrelated raw
         // indices. Installing the desired Full keys under that same cache lock
-        // also evicts stale speculative buffers and rejects late completions.
+        // rejects late completions for keys outside the new working set;
+        // already-resident out-of-set buffers stay until byte pressure evicts
+        // them so revisits remain RAM hits.
         cache.set_navigation_policy(
             pins,
             targets
@@ -3837,7 +3839,15 @@ mod tests {
 
         // Losing the observed object must become recoverable once the Full
         // pixels leave RAM and a later rehydrate observes the disk miss.
-        shared.cache.set_navigation_policy([], []);
+        // Retention is lazy, so displace the resident pixels through byte
+        // pressure instead of expecting the working-set change to evict them.
+        shared.cache.set_navigation_policy([], [(1, Tier::Full)]);
+        assert!(
+            shared
+                .cache
+                .insert_rgba_if_desired((1, Tier::Full), Arc::new(patterned_buf(4, 4)))
+        );
+        assert!(!shared.cache.has_rgba((0, Tier::Full)));
         shared.cache.set_navigation_policy([], [(0, Tier::Full)]);
         run_rehydrate(
             &shared,
