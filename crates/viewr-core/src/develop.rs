@@ -1321,7 +1321,10 @@ mod tests {
 
     #[test]
     #[ignore = "requires the local ignored portrait Sony RAW fixture"]
-    fn real_sony_raw_portrait_region_assembly_matches_display_pipeline() {
+    // Deliberately outside the `real_sony_raw_` prefix: CI's pinned-fixture
+    // pass runs that filter against the public landscape fixture, and this
+    // test needs the private portrait file next to VIEWR_TEST_RAW.
+    fn portrait_arw_region_assembly_matches_display_pipeline() {
         use crate::types::Orient;
 
         let path = real_sony_raw_fixture().with_file_name("HCA05417.ARW");
