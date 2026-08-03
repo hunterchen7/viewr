@@ -428,8 +428,7 @@ mod tests {
             buf: PixelBuf {
                 width: full.width,
                 height,
-                rgba: full.rgba
-                    [y0 as usize * row_bytes..(y0 + height) as usize * row_bytes]
+                rgba: full.rgba[y0 as usize * row_bytes..(y0 + height) as usize * row_bytes]
                     .to_vec(),
             },
         }

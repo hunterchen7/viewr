@@ -23,13 +23,13 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, TryLockError};
 use std::time::Duration;
 
 use crate::cache_disk::{DEFAULT_CACHE_JPEG_QUALITY, DiskCache};
-use crate::cache_ram::{FullBand, RamCache};
 #[cfg(test)]
 use crate::cache_ram::RamCacheBudgets;
-use crate::jpeg_restart::{BandRequest, PrioritizedDecode};
+use crate::cache_ram::{FullBand, RamCache};
 use crate::decode;
 use crate::develop::{Quality, develop};
 use crate::folder::{FolderEntry, outward_order};
+use crate::jpeg_restart::{BandRequest, PrioritizedDecode};
 use crate::meta::FileMeta;
 #[cfg(feature = "benchmarks")]
 use crate::planning::build_plan_targets;
@@ -4064,7 +4064,10 @@ mod tests {
             panic!("a cancelled rehydrate must not publish: {e:?}")
         });
 
-        assert!(disk.has(&key), "cancellation must not remove the disk object");
+        assert!(
+            disk.has(&key),
+            "cancellation must not remove the disk object"
+        );
         assert!(!cache.has_jpeg((0, Tier::Full)));
         assert!(!cache.has_rgba((0, Tier::Full)));
         assert!(cache.get_full_band(0).is_some());
@@ -4109,7 +4112,10 @@ mod tests {
                 &|event| events.lock().unwrap().push(event),
             );
 
-            assert!(cache.has_rgba((0, Tier::Full)), "{hint:?}/{mode:?} installs");
+            assert!(
+                cache.has_rgba((0, Tier::Full)),
+                "{hint:?}/{mode:?} installs"
+            );
             assert!(
                 cache.get_full_band(0).is_none(),
                 "{hint:?}/{mode:?} must not leave a band"

@@ -1385,7 +1385,10 @@ mod tests {
         assert_eq!(cache.get_full_band(4).map(|band| band.y0), Some(4));
 
         cache.clear_full_band(3);
-        assert!(cache.get_full_band(4).is_some(), "mismatched clear is a no-op");
+        assert!(
+            cache.get_full_band(4).is_some(),
+            "mismatched clear is a no-op"
+        );
         cache.clear_full_band(4);
         assert!(cache.get_full_band(4).is_none());
     }

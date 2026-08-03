@@ -773,12 +773,9 @@ mod tests {
             let mut band_calls = 0usize;
             assert!(
                 matches!(
-                    try_decode_prioritized(
-                        &encoded[..cut],
-                        band(),
-                        &|| false,
-                        &mut |_| band_calls += 1
-                    ),
+                    try_decode_prioritized(&encoded[..cut], band(), &|| false, &mut |_| {
+                        band_calls += 1
+                    }),
                     PrioritizedDecode::Unsupported
                 ),
                 "truncated at {cut}"
