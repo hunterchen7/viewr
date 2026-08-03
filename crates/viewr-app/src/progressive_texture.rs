@@ -271,6 +271,7 @@ pub(crate) fn color_image_band(band: &FullBand, tile: TileCoord) -> Option<egui:
         ],
         pixels,
     ))
+}
 
 /// Whether `target` is entirely inside the union of `covered` rectangles
 /// (`[x, y, width, height]` each). Subtracts each covered rectangle from a

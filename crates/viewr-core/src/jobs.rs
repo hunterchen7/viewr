@@ -4473,6 +4473,8 @@ mod tests {
                 navigation: Mutex::new(NavigationOrder::default()),
                 raw_share: RawDecodeShare::new(),
                 view_hint: Mutex::new(hint),
+                full_viewport: Mutex::new(None),
+                progressive: Mutex::new(None),
             },
             receiver,
         )
@@ -6511,6 +6513,7 @@ mod tests {
             jpeg_quality: CACHE_JPEG_QUALITY,
             navigation: Mutex::new(NavigationOrder::default()),
             raw_share: RawDecodeShare::new(),
+            view_hint: Mutex::new(None),
             full_viewport: Mutex::new(None),
             progressive: Mutex::new(None),
         };
@@ -6599,6 +6602,7 @@ mod tests {
             jpeg_quality: CACHE_JPEG_QUALITY,
             navigation: Mutex::new(NavigationOrder::default()),
             raw_share: RawDecodeShare::new(),
+            view_hint: Mutex::new(None),
             full_viewport: Mutex::new(None),
             progressive: Mutex::new(None),
         };

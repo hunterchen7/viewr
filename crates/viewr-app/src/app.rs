@@ -1137,9 +1137,8 @@ impl App {
             NotCovered,
             Invalid,
         }
-        let extract = |source: &OverlaySource,
-                       engine: &viewr_core::jobs::Engine,
-                       tile| match source {
+        let extract = |source: &OverlaySource, engine: &viewr_core::jobs::Engine, tile| match source
+        {
             OverlaySource::Full(buf) => match progressive_texture::color_image(buf, tile) {
                 Some(image) => TileImage::Ready(image),
                 None => TileImage::Invalid,
