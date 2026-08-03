@@ -746,6 +746,10 @@ impl App {
                     star_markers_dirty |= (old_rating > 0) != (new_rating > 0);
                 }
                 Event::ImageReady { .. } => replan = true,
+                // Progress ping only: the staged rects are read from the
+                // engine's snapshot during painting, and the notify callback
+                // already requested this repaint. No replan.
+                Event::ImageRegionReady { .. } => {}
                 Event::ImageFailed { index, tier, error } => {
                     if tier == Tier::Thumb && session.thumb_requests.remove(&index).is_some() {
                         session
