@@ -18,7 +18,7 @@ use viewr_core::cache_disk::DiskCache;
 use viewr_core::cache_ram::{RamCache, RamCacheBudgets};
 use viewr_core::db::{Db, default_db_path};
 use viewr_core::folder::{FolderEntry, normalize_physical_path, scan};
-use viewr_core::jobs::{Engine, EngineOptions, Event, NavState};
+use viewr_core::jobs::{Engine, EngineOptions, Event, NavState, ViewHint};
 use viewr_core::library::{
     Library, RatingLoad, load_ratings_with_owners, rating_owner_keys, try_load_ratings_with_owners,
 };
@@ -351,6 +351,17 @@ struct Session {
     /// pixels are already resident. Browse stays underneath them so
     /// incomplete regions remain usable.
     full_tiles: HashMap<(usize, TileCoord), egui::TextureHandle>,
+    /// Tiles in `full_tiles` uploaded from a provisional decode band rather
+    /// than the installed Full buffer. Normally the finished buffer contains
+    /// the same bytes and these simply reclassify; if the band's backing
+    /// object turns out corrupt (band gone, no Full pixels), they are
+    /// dropped so a RAW re-development cannot hide behind stale tiles.
+    full_tiles_from_band: HashSet<(usize, TileCoord)>,
+    /// Consecutive frames in which neither Full pixels nor a band backed the
+    /// band-sourced tiles. Draining waits for a second miss so microsecond
+    /// races (install-then-clear between the two cache probes, or a cancelled
+    /// straggler overwriting the band slot) cannot drop still-valid tiles.
+    band_tile_miss_frames: u8,
 }
 
 pub struct App {
@@ -375,6 +386,9 @@ pub struct App {
     /// Last known full-res logical size; carries the zoom framing onto
     /// thumb placeholders before the new image's develop lands.
     last_logical: Option<egui::Vec2>,
+    /// The loupe rect allocated by the last painted frame; with the retained
+    /// zoom and logical size it reproduces the visible UV for view hints.
+    last_loupe_rect: Option<egui::Rect>,
     status: Status,
     scroll_to_current: bool,
     starred_visible_positions: Vec<usize>,
@@ -405,6 +419,7 @@ impl App {
             show_metadata: false,
             nav_started: None,
             last_logical: None,
+            last_loupe_rect: None,
             status: Status::Empty,
             scroll_to_current: true,
             starred_visible_positions: Vec::new(),
@@ -502,6 +517,8 @@ impl App {
             thumb_retry_after: HashMap::new(),
             textures: HashMap::new(),
             full_tiles: HashMap::new(),
+            full_tiles_from_band: HashSet::new(),
+            band_tile_miss_frames: 0,
         });
         self.current = start;
         self.direction = 1;
@@ -560,12 +577,42 @@ impl App {
 
     fn replan(&self) {
         if let Some(session) = &self.session {
+            // Publish the hint before the plan so a rehydrate claimed right
+            // after set_plan already sees the framing it decodes for. The
+            // hint is advisory and outside job identity: updating it cannot
+            // cancel in-flight work, and staleness only costs latency.
+            session.engine.set_view_hint(self.view_hint(session));
             session.engine.navigate(NavState {
                 current: self.current,
                 direction: self.direction,
                 zoomed: full_resolution_is_urgent(self.mode, self.zoom),
             });
         }
+    }
+
+    /// The advisory visible-band hint for the current zoomed framing.
+    ///
+    /// Zoom framing is retained across navigation, so the previous logical
+    /// size reproduces the new image's visible rows for burst sequences; a
+    /// dimension mismatch only degrades the advisory band, never the output.
+    fn view_hint(&self, session: &Session) -> Option<ViewHint> {
+        if !full_resolution_is_urgent(self.mode, self.zoom) {
+            return None;
+        }
+        let rect = self.last_loupe_rect?;
+        let img_size = session
+            .cache
+            .get_rgba((self.current, Tier::Full))
+            .map(|buf| vec2(buf.width as f32, buf.height as f32))
+            .or(self.last_logical)?;
+        let uv = loupe::visible_uv_for(rect, img_size, self.zoom);
+        Some(ViewHint {
+            index: self.current,
+            uv_y0: uv.min.y,
+            uv_y1: uv.max.y,
+            align_px: progressive_texture::TILE_EDGE,
+            gutter_px: progressive_texture::SAMPLE_GUTTER,
+        })
     }
 
     /// Position of `current` within the visible sequence (nearest if the
@@ -938,6 +985,9 @@ impl App {
         session
             .full_tiles
             .retain(|(index, _), _| full_tile_should_be_kept(*index, current, next_ahead, zoomed));
+        session
+            .full_tiles_from_band
+            .retain(|(index, _)| full_tile_should_be_kept(*index, current, next_ahead, zoomed));
 
         let mut upload = |key: (usize, Tier), budget: &mut i32| {
             if *budget <= 0 || session.textures.contains_key(&key) {
@@ -965,11 +1015,19 @@ impl App {
 
     /// Upload Full-resolution tiles under the current zoom rectangle first and
     /// paint them over the Browse stand-in. Once the visible rectangle is
-    /// complete, one tile per frame expands the Full texture outward; once the
-    /// whole current texture is resident, the same one-tile-per-frame budget
-    /// pre-uploads the next-ahead image's predicted-visible tiles from its
-    /// resident Full pixels so zoomed navigation paints sharp on frame one.
+    /// complete, the background budget pre-uploads the next-ahead image's
+    /// predicted-visible tiles so zoomed navigation paints sharp on frame
+    /// one, then trickles this image's remaining tiles outward.
+    ///
+    /// Before the installed Full buffer lands, the provisional decode band
+    /// (published between the rehydrate's decode phases) backs the same
+    /// tiles: same keys, same bytes, so tiles uploaded from the band are
+    /// reused as-is once the full buffer arrives.
     fn progressive_full_overlay(&mut self, ui: &egui::Ui, response: &LoupeResponse) -> bool {
+        enum OverlaySource {
+            Full(std::sync::Arc<viewr_core::types::PixelBuf>),
+            Band(std::sync::Arc<viewr_core::cache_ram::FullBand>),
+        }
         if matches!(self.zoom, Zoom::Fit) {
             return false;
         }
@@ -977,17 +1035,48 @@ impl App {
         let next_ahead =
             next_ahead_index(&self.visible, self.visible_pos(), self.direction, current);
         let ctx = self.ctx.clone();
-        let Some(buf) = self
-            .session
-            .as_ref()
-            .and_then(|session| session.cache.get_rgba((current, Tier::Full)))
-        else {
-            return false;
+        let source = {
+            let Some(session) = &self.session else {
+                return false;
+            };
+            if let Some(buf) = session.cache.get_rgba((current, Tier::Full)) {
+                OverlaySource::Full(buf)
+            } else if let Some(band) = session.cache.get_full_band(current) {
+                OverlaySource::Band(band)
+            } else {
+                // Neither pixels nor a band. Any band-sourced tiles have lost
+                // their backing cache object (corrupt-object fallback): drop
+                // them so the RAW re-development cannot sit behind stale
+                // JPEG-derived tiles. A single miss can also be a benign
+                // probe race, so draining waits for a second consecutive
+                // miss; recovery repaints are already scheduled either way.
+                let Some(session) = &mut self.session else {
+                    return false;
+                };
+                if session.band_tile_miss_frames >= 1 {
+                    for key in session.full_tiles_from_band.drain() {
+                        session.full_tiles.remove(&key);
+                    }
+                } else {
+                    session.band_tile_miss_frames += 1;
+                    ctx.request_repaint();
+                }
+                return false;
+            }
         };
-        let order = progressive_texture::priority_order(buf.width, buf.height, response.visible_uv);
+        // Reached only with a backing source; a hit resets the miss debounce.
+        if let Some(session) = &mut self.session {
+            session.band_tile_miss_frames = 0;
+        }
+        let (image_width, image_height) = match &source {
+            OverlaySource::Full(buf) => (buf.width, buf.height),
+            OverlaySource::Band(band) => (band.full_width, band.full_height),
+        };
+        let order =
+            progressive_texture::priority_order(image_width, image_height, response.visible_uv);
         let visible_count = progressive_texture::visible_prefix_len(
-            buf.width,
-            buf.height,
+            image_width,
+            image_height,
             response.visible_uv,
             &order,
         );
@@ -1008,6 +1097,25 @@ impl App {
         };
         let mut uploaded = 0;
         let mut invalid_storage = false;
+        // Extracts one tile from whichever pixel source backs this frame:
+        // the installed Full buffer, or the provisional decode band (whose
+        // covered tiles carry identical bytes). Band-uncovered tiles wait
+        // for the complete frame without counting as invalid storage.
+        enum TileImage {
+            Ready(egui::ColorImage),
+            NotCovered,
+            Invalid,
+        }
+        let extract = |source: &OverlaySource, tile| match source {
+            OverlaySource::Full(buf) => match progressive_texture::color_image(buf, tile) {
+                Some(image) => TileImage::Ready(image),
+                None => TileImage::Invalid,
+            },
+            OverlaySource::Band(band) => match progressive_texture::color_image_band(band, tile) {
+                Some(image) => TileImage::Ready(image),
+                None => TileImage::NotCovered,
+            },
+        };
         if missing_visible > 0 {
             for &tile in &order {
                 if uploaded >= upload_budget {
@@ -1017,9 +1125,13 @@ impl App {
                 if session.full_tiles.contains_key(&key) {
                     continue;
                 }
-                let Some(image) = progressive_texture::color_image(&buf, tile) else {
-                    invalid_storage = true;
-                    break;
+                let image = match extract(&source, tile) {
+                    TileImage::Ready(image) => image,
+                    TileImage::NotCovered => continue,
+                    TileImage::Invalid => {
+                        invalid_storage = true;
+                        break;
+                    }
                 };
                 let texture = ctx.load_texture(
                     format!("img{current}-Full-{}-{}", tile.col, tile.row),
@@ -1027,8 +1139,16 @@ impl App {
                     egui::TextureOptions::LINEAR,
                 );
                 session.full_tiles.insert(key, texture);
+                if matches!(source, OverlaySource::Band(_)) {
+                    session.full_tiles_from_band.insert(key);
+                }
                 uploaded += 1;
             }
+        }
+        if matches!(source, OverlaySource::Full(_)) {
+            // The finished buffer contains the same bytes the band carried;
+            // its tiles are no longer provisional.
+            session.full_tiles_from_band.clear();
         }
         // With the visible rect complete, the background budget goes first to
         // the next-ahead warm below — an imminent zoomed navigation values the
@@ -1041,8 +1161,8 @@ impl App {
                 continue;
             };
             let Some(geometry) = progressive_texture::paint_geometry(
-                buf.width,
-                buf.height,
+                image_width,
+                image_height,
                 tile,
                 response.visible_uv,
                 response.image_draw_rect,
@@ -1069,10 +1189,10 @@ impl App {
         let mut more_upload_work = current_resident < order.len();
 
         // The visible rect is complete, so the background budget warms the
-        // next-ahead image's predicted-visible tiles first. Zoom framing persists across images, making the current
-        // visible_uv the best prediction; an aspect-ratio mismatch is
-        // harmless because extra tiles simply go unpainted and the order is
-        // recomputed on arrival.
+        // next-ahead image's predicted-visible tiles first. Zoom framing
+        // persists across images, making the current visible_uv the best
+        // prediction; an aspect-ratio mismatch is harmless because extra
+        // tiles simply go unpainted and the order is recomputed on arrival.
         if !invalid_storage
             && missing_visible == 0
             && uploaded < upload_budget
@@ -1131,9 +1251,13 @@ impl App {
                 if session.full_tiles.contains_key(&key) {
                     continue;
                 }
-                let Some(image) = progressive_texture::color_image(&buf, tile) else {
-                    invalid_storage = true;
-                    break;
+                let image = match extract(&source, tile) {
+                    TileImage::Ready(image) => image,
+                    TileImage::NotCovered => continue,
+                    TileImage::Invalid => {
+                        invalid_storage = true;
+                        break;
+                    }
                 };
                 let texture = ctx.load_texture(
                     format!("img{current}-Full-{}-{}", tile.col, tile.row),
@@ -1145,8 +1269,17 @@ impl App {
             }
         }
 
-        if !invalid_storage && more_upload_work {
-            ctx.request_repaint();
+        match &source {
+            OverlaySource::Full(_) => {
+                if !invalid_storage && more_upload_work {
+                    ctx.request_repaint();
+                }
+            }
+            OverlaySource::Band(_) => {
+                // The rest of the frame is still decoding; keep polling for
+                // the installed buffer and the tiles the band cannot back.
+                ctx.request_repaint();
+            }
         }
         visible_complete
     }
@@ -1787,6 +1920,7 @@ impl App {
         } else {
             ui.available_rect_before_wrap()
         };
+        self.last_loupe_rect = Some(loupe_rect);
 
         // Loupe. The zoom state lives in full-res "logical" space so the
         // same framing holds no matter which tier backs the texture:
