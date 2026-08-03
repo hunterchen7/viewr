@@ -6630,6 +6630,102 @@ mod tests {
 
     #[test]
     #[ignore = "requires the pinned public-domain Sony RAW fixture or VIEWR_TEST_RAW"]
+    fn real_sony_raw_progressive_latency_measurement() {
+        use std::time::Instant;
+
+        let path = real_sony_raw_fixture();
+        let decoded = decode::load(&path).expect("fixture decodes");
+        let meta = FileMeta::from_metadata(&decoded.metadata);
+        let decode_wall = decoded.t_open + decoded.t_metadata + decoded.t_raw_decode;
+        let raw = decoded.raw;
+
+        // Warm the gamma LUT and Rayon pool so both paths measure steady
+        // state rather than first-use initialization.
+        crate::develop::warm_gamma_lut();
+        drop(develop(raw.clone(), Quality::Full).expect("warm-up develop"));
+
+        // Monolithic Display path: whole-frame develop plus display rotate.
+        let t = Instant::now();
+        let (buf, timings) = develop(raw.clone(), Quality::Full).expect("monolithic develop");
+        let monolithic_develop = t.elapsed();
+        let t = Instant::now();
+        let oriented = apply_orient(buf, meta.orient);
+        let rotate_wall = t.elapsed();
+
+        // Progressive path: plan (rescale), visible region, then assembly.
+        let t = Instant::now();
+        let plan = plan_full_develop(raw).expect("plan");
+        let plan_wall = t.elapsed();
+        let orient = meta.orient;
+        let (display_w, display_h) = plan.display_size(orient);
+        assert_eq!((display_w, display_h), (oriented.width, oriented.height));
+        let (out_w, out_h) = plan.output_size();
+
+        // A 2560x1440 display viewport at 100% zoom, centered.
+        let view_w = 2560.min(display_w);
+        let view_h = 1440.min(display_h);
+        let uv = [
+            (display_w - view_w) as f32 / 2.0 / display_w as f32,
+            (display_h - view_h) as f32 / 2.0 / display_h as f32,
+            ((display_w - view_w) / 2 + view_w) as f32 / display_w as f32,
+            ((display_h - view_h) / 2 + view_h) as f32 / display_h as f32,
+        ];
+        let first = progressive_first_rect(uv, orient, out_w, out_h);
+        let mut canvas = vec![0u8; display_w as usize * display_h as usize * 4];
+
+        let region_into = |rect: [u32; 4], canvas: &mut Vec<u8>| {
+            let out_rect = Rect::new(
+                Point::new(rect[0] as usize, rect[1] as usize),
+                Dim2::new(rect[2] as usize, rect[3] as usize),
+            );
+            plan.develop_region_into(out_rect, orient, canvas, display_w, [0, 0]);
+        };
+
+        let mut visible_wall = None::<std::time::Duration>;
+        for _ in 0..3 {
+            let t = Instant::now();
+            region_into(first, &mut canvas);
+            let wall = t.elapsed();
+            visible_wall = Some(visible_wall.map_or(wall, |best| best.min(wall)));
+        }
+        let visible_wall = visible_wall.expect("measured");
+
+        let t = Instant::now();
+        let mut band_walls = Vec::new();
+        for band in progressive_remainder(out_w, out_h, first, PROGRESSIVE_BAND_ROWS) {
+            let band_start = Instant::now();
+            region_into(band, &mut canvas);
+            band_walls.push(band_start.elapsed());
+        }
+        let assembly_wall = t.elapsed();
+        assert_eq!(canvas, oriented.rgba, "measured assembly must stay exact");
+
+        let visible_mp = f64::from(first[2]) * f64::from(first[3]) / 1e6;
+        let max_band = band_walls.iter().max().copied().unwrap_or_default();
+        eprintln!(
+            "== progressive Full develop latency ({}x{} {orient:?}) ==",
+            out_w, out_h
+        );
+        eprintln!("decode (open+meta+raw): {decode_wall:?}");
+        eprintln!(
+            "monolithic develop: {monolithic_develop:?} ({:?} demosaic) + rotate {rotate_wall:?}",
+            timings.demosaic
+        );
+        eprintln!("plan (rescale): {plan_wall:?}");
+        eprintln!("visible region {first:?} ({visible_mp:.1} MP): {visible_wall:?}");
+        eprintln!(
+            "remaining assembly: {assembly_wall:?} over {} bands (max band {max_band:?})",
+            band_walls.len()
+        );
+        eprintln!(
+            "cold zoom-to-sharp (post-decode): monolithic {:?} vs progressive {:?}",
+            monolithic_develop + rotate_wall,
+            plan_wall + visible_wall
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the pinned public-domain Sony RAW fixture or VIEWR_TEST_RAW"]
     fn real_sony_raw_progressive_develop_cancels_at_region_boundaries() {
         let path = real_sony_raw_fixture();
         let decoded = decode::load(&path).expect("fixture decodes");
