@@ -357,6 +357,11 @@ struct Session {
     /// object turns out corrupt (band gone, no Full pixels), they are
     /// dropped so a RAW re-development cannot hide behind stale tiles.
     full_tiles_from_band: HashSet<(usize, TileCoord)>,
+    /// Consecutive frames in which neither Full pixels nor a band backed the
+    /// band-sourced tiles. Draining waits for a second miss so microsecond
+    /// races (install-then-clear between the two cache probes, or a cancelled
+    /// straggler overwriting the band slot) cannot drop still-valid tiles.
+    band_tile_miss_frames: u8,
 }
 
 pub struct App {
@@ -513,6 +518,7 @@ impl App {
             textures: HashMap::new(),
             full_tiles: HashMap::new(),
             full_tiles_from_band: HashSet::new(),
+            band_tile_miss_frames: 0,
         });
         self.current = start;
         self.direction = 1;
@@ -1041,16 +1047,27 @@ impl App {
                 // Neither pixels nor a band. Any band-sourced tiles have lost
                 // their backing cache object (corrupt-object fallback): drop
                 // them so the RAW re-development cannot sit behind stale
-                // JPEG-derived tiles.
+                // JPEG-derived tiles. A single miss can also be a benign
+                // probe race, so draining waits for a second consecutive
+                // miss; recovery repaints are already scheduled either way.
                 let Some(session) = &mut self.session else {
                     return false;
                 };
-                for key in session.full_tiles_from_band.drain() {
-                    session.full_tiles.remove(&key);
+                if session.band_tile_miss_frames >= 1 {
+                    for key in session.full_tiles_from_band.drain() {
+                        session.full_tiles.remove(&key);
+                    }
+                } else {
+                    session.band_tile_miss_frames += 1;
+                    ctx.request_repaint();
                 }
                 return false;
             }
         };
+        // Reached only with a backing source; a hit resets the miss debounce.
+        if let Some(session) = &mut self.session {
+            session.band_tile_miss_frames = 0;
+        }
         let (image_width, image_height) = match &source {
             OverlaySource::Full(buf) => (buf.width, buf.height),
             OverlaySource::Band(band) => (band.full_width, band.full_height),
