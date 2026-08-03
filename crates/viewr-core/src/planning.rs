@@ -290,7 +290,9 @@ pub fn build_plan_targets(
 /// with the current image and both immediate visible neighbors, then grow in a
 /// forward-biased 3:1 wave until the next candidate would cross the byte
 /// budget. Optional Full work is lower priority than the complete interactive
-/// Browse wave and is identified as [`PlanKind::Prefetch`].
+/// Browse wave and is identified as [`PlanKind::Prefetch`]. While `zoomed`,
+/// the ahead neighbor's Full target is ordered before its Browse target so
+/// the next navigation is sharp first.
 ///
 /// A filtered `sequence` ignores out-of-range entries and later duplicates
 /// while preserving the first occurrence.
@@ -386,24 +388,33 @@ pub(crate) fn build_plan_targets_with_normalized_prefetch(
             continue;
         }
         let (_, effective_distance) = weighted_distance(position, current_position, direction);
-        targets.push(PlanTarget {
+        let browse_target = PlanTarget {
             index,
             tier: Tier::Browse,
             class: 2,
             effective_distance,
             kind: PlanKind::Display,
-        });
-        if full
+        };
+        let full_target = full
             .iter()
             .any(|selection| selection.required && selection.index == index)
-        {
-            targets.push(PlanTarget {
+            .then_some(PlanTarget {
                 index,
                 tier: Tier::Full,
                 class: 2,
                 effective_distance,
                 kind: PlanKind::Display,
             });
+        // While zoomed, the ahead neighbor is displayed at native resolution
+        // on the very next navigation, so its Full render precedes its Browse
+        // render within the equal (class, distance) FIFO order.
+        let ahead = (position > current_position) == (direction >= 0);
+        if zoomed && ahead {
+            targets.extend(full_target);
+            targets.push(browse_target);
+        } else {
+            targets.push(browse_target);
+            targets.extend(full_target);
         }
     }
     targets.extend(
@@ -976,6 +987,51 @@ mod tests {
                 (55, PlanKind::Prefetch, 5),
             ]
         );
+    }
+
+    #[test]
+    fn zoomed_wave_orders_the_ahead_neighbor_full_before_its_browse() {
+        let budget = navigation_budgets(FullPrefetchBudget::new(700, 100, HashMap::new()));
+        let position_of = |targets: &[PlanTarget], index: usize, tier: Tier| {
+            targets
+                .iter()
+                .position(|target| target.index == index && target.tier == tier)
+                .unwrap_or_else(|| panic!("missing target {index}/{tier:?}: {targets:?}"))
+        };
+        for (direction, ahead, behind) in [(1_i8, 51_usize, 49_usize), (-1, 49, 51)] {
+            let zoomed = build_plan_targets_with_full_prefetch(
+                100,
+                50,
+                direction,
+                true,
+                &[],
+                &budget,
+                false,
+            );
+            assert!(
+                position_of(&zoomed, ahead, Tier::Full) < position_of(&zoomed, ahead, Tier::Browse),
+                "direction {direction}: the zoomed ahead neighbor develops Full first"
+            );
+            assert!(
+                position_of(&zoomed, behind, Tier::Browse)
+                    < position_of(&zoomed, behind, Tier::Full),
+                "direction {direction}: the behind neighbor keeps Browse first"
+            );
+
+            let fit = build_plan_targets_with_full_prefetch(
+                100,
+                50,
+                direction,
+                false,
+                &[],
+                &budget,
+                false,
+            );
+            assert!(
+                position_of(&fit, ahead, Tier::Browse) < position_of(&fit, ahead, Tier::Full),
+                "direction {direction}: fit mode keeps Browse first everywhere"
+            );
+        }
     }
 
     #[test]
