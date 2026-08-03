@@ -1008,26 +1008,32 @@ impl App {
         };
         let mut uploaded = 0;
         let mut invalid_storage = false;
-        for &tile in &order {
-            if uploaded >= upload_budget {
-                break;
+        if missing_visible > 0 {
+            for &tile in &order {
+                if uploaded >= upload_budget {
+                    break;
+                }
+                let key = (current, tile);
+                if session.full_tiles.contains_key(&key) {
+                    continue;
+                }
+                let Some(image) = progressive_texture::color_image(&buf, tile) else {
+                    invalid_storage = true;
+                    break;
+                };
+                let texture = ctx.load_texture(
+                    format!("img{current}-Full-{}-{}", tile.col, tile.row),
+                    image,
+                    egui::TextureOptions::LINEAR,
+                );
+                session.full_tiles.insert(key, texture);
+                uploaded += 1;
             }
-            let key = (current, tile);
-            if session.full_tiles.contains_key(&key) {
-                continue;
-            }
-            let Some(image) = progressive_texture::color_image(&buf, tile) else {
-                invalid_storage = true;
-                break;
-            };
-            let texture = ctx.load_texture(
-                format!("img{current}-Full-{}-{}", tile.col, tile.row),
-                image,
-                egui::TextureOptions::LINEAR,
-            );
-            session.full_tiles.insert(key, texture);
-            uploaded += 1;
         }
+        // With the visible rect complete, the background budget goes first to
+        // the next-ahead warm below — an imminent zoomed navigation values the
+        // neighbor's visible tiles above this image's off-screen remainder —
+        // and any leftover trickles the current image afterwards.
 
         let painter = ui.painter().with_clip_rect(response.viewport_rect);
         for &tile in &order[..visible_count] {
@@ -1062,9 +1068,8 @@ impl App {
             .count();
         let mut more_upload_work = current_resident < order.len();
 
-        // The current image needs no upload this frame, so spend the spare
-        // background budget warming the next-ahead image's predicted-visible
-        // tiles. Zoom framing persists across images, making the current
+        // The visible rect is complete, so the background budget warms the
+        // next-ahead image's predicted-visible tiles first. Zoom framing persists across images, making the current
         // visible_uv the best prediction; an aspect-ratio mismatch is
         // harmless because extra tiles simply go unpainted and the order is
         // recomputed on arrival.
@@ -1112,6 +1117,31 @@ impl App {
                     .filter(|&&tile| session.full_tiles.contains_key(&(next_ahead, tile)))
                     .count();
                 more_upload_work |= next_resident < next_visible;
+            }
+        }
+
+        // Background budget the neighbor warm left over trickles the current
+        // image's remaining off-screen tiles.
+        if missing_visible == 0 && uploaded < upload_budget && !invalid_storage {
+            for &tile in &order {
+                if uploaded >= upload_budget {
+                    break;
+                }
+                let key = (current, tile);
+                if session.full_tiles.contains_key(&key) {
+                    continue;
+                }
+                let Some(image) = progressive_texture::color_image(&buf, tile) else {
+                    invalid_storage = true;
+                    break;
+                };
+                let texture = ctx.load_texture(
+                    format!("img{current}-Full-{}-{}", tile.col, tile.row),
+                    image,
+                    egui::TextureOptions::LINEAR,
+                );
+                session.full_tiles.insert(key, texture);
+                uploaded += 1;
             }
         }
 
