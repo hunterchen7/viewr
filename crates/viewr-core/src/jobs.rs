@@ -1849,6 +1849,11 @@ impl Engine {
     /// never affects produced bytes, only their order. Cleared by
     /// [`navigate`](Self::navigate) when not zoomed.
     pub fn set_full_viewport(&self, index: usize, uv: [f32; 4]) {
+        // A non-finite framing (degenerate layout mid-resize) is advisory
+        // garbage; downstream clamps would panic on NaN.
+        if !uv.iter().all(|value| value.is_finite()) {
+            return;
+        }
         *self.shared.full_viewport.lock().unwrap() = Some((index, uv));
     }
 
@@ -2470,7 +2475,7 @@ fn run_develop(
     // image reuses this decode instead of re-opening and entropy-decoding
     // the identical RAW.
     let join = shared.raw_share.join(index, token);
-    let (raw, meta) = match join {
+    let (mut raw, meta) = match join {
         RawShareJoin::Shared(shared_raw) => {
             let meta = FileMeta::from_metadata(&shared_raw.metadata);
             // The publisher cloned for exactly one follower, so sole
@@ -2525,17 +2530,29 @@ fn run_develop(
         return DevelopCompletion::Cancelled;
     }
     // Visible-region-first Full develop: only the interactive Display path of
-    // the image whose zoomed viewport is published stages regions; every
-    // other producer (prefetch, warm, rehydrate fallback for neighbors) keeps
-    // the monolithic path, so at most one staging canvas ever exists.
+    // the CURRENT image whose zoomed viewport is published stages regions.
+    // The navigation check closes the stale-mailbox window between a zoomed
+    // navigation and its next painted frame, so a neighbor's develop can
+    // never route through the progressive path; prefetch, warm, and
+    // rehydrate fallbacks keep the monolithic path. A develop that finds the
+    // single staging slot occupied by another image declines and develops
+    // monolithically rather than discarding that image's assembly.
     if mode == DevelopMode::Display
         && tier == Tier::Full
         && quality == Quality::Full
         && supports_region_develop(&raw)
     {
         let viewport = *shared.full_viewport.lock().unwrap();
-        if let Some((_, uv)) = viewport.filter(|(viewport_index, _)| *viewport_index == index) {
-            return run_progressive_full_develop(
+        let is_navigation_current = shared
+            .navigation
+            .lock()
+            .unwrap()
+            .last_nav
+            .is_some_and(|nav| nav.current == index);
+        if is_navigation_current
+            && let Some((_, uv)) = viewport.filter(|(viewport_index, _)| *viewport_index == index)
+        {
+            match run_progressive_full_develop(
                 shared,
                 index,
                 tier,
@@ -2544,7 +2561,10 @@ fn run_develop(
                 uv,
                 token,
                 emit,
-            );
+            ) {
+                Ok(completion) => return completion,
+                Err(declined) => raw = *declined,
+            }
         }
     }
     let (buf, _) = match develop(raw, quality) {
@@ -2832,6 +2852,9 @@ fn clear_progressive(shared: &Shared, index: usize) {
 /// and disk objects are unchanged. Cancellation is honored at every region
 /// boundary and clears the staging entry.
 #[allow(clippy::too_many_arguments)]
+/// Runs the visible-region-first Full develop, or returns the untouched
+/// mosaic in `Err` when the single staging slot is occupied by another
+/// image's mid-assembly develop (the caller then develops monolithically).
 fn run_progressive_full_develop(
     shared: &Shared,
     index: usize,
@@ -2841,10 +2864,27 @@ fn run_progressive_full_develop(
     initial_uv: [f32; 4],
     token: &CancelToken,
     emit: &dyn Fn(Event),
-) -> DevelopCompletion {
+) -> Result<DevelopCompletion, Box<rawler::RawImage>> {
+    // Reserve the staging slot atomically before any expensive work: at most
+    // one canvas exists, and stealing an active one would discard a
+    // near-complete assembly whose job stays wanted as a neighbor.
+    {
+        let mut staging = shared.progressive.lock().unwrap();
+        if staging.as_ref().is_some_and(|canvas| canvas.index != index) {
+            return Err(Box::new(raw));
+        }
+        *staging = Some(ProgressiveCanvas {
+            index,
+            width: 0,
+            height: 0,
+            rgba: Vec::new(),
+            covered: Vec::new(),
+        });
+    }
     let plan = match plan_full_develop(raw) {
         Ok(plan) => plan,
         Err(e) => {
+            clear_progressive(shared, index);
             if !token.cancelled() {
                 emit(Event::ImageFailed {
                     index,
@@ -2852,18 +2892,19 @@ fn run_progressive_full_develop(
                     error: e.to_string(),
                 });
             }
-            return if token.cancelled() {
+            return Ok(if token.cancelled() {
                 DevelopCompletion::Cancelled
             } else {
                 DevelopCompletion::Finished
-            };
+            });
         }
     };
     let (display_w, display_h) = plan.display_size(orient);
     let (out_w, out_h) = plan.output_size();
 
-    // Install the staging canvas, replacing any previous entry: at most one
-    // exists, and `in_flight` guarantees a single writer per (index, Full).
+    // Fill in the reserved staging canvas; `in_flight` guarantees a single
+    // writer per (index, Full), and the reservation above guarantees the
+    // slot is ours.
     {
         let mut staging = shared.progressive.lock().unwrap();
         *staging = Some(ProgressiveCanvas {
@@ -2923,7 +2964,7 @@ fn run_progressive_full_develop(
         && first[3] > 0
         && let Some(done) = develop_one(first, &mut scratch)
     {
-        return done;
+        return Ok(done);
     }
     while !remaining.is_empty() {
         // Ordering only: a moved viewport re-prioritizes the remaining bands
@@ -2940,41 +2981,45 @@ fn run_progressive_full_develop(
             .expect("remaining is non-empty");
         let rect = remaining.swap_remove(nearest);
         if let Some(done) = develop_one(rect, &mut scratch) {
-            return done;
+            return Ok(done);
         }
     }
     drop(scratch);
 
-    if token.cancelled() {
-        clear_progressive(shared, index);
-        return DevelopCompletion::Cancelled;
-    }
-    let taken = {
+    // Hand the finished canvas to the cache atomically with clearing the
+    // staging slot: the overlay's fallback reads hold the staging lock, so
+    // no frame can observe the moment where neither source exists. Nothing
+    // inside the critical section takes the staging lock again (the cache
+    // ring has its own mutex and never calls back), so no cycle exists.
+    let (buf, retained) = {
         let mut staging = shared.progressive.lock().unwrap();
-        if staging.as_ref().is_some_and(|canvas| canvas.index == index) {
+        if token.cancelled() {
+            if staging.as_ref().is_some_and(|canvas| canvas.index == index) {
+                *staging = None;
+            }
+            return Ok(DevelopCompletion::Cancelled);
+        }
+        let taken = if staging.as_ref().is_some_and(|canvas| canvas.index == index) {
             staging.take()
         } else {
             None
-        }
+        };
+        let Some(canvas) = taken else {
+            return Ok(DevelopCompletion::Cancelled);
+        };
+        let buf = Arc::new(PixelBuf {
+            width: canvas.width,
+            height: canvas.height,
+            rgba: canvas.rgba,
+        });
+        let retained = shared
+            .cache
+            .insert_rgba_if_desired((index, tier), buf.clone());
+        (buf, retained)
     };
-    let Some(canvas) = taken else {
-        return DevelopCompletion::Cancelled;
-    };
-    let buf = Arc::new(PixelBuf {
-        width: canvas.width,
-        height: canvas.height,
-        rgba: canvas.rgba,
-    });
-
     // From here on: exactly the monolithic Display-mode tail.
-    if token.cancelled() {
-        return DevelopCompletion::Cancelled;
-    }
-    if !shared
-        .cache
-        .insert_rgba_if_desired((index, tier), buf.clone())
-    {
-        return DevelopCompletion::Finished;
+    if !retained {
+        return Ok(DevelopCompletion::Finished);
     }
     emit(Event::ImageReady { index, tier });
     if !shared.cache.has_jpeg((index, tier)) {
@@ -2991,12 +3036,12 @@ fn run_progressive_full_develop(
                 shared.persistence.pending_budget_bytes
             );
         }
-        return DevelopCompletion::Persistence {
+        return Ok(DevelopCompletion::Persistence {
             outcome: enqueue,
             retained_bytes,
-        };
+        });
     }
-    DevelopCompletion::Finished
+    Ok(DevelopCompletion::Finished)
 }
 
 fn run_rehydrate(
@@ -3334,6 +3379,23 @@ pub fn benchmark_encode_jpeg_plain(buf: &PixelBuf, quality: u8) -> Result<Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Unwraps the progressive develop's slot-decline channel for tests that
+    /// start with a free staging slot.
+    #[allow(clippy::too_many_arguments)]
+    fn run_progressive_full_develop_ok(
+        shared: &Shared,
+        index: usize,
+        tier: Tier,
+        raw: rawler::RawImage,
+        orient: Orient,
+        initial_uv: [f32; 4],
+        token: &CancelToken,
+        emit: &dyn Fn(Event),
+    ) -> DevelopCompletion {
+        run_progressive_full_develop(shared, index, tier, raw, orient, initial_uv, token, emit)
+            .unwrap_or_else(|_| panic!("staging slot unexpectedly occupied"))
+    }
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -6567,7 +6629,7 @@ mod tests {
         let region_events = std::cell::Cell::new(0usize);
         let ready_events = std::cell::Cell::new(0usize);
         let token = CancelToken::default();
-        let completion = run_progressive_full_develop(
+        let completion = run_progressive_full_develop_ok(
             &shared,
             0,
             Tier::Full,
@@ -6736,7 +6798,7 @@ mod tests {
         *shared.full_viewport.lock().unwrap() = Some((0, uv));
 
         let token = CancelToken::default();
-        let completion = run_progressive_full_develop(
+        let completion = run_progressive_full_develop_ok(
             &shared,
             0,
             Tier::Full,
