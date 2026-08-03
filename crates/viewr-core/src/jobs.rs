@@ -27,7 +27,7 @@ use crate::cache_disk::{DEFAULT_CACHE_JPEG_QUALITY, DiskCache};
 use crate::cache_ram::RamCacheBudgets;
 use crate::cache_ram::{FullBand, RamCache};
 use crate::decode;
-use crate::develop::{Quality, develop};
+use crate::develop::{Quality, develop, plan_full_develop, supports_region_develop};
 use crate::folder::{FolderEntry, outward_order};
 use crate::jpeg_restart::{BandRequest, PrioritizedDecode};
 use crate::meta::FileMeta;
@@ -38,7 +38,8 @@ use crate::planning::{
     build_plan_targets_with_normalized_prefetch,
 };
 use crate::resize::apply_orient;
-use crate::types::{PixelBuf, Tier};
+use crate::types::{Orient, PixelBuf, Tier};
+use rawler::imgop::{Dim2, Point, Rect};
 
 /// Scheduler identity as `(folder index, render tier)`.
 pub type JobId = (usize, Tier);
@@ -130,6 +131,19 @@ pub enum Event {
         /// Index in the engine's immutable folder entry list.
         index: usize,
         /// Resident render tier.
+        tier: Tier,
+    },
+    /// A progressive Full develop finished one region into the staging
+    /// canvas.
+    ///
+    /// A payload-free progress ping: the covered rectangles live in the
+    /// staging snapshot read through [`Engine::with_progressive_full`].
+    /// Receivers need no replan — the accompanying notify callback already
+    /// requests a repaint.
+    ImageRegionReady {
+        /// Index in the engine's immutable folder entry list.
+        index: usize,
+        /// Tier being staged (always [`Tier::Full`] today).
         tier: Tier,
     },
     /// An image decode, development, or rehydration attempt failed.
@@ -1351,6 +1365,28 @@ struct Shared {
     /// Advisory visible-band mailbox read once at Full rehydrate decode
     /// start. Never part of job identity or plan equality.
     view_hint: Mutex<Option<ViewHint>>,
+    /// Viewport mailbox: latest zoomed display-space UV rectangle for one
+    /// image, written by the UI every zoomed frame. A Display+Full develop
+    /// whose index matches takes the progressive visible-region-first path;
+    /// between regions it is re-read for ordering only, so its value can
+    /// never change assembled bytes.
+    full_viewport: Mutex<Option<(usize, [f32; 4])>>,
+    /// The single staging canvas of the in-progress progressive Full
+    /// develop. `in_flight` guarantees one writer per (index, Full); a
+    /// replacing generation reinstalls the entry and cancellation clears it.
+    progressive: Mutex<Option<ProgressiveCanvas>>,
+}
+
+/// Display-space staging canvas assembled region by region by a progressive
+/// Full develop. UI readers copy tile rows out under the lock and never
+/// retain references.
+struct ProgressiveCanvas {
+    index: usize,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+    /// Display rectangles (`[x, y, width, height]`) already blitted.
+    covered: Vec<[u32; 4]>,
 }
 
 /// Construction options for an image-processing [`Engine`].
@@ -1582,6 +1618,8 @@ impl Engine {
                 navigation: Mutex::new(NavigationOrder::default()),
                 raw_share: RawDecodeShare::new(),
                 view_hint: Mutex::new(None),
+                full_viewport: Mutex::new(None),
+                progressive: Mutex::new(None),
             }),
             workers: Vec::with_capacity(HEAVY_WORKERS + LIGHT_WORKERS),
             persistence_worker: None,
@@ -1638,6 +1676,12 @@ impl Engine {
             direction: if nav.direction < 0 { -1 } else { 1 },
             zoomed: nav.zoomed,
         };
+        // Leaving zoom retires the viewport mailbox so later Full develops
+        // take the monolithic path; while zoomed the app republishes the
+        // viewport for the new current image every loupe frame.
+        if !nav.zoomed {
+            *self.shared.full_viewport.lock().unwrap() = None;
+        }
         let current = nav.current;
         let cache = &self.shared.cache;
         // Keep navigation generation, cache admission, and queue replacement
@@ -1794,6 +1838,47 @@ impl Engine {
     pub fn cache(&self) -> &Arc<RamCache> {
         &self.shared.cache
     }
+
+    /// Publishes the zoomed viewport for `index` as a display-space UV
+    /// rectangle `[min_x, min_y, max_x, max_y]`.
+    ///
+    /// Call every loupe frame while zoomed (a cheap store). The next
+    /// Display+Full develop of `index` then develops the visible region
+    /// first and assembles the rest outward; an in-flight develop re-reads
+    /// the mailbox between regions to re-order remaining work. The value
+    /// never affects produced bytes, only their order. Cleared by
+    /// [`navigate`](Self::navigate) when not zoomed.
+    pub fn set_full_viewport(&self, index: usize, uv: [f32; 4]) {
+        // A non-finite framing (degenerate layout mid-resize) is advisory
+        // garbage; downstream clamps would panic on NaN.
+        if !uv.iter().all(|value| value.is_finite()) {
+            return;
+        }
+        *self.shared.full_viewport.lock().unwrap() = Some((index, uv));
+    }
+
+    /// Reads the progressive Full staging canvas for `index`, if one is being
+    /// assembled.
+    ///
+    /// `f` receives the display-space canvas dimensions, its RGBA bytes, and
+    /// the covered display rectangles (`[x, y, width, height]`), all under
+    /// the staging lock: copy what you need and return quickly. Covered bytes
+    /// are identical to the finished Full buffer, so anything uploaded from
+    /// here never needs re-uploading after `ImageReady`.
+    pub fn with_progressive_full<R>(
+        &self,
+        index: usize,
+        f: impl FnOnce(u32, u32, &[u8], &[[u32; 4]]) -> R,
+    ) -> Option<R> {
+        let staging = self.shared.progressive.lock().unwrap();
+        let canvas = staging.as_ref().filter(|canvas| canvas.index == index)?;
+        Some(f(
+            canvas.width,
+            canvas.height,
+            &canvas.rgba,
+            &canvas.covered,
+        ))
+    }
 }
 
 impl Drop for Engine {
@@ -1807,6 +1892,8 @@ impl Drop for Engine {
         if let Some(worker) = self.persistence_worker.take() {
             let _ = worker.join();
         }
+        // Workers have joined: any staging canvas is abandoned for certain.
+        *self.shared.progressive.lock().unwrap() = None;
     }
 }
 
@@ -2388,7 +2475,7 @@ fn run_develop(
     // image reuses this decode instead of re-opening and entropy-decoding
     // the identical RAW.
     let join = shared.raw_share.join(index, token);
-    let (raw, meta) = match join {
+    let (mut raw, meta) = match join {
         RawShareJoin::Shared(shared_raw) => {
             let meta = FileMeta::from_metadata(&shared_raw.metadata);
             // The publisher cloned for exactly one follower, so sole
@@ -2441,6 +2528,44 @@ fn run_develop(
     };
     if token.cancelled() {
         return DevelopCompletion::Cancelled;
+    }
+    // Visible-region-first Full develop: only the interactive Display path of
+    // the CURRENT image whose zoomed viewport is published stages regions.
+    // The navigation check closes the stale-mailbox window between a zoomed
+    // navigation and its next painted frame, so a neighbor's develop can
+    // never route through the progressive path; prefetch, warm, and
+    // rehydrate fallbacks keep the monolithic path. A develop that finds the
+    // single staging slot occupied by another image declines and develops
+    // monolithically rather than discarding that image's assembly.
+    if mode == DevelopMode::Display
+        && tier == Tier::Full
+        && quality == Quality::Full
+        && supports_region_develop(&raw)
+    {
+        let viewport = *shared.full_viewport.lock().unwrap();
+        let is_navigation_current = shared
+            .navigation
+            .lock()
+            .unwrap()
+            .last_nav
+            .is_some_and(|nav| nav.current == index);
+        if is_navigation_current
+            && let Some((_, uv)) = viewport.filter(|(viewport_index, _)| *viewport_index == index)
+        {
+            match run_progressive_full_develop(
+                shared,
+                index,
+                tier,
+                raw,
+                meta.orient,
+                uv,
+                token,
+                emit,
+            ) {
+                Ok(completion) => return completion,
+                Err(declined) => raw = *declined,
+            }
+        }
     }
     let (buf, _) = match develop(raw, quality) {
         Ok(r) => r,
@@ -2581,6 +2706,342 @@ fn decode_jpeg_for_rehydrate(
             Err(_) => DecodeOutcome::Corrupt,
         },
     }
+}
+
+/// Extra pre-orient pixels developed around the visible viewport. Covers the
+/// UI tiles' one-pixel sampling gutter with slack for small pans.
+const PROGRESSIVE_VIEWPORT_MARGIN: u32 = 32;
+/// Row height of the full-width assembly bands developed after the visible
+/// region. Also the cancellation granularity of a progressive Full develop.
+const PROGRESSIVE_BAND_ROWS: u32 = 1024;
+
+/// Display-space UV rectangle → display pixel rectangle `[x, y, w, h]`, the
+/// same floor/ceil clamp math as the UI's visible-tile selection.
+fn visible_display_pixels(uv: [f32; 4], display_w: u32, display_h: u32) -> [u32; 4] {
+    let min_x = uv[0].clamp(0.0, 1.0);
+    let min_y = uv[1].clamp(0.0, 1.0);
+    let max_x = uv[2].clamp(min_x, 1.0);
+    let max_y = uv[3].clamp(min_y, 1.0);
+    let x = ((min_x * display_w as f32).floor() as u32).min(display_w);
+    let y = ((min_y * display_h as f32).floor() as u32).min(display_h);
+    let right = ((max_x * display_w as f32).ceil() as u32).min(display_w);
+    let bottom = ((max_y * display_h as f32).ceil() as u32).min(display_h);
+    [x, y, right.saturating_sub(x), bottom.saturating_sub(y)]
+}
+
+/// Display rectangle → pre-orient output rectangle: the inverse of the
+/// forward rectangle mapping used by the fused oriented pack.
+fn inverse_orient_rect(display: [u32; 4], orient: Orient, out_w: u32, out_h: u32) -> [u32; 4] {
+    let [x, y, w, h] = display;
+    match orient {
+        Orient::R0 => [x, y, w, h],
+        Orient::R90 => [y, out_h - x - w, h, w],
+        Orient::R180 => [out_w - x - w, out_h - y - h, w, h],
+        Orient::R270 => [out_w - y - h, x, h, w],
+    }
+}
+
+/// Expands a rectangle by `margin` on every side and clamps it to the frame.
+fn expand_and_clamp(rect: [u32; 4], margin: u32, out_w: u32, out_h: u32) -> [u32; 4] {
+    let x = rect[0].saturating_sub(margin).min(out_w);
+    let y = rect[1].saturating_sub(margin).min(out_h);
+    let right = rect[0]
+        .saturating_add(rect[2])
+        .saturating_add(margin)
+        .min(out_w);
+    let bottom = rect[1]
+        .saturating_add(rect[3])
+        .saturating_add(margin)
+        .min(out_h);
+    [x, y, right.saturating_sub(x), bottom.saturating_sub(y)]
+}
+
+/// Zoomed display viewport → the first developed pre-orient rectangle.
+fn progressive_first_rect(uv: [f32; 4], orient: Orient, out_w: u32, out_h: u32) -> [u32; 4] {
+    let (display_w, display_h) = if orient.swaps_axes() {
+        (out_h, out_w)
+    } else {
+        (out_w, out_h)
+    };
+    let visible = visible_display_pixels(uv, display_w, display_h);
+    let out = inverse_orient_rect(visible, orient, out_w, out_h);
+    expand_and_clamp(out, PROGRESSIVE_VIEWPORT_MARGIN, out_w, out_h)
+}
+
+/// Covers the out frame minus `first` exactly once: full-width bands of
+/// `band_rows` rows, where a band overlapping `first`'s row span contributes
+/// its rows above and below plus the left/right remnants beside `first`.
+fn progressive_remainder(out_w: u32, out_h: u32, first: [u32; 4], band_rows: u32) -> Vec<[u32; 4]> {
+    let mut bands = Vec::new();
+    if out_w == 0 || out_h == 0 {
+        return bands;
+    }
+    let band_rows = band_rows.max(1);
+    let [first_x, first_y, first_w, first_h] = first;
+    let first_right = first_x + first_w;
+    let first_bottom = first_y + first_h;
+    let mut push = |rect: [u32; 4]| {
+        if rect[2] > 0 && rect[3] > 0 {
+            bands.push(rect);
+        }
+    };
+    let mut y = 0;
+    while y < out_h {
+        let bottom = (y + band_rows).min(out_h);
+        let overlap_top = y.max(first_y);
+        let overlap_bottom = bottom.min(first_bottom);
+        if overlap_top >= overlap_bottom || first_w == 0 {
+            push([0, y, out_w, bottom - y]);
+        } else {
+            push([0, y, out_w, overlap_top - y]);
+            push([0, overlap_top, first_x, overlap_bottom - overlap_top]);
+            push([
+                first_right,
+                overlap_top,
+                out_w - first_right,
+                overlap_bottom - overlap_top,
+            ]);
+            push([0, overlap_bottom, out_w, bottom - overlap_bottom]);
+        }
+        y = bottom;
+    }
+    bands
+}
+
+/// Ordering key for remaining assembly work: squared axis-gap distance to the
+/// target rectangle, then squared center distance as a deterministic
+/// tiebreak. Ordering never affects assembled bytes.
+fn rect_distance_key(rect: [u32; 4], target: [u32; 4]) -> (u64, u64) {
+    let gap = |a0: u32, a1: u32, b0: u32, b1: u32| -> u64 {
+        if a1 <= b0 {
+            u64::from(b0 - a1)
+        } else if b1 <= a0 {
+            u64::from(a0 - b1)
+        } else {
+            0
+        }
+    };
+    let gap_x = gap(rect[0], rect[0] + rect[2], target[0], target[0] + target[2]);
+    let gap_y = gap(rect[1], rect[1] + rect[3], target[1], target[1] + target[3]);
+    let center = |r: [u32; 4]| {
+        (
+            i64::from(r[0]) * 2 + i64::from(r[2]),
+            i64::from(r[1]) * 2 + i64::from(r[3]),
+        )
+    };
+    let (center_x, center_y) = center(rect);
+    let (target_x, target_y) = center(target);
+    let dx = (center_x - target_x).unsigned_abs();
+    let dy = (center_y - target_y).unsigned_abs();
+    (gap_x * gap_x + gap_y * gap_y, dx * dx + dy * dy)
+}
+
+/// Drops the staging canvas if this develop still owns it.
+fn clear_progressive(shared: &Shared, index: usize) {
+    let mut staging = shared.progressive.lock().unwrap();
+    if staging.as_ref().is_some_and(|canvas| canvas.index == index) {
+        *staging = None;
+    }
+}
+
+/// Visible-region-first Full develop: develops the published viewport first,
+/// assembles the remaining frame outward in bands through the staging canvas,
+/// and finishes with exactly the monolithic Display tail over the assembled
+/// buffer — which is byte-identical to
+/// `apply_orient(develop(raw, Full), orient)`, so RAM entries, JPEG bytes,
+/// and disk objects are unchanged. Cancellation is honored at every region
+/// boundary and clears the staging entry.
+#[allow(clippy::too_many_arguments)]
+/// Runs the visible-region-first Full develop, or returns the untouched
+/// mosaic in `Err` when the single staging slot is occupied by another
+/// image's mid-assembly develop (the caller then develops monolithically).
+fn run_progressive_full_develop(
+    shared: &Shared,
+    index: usize,
+    tier: Tier,
+    raw: rawler::RawImage,
+    orient: Orient,
+    initial_uv: [f32; 4],
+    token: &CancelToken,
+    emit: &dyn Fn(Event),
+) -> Result<DevelopCompletion, Box<rawler::RawImage>> {
+    // Reserve the staging slot atomically before any expensive work: at most
+    // one canvas exists, and stealing an active one would discard a
+    // near-complete assembly whose job stays wanted as a neighbor.
+    {
+        let mut staging = shared.progressive.lock().unwrap();
+        if staging.as_ref().is_some_and(|canvas| canvas.index != index) {
+            return Err(Box::new(raw));
+        }
+        *staging = Some(ProgressiveCanvas {
+            index,
+            width: 0,
+            height: 0,
+            rgba: Vec::new(),
+            covered: Vec::new(),
+        });
+    }
+    let plan = match plan_full_develop(raw) {
+        Ok(plan) => plan,
+        Err(e) => {
+            clear_progressive(shared, index);
+            if !token.cancelled() {
+                emit(Event::ImageFailed {
+                    index,
+                    tier,
+                    error: e.to_string(),
+                });
+            }
+            return Ok(if token.cancelled() {
+                DevelopCompletion::Cancelled
+            } else {
+                DevelopCompletion::Finished
+            });
+        }
+    };
+    let (display_w, display_h) = plan.display_size(orient);
+    let (out_w, out_h) = plan.output_size();
+
+    // Fill in the reserved staging canvas; `in_flight` guarantees a single
+    // writer per (index, Full), and the reservation above guarantees the
+    // slot is ours.
+    {
+        let mut staging = shared.progressive.lock().unwrap();
+        *staging = Some(ProgressiveCanvas {
+            index,
+            width: display_w,
+            height: display_h,
+            rgba: vec![0; display_w as usize * display_h as usize * 4],
+            covered: Vec::new(),
+        });
+    }
+
+    // Develop one region into a region-local scratch, then blit it into the
+    // staging canvas under the lock (the lock is never held during develop).
+    let mut scratch: Vec<u8> = Vec::new();
+    let develop_one = |rect: [u32; 4], scratch: &mut Vec<u8>| -> Option<DevelopCompletion> {
+        if token.cancelled() {
+            clear_progressive(shared, index);
+            return Some(DevelopCompletion::Cancelled);
+        }
+        let out_rect = Rect::new(
+            Point::new(rect[0] as usize, rect[1] as usize),
+            Dim2::new(rect[2] as usize, rect[3] as usize),
+        );
+        let display = plan.display_rect(out_rect, orient);
+        scratch.clear();
+        scratch.resize(display[2] as usize * display[3] as usize * 4, 0);
+        plan.develop_region_into(
+            out_rect,
+            orient,
+            scratch,
+            display[2],
+            [display[0], display[1]],
+        );
+        let row_bytes = display[2] as usize * 4;
+        let mut staging = shared.progressive.lock().unwrap();
+        let Some(canvas) = staging.as_mut().filter(|canvas| canvas.index == index) else {
+            // A replacing generation owns the staging slot; this generation's
+            // publication would be rejected anyway.
+            return Some(DevelopCompletion::Cancelled);
+        };
+        let stride = canvas.width as usize * 4;
+        for row in 0..display[3] as usize {
+            let dst = (display[1] as usize + row) * stride + display[0] as usize * 4;
+            canvas.rgba[dst..dst + row_bytes]
+                .copy_from_slice(&scratch[row * row_bytes..(row + 1) * row_bytes]);
+        }
+        canvas.covered.push(display);
+        drop(staging);
+        emit(Event::ImageRegionReady { index, tier });
+        None
+    };
+
+    let first = progressive_first_rect(initial_uv, orient, out_w, out_h);
+    let mut remaining = progressive_remainder(out_w, out_h, first, PROGRESSIVE_BAND_ROWS);
+    let mut target = first;
+    if first[2] > 0
+        && first[3] > 0
+        && let Some(done) = develop_one(first, &mut scratch)
+    {
+        return Ok(done);
+    }
+    while !remaining.is_empty() {
+        // Ordering only: a moved viewport re-prioritizes the remaining bands
+        // but cannot change any assembled byte.
+        let viewport = *shared.full_viewport.lock().unwrap();
+        if let Some((_, uv)) = viewport.filter(|(viewport_index, _)| *viewport_index == index) {
+            target = progressive_first_rect(uv, orient, out_w, out_h);
+        }
+        let nearest = remaining
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, rect)| rect_distance_key(**rect, target))
+            .map(|(position, _)| position)
+            .expect("remaining is non-empty");
+        let rect = remaining.swap_remove(nearest);
+        if let Some(done) = develop_one(rect, &mut scratch) {
+            return Ok(done);
+        }
+    }
+    drop(scratch);
+
+    // Hand the finished canvas to the cache atomically with clearing the
+    // staging slot: the overlay's fallback reads hold the staging lock, so
+    // no frame can observe the moment where neither source exists. Nothing
+    // inside the critical section takes the staging lock again (the cache
+    // ring has its own mutex and never calls back), so no cycle exists.
+    let (buf, retained) = {
+        let mut staging = shared.progressive.lock().unwrap();
+        if token.cancelled() {
+            if staging.as_ref().is_some_and(|canvas| canvas.index == index) {
+                *staging = None;
+            }
+            return Ok(DevelopCompletion::Cancelled);
+        }
+        let taken = if staging.as_ref().is_some_and(|canvas| canvas.index == index) {
+            staging.take()
+        } else {
+            None
+        };
+        let Some(canvas) = taken else {
+            return Ok(DevelopCompletion::Cancelled);
+        };
+        let buf = Arc::new(PixelBuf {
+            width: canvas.width,
+            height: canvas.height,
+            rgba: canvas.rgba,
+        });
+        let retained = shared
+            .cache
+            .insert_rgba_if_desired((index, tier), buf.clone());
+        (buf, retained)
+    };
+    // From here on: exactly the monolithic Display-mode tail.
+    if !retained {
+        return Ok(DevelopCompletion::Finished);
+    }
+    emit(Event::ImageReady { index, tier });
+    if !shared.cache.has_jpeg((index, tier)) {
+        let retained_bytes = buf.byte_len();
+        let enqueue = shared.persistence.enqueue(PersistenceRequest {
+            id: (index, tier),
+            pixels: buf,
+            insert_ram: true,
+            warm_completion: false,
+        });
+        if enqueue == PersistenceEnqueue::Oversized {
+            eprintln!(
+                "disk cache persistence skipped: {retained_bytes} byte buffer exceeds the {} byte pending budget",
+                shared.persistence.pending_budget_bytes
+            );
+        }
+        return Ok(DevelopCompletion::Persistence {
+            outcome: enqueue,
+            retained_bytes,
+        });
+    }
+    Ok(DevelopCompletion::Finished)
 }
 
 fn run_rehydrate(
@@ -2918,6 +3379,23 @@ pub fn benchmark_encode_jpeg_plain(buf: &PixelBuf, quality: u8) -> Result<Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Unwraps the progressive develop's slot-decline channel for tests that
+    /// start with a free staging slot.
+    #[allow(clippy::too_many_arguments)]
+    fn run_progressive_full_develop_ok(
+        shared: &Shared,
+        index: usize,
+        tier: Tier,
+        raw: rawler::RawImage,
+        orient: Orient,
+        initial_uv: [f32; 4],
+        token: &CancelToken,
+        emit: &dyn Fn(Event),
+    ) -> DevelopCompletion {
+        run_progressive_full_develop(shared, index, tier, raw, orient, initial_uv, token, emit)
+            .unwrap_or_else(|_| panic!("staging slot unexpectedly occupied"))
+    }
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -3613,6 +4091,8 @@ mod tests {
             navigation: Mutex::new(NavigationOrder::default()),
             raw_share: RawDecodeShare::new(),
             view_hint: Mutex::new(None),
+            full_viewport: Mutex::new(None),
+            progressive: Mutex::new(None),
         };
 
         publish_claimed(
@@ -3886,6 +4366,8 @@ mod tests {
             navigation: Mutex::new(NavigationOrder::default()),
             raw_share: RawDecodeShare::new(),
             view_hint: Mutex::new(None),
+            full_viewport: Mutex::new(None),
+            progressive: Mutex::new(None),
         })
     }
 
@@ -3991,6 +4473,8 @@ mod tests {
                 navigation: Mutex::new(NavigationOrder::default()),
                 raw_share: RawDecodeShare::new(),
                 view_hint: Mutex::new(hint),
+                full_viewport: Mutex::new(None),
+                progressive: Mutex::new(None),
             },
             receiver,
         )
@@ -5309,6 +5793,8 @@ mod tests {
             navigation: Mutex::new(NavigationOrder::default()),
             raw_share: RawDecodeShare::new(),
             view_hint: Mutex::new(None),
+            full_viewport: Mutex::new(None),
+            progressive: Mutex::new(None),
         };
 
         run_warm_develop(
@@ -5726,6 +6212,8 @@ mod tests {
             navigation: Mutex::new(NavigationOrder::default()),
             raw_share: RawDecodeShare::new(),
             view_hint: Mutex::new(None),
+            full_viewport: Mutex::new(None),
+            progressive: Mutex::new(None),
         };
 
         run_rehydrate(
@@ -5894,6 +6382,453 @@ mod tests {
                 .unwrap(),
             (second.width, second.height)
         );
+    }
+
+    #[test]
+    fn inverse_orient_rect_matches_the_per_pixel_inverse_mapping() {
+        let (out_w, out_h) = (7u32, 5u32);
+        for orient in [Orient::R0, Orient::R90, Orient::R180, Orient::R270] {
+            let (display_w, display_h) = if orient.swaps_axes() {
+                (out_h, out_w)
+            } else {
+                (out_w, out_h)
+            };
+            for x in 0..display_w {
+                for y in 0..display_h {
+                    for w in 1..=display_w - x {
+                        for h in 1..=display_h - y {
+                            let rect = inverse_orient_rect([x, y, w, h], orient, out_w, out_h);
+                            // Bounding box of the display pixels mapped through
+                            // apply_orient's source-lookup formulas.
+                            let (mut min_x, mut min_y) = (u32::MAX, u32::MAX);
+                            let (mut max_x, mut max_y) = (0, 0);
+                            for yd in y..y + h {
+                                for xd in x..x + w {
+                                    let (xs, ys) = match orient {
+                                        Orient::R0 => (xd, yd),
+                                        Orient::R90 => (yd, out_h - 1 - xd),
+                                        Orient::R180 => (out_w - 1 - xd, out_h - 1 - yd),
+                                        Orient::R270 => (out_w - 1 - yd, xd),
+                                    };
+                                    min_x = min_x.min(xs);
+                                    min_y = min_y.min(ys);
+                                    max_x = max_x.max(xs);
+                                    max_y = max_y.max(ys);
+                                }
+                            }
+                            assert_eq!(
+                                rect,
+                                [min_x, min_y, max_x - min_x + 1, max_y - min_y + 1],
+                                "{orient:?} display [{x},{y},{w},{h}]"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn progressive_remainder_covers_the_frame_minus_first_exactly_once() {
+        let cases: [(u32, u32, [u32; 4], u32); 7] = [
+            (23, 40, [4, 9, 6, 7], 7),
+            (23, 40, [0, 0, 23, 40], 7),
+            (23, 40, [0, 0, 0, 0], 7),
+            (23, 40, [0, 12, 23, 5], 1),
+            (16, 8, [10, 0, 6, 8], 1024),
+            (5, 3, [2, 1, 1, 1], 2),
+            (64, 64, [60, 60, 4, 4], 9),
+        ];
+        for (w, h, first, band_rows) in cases {
+            let mut counts = vec![0u8; (w * h) as usize];
+            for rect in progressive_remainder(w, h, first, band_rows) {
+                assert!(rect[0] + rect[2] <= w && rect[1] + rect[3] <= h);
+                assert!(rect[2] > 0 && rect[3] > 0);
+                for y in rect[1]..rect[1] + rect[3] {
+                    for x in rect[0]..rect[0] + rect[2] {
+                        counts[(y * w + x) as usize] += 1;
+                    }
+                }
+            }
+            for y in 0..h {
+                for x in 0..w {
+                    let inside_first = x >= first[0]
+                        && x < first[0] + first[2]
+                        && y >= first[1]
+                        && y < first[1] + first[3];
+                    assert_eq!(
+                        counts[(y * w + x) as usize],
+                        u8::from(!inside_first),
+                        "({x},{y}) in {w}x{h}, first {first:?}, bands of {band_rows}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn progressive_first_rect_expands_the_viewport_and_survives_degenerate_input() {
+        // A centered viewport expands by the margin and clamps to the frame.
+        // Expected values follow the deterministic f32 floor/ceil math of
+        // visible_display_pixels (0.6 * 3000 rounds up to 1801, for example).
+        let uv = [0.4, 0.4, 0.6, 0.6];
+        assert_eq!(
+            progressive_first_rect(uv, Orient::R0, 4000, 3000),
+            [1568, 1168, 864, 665]
+        );
+        assert_eq!(
+            progressive_first_rect(uv, Orient::R90, 4000, 3000),
+            [1568, 1167, 864, 665]
+        );
+
+        // Off-frame viewport clamps to an edge but stays developable.
+        let rect = progressive_first_rect([1.2, 1.3, 1.4, 1.5], Orient::R0, 4000, 3000);
+        assert!(rect[2] > 0 && rect[3] > 0);
+        assert!(rect[0] + rect[2] <= 4000 && rect[1] + rect[3] <= 3000);
+
+        // Degenerate zero-area viewport still produces a developable rect.
+        for orient in [Orient::R0, Orient::R90, Orient::R180, Orient::R270] {
+            let rect = progressive_first_rect([0.5, 0.5, 0.5, 0.5], orient, 3000, 2000);
+            assert!(rect[2] > 0 && rect[3] > 0, "{orient:?}");
+            assert!(
+                rect[0] + rect[2] <= 3000 && rect[1] + rect[3] <= 2000,
+                "{orient:?}"
+            );
+        }
+    }
+
+    fn staging_test_shared() -> (Shared, Receiver<Event>) {
+        let (events, receiver) = std::sync::mpsc::channel();
+        let shared = Shared {
+            entries: Arc::new(Vec::new()),
+            cache: Arc::new(test_cache(0, 0, 0)),
+            disk: None,
+            events,
+            notify: Arc::new(|| {}),
+            processing_pool: None,
+            heavy: JobQueue::new(),
+            light: JobQueue::new(),
+            persistence: PersistenceQueue::new(),
+            persistence_known_present: Mutex::new(HashSet::new()),
+            jpeg_quality: CACHE_JPEG_QUALITY,
+            navigation: Mutex::new(NavigationOrder::default()),
+            raw_share: RawDecodeShare::new(),
+            view_hint: Mutex::new(None),
+            full_viewport: Mutex::new(None),
+            progressive: Mutex::new(None),
+        };
+        (shared, receiver)
+    }
+
+    #[test]
+    fn progressive_staging_is_cleared_only_by_its_owning_index() {
+        let (shared, _receiver) = staging_test_shared();
+        *shared.progressive.lock().unwrap() = Some(ProgressiveCanvas {
+            index: 3,
+            width: 2,
+            height: 1,
+            rgba: vec![0; 8],
+            covered: vec![[0, 0, 1, 1]],
+        });
+        clear_progressive(&shared, 5);
+        assert!(shared.progressive.lock().unwrap().is_some());
+        clear_progressive(&shared, 3);
+        assert!(shared.progressive.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn full_viewport_mailbox_round_trips_and_clears_when_not_zoomed() {
+        let entries = Arc::new(vec![FolderEntry {
+            path: "/nonexistent/viewr-progressive-test.arw".into(),
+            file_name: "viewr-progressive-test.arw".into(),
+            size: 0,
+            mtime_ns: 0,
+        }]);
+        let cache = Arc::new(test_cache(0, 0, 0));
+        let (engine, _events) = Engine::new(entries, 0, cache, None, Arc::new(|| {}));
+
+        engine.set_full_viewport(0, [0.25, 0.25, 0.75, 0.75]);
+        assert_eq!(
+            *engine.shared.full_viewport.lock().unwrap(),
+            Some((0, [0.25, 0.25, 0.75, 0.75]))
+        );
+        assert!(engine.with_progressive_full(0, |_, _, _, _| ()).is_none());
+
+        engine.navigate(NavState {
+            current: 0,
+            direction: 1,
+            zoomed: true,
+        });
+        assert!(engine.shared.full_viewport.lock().unwrap().is_some());
+
+        engine.navigate(NavState {
+            current: 0,
+            direction: 1,
+            zoomed: false,
+        });
+        assert!(engine.shared.full_viewport.lock().unwrap().is_none());
+    }
+
+    fn real_sony_raw_fixture() -> std::path::PathBuf {
+        std::env::var_os("VIEWR_TEST_RAW")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../testdata/real-raw-corpus/HCA04875.ARW")
+            })
+    }
+
+    fn progressive_fixture_shared(path: &std::path::Path) -> (Shared, Receiver<Event>) {
+        let (events, receiver) = std::sync::mpsc::channel();
+        let shared = Shared {
+            entries: Arc::new(vec![FolderEntry {
+                path: path.to_path_buf(),
+                file_name: path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                size: 0,
+                mtime_ns: 0,
+            }]),
+            cache: Arc::new(RamCache::new(RamCacheBudgets::new(0, 0, 1 << 30, 0))),
+            disk: None,
+            events,
+            notify: Arc::new(|| {}),
+            processing_pool: None,
+            heavy: JobQueue::new(),
+            light: JobQueue::new(),
+            persistence: PersistenceQueue::new(),
+            persistence_known_present: Mutex::new(HashSet::new()),
+            jpeg_quality: CACHE_JPEG_QUALITY,
+            navigation: Mutex::new(NavigationOrder::default()),
+            raw_share: RawDecodeShare::new(),
+            view_hint: Mutex::new(None),
+            full_viewport: Mutex::new(None),
+            progressive: Mutex::new(None),
+        };
+        shared
+            .cache
+            .set_navigation_policy(vec![(0, Tier::Full)], [(0, Tier::Full)]);
+        (shared, receiver)
+    }
+
+    #[test]
+    #[ignore = "requires the pinned public-domain Sony RAW fixture or VIEWR_TEST_RAW"]
+    fn real_sony_raw_progressive_develop_matches_monolithic_and_stages_regions() {
+        let path = real_sony_raw_fixture();
+        let decoded = decode::load(&path).expect("fixture decodes");
+        let meta = FileMeta::from_metadata(&decoded.metadata);
+        let raw = decoded.raw;
+        let reference = apply_orient(
+            develop(raw.clone(), Quality::Full)
+                .expect("monolithic develop")
+                .0,
+            meta.orient,
+        );
+
+        let (shared, _receiver) = progressive_fixture_shared(&path);
+        let uv = [0.45f32, 0.4, 0.55, 0.6];
+        *shared.full_viewport.lock().unwrap() = Some((0, uv));
+
+        let region_events = std::cell::Cell::new(0usize);
+        let ready_events = std::cell::Cell::new(0usize);
+        let token = CancelToken::default();
+        let completion = run_progressive_full_develop_ok(
+            &shared,
+            0,
+            Tier::Full,
+            raw,
+            meta.orient,
+            uv,
+            &token,
+            &|event| match event {
+                Event::ImageRegionReady {
+                    index: 0,
+                    tier: Tier::Full,
+                } => {
+                    region_events.set(region_events.get() + 1);
+                    // Every covered byte must already carry final-frame bytes.
+                    let staging = shared.progressive.lock().unwrap();
+                    let canvas = staging.as_ref().expect("staging present during regions");
+                    let last = *canvas.covered.last().expect("covered rect recorded");
+                    let stride = canvas.width as usize * 4;
+                    for row in [0, last[3] as usize / 2, last[3] as usize - 1] {
+                        let start = (last[1] as usize + row) * stride + last[0] as usize * 4;
+                        let len = last[2] as usize * 4;
+                        assert_eq!(
+                            &canvas.rgba[start..start + len],
+                            &reference.rgba[start..start + len],
+                            "covered rect {last:?} row {row} differs from the final frame"
+                        );
+                    }
+                }
+                Event::ImageReady {
+                    index: 0,
+                    tier: Tier::Full,
+                } => ready_events.set(ready_events.get() + 1),
+                other => panic!("unexpected event {other:?}"),
+            },
+        );
+
+        assert!(
+            matches!(
+                completion,
+                DevelopCompletion::Finished | DevelopCompletion::Persistence { .. }
+            ),
+            "{completion:?}"
+        );
+        assert!(region_events.get() >= 2, "expected several staged regions");
+        assert_eq!(ready_events.get(), 1);
+        assert!(shared.progressive.lock().unwrap().is_none());
+        let cached = shared
+            .cache
+            .get_rgba((0, Tier::Full))
+            .expect("assembled pixels admitted to the Full ring");
+        assert_eq!(
+            (cached.width, cached.height),
+            (reference.width, reference.height)
+        );
+        assert!(
+            cached.rgba == reference.rgba,
+            "assembled bytes differ from the monolithic develop"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the pinned public-domain Sony RAW fixture or VIEWR_TEST_RAW"]
+    fn real_sony_raw_progressive_latency_measurement() {
+        use std::time::Instant;
+
+        let path = real_sony_raw_fixture();
+        let decoded = decode::load(&path).expect("fixture decodes");
+        let meta = FileMeta::from_metadata(&decoded.metadata);
+        let decode_wall = decoded.t_open + decoded.t_metadata + decoded.t_raw_decode;
+        let raw = decoded.raw;
+
+        // Warm the gamma LUT and Rayon pool so both paths measure steady
+        // state rather than first-use initialization.
+        crate::develop::warm_gamma_lut();
+        drop(develop(raw.clone(), Quality::Full).expect("warm-up develop"));
+
+        // Monolithic Display path: whole-frame develop plus display rotate.
+        let t = Instant::now();
+        let (buf, timings) = develop(raw.clone(), Quality::Full).expect("monolithic develop");
+        let monolithic_develop = t.elapsed();
+        let t = Instant::now();
+        let oriented = apply_orient(buf, meta.orient);
+        let rotate_wall = t.elapsed();
+
+        // Progressive path: plan (rescale), visible region, then assembly.
+        let t = Instant::now();
+        let plan = plan_full_develop(raw).expect("plan");
+        let plan_wall = t.elapsed();
+        let orient = meta.orient;
+        let (display_w, display_h) = plan.display_size(orient);
+        assert_eq!((display_w, display_h), (oriented.width, oriented.height));
+        let (out_w, out_h) = plan.output_size();
+
+        // A 2560x1440 display viewport at 100% zoom, centered.
+        let view_w = 2560.min(display_w);
+        let view_h = 1440.min(display_h);
+        let uv = [
+            (display_w - view_w) as f32 / 2.0 / display_w as f32,
+            (display_h - view_h) as f32 / 2.0 / display_h as f32,
+            ((display_w - view_w) / 2 + view_w) as f32 / display_w as f32,
+            ((display_h - view_h) / 2 + view_h) as f32 / display_h as f32,
+        ];
+        let first = progressive_first_rect(uv, orient, out_w, out_h);
+        let mut canvas = vec![0u8; display_w as usize * display_h as usize * 4];
+
+        let region_into = |rect: [u32; 4], canvas: &mut Vec<u8>| {
+            let out_rect = Rect::new(
+                Point::new(rect[0] as usize, rect[1] as usize),
+                Dim2::new(rect[2] as usize, rect[3] as usize),
+            );
+            plan.develop_region_into(out_rect, orient, canvas, display_w, [0, 0]);
+        };
+
+        let mut visible_wall = None::<std::time::Duration>;
+        for _ in 0..3 {
+            let t = Instant::now();
+            region_into(first, &mut canvas);
+            let wall = t.elapsed();
+            visible_wall = Some(visible_wall.map_or(wall, |best| best.min(wall)));
+        }
+        let visible_wall = visible_wall.expect("measured");
+
+        let t = Instant::now();
+        let mut band_walls = Vec::new();
+        for band in progressive_remainder(out_w, out_h, first, PROGRESSIVE_BAND_ROWS) {
+            let band_start = Instant::now();
+            region_into(band, &mut canvas);
+            band_walls.push(band_start.elapsed());
+        }
+        let assembly_wall = t.elapsed();
+        assert_eq!(canvas, oriented.rgba, "measured assembly must stay exact");
+
+        let visible_mp = f64::from(first[2]) * f64::from(first[3]) / 1e6;
+        let max_band = band_walls.iter().max().copied().unwrap_or_default();
+        eprintln!(
+            "== progressive Full develop latency ({}x{} {orient:?}) ==",
+            out_w, out_h
+        );
+        eprintln!("decode (open+meta+raw): {decode_wall:?}");
+        eprintln!(
+            "monolithic develop: {monolithic_develop:?} ({:?} demosaic) + rotate {rotate_wall:?}",
+            timings.demosaic
+        );
+        eprintln!("plan (rescale): {plan_wall:?}");
+        eprintln!("visible region {first:?} ({visible_mp:.1} MP): {visible_wall:?}");
+        eprintln!(
+            "remaining assembly: {assembly_wall:?} over {} bands (max band {max_band:?})",
+            band_walls.len()
+        );
+        eprintln!(
+            "cold zoom-to-sharp (post-decode): monolithic {:?} vs progressive {:?}",
+            monolithic_develop + rotate_wall,
+            plan_wall + visible_wall
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the pinned public-domain Sony RAW fixture or VIEWR_TEST_RAW"]
+    fn real_sony_raw_progressive_develop_cancels_at_region_boundaries() {
+        let path = real_sony_raw_fixture();
+        let decoded = decode::load(&path).expect("fixture decodes");
+        let meta = FileMeta::from_metadata(&decoded.metadata);
+
+        let (shared, _receiver) = progressive_fixture_shared(&path);
+        let uv = [0.45f32, 0.4, 0.55, 0.6];
+        *shared.full_viewport.lock().unwrap() = Some((0, uv));
+
+        let token = CancelToken::default();
+        let completion = run_progressive_full_develop_ok(
+            &shared,
+            0,
+            Tier::Full,
+            decoded.raw,
+            meta.orient,
+            uv,
+            &token,
+            &|event| {
+                assert!(
+                    !matches!(event, Event::ImageReady { .. }),
+                    "a cancelled develop must never publish readiness"
+                );
+                if matches!(event, Event::ImageRegionReady { .. }) {
+                    // Cancel as soon as the first region lands: the next
+                    // region boundary must stop and clear staging.
+                    token.cancel();
+                }
+            },
+        );
+
+        assert_eq!(completion, DevelopCompletion::Cancelled);
+        assert!(
+            shared.progressive.lock().unwrap().is_none(),
+            "cancellation must clear the staging canvas"
+        );
+        assert!(shared.cache.get_rgba((0, Tier::Full)).is_none());
     }
 
     #[test]
