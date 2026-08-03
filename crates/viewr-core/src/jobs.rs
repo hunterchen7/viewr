@@ -23,9 +23,10 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, TryLockError};
 use std::time::Duration;
 
 use crate::cache_disk::{DEFAULT_CACHE_JPEG_QUALITY, DiskCache};
-use crate::cache_ram::RamCache;
+use crate::cache_ram::{FullBand, RamCache};
 #[cfg(test)]
 use crate::cache_ram::RamCacheBudgets;
+use crate::jpeg_restart::{BandRequest, PrioritizedDecode};
 use crate::decode;
 use crate::develop::{Quality, develop};
 use crate::folder::{FolderEntry, outward_order};
@@ -164,6 +165,27 @@ pub struct NavState {
     /// Full resolution fills its adaptive RAM working set in every mode. This
     /// flag raises the current Full render's priority.
     pub zoomed: bool,
+}
+
+/// Advisory visible-band hint consumed by Full-tier cache rehydrates.
+///
+/// The hint is deliberately outside [`NavState`] and job identity: replans
+/// never cancel or reprioritize in-flight work because a hint changed, and a
+/// stale or mismatched hint only affects which rows of the frame decode
+/// first — never the decoded bytes, the installed cache object, or any
+/// fallback behavior.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewHint {
+    /// Folder index the hint describes; jobs for other indices ignore it.
+    pub index: usize,
+    /// Top of the visible range as an image-space V coordinate (0..1).
+    pub uv_y0: f32,
+    /// Bottom of the visible range as an image-space V coordinate (0..1).
+    pub uv_y1: f32,
+    /// Consumer tile edge in pixels; the decoded band expands to this grid.
+    pub align_px: u32,
+    /// Consumer sampling gutter beyond each tile edge, in pixels.
+    pub gutter_px: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1326,6 +1348,9 @@ struct Shared {
     navigation: Mutex<NavigationOrder>,
     /// Decode handoff between paired Browse/Full develops of one image.
     raw_share: RawDecodeShare,
+    /// Advisory visible-band mailbox read once at Full rehydrate decode
+    /// start. Never part of job identity or plan equality.
+    view_hint: Mutex<Option<ViewHint>>,
 }
 
 /// Construction options for an image-processing [`Engine`].
@@ -1556,6 +1581,7 @@ impl Engine {
                 jpeg_quality: options.jpeg_quality,
                 navigation: Mutex::new(NavigationOrder::default()),
                 raw_share: RawDecodeShare::new(),
+                view_hint: Mutex::new(None),
             }),
             workers: Vec::with_capacity(HEAVY_WORKERS + LIGHT_WORKERS),
             persistence_worker: None,
@@ -1752,6 +1778,16 @@ impl Engine {
                 .filter(|index| *index < self.shared.entries.len())
                 .map(|index| ((index, Tier::Thumb), Action::Thumb)),
         )
+    }
+
+    /// Stores the advisory visible-band hint for Full-tier rehydrates.
+    ///
+    /// The hint is a cheap mailbox store, read once when a Full display
+    /// rehydrate starts decoding. It never enters [`NavState`] equality or
+    /// job identity, so updating it cannot cancel in-flight work or thrash
+    /// replans; a stale or mismatched hint only costs latency, never bytes.
+    pub fn set_view_hint(&self, hint: Option<ViewHint>) {
+        *self.shared.view_hint.lock().unwrap() = hint;
     }
 
     /// Returns the shared RAM cache populated by this engine.
@@ -2466,6 +2502,87 @@ fn run_develop(
     DevelopCompletion::Finished
 }
 
+#[derive(Debug)]
+/// Outcome of one cache-JPEG decode attempt inside a rehydrate.
+///
+/// `Cancelled` is deliberately distinct from `Corrupt`: a cooperative abort
+/// between decode phases must never trigger the corrupt-object eviction
+/// path, or a replan racing a rehydrate would delete healthy cache objects.
+enum DecodeOutcome {
+    Pixels(PixelBuf),
+    Cancelled,
+    Corrupt,
+}
+
+/// Decodes cache-JPEG bytes for a rehydrate, publishing the advisory visible
+/// band before the rest of the frame when a matching view hint exists.
+///
+/// The band applies only to Full-tier display work; prefetches and other
+/// tiers decode exactly as before. The published band rows are copies of the
+/// final buffer's rows, so tiles built from the band equal tiles built from
+/// the installed frame. `Unsupported` streams fall back to the serial decode,
+/// preserving every historical fallback behavior byte for byte.
+fn decode_jpeg_for_rehydrate(
+    shared: &Shared,
+    index: usize,
+    tier: Tier,
+    token: &CancelToken,
+    mode: DevelopMode,
+    bytes: &[u8],
+) -> DecodeOutcome {
+    let band = if mode == DevelopMode::Display && tier == Tier::Full {
+        let hint = *shared.view_hint.lock().unwrap();
+        hint.filter(|hint| hint.index == index)
+            .map(|hint| BandRequest {
+                uv_y0: hint.uv_y0,
+                uv_y1: hint.uv_y1,
+                align_px: hint.align_px,
+                gutter_px: hint.gutter_px,
+            })
+    } else {
+        None
+    };
+    let outcome = crate::jpeg_restart::try_decode_prioritized(
+        bytes,
+        band,
+        &|| token.cancelled(),
+        &mut |band_pixels| {
+            if token.cancelled() {
+                return;
+            }
+            let row_bytes = band_pixels.full_width as usize * 4;
+            if row_bytes == 0 {
+                return;
+            }
+            let band_height = band_pixels.rows.len() / row_bytes;
+            shared.cache.publish_full_band(
+                index,
+                FullBand {
+                    full_width: band_pixels.full_width,
+                    full_height: band_pixels.full_height,
+                    y0: band_pixels.y0,
+                    buf: PixelBuf {
+                        width: band_pixels.full_width,
+                        height: band_height as u32,
+                        rgba: band_pixels.rows.to_vec(),
+                    },
+                },
+            );
+            // No dedicated event: the UI polls the band slot each frame, so a
+            // repaint request is enough to reach it.
+            notify_safely(shared.notify.as_ref());
+        },
+    );
+    match outcome {
+        PrioritizedDecode::Done(buf) => DecodeOutcome::Pixels(buf),
+        PrioritizedDecode::Cancelled => DecodeOutcome::Cancelled,
+        PrioritizedDecode::Unsupported => match decode_jpeg_serial(bytes) {
+            Ok(buf) => DecodeOutcome::Pixels(buf),
+            Err(_) => DecodeOutcome::Corrupt,
+        },
+    }
+}
+
 fn run_rehydrate(
     shared: &Shared,
     index: usize,
@@ -2476,17 +2593,29 @@ fn run_rehydrate(
 ) {
     // Ring 2 first, then ring 3 (disk). Disk bytes enter RAM only after JPEG
     // validation; a corrupt rebuildable object is evicted and falls through
-    // to RAW development instead of poisoning every later request.
+    // to RAW development instead of poisoning every later request. A decode
+    // cancelled between band phases is NOT corrupt: the cache object must
+    // stay for the replacement generation.
     if token.cancelled() {
         return;
     }
     let id = (index, tier);
     if let Some(bytes) = shared.cache.get_jpeg(id) {
-        if let Ok(buf) = decode_jpeg(&bytes) {
-            install_rehydrated(shared, index, tier, buf, token, emit);
-            return;
+        match decode_jpeg_for_rehydrate(shared, index, tier, token, mode, &bytes) {
+            DecodeOutcome::Pixels(buf) => {
+                install_rehydrated(shared, index, tier, buf, token, emit);
+                return;
+            }
+            DecodeOutcome::Cancelled => return,
+            DecodeOutcome::Corrupt => {
+                shared.cache.remove_jpeg(id);
+                if tier == Tier::Full {
+                    // A band decoded from the corrupt object must not
+                    // outlive it: the fallback re-develops from RAW.
+                    shared.cache.clear_full_band(index);
+                }
+            }
         }
-        shared.cache.remove_jpeg(id);
     }
 
     if token.cancelled() {
@@ -2499,13 +2628,20 @@ fn run_rehydrate(
             if token.cancelled() {
                 return;
             }
-            if let Ok(buf) = decode_jpeg(&bytes) {
-                if install_rehydrated(shared, index, tier, buf, token, emit)
-                    && mode == DevelopMode::Display
-                {
-                    shared.cache.insert_jpeg(id, Arc::new(bytes));
+            match decode_jpeg_for_rehydrate(shared, index, tier, token, mode, &bytes) {
+                DecodeOutcome::Pixels(buf) => {
+                    if install_rehydrated(shared, index, tier, buf, token, emit)
+                        && mode == DevelopMode::Display
+                    {
+                        shared.cache.insert_jpeg(id, Arc::new(bytes));
+                    }
+                    return;
                 }
-                return;
+                DecodeOutcome::Cancelled => return,
+                DecodeOutcome::Corrupt => {}
+            }
+            if tier == Tier::Full {
+                shared.cache.clear_full_band(index);
             }
             if let Err(error) = disk.remove(&key) {
                 eprintln!("failed to remove corrupt disk cache object: {error}");
@@ -3476,6 +3612,7 @@ mod tests {
             jpeg_quality: CACHE_JPEG_QUALITY,
             navigation: Mutex::new(NavigationOrder::default()),
             raw_share: RawDecodeShare::new(),
+            view_hint: Mutex::new(None),
         };
 
         publish_claimed(
@@ -3748,6 +3885,7 @@ mod tests {
             jpeg_quality,
             navigation: Mutex::new(NavigationOrder::default()),
             raw_share: RawDecodeShare::new(),
+            view_hint: Mutex::new(None),
         })
     }
 
@@ -3806,6 +3944,242 @@ mod tests {
 
         assert!(!cache.has_rgba((0, Tier::Full)));
         assert!(events.lock().unwrap().is_empty());
+    }
+
+    /// A production-quality encode large enough for the parallel band path.
+    fn band_capable_jpeg() -> Arc<Vec<u8>> {
+        let pixels = textured_buf(1023, 769);
+        let encoded = encode_jpeg(&pixels, CACHE_JPEG_QUALITY).expect("encode succeeds");
+        assert!(
+            crate::jpeg_restart::try_decode(&encoded).is_some(),
+            "fixture must qualify for the parallel restart path"
+        );
+        Arc::new(encoded)
+    }
+
+    fn mid_band_hint(index: usize) -> ViewHint {
+        ViewHint {
+            index,
+            uv_y0: 0.4,
+            uv_y1: 0.6,
+            align_px: 128,
+            gutter_px: 1,
+        }
+    }
+
+    fn band_shared(
+        entries: Vec<FolderEntry>,
+        cache: Arc<RamCache>,
+        disk: Option<DiskCache>,
+        notify: Arc<dyn Fn() + Send + Sync>,
+        hint: Option<ViewHint>,
+    ) -> (Shared, Receiver<Event>) {
+        let (events, receiver) = std::sync::mpsc::channel();
+        (
+            Shared {
+                entries: Arc::new(entries),
+                cache,
+                disk,
+                events,
+                notify,
+                processing_pool: None,
+                heavy: JobQueue::new(),
+                light: JobQueue::new(),
+                persistence: PersistenceQueue::new(),
+                persistence_known_present: Mutex::new(HashSet::new()),
+                jpeg_quality: CACHE_JPEG_QUALITY,
+                navigation: Mutex::new(NavigationOrder::default()),
+                raw_share: RawDecodeShare::new(),
+                view_hint: Mutex::new(hint),
+            },
+            receiver,
+        )
+    }
+
+    #[test]
+    fn mid_decode_cancellation_preserves_the_ram_cache_object() {
+        let encoded = band_capable_jpeg();
+        let cache = Arc::new(RamCache::new(RamCacheBudgets::new(
+            0,
+            0,
+            64 * 1024 * 1024,
+            16 * 1024 * 1024,
+        )));
+        cache.set_navigation_policy([], [(0, Tier::Full)]);
+        cache.insert_jpeg((0, Tier::Full), encoded.clone());
+        // Band publication runs the notify callback; cancelling there models a
+        // replan landing exactly between the two decode phases.
+        let token = Arc::new(CancelToken::default());
+        let cancel_on_notify = token.clone();
+        let (shared, _receiver) = band_shared(
+            Vec::new(),
+            cache.clone(),
+            None,
+            Arc::new(move || cancel_on_notify.cancel()),
+            Some(mid_band_hint(0)),
+        );
+
+        run_rehydrate(&shared, 0, Tier::Full, &token, DevelopMode::Display, &|e| {
+            panic!("a cancelled rehydrate must not publish: {e:?}")
+        });
+
+        assert!(
+            cache.has_jpeg((0, Tier::Full)),
+            "cancellation must not take the corrupt-object eviction path"
+        );
+        assert!(!cache.has_rgba((0, Tier::Full)));
+        let band = cache
+            .get_full_band(0)
+            .expect("the band published before the cancellation flipped");
+        assert_eq!(band.full_width, 1023);
+        assert_eq!(band.full_height, 769);
+    }
+
+    #[test]
+    fn mid_decode_cancellation_preserves_the_disk_cache_object() {
+        let encoded = band_capable_jpeg();
+        let dir = tempfile::tempdir().unwrap();
+        let raw_entry = entry(dir.path().join("cancelled.arw"), 100);
+        let disk = DiskCache::open_at(dir.path().join("cache"));
+        let key = DiskCache::key_with_jpeg_quality(&raw_entry, Tier::Full, CACHE_JPEG_QUALITY);
+        disk.put(&key, &encoded).unwrap();
+        let cache = Arc::new(RamCache::new(RamCacheBudgets::new(
+            0,
+            0,
+            64 * 1024 * 1024,
+            16 * 1024 * 1024,
+        )));
+        cache.set_navigation_policy([], [(0, Tier::Full)]);
+        let token = Arc::new(CancelToken::default());
+        let cancel_on_notify = token.clone();
+        let (shared, _receiver) = band_shared(
+            vec![raw_entry],
+            cache.clone(),
+            Some(disk.clone()),
+            Arc::new(move || cancel_on_notify.cancel()),
+            Some(mid_band_hint(0)),
+        );
+
+        run_rehydrate(&shared, 0, Tier::Full, &token, DevelopMode::Display, &|e| {
+            panic!("a cancelled rehydrate must not publish: {e:?}")
+        });
+
+        assert!(disk.has(&key), "cancellation must not remove the disk object");
+        assert!(!cache.has_jpeg((0, Tier::Full)));
+        assert!(!cache.has_rgba((0, Tier::Full)));
+        assert!(cache.get_full_band(0).is_some());
+    }
+
+    #[test]
+    fn band_publication_requires_a_matching_display_full_hint() {
+        let encoded = band_capable_jpeg();
+        for (hint, mode) in [
+            // A hint for another image must not produce a band for this one.
+            (Some(mid_band_hint(1)), DevelopMode::Display),
+            // Speculative prefetches never publish a band, hint or not.
+            (Some(mid_band_hint(0)), DevelopMode::Prefetch),
+            // No hint at all: the historical single-phase decode.
+            (None, DevelopMode::Display),
+        ] {
+            let cache = Arc::new(RamCache::new(RamCacheBudgets::new(
+                0,
+                0,
+                64 * 1024 * 1024,
+                16 * 1024 * 1024,
+            )));
+            cache.set_navigation_policy([], [(0, Tier::Full)]);
+            cache.insert_jpeg((0, Tier::Full), encoded.clone());
+            let notified = Arc::new(AtomicBool::new(false));
+            let notified_flag = notified.clone();
+            let (shared, _receiver) = band_shared(
+                Vec::new(),
+                cache.clone(),
+                None,
+                Arc::new(move || notified_flag.store(true, Ordering::SeqCst)),
+                hint,
+            );
+            let events = Mutex::new(Vec::new());
+
+            run_rehydrate(
+                &shared,
+                0,
+                Tier::Full,
+                &CancelToken::default(),
+                mode,
+                &|event| events.lock().unwrap().push(event),
+            );
+
+            assert!(cache.has_rgba((0, Tier::Full)), "{hint:?}/{mode:?} installs");
+            assert!(
+                cache.get_full_band(0).is_none(),
+                "{hint:?}/{mode:?} must not leave a band"
+            );
+            assert!(
+                !notified.load(Ordering::SeqCst),
+                "{hint:?}/{mode:?} must not publish a band mid-decode"
+            );
+            assert!(matches!(
+                events.lock().unwrap().as_slice(),
+                [Event::ImageReady {
+                    index: 0,
+                    tier: Tier::Full
+                }]
+            ));
+        }
+    }
+
+    #[test]
+    fn published_band_is_cleared_by_the_full_install() {
+        let encoded = band_capable_jpeg();
+        let cache = Arc::new(RamCache::new(RamCacheBudgets::new(
+            0,
+            0,
+            64 * 1024 * 1024,
+            16 * 1024 * 1024,
+        )));
+        cache.set_navigation_policy([], [(0, Tier::Full)]);
+        cache.insert_jpeg((0, Tier::Full), encoded.clone());
+        let saw_band = Arc::new(AtomicBool::new(false));
+        let saw_band_flag = saw_band.clone();
+        let observe_cache = cache.clone();
+        let (shared, _receiver) = band_shared(
+            Vec::new(),
+            cache.clone(),
+            None,
+            Arc::new(move || {
+                if observe_cache.get_full_band(0).is_some() {
+                    saw_band_flag.store(true, Ordering::SeqCst);
+                }
+            }),
+            Some(mid_band_hint(0)),
+        );
+        let events = Mutex::new(Vec::new());
+
+        run_rehydrate(
+            &shared,
+            0,
+            Tier::Full,
+            &CancelToken::default(),
+            DevelopMode::Display,
+            &|event| events.lock().unwrap().push(event),
+        );
+
+        assert!(
+            saw_band.load(Ordering::SeqCst),
+            "the visible band must be readable while the frame still decodes"
+        );
+        assert!(cache.has_rgba((0, Tier::Full)));
+        assert!(
+            cache.get_full_band(0).is_none(),
+            "the installed frame supersedes the provisional band"
+        );
+        assert!(matches!(
+            events.lock().unwrap().as_slice(),
+            [Event::ImageReady {
+                index: 0,
+                tier: Tier::Full
+            }]
+        ));
     }
 
     #[test]
@@ -4928,6 +5302,7 @@ mod tests {
             jpeg_quality: CACHE_JPEG_QUALITY,
             navigation: Mutex::new(NavigationOrder::default()),
             raw_share: RawDecodeShare::new(),
+            view_hint: Mutex::new(None),
         };
 
         run_warm_develop(
@@ -5344,6 +5719,7 @@ mod tests {
             jpeg_quality: CACHE_JPEG_QUALITY,
             navigation: Mutex::new(NavigationOrder::default()),
             raw_share: RawDecodeShare::new(),
+            view_hint: Mutex::new(None),
         };
 
         run_rehydrate(
