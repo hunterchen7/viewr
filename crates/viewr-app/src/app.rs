@@ -40,8 +40,11 @@ const THUMB_BUDGET: u64 = 384 * 1024 * 1024;
 /// Logical RGBA bytes retained by thumbnail texture handles. Actual backend
 /// allocation can be slightly higher, but remains proportional to this cap.
 const THUMB_TEXTURE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
-const THUMB_UPLOADS_PER_FRAME: usize = 8;
-const VISIBLE_FULL_TILE_UPLOADS_PER_FRAME: usize = 4;
+const THUMB_UPLOADS_PER_FRAME: usize = 24;
+/// Upper bound on visible Full tiles uploaded in one frame. The visible rect
+/// normally uploads completely in its arrival frame (4-6 tiles on common
+/// viewports, ~0.5-0.9 ms each); the cap bounds pathological viewports.
+const MAX_VISIBLE_FULL_TILE_UPLOADS_PER_FRAME: usize = 16;
 const BACKGROUND_FULL_TILE_UPLOADS_PER_FRAME: usize = 1;
 const THUMB_REQUEST_POLL_AFTER: Duration = Duration::from_millis(16);
 const THUMB_REQUEST_STALE_AFTER: Duration = Duration::from_millis(500);
@@ -962,8 +965,11 @@ impl App {
             .iter()
             .filter(|&&tile| !session.full_tiles.contains_key(&(current, tile)))
             .count();
+        // Sharpen the whole visible rect in the arrival frame: per-tile cost
+        // is well under a millisecond, so even a 5K viewport's tiles fit one
+        // 120 Hz frame; the cap only bounds pathological viewports.
         let upload_budget = if missing_visible > 0 {
-            VISIBLE_FULL_TILE_UPLOADS_PER_FRAME
+            missing_visible.min(MAX_VISIBLE_FULL_TILE_UPLOADS_PER_FRAME)
         } else {
             BACKGROUND_FULL_TILE_UPLOADS_PER_FRAME
         };
@@ -1021,7 +1027,13 @@ impl App {
         visible_complete
     }
 
-    fn handle_keys(&mut self, loupe_rect: egui::Rect, img_size: Option<egui::Vec2>) {
+    /// Handles every key that needs no frame-local layout, at frame START —
+    /// before events drain and textures upload — so a navigation keypress
+    /// paints the new image in the same frame instead of one frame later.
+    /// Zoom toggling needs this frame's loupe geometry and stays in
+    /// [`handle_keys`](Self::handle_keys); each bound key is read in exactly
+    /// one of the two methods (`key_pressed` does not consume).
+    fn handle_nav_keys(&mut self) {
         if self.settings.capturing() || self.updates.blocks_app_input() {
             return; // a modal owns this frame's keystrokes
         }
@@ -1034,7 +1046,6 @@ impl App {
             shift: bool,
             home: bool,
             end: bool,
-            toggle_zoom: bool,
             grid: bool,
             info: bool,
             fullscreen: bool,
@@ -1052,7 +1063,6 @@ impl App {
             shift: i.modifiers.shift,
             home: config.pressed(i, Action::First),
             end: config.pressed(i, Action::Last),
-            toggle_zoom: config.pressed(i, Action::ToggleZoom),
             grid: config.pressed(i, Action::Grid) || (in_grid && i.key_pressed(egui::Key::Enter)),
             info: config.pressed(i, Action::Metadata),
             fullscreen: config.pressed(i, Action::Fullscreen),
@@ -1114,7 +1124,21 @@ impl App {
             self.fullscreen = !self.fullscreen;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
         }
-        if k.toggle_zoom
+    }
+
+    /// Handles the zoom toggle, which anchors on this frame's loupe geometry
+    /// and therefore runs after the loupe lays out. Every other key is
+    /// handled at frame start by [`handle_nav_keys`](Self::handle_nav_keys).
+    fn handle_keys(&mut self, loupe_rect: egui::Rect, img_size: Option<egui::Vec2>) {
+        if self.settings.capturing() || self.updates.blocks_app_input() {
+            return; // a modal owns this frame's keystrokes
+        }
+        let ctx = self.ctx.clone();
+        let toggle_zoom = {
+            let config = &self.config;
+            ctx.input(|i| config.pressed(i, Action::ToggleZoom))
+        };
+        if toggle_zoom
             && self.mode == Mode::Loupe
             && let Some(size) = img_size
         {
@@ -1265,13 +1289,19 @@ impl eframe::App for App {
         }
         self.updates.show();
         self.refresh_ratings_after_database_ready();
+        if self.session.is_some() {
+            // Frame start: a navigation keypress changes `current` before
+            // events drain and textures upload, so the new image paints in
+            // this frame instead of the next one.
+            self.handle_nav_keys();
+        }
         self.drain_events();
         self.manage_textures();
         if self.session.is_none() {
             ui.centered_and_justified(|u| {
                 u.label("Open a folder of raws with Cmd+O");
             });
-            self.handle_keys(ui.max_rect(), None);
+            self.handle_nav_keys();
             return;
         }
 
@@ -1742,7 +1772,6 @@ impl App {
         let mut open_loupe = false;
         let current = self.current;
         let scroll_to = self.scroll_to_current;
-        let rect = ui.max_rect();
         let mut demanded_thumbs = vec![current];
         if let Some(session) = &self.session {
             let rows = self.visible.len().div_ceil(cols);
@@ -1836,7 +1865,6 @@ impl App {
                 self.replan();
             }
         }
-        self.handle_keys(rect, None);
     }
 }
 
