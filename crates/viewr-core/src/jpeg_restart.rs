@@ -510,7 +510,7 @@ pub(crate) fn try_decode_prioritized(
 #[cfg(test)]
 mod tests {
     use super::{
-        BandRequest, PrioritizedDecode, chunk_rows, parse_layout, try_decode,
+        BandRequest, PrioritizedDecode, band_mcu_rows, chunk_rows, parse_layout, try_decode,
         try_decode_prioritized,
     };
     use crate::jobs::{decode_jpeg, encode_jpeg};
@@ -975,19 +975,41 @@ mod tests {
                 panic!("{quality:?} prioritized decode must complete");
             };
             assert_eq!(prioritized.rgba, serial.rgba, "{quality:?} prioritized");
-            let (band_elapsed, y0, rows) =
-                band_seen.expect("a mid-frame band publishes for real cache objects");
-            let row_bytes = serial.width as usize * 4;
-            let band_start = y0 as usize * row_bytes;
-            assert_eq!(
-                rows.as_slice(),
-                &serial.rgba[band_start..band_start + rows.len()],
-                "{quality:?} band rows"
-            );
-            eprintln!(
-                "{quality:?}: visible band ({} rows) ready in {band_elapsed:?}; full frame in {full_elapsed:?}",
-                rows.len() / row_bytes
-            );
+            // Small frames (the public-domain CI fixture's Browse tier) can
+            // legitimately align the request out to the whole frame, which
+            // collapses to the historical single-phase decode with no early
+            // band. Require a band exactly when the request stays partial.
+            let layout = parse_layout(&encoded).expect("cache object parses");
+            let expects_band = band_mcu_rows(
+                &layout,
+                &BandRequest {
+                    uv_y0: 0.4,
+                    uv_y1: 0.6,
+                    align_px: 1024,
+                    gutter_px: 1,
+                },
+            )
+            .is_some();
+            match band_seen {
+                Some((band_elapsed, y0, rows)) => {
+                    assert!(expects_band, "{quality:?} published an unexpected band");
+                    let row_bytes = serial.width as usize * 4;
+                    let band_start = y0 as usize * row_bytes;
+                    assert_eq!(
+                        rows.as_slice(),
+                        &serial.rgba[band_start..band_start + rows.len()],
+                        "{quality:?} band rows"
+                    );
+                    eprintln!(
+                        "{quality:?}: visible band ({} rows) ready in {band_elapsed:?}; full frame in {full_elapsed:?}",
+                        rows.len() / row_bytes
+                    );
+                }
+                None => assert!(
+                    !expects_band,
+                    "{quality:?}: a partial band request must publish a band"
+                ),
+            }
         }
     }
 
