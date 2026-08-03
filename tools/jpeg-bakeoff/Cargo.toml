@@ -30,3 +30,9 @@ lto = "thin"
 
 [profile.bench]
 lto = "thin"
+
+# The root workspace patches rawler to the in-tree fork; this workspace builds
+# viewr-core too and must resolve the same rawler, or fork-only APIs fail to
+# compile during release source validation.
+[patch.crates-io]
+rawler = { path = "../../thirdparty/dnglab/rawler" }

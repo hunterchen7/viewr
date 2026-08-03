@@ -25,8 +25,8 @@ dependency to that path, so its files are directly editable:
 2. Run `cargo build --release --locked --offline`.
 
 Do not edit other `vendor/` directories. Cargo verifies those against
-`.cargo-checksum.json`; `vendor/rawler-0.7.2` in this archive serves only
-the vendored JPEG bake-off workspace.
+`.cargo-checksum.json`. Both workspaces — Viewr and the vendored JPEG
+bake-off — resolve rawler from the same in-tree fork.
 
 The project README lists the required Linux packages, including
 `build-essential` and `pkg-config`. The macOS build requires Xcode
