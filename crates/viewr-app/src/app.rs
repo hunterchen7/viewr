@@ -236,6 +236,30 @@ fn main_texture_should_be_kept(index: usize, tier: Tier, near: &[usize]) -> bool
     }
 }
 
+/// The image the next arrow-key navigation reaches: the visible-sequence
+/// neighbor one step from `pos` in the navigation direction.
+fn next_ahead_index(visible: &[usize], pos: usize, direction: i8, current: usize) -> Option<usize> {
+    let next_pos = if direction < 0 {
+        pos.checked_sub(1)?
+    } else {
+        pos.checked_add(1)?
+    };
+    let index = visible.get(next_pos).copied()?;
+    (index != current).then_some(index)
+}
+
+/// Full tiles are bounded to the current zoomed image plus exactly one
+/// pre-uploaded neighbor (the next-ahead image), so zoomed arrow-key
+/// navigation can paint sharp on its first frame without unbounded GPU growth.
+fn full_tile_should_be_kept(
+    index: usize,
+    current: usize,
+    next_ahead: Option<usize>,
+    zoomed: bool,
+) -> bool {
+    zoomed && (index == current || Some(index) == next_ahead)
+}
+
 fn install_metadata(
     ratings: &mut HashMap<usize, u8>,
     metas: &mut HashMap<usize, FileMeta>,
@@ -322,8 +346,10 @@ struct Session {
     thumb_requests: HashMap<usize, Instant>,
     thumb_retry_after: HashMap<usize, Instant>,
     textures: HashMap<(usize, Tier), egui::TextureHandle>,
-    /// Full-resolution texture tiles exist only for the current zoomed image.
-    /// Browse stays underneath them so incomplete regions remain usable.
+    /// Full-resolution texture tiles exist only for the current zoomed image
+    /// and, once its own tiles are complete, the next-ahead image whose Full
+    /// pixels are already resident. Browse stays underneath them so
+    /// incomplete regions remain usable.
     full_tiles: HashMap<(usize, TileCoord), egui::TextureHandle>,
 }
 
@@ -901,15 +927,17 @@ impl App {
                     .flatten()
             })
             .collect();
+        let next_ahead = next_ahead_index(&self.visible, pos, self.direction, current);
         let Some(session) = &mut self.session else {
             return;
         };
         session
             .textures
             .retain(|(i, tier), _| main_texture_should_be_kept(*i, *tier, &near));
+        let zoomed = !matches!(zoom, Zoom::Fit);
         session
             .full_tiles
-            .retain(|(index, _), _| *index == current && !matches!(zoom, Zoom::Fit));
+            .retain(|(index, _), _| full_tile_should_be_kept(*index, current, next_ahead, zoomed));
 
         let mut upload = |key: (usize, Tier), budget: &mut i32| {
             if *budget <= 0 || session.textures.contains_key(&key) {
@@ -937,12 +965,17 @@ impl App {
 
     /// Upload Full-resolution tiles under the current zoom rectangle first and
     /// paint them over the Browse stand-in. Once the visible rectangle is
-    /// complete, one tile per frame expands the Full texture outward.
+    /// complete, one tile per frame expands the Full texture outward; once the
+    /// whole current texture is resident, the same one-tile-per-frame budget
+    /// pre-uploads the next-ahead image's predicted-visible tiles from its
+    /// resident Full pixels so zoomed navigation paints sharp on frame one.
     fn progressive_full_overlay(&mut self, ui: &egui::Ui, response: &LoupeResponse) -> bool {
         if matches!(self.zoom, Zoom::Fit) {
             return false;
         }
         let current = self.current;
+        let next_ahead =
+            next_ahead_index(&self.visible, self.visible_pos(), self.direction, current);
         let ctx = self.ctx.clone();
         let Some(buf) = self
             .session
@@ -975,26 +1008,32 @@ impl App {
         };
         let mut uploaded = 0;
         let mut invalid_storage = false;
-        for &tile in &order {
-            if uploaded >= upload_budget {
-                break;
+        if missing_visible > 0 {
+            for &tile in &order {
+                if uploaded >= upload_budget {
+                    break;
+                }
+                let key = (current, tile);
+                if session.full_tiles.contains_key(&key) {
+                    continue;
+                }
+                let Some(image) = progressive_texture::color_image(&buf, tile) else {
+                    invalid_storage = true;
+                    break;
+                };
+                let texture = ctx.load_texture(
+                    format!("img{current}-Full-{}-{}", tile.col, tile.row),
+                    image,
+                    egui::TextureOptions::LINEAR,
+                );
+                session.full_tiles.insert(key, texture);
+                uploaded += 1;
             }
-            let key = (current, tile);
-            if session.full_tiles.contains_key(&key) {
-                continue;
-            }
-            let Some(image) = progressive_texture::color_image(&buf, tile) else {
-                invalid_storage = true;
-                break;
-            };
-            let texture = ctx.load_texture(
-                format!("img{current}-Full-{}-{}", tile.col, tile.row),
-                image,
-                egui::TextureOptions::LINEAR,
-            );
-            session.full_tiles.insert(key, texture);
-            uploaded += 1;
         }
+        // With the visible rect complete, the background budget goes first to
+        // the next-ahead warm below — an imminent zoomed navigation values the
+        // neighbor's visible tiles above this image's off-screen remainder —
+        // and any leftover trickles the current image afterwards.
 
         let painter = ui.painter().with_clip_rect(response.viewport_rect);
         for &tile in &order[..visible_count] {
@@ -1021,7 +1060,92 @@ impl App {
         let visible_complete = order[..visible_count]
             .iter()
             .all(|&tile| session.full_tiles.contains_key(&(current, tile)));
-        if !invalid_storage && session.full_tiles.len() < order.len() {
+        // The tile map may also hold next-ahead tiles, so progress is counted
+        // per image rather than by the map's total size.
+        let current_resident = order
+            .iter()
+            .filter(|&&tile| session.full_tiles.contains_key(&(current, tile)))
+            .count();
+        let mut more_upload_work = current_resident < order.len();
+
+        // The visible rect is complete, so the background budget warms the
+        // next-ahead image's predicted-visible tiles first. Zoom framing persists across images, making the current
+        // visible_uv the best prediction; an aspect-ratio mismatch is
+        // harmless because extra tiles simply go unpainted and the order is
+        // recomputed on arrival.
+        if !invalid_storage
+            && missing_visible == 0
+            && uploaded < upload_budget
+            && let Some(next_ahead) = next_ahead
+            && let Some(next_buf) = session.cache.get_rgba((next_ahead, Tier::Full))
+        {
+            let next_order = progressive_texture::priority_order(
+                next_buf.width,
+                next_buf.height,
+                response.visible_uv,
+            );
+            let next_visible = progressive_texture::visible_prefix_len(
+                next_buf.width,
+                next_buf.height,
+                response.visible_uv,
+                &next_order,
+            );
+            let mut next_invalid = false;
+            for &tile in &next_order[..next_visible] {
+                if uploaded >= upload_budget {
+                    break;
+                }
+                let key = (next_ahead, tile);
+                if session.full_tiles.contains_key(&key) {
+                    continue;
+                }
+                let Some(image) = progressive_texture::color_image(&next_buf, tile) else {
+                    next_invalid = true;
+                    break;
+                };
+                let texture = ctx.load_texture(
+                    format!("img{next_ahead}-Full-{}-{}", tile.col, tile.row),
+                    image,
+                    egui::TextureOptions::LINEAR,
+                );
+                session.full_tiles.insert(key, texture);
+                uploaded += 1;
+            }
+            if !next_invalid {
+                let next_resident = next_order[..next_visible]
+                    .iter()
+                    .filter(|&&tile| session.full_tiles.contains_key(&(next_ahead, tile)))
+                    .count();
+                more_upload_work |= next_resident < next_visible;
+            }
+        }
+
+        // Background budget the neighbor warm left over trickles the current
+        // image's remaining off-screen tiles.
+        if missing_visible == 0 && uploaded < upload_budget && !invalid_storage {
+            for &tile in &order {
+                if uploaded >= upload_budget {
+                    break;
+                }
+                let key = (current, tile);
+                if session.full_tiles.contains_key(&key) {
+                    continue;
+                }
+                let Some(image) = progressive_texture::color_image(&buf, tile) else {
+                    invalid_storage = true;
+                    break;
+                };
+                let texture = ctx.load_texture(
+                    format!("img{current}-Full-{}-{}", tile.col, tile.row),
+                    image,
+                    egui::TextureOptions::LINEAR,
+                );
+                session.full_tiles.insert(key, texture);
+                uploaded += 1;
+            }
+        }
+
+        if !invalid_storage && more_upload_work {
             ctx.request_repaint();
         }
         visible_complete
@@ -2171,6 +2295,34 @@ mod tests {
         assert!(!main_texture_should_be_kept(8, Tier::Full, &near));
         assert!(main_texture_should_be_kept(8, Tier::Browse, &near));
         assert!(!main_texture_should_be_kept(9, Tier::Browse, &near));
+    }
+
+    #[test]
+    fn next_ahead_follows_the_navigation_direction_within_the_visible_sequence() {
+        let visible = [2, 5, 9];
+        assert_eq!(next_ahead_index(&visible, 1, 1, 5), Some(9));
+        assert_eq!(next_ahead_index(&visible, 1, -1, 5), Some(2));
+        // Sequence boundaries have no ahead neighbor.
+        assert_eq!(next_ahead_index(&visible, 2, 1, 9), None);
+        assert_eq!(next_ahead_index(&visible, 0, -1, 2), None);
+        assert_eq!(next_ahead_index(&[], 0, 1, 0), None);
+        // A duplicate of the current image is not a pre-upload target.
+        assert_eq!(next_ahead_index(&[3, 3], 0, 1, 3), None);
+    }
+
+    #[test]
+    fn full_tile_retention_is_bounded_to_current_plus_the_next_ahead_neighbor() {
+        // While zoomed, exactly {current, next_ahead} tiles survive.
+        assert!(full_tile_should_be_kept(7, 7, Some(8), true));
+        assert!(full_tile_should_be_kept(8, 7, Some(8), true));
+        assert!(!full_tile_should_be_kept(6, 7, Some(8), true));
+        assert!(!full_tile_should_be_kept(9, 7, Some(8), true));
+        // Without an ahead neighbor only the current image is kept.
+        assert!(full_tile_should_be_kept(7, 7, None, true));
+        assert!(!full_tile_should_be_kept(8, 7, None, true));
+        // Fit mode drops every Full tile, as before.
+        assert!(!full_tile_should_be_kept(7, 7, Some(8), false));
+        assert!(!full_tile_should_be_kept(8, 7, Some(8), false));
     }
 
     #[test]

@@ -3,8 +3,11 @@
 //! Independent rings hold thumbnail, Browse RGBA, Full RGBA, and encoded JPEG
 //! payloads. Every ring is exact LRU by bytes, never by image count. Pinned
 //! keys (current ±1) are never evicted. The Full ring additionally follows an
-//! explicit navigation working set, so stale speculative renders are removed
-//! immediately and late completions cannot repopulate them.
+//! explicit navigation working set that gates admission: late completions for
+//! keys outside it cannot enter the ring. Entries already resident when they
+//! fall out of the working set are retained until byte pressure evicts them,
+//! so direction flips and jumps revisit them as RAM hits instead of paying a
+//! redevelop.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -380,14 +383,6 @@ impl<V: Clone> ByteLru<V> {
     fn budget_bytes(&self) -> u64 {
         self.budget
     }
-
-    fn retain_keys(&mut self, mut keep: impl FnMut(&Key) -> bool) -> Vec<V> {
-        let removed: Vec<_> = self.map.keys().filter(|key| !keep(key)).copied().collect();
-        removed
-            .into_iter()
-            .filter_map(|key| self.remove(&key))
-            .collect()
-    }
 }
 
 /// Conservative reservation before Viewr has observed a rendered size in the
@@ -519,9 +514,13 @@ impl RamCache {
 
     /// Atomically installs navigation pins and the desired Full working set.
     ///
-    /// Full entries outside `full_keys` are removed immediately even when the
-    /// ring is below budget. Later worker completions for those stale keys are
-    /// rejected by [`insert_rgba`](Self::insert_rgba) under the same mutex.
+    /// The working set gates admission only: later worker completions for keys
+    /// outside `full_keys` are rejected by [`insert_rgba`](Self::insert_rgba)
+    /// under the same mutex. Resident Full entries that fall out of the
+    /// working set are deliberately retained while the ring is under budget —
+    /// a direction flip or jump revisiting them costs a RAM hit rather than a
+    /// redevelop. Losing their pin makes them ordinary LRU victims, so byte
+    /// pressure reclaims them before any in-set entry inserted afterwards.
     pub fn set_navigation_policy(
         &self,
         pins: impl IntoIterator<Item = Key>,
@@ -548,9 +547,7 @@ impl RamCache {
             .into_iter()
             .filter(|(_, tier)| *tier == Tier::Full)
             .collect();
-        let mut removed_pixels = inner
-            .full_rgba
-            .retain_keys(|key| full_working_set.contains(key));
+        let mut removed_pixels = Vec::new();
         inner.full_working_set = full_working_set;
         let mut removed_jpegs = Vec::new();
         inner.thumbs.evict_over_budget_into(&mut removed_pixels);
@@ -1151,8 +1148,8 @@ mod tests {
     }
 
     #[test]
-    fn full_working_set_evicts_stale_full_without_touching_other_rings() {
-        let cache = RamCache::new(RamCacheBudgets::new(16, 16, 64, 16));
+    fn out_of_working_set_full_is_retained_until_budget_pressure() {
+        let cache = RamCache::new(RamCacheBudgets::new(16, 16, 24, 16));
         let old_full = (0, Tier::Full);
         let kept_full = (1, Tier::Full);
         cache.set_navigation_policy(
@@ -1167,11 +1164,20 @@ mod tests {
 
         cache.set_navigation_policy(
             [(0, Tier::Thumb), (0, Tier::Browse), kept_full],
-            [kept_full],
+            [kept_full, (2, Tier::Full)],
         );
 
+        // Falling out of the working set no longer evicts a resident entry
+        // while the ring is under budget: a revisit stays a RAM hit.
+        assert!(cache.has_rgba(old_full));
+        assert!(cache.has_rgba(kept_full));
+
+        // Byte pressure reclaims the stale unpinned entry before any in-set
+        // entry inserted after it, without touching the other rings.
+        assert!(cache.insert_rgba_if_desired((2, Tier::Full), buf(16)));
         assert!(!cache.has_rgba(old_full));
         assert!(cache.has_rgba(kept_full));
+        assert!(cache.has_rgba((2, Tier::Full)));
         assert!(cache.has_rgba((0, Tier::Thumb)));
         assert!(cache.has_rgba((0, Tier::Browse)));
         assert!(cache.has_jpeg((0, Tier::Browse)));
@@ -1196,8 +1202,13 @@ mod tests {
         let weak = Arc::downgrade(&pixels);
         assert!(cache.insert_rgba_if_desired((0, Tier::Full), pixels));
 
-        cache.set_navigation_policy([], []);
+        // Leaving the working set keeps the entry resident (lazy retention);
+        // only byte pressure may evict it, and eviction must release the
+        // cache's owner so the allocation can actually return to the system.
+        cache.set_navigation_policy([], [(1, Tier::Full)]);
+        assert!(weak.upgrade().is_some());
 
+        assert!(cache.insert_rgba_if_desired((1, Tier::Full), buf(60)));
         assert!(weak.upgrade().is_none());
     }
 
@@ -1280,21 +1291,56 @@ mod tests {
             cache.insert_rgba(*key, buf(8));
         }
 
+        // A jump keeps resident entries (revisits stay RAM hits) but a late
+        // completion for a key outside the new working set is still rejected.
         let jumped: Vec<_> = (80..84).map(|index| (index, Tier::Full)).collect();
         cache.set_navigation_policy([], jumped.iter().copied());
-        assert!(first.iter().all(|key| !cache.has_rgba(*key)));
-        assert!(!cache.insert_rgba_if_desired(first[0], buf(8)));
+        assert!(first.iter().all(|key| cache.has_rgba(*key)));
+        assert!(!cache.insert_rgba_if_desired((14, Tier::Full), buf(8)));
+
+        // Filling the new working set exceeds the budget; the stale pre-jump
+        // entries are the LRU victims, in insertion order.
         for key in &jumped {
             cache.insert_rgba(*key, buf(8));
         }
+        assert!(first.iter().all(|key| !cache.has_rgba(*key)));
+        assert!(jumped.iter().all(|key| cache.has_rgba(*key)));
 
         let reversed: Vec<_> = (79..83).map(|index| (index, Tier::Full)).collect();
         cache.set_navigation_policy([], reversed.iter().copied());
-        assert!(!cache.has_rgba((83, Tier::Full)));
         assert!(
-            (80..83).all(|index| cache.has_rgba((index, Tier::Full))),
-            "overlapping entries must survive a direction reversal"
+            (80..84).all(|index| cache.has_rgba((index, Tier::Full))),
+            "a direction reversal must not discard the resident prefix"
         );
+    }
+
+    #[test]
+    fn direction_flip_and_return_revisit_the_full_prefix_as_ram_hits() {
+        let cache = RamCache::new(RamCacheBudgets::new(0, 0, 1_000, 0));
+        let forward: Vec<_> = (10..20).map(|index| (index, Tier::Full)).collect();
+        cache.set_navigation_policy([], forward.iter().copied());
+        for key in &forward {
+            assert!(cache.insert_rgba_if_desired(*key, buf(10)));
+        }
+
+        // One back-arrow flips the desired working set behind the cursor. The
+        // forward prefix must survive: it is under budget and rebuilding it
+        // would cost a full RAW develop per image.
+        let backward: Vec<_> = (5..=10).map(|index| (index, Tier::Full)).collect();
+        cache.set_navigation_policy([], backward.iter().copied());
+        assert!(
+            forward.iter().all(|key| cache.has_rgba(*key)),
+            "an under-budget direction flip must retain the prefetched prefix"
+        );
+        // The admission guard still tracks the *new* working set.
+        assert!(!cache.insert_rgba_if_desired((25, Tier::Full), buf(10)));
+        assert!(cache.insert_rgba_if_desired((5, Tier::Full), buf(10)));
+
+        // Flipping forward again finds every prefix entry still resident:
+        // navigation needs zero redevelops.
+        cache.set_navigation_policy([], forward.iter().copied());
+        assert!(forward.iter().all(|key| cache.has_rgba(*key)));
+        assert!(cache.has_rgba((5, Tier::Full)));
     }
 
     fn model_key(value: usize) -> Key {

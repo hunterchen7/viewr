@@ -581,9 +581,10 @@ impl JobQueue {
 
     /// Replace the interactive job set. In-flight interactive jobs no longer
     /// wanted are cancelled; in-flight jobs still wanted keep running (not
-    /// duplicated). A real navigation change can also cancel active
-    /// background generations so newly interactive work reaches a worker at
-    /// the next cancellation point.
+    /// duplicated). `navigation_changed` means the navigation position moved
+    /// (not a zoom toggle); it also cancels active background generations so
+    /// newly interactive work reaches a worker at the next cancellation
+    /// point, and grants failed speculative targets a retry.
     fn set_plan(&self, mut plan: Vec<(JobId, u8, u32, Action)>, navigation_changed: bool) {
         let mut state = self.state.lock().unwrap();
         if state.closed {
@@ -1026,10 +1027,19 @@ struct NavigationOrder {
 }
 
 impl NavigationOrder {
+    /// Records `nav` and reports whether the navigation *position* changed:
+    /// a different current index or direction, or an invalidated sequence.
+    ///
+    /// A pure zoom toggle flips only `zoomed`, which reclassifies the plan
+    /// but is not a navigation change: it must neither cancel in-flight
+    /// background generations nor grant failed speculative targets a retry,
+    /// so it deliberately does not count here.
     fn update_navigation(&mut self, nav: NavState) -> bool {
-        let changed = self.last_nav != Some(nav);
+        let position_changed = self
+            .last_nav
+            .is_none_or(|last| (last.current, last.direction) != (nav.current, nav.direction));
         self.last_nav = Some(nav);
-        changed
+        position_changed
     }
 
     fn current_position(&self, current: usize) -> usize {
@@ -1610,7 +1620,7 @@ impl Engine {
         // snapshots inside this transaction also keeps a waiting navigate call
         // from extending the copy-on-write observation window.
         let mut navigation = self.shared.navigation.lock().unwrap();
-        let navigation_changed = navigation.update_navigation(nav);
+        let position_changed = navigation.update_navigation(nav);
         let current_position = navigation.current_position(current);
         let (full_snapshot, browse_snapshot) = cache.prefetch_snapshots();
         let prefetch_budgets = NavigationPrefetchBudgets::new(
@@ -1642,7 +1652,9 @@ impl Engine {
         drop(prefetch_budgets);
         // Filtered navigation pins visible neighbors rather than unrelated raw
         // indices. Installing the desired Full keys under that same cache lock
-        // also evicts stale speculative buffers and rejects late completions.
+        // rejects late completions for keys outside the new working set;
+        // already-resident out-of-set buffers stay until byte pressure evicts
+        // them so revisits remain RAM hits.
         cache.set_navigation_policy(
             pins,
             targets
@@ -1705,7 +1717,7 @@ impl Engine {
         }
         drop(persistence_known_present);
 
-        self.shared.heavy.set_plan(plan, navigation_changed);
+        self.shared.heavy.set_plan(plan, position_changed);
         if disk.is_some() {
             self.shared
                 .heavy
@@ -3837,7 +3849,15 @@ mod tests {
 
         // Losing the observed object must become recoverable once the Full
         // pixels leave RAM and a later rehydrate observes the disk miss.
-        shared.cache.set_navigation_policy([], []);
+        // Retention is lazy, so displace the resident pixels through byte
+        // pressure instead of expecting the working-set change to evict them.
+        shared.cache.set_navigation_policy([], [(1, Tier::Full)]);
+        assert!(
+            shared
+                .cache
+                .insert_rgba_if_desired((1, Tier::Full), Arc::new(patterned_buf(4, 4)))
+        );
+        assert!(!shared.cache.has_rgba((0, Tier::Full)));
         shared.cache.set_navigation_policy([], [(0, Tier::Full)]);
         run_rehydrate(
             &shared,
@@ -4044,6 +4064,38 @@ mod tests {
         order.replace_indices(10, vec![1, 4, 8]);
         assert_eq!(order.indices, [1, 4, 8]);
         assert!(order.update_navigation(nav));
+    }
+
+    #[test]
+    fn zoom_toggle_is_not_a_navigation_position_change() {
+        let mut order = NavigationOrder::default();
+        let nav = NavState {
+            current: 4,
+            direction: 1,
+            zoomed: false,
+        };
+        assert!(order.update_navigation(nav));
+
+        // Toggling zoom in place replans but must not count as navigation.
+        let zoomed = NavState {
+            zoomed: true,
+            ..nav
+        };
+        assert!(!order.update_navigation(zoomed));
+        assert!(!order.update_navigation(nav));
+
+        // Moving or turning around is a real position change even while the
+        // zoom state changes in the same update.
+        assert!(order.update_navigation(NavState {
+            current: 5,
+            zoomed: true,
+            ..nav
+        }));
+        assert!(order.update_navigation(NavState {
+            current: 5,
+            direction: -1,
+            zoomed: false,
+        }));
     }
 
     #[test]
@@ -4700,6 +4752,30 @@ mod tests {
         let (second, _, second_token) = q.try_pop().unwrap();
         assert_eq!(second, (1, Tier::Browse));
         q.finish(second, &second_token);
+    }
+
+    #[test]
+    fn zoom_toggle_replan_keeps_background_generations_running() {
+        let q = JobQueue::new();
+        q.initialize_background(|| [((3, Tier::Browse), Action::WarmDevelop(Quality::Browse))]);
+        let (warm_id, _, warm_token) = q.pop().unwrap();
+        assert_eq!(warm_id, (3, Tier::Browse));
+
+        // A pure zoom toggle replaces the plan without a navigation position
+        // change; the in-flight background develop must keep its progress.
+        q.set_plan(
+            vec![((0, Tier::Full), 0, 0, Action::Develop(Quality::Full))],
+            false,
+        );
+        assert!(!warm_token.cancelled());
+
+        // Real navigation still cancels it so newly interactive work reaches
+        // a worker at the next cancellation point.
+        q.set_plan(
+            vec![((1, Tier::Browse), 0, 0, Action::Develop(Quality::Browse))],
+            true,
+        );
+        assert!(warm_token.cancelled());
     }
 
     #[test]
