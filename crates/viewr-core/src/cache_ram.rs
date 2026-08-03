@@ -462,6 +462,23 @@ pub struct RamCacheStats {
     pub thumb_bytes: u64,
 }
 
+/// Provisional visible rows of one in-progress Full-tier decode.
+///
+/// A rehydrate publishes the band after its first decode phase so the UI can
+/// upload sharp visible tiles before the rest of the frame finishes. The
+/// rows are copies of the exact bytes the finished frame will contain, so a
+/// tile built from a band equals the tile built later from the full buffer.
+pub struct FullBand {
+    /// Width of the full image the band was cut from.
+    pub full_width: u32,
+    /// Height of the full image the band was cut from.
+    pub full_height: u32,
+    /// First image row covered by [`Self::buf`].
+    pub y0: u32,
+    /// Tightly packed RGBA rows `y0..y0 + buf.height` at full image width.
+    pub buf: PixelBuf,
+}
+
 /// Thread-safe, byte-budgeted cache shared by UI and worker threads.
 ///
 /// Thumbnails, Browse RGBA buffers, Full RGBA buffers, and developed JPEGs
@@ -470,10 +487,20 @@ pub struct RamCacheStats {
 /// temporarily exceed its configured budget when all possible victims are
 /// pinned.
 ///
-/// All operations serialize through one mutex. A panic while that mutex is
-/// held poisons the cache and causes later operations to panic.
+/// A separate single-slot side channel holds at most one [`FullBand`] — the
+/// visible rows of the Full decode currently in flight. The slot is outside
+/// every ring budget (bounded to one band, lifetime ≈ the tail of one
+/// decode): it is replaced by the next publication, cleared when the matching
+/// Full RGBA entry is installed, and cleared when its image leaves the
+/// desired Full working set.
+///
+/// All ring operations serialize through one mutex; the band slot has its
+/// own. When both are taken the order is always ring mutex → band mutex. A
+/// panic while a mutex is held poisons the cache and causes later operations
+/// to panic.
 pub struct RamCache {
     inner: Mutex<Inner>,
+    band: Mutex<Option<(usize, Arc<FullBand>)>>,
 }
 
 struct Inner {
@@ -509,6 +536,7 @@ impl RamCache {
                 largest_observed_full_estimate: None,
                 largest_observed_browse_bytes: None,
             }),
+            band: Mutex::new(None),
         }
     }
 
@@ -547,6 +575,20 @@ impl RamCache {
             .into_iter()
             .filter(|(_, tier)| *tier == Tier::Full)
             .collect();
+        {
+            // Band hygiene: the provisional band follows the desired Full
+            // working set exactly like resident Full pixels do. Lock order is
+            // ring mutex → band mutex.
+            let mut band = self.band.lock().unwrap();
+            if band
+                .as_ref()
+                .is_some_and(|(index, _)| !full_working_set.contains(&(*index, Tier::Full)))
+            {
+                *band = None;
+            }
+        }
+        // Full pixels leaving the working set stay resident as unpinned LRU
+        // victims (lazy eviction); only the byte budget reclaims them.
         let mut removed_pixels = Vec::new();
         inner.full_working_set = full_working_set;
         let mut removed_jpegs = Vec::new();
@@ -713,7 +755,40 @@ impl RamCache {
         };
         drop(inner);
         drop(removed_pixels);
+        if retained && key.1 == Tier::Full {
+            // The resident full frame supersedes its provisional band.
+            self.clear_full_band(key.0);
+        }
         retained
+    }
+
+    /// Publishes the provisional visible band of an in-progress Full decode,
+    /// replacing whatever band the single slot held before.
+    ///
+    /// The slot is deliberately outside the ring byte budgets: it is bounded
+    /// to one band whose lifetime spans only the tail of one decode. See
+    /// [`get_full_band`](Self::get_full_band) for the read side.
+    pub fn publish_full_band(&self, index: usize, band: FullBand) {
+        let replaced = self.band.lock().unwrap().replace((index, Arc::new(band)));
+        drop(replaced);
+    }
+
+    /// Returns the published band when it belongs to `index`.
+    pub fn get_full_band(&self, index: usize) -> Option<Arc<FullBand>> {
+        self.band
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(owner, _)| *owner == index)
+            .map(|(_, band)| Arc::clone(band))
+    }
+
+    /// Clears the band slot when it belongs to `index`.
+    pub(crate) fn clear_full_band(&self, index: usize) {
+        let mut band = self.band.lock().unwrap();
+        if band.as_ref().is_some_and(|(owner, _)| *owner == index) {
+            *band = None;
+        }
     }
 
     /// Inserts or replaces an encoded JPEG entry and enforces the JPEG budget.
@@ -1279,6 +1354,88 @@ mod tests {
         assert_eq!(
             cache.full_prefetch_snapshot().per_index_bytes.get(&0),
             Some(&24)
+        );
+    }
+
+    fn band(index: u32) -> FullBand {
+        FullBand {
+            full_width: 4,
+            full_height: 8,
+            y0: index,
+            buf: PixelBuf {
+                width: 4,
+                height: 2,
+                rgba: vec![index as u8; 4 * 2 * 4],
+            },
+        }
+    }
+
+    #[test]
+    fn full_band_slot_is_single_and_index_checked() {
+        let cache = RamCache::new(RamCacheBudgets::new(0, 0, 64, 0));
+        assert!(cache.get_full_band(3).is_none());
+
+        cache.publish_full_band(3, band(3));
+        assert_eq!(cache.get_full_band(3).map(|band| band.y0), Some(3));
+        assert!(cache.get_full_band(4).is_none(), "index mismatch");
+
+        // One slot only: a newer publication replaces the previous band.
+        cache.publish_full_band(4, band(4));
+        assert!(cache.get_full_band(3).is_none());
+        assert_eq!(cache.get_full_band(4).map(|band| band.y0), Some(4));
+
+        cache.clear_full_band(3);
+        assert!(cache.get_full_band(4).is_some(), "mismatched clear is a no-op");
+        cache.clear_full_band(4);
+        assert!(cache.get_full_band(4).is_none());
+    }
+
+    #[test]
+    fn full_band_is_cleared_by_the_matching_full_install_only() {
+        let cache = RamCache::new(RamCacheBudgets::new(64, 64, 64, 0));
+        cache.set_navigation_policy([], [(0, Tier::Full), (1, Tier::Full)]);
+        cache.publish_full_band(0, band(0));
+
+        // Unrelated installs leave the band alone.
+        cache.insert_rgba((0, Tier::Browse), buf(8));
+        cache.insert_rgba((0, Tier::Thumb), buf(8));
+        assert!(cache.insert_rgba_if_desired((1, Tier::Full), buf(8)));
+        assert!(cache.get_full_band(0).is_some());
+
+        // The matching Full install supersedes the provisional band.
+        assert!(cache.insert_rgba_if_desired((0, Tier::Full), buf(8)));
+        assert!(cache.get_full_band(0).is_none());
+    }
+
+    #[test]
+    fn full_band_follows_the_navigation_working_set() {
+        let cache = RamCache::new(RamCacheBudgets::new(0, 0, 64, 0));
+        cache.set_navigation_policy([], [(5, Tier::Full)]);
+        cache.publish_full_band(5, band(5));
+
+        cache.set_navigation_policy([], [(5, Tier::Full), (6, Tier::Full)]);
+        assert!(
+            cache.get_full_band(5).is_some(),
+            "a band inside the working set survives a replan"
+        );
+
+        cache.set_navigation_policy([], [(6, Tier::Full)]);
+        assert!(
+            cache.get_full_band(5).is_none(),
+            "a band outside the working set is dropped"
+        );
+    }
+
+    #[test]
+    fn full_band_stays_outside_ring_budgets_and_stats() {
+        let cache = RamCache::new(RamCacheBudgets::new(0, 0, 0, 0));
+        cache.publish_full_band(0, band(0));
+        let stats = cache.stats();
+        assert_eq!(stats.rgba_bytes, 0);
+        assert_eq!(stats.full_rgba_bytes, 0);
+        assert!(
+            cache.get_full_band(0).is_some(),
+            "a zero-budget cache still holds the single band slot"
         );
     }
 
