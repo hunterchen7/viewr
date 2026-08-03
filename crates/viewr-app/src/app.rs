@@ -71,9 +71,13 @@ pub fn run(dir: &Path, select: Option<&Path>) -> Result<()> {
         options,
         Box::new(move |cc| {
             crate::color::pin_srgb_colorspace(cc);
-            // Build the shared develop transfer table before the first image
-            // job needs it, off the UI thread.
-            std::thread::spawn(viewr_core::develop::warm_gamma_lut);
+            // Build the shared develop transfer table and rawler's camera and
+            // lens databases before the first image job needs them, off the
+            // UI thread.
+            std::thread::spawn(|| {
+                viewr_core::decode::prewarm_decoder_statics();
+                viewr_core::develop::warm_gamma_lut();
+            });
             let mut app = App::empty(cc);
             if app.config.clear_disk_cache_on_exit {
                 // Crash leftovers: a clean exit already purged, so this is

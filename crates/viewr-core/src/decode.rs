@@ -11,6 +11,17 @@ use crate::meta::FileMeta;
 use crate::resize;
 use crate::types::PixelBuf;
 
+/// Forces rawler's lazily built camera and lens databases to initialize.
+///
+/// Both are `lazy_static` TOML parses (~40 ms each) that otherwise run inside
+/// the first decode job after launch, serializing every concurrently started
+/// worker behind them. Idempotent and safe from any thread; a racing first
+/// job simply blocks exactly as it does today.
+pub fn prewarm_decoder_statics() {
+    rawler::force_initialization();
+    let _ = rawler::lens::get_lenses();
+}
+
 #[derive(Debug, thiserror::Error)]
 /// Failure while opening a RAW container or extracting its data.
 pub enum DecodeError {
@@ -46,7 +57,9 @@ pub struct ThumbResult {
 /// Returns [`DecodeError::Io`] for file access failures and
 /// [`DecodeError::Rawler`] for unsupported or malformed RAW containers.
 pub fn metadata(path: &Path) -> Result<FileMeta, DecodeError> {
-    let source = RawSource::new(path)?;
+    // Metadata reads a few hundred KB of headers; the readahead-hinted open
+    // would request the whole multi-megabyte file during folder-open sweeps.
+    let source = RawSource::new_lazy(path)?;
     let decoder = rawler::get_decoder(&source)?;
     let params = RawDecodeParams::default();
     let md = decoder.raw_metadata(&source, &params)?;
