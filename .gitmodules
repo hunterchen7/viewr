@@ -1,4 +1,4 @@
 [submodule "thirdparty/dnglab"]
 	path = thirdparty/dnglab
 	url = https://github.com/hunterchen7/dnglab
-	branch = viewr-arw-decode-perf
+	branch = viewr-region-develop
