@@ -78,7 +78,9 @@ required=(
   "$top_level/tools/jpeg-bakeoff/Cargo.toml"
   "$top_level/vendor/jpeg-encoder-0.6.1/LICENSE-APACHE"
   "$top_level/vendor/jpeg-encoder-0.6.1/LICENSE-MIT"
-  "$top_level/vendor/jpeg-rusturbo-0.9.2/NOTICE.md"
+  "$top_level/thirdparty/jpeg-rusturbo/NOTICE.md"
+  "$top_level/thirdparty/jpeg-rusturbo/LICENSE-APACHE"
+  "$top_level/thirdparty/jpeg-rusturbo/LICENSE-MIT"
   "$top_level/thirdparty/dnglab/rawler/LICENSE"
   "$top_level/vendor/turbojpeg-sys-1.2.0/libjpeg-turbo/LICENSE.md"
   "$top_level/vendor/turbojpeg-sys-1.2.0/libjpeg-turbo/README.ijg"
@@ -152,11 +154,11 @@ if [[ "$(
   echo "in-tree rawler fork license does not match the expected LGPL text" >&2
   exit 1
 fi
-jpeg_rusturbo_notice="$source_root/vendor/jpeg-rusturbo-${JPEG_RUSTURBO_VERSION}/NOTICE.md"
+jpeg_rusturbo_notice="$source_root/thirdparty/jpeg-rusturbo/NOTICE.md"
 if [[ "$(
   sha256sum "$jpeg_rusturbo_notice" | awk '{print $1}'
 )" != "$JPEG_RUSTURBO_NOTICE_SHA256" ]]; then
-  echo "vendored jpeg-rusturbo ${JPEG_RUSTURBO_VERSION} NOTICE has an unexpected SHA-256" >&2
+  echo "in-tree jpeg-rusturbo ${JPEG_RUSTURBO_VERSION} NOTICE has an unexpected SHA-256" >&2
   exit 1
 fi
 packaged_jpeg_rusturbo_notice="$work_dir/packaged-jpeg-rusturbo-NOTICE.md"
@@ -180,7 +182,7 @@ fi
     --manifest-path tools/jpeg-bakeoff/Cargo.toml \
     --locked \
     --offline
-  # The rawler fork ships editable in-tree: prove a source edit passes an
+  # Both reviewed forks ship editable in-tree: prove source edits pass an
   # offline rebuild without any relink step.
   if [[ -e thirdparty/dnglab/rawler/.cargo-checksum.json ]]; then
     echo "in-tree rawler must not carry a vendor checksum file" >&2
@@ -199,6 +201,25 @@ fi
   )"
   if [[ "$rawler_source" != "null" ]]; then
     echo "Cargo did not select the in-tree rawler source" >&2
+    exit 1
+  fi
+  if [[ -e thirdparty/jpeg-rusturbo/.cargo-checksum.json ]]; then
+    echo "in-tree jpeg-rusturbo must not carry a vendor checksum file" >&2
+    exit 1
+  fi
+  printf '\n// Viewr release-source edit validation.\n' \
+    >>thirdparty/jpeg-rusturbo/src/lib.rs
+  jpeg_rusturbo_source="$(
+    cargo metadata --locked --offline --format-version 1 |
+      jq -r '
+        [.packages[]
+          | select(.name == "jpeg-rusturbo" and .version == "0.9.2")
+          | .source]
+        | if length == 1 then .[0] else error("expected local jpeg-rusturbo") end
+      '
+  )"
+  if [[ "$jpeg_rusturbo_source" != "null" ]]; then
+    echo "Cargo did not select the in-tree jpeg-rusturbo source" >&2
     exit 1
   fi
   cargo build --release --locked --offline -p viewr --bin viewr

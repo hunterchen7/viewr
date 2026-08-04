@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["crates/viewr-core", "crates/viewr-app"]
+members = [
+    "crates/viewr-core",
+    "crates/viewr-app",
+    "thirdparty/jpeg-rusturbo",
+]
 
 [workspace.package]
 version = "0.5.0" # x-release-please-version
@@ -81,3 +85,4 @@ opt-level = 0
 # Full develop at 33 MP. See docs/browsing-loading-optimization-2026-08-01.md.
 [patch.crates-io]
 rawler = { path = "thirdparty/dnglab/rawler" }
+jpeg-rusturbo = { path = "thirdparty/jpeg-rusturbo" }

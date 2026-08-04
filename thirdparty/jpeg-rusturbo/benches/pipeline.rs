@@ -1,0 +1,537 @@
+//! Unified micro-benchmark for jpeg-rusturbo.
+//!
+//! Build with `cargo bench --bench pipeline -- [--section <name>]`.
+//! The build label reflects the active arch backend selected at compile
+//! time. Run the same command twice — once normally, once with
+//! `--features force-scalar` — to get the SIMD and scalar numbers that
+//! the SIMD-vs-scalar speedup tables in `BENCH.md` are derived from.
+//!
+//! Sections (descriptive names, no letters — `--section <name>`):
+//!   encode            : encode pipeline, 3 res × 3 subsampling × q=80
+//!   threads           : thread scaling, 2 res × {1,2,4,8,auto} × 4:2:0
+//!   optimize-huffman  : size + two-pass time, 3 res × 3 subsampling × q{70,80,90}
+//!   progressive       : baseline (SOF0) vs progressive (SOF2), 3 res × 4:2:0
+//!   decode-synthetic  : decode pipeline, synthetic XOR corpus
+//!   decode-natural    : decode pipeline, procedural natural-like corpus
+//!   all (default)     : every section above, in order
+//!
+//! Cross-crate comparison vs the `image` crate (encode + decode) lives in
+//! `benches/vs_image.rs`:
+//!   cargo bench --bench vs_image
+//!
+//! A full symmetric campaign on one host is exactly three commands:
+//!   cargo bench --bench pipeline -- --section all
+//!   cargo bench --bench pipeline --features force-scalar -- --section all
+//!   cargo bench --bench vs_image
+
+use std::env;
+use std::time::Instant;
+
+use jpeg_rusturbo::{ChromaSubsampling, JpegEncoder, PixelFormat, decode};
+
+const WARMUP: usize = 3;
+const ITERATIONS: usize = 50;
+
+const RES_ALL: &[(&str, u32, u32)] = &[
+    ("1592x1124 (session-size)", 1592, 1124),
+    ("1920x1080 (1080p)", 1920, 1080),
+    ("3840x2160 (4K)", 3840, 2160),
+];
+const RES_THREADS: &[(&str, u32, u32)] = &[
+    ("1920x1080 (1080p)", 1920, 1080),
+    ("3840x2160 (4K)", 3840, 2160),
+];
+
+const SUBSAMP_ALL: &[(&str, ChromaSubsampling)] = &[
+    ("4:4:4", ChromaSubsampling::Yuv444),
+    ("4:2:2", ChromaSubsampling::Yuv422),
+    ("4:2:0", ChromaSubsampling::Yuv420),
+];
+
+fn main() {
+    let section = parse_section();
+    print_header(section);
+
+    match section {
+        Section::Encode => bench_encode(),
+        Section::Threads => bench_threads(),
+        Section::OptimizeHuffman => bench_optimize_huffman(),
+        Section::Progressive => bench_progressive(),
+        Section::DecodeSynthetic => bench_decode_synthetic(),
+        Section::DecodeNatural => bench_decode_natural(),
+        Section::All => {
+            bench_encode();
+            bench_threads();
+            bench_optimize_huffman();
+            bench_progressive();
+            bench_decode_synthetic();
+            bench_decode_natural();
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+enum Section {
+    Encode,
+    Threads,
+    OptimizeHuffman,
+    Progressive,
+    DecodeSynthetic,
+    DecodeNatural,
+    All,
+}
+
+fn parse_section() -> Section {
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--section" {
+            let name = args.next().unwrap_or_else(|| usage_and_exit());
+            return match name.as_str() {
+                "encode" | "enc" => Section::Encode,
+                "threads" | "thr" => Section::Threads,
+                "optimize-huffman" | "opt-huffman" | "oh" => Section::OptimizeHuffman,
+                "progressive" | "prog" => Section::Progressive,
+                "decode-synthetic" | "decode-syn" | "dsyn" => Section::DecodeSynthetic,
+                "decode-natural" | "decode-nat" | "dnat" => Section::DecodeNatural,
+                "all" | "All" => Section::All,
+                _ => usage_and_exit(),
+            };
+        } else if arg == "--help" || arg == "-h" {
+            usage_and_exit();
+        }
+    }
+    Section::All
+}
+
+fn usage_and_exit() -> ! {
+    eprintln!(
+        "usage: bench [--section \
+         encode|threads|optimize-huffman|progressive|decode-synthetic|decode-natural|all]"
+    );
+    std::process::exit(2);
+}
+
+fn print_header(section: Section) {
+    let arch = if cfg!(all(target_arch = "aarch64", not(feature = "force-scalar"))) {
+        "aarch64 (NEON: main kernels + huffman bitmap)"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64 (force-scalar — NEON kernels disabled)"
+    } else if cfg!(all(target_arch = "x86_64", not(feature = "force-scalar"))) {
+        "x86_64 (AVX2: main kernels; SSE2: huffman bitmap)"
+    } else if cfg!(target_arch = "x86_64") {
+        "x86_64 (force-scalar — AVX2 kernels disabled)"
+    } else {
+        "scalar (other arch)"
+    };
+    let profile = if cfg!(debug_assertions) {
+        "debug (numbers will be useless)"
+    } else {
+        "release"
+    };
+    let sec = match section {
+        Section::Encode => "encode (encode pipeline)",
+        Section::Threads => "threads (thread scaling)",
+        Section::OptimizeHuffman => "optimize-huffman (size + two-pass time)",
+        Section::Progressive => "progressive (SOF0 vs SOF2)",
+        Section::DecodeSynthetic => "decode-synthetic (decode, synthetic XOR)",
+        Section::DecodeNatural => "decode-natural (decode, natural-like)",
+        Section::All => "all",
+    };
+    println!("jpeg-rusturbo bench — section: {sec}");
+    println!("build: {arch}, profile: {profile}");
+    println!("warmup: {WARMUP} iter, measured: {ITERATIONS} iter");
+}
+
+// ---------------------------------------------------------------------------
+// encode pipeline
+// ---------------------------------------------------------------------------
+
+fn bench_encode() {
+    println!("\n=== encode pipeline (q=80, threads=1, optimize-huffman=off) ===");
+    println!("  two rows per case: RGBA = 4-byte input, RGB = 3-byte input");
+    for &(sub_label, sub) in SUBSAMP_ALL {
+        println!("\n  subsampling: {sub_label}");
+        for &(label, w, h) in RES_ALL {
+            let rgba = make_image(w, h);
+            let rgb = make_image_rgb(w, h);
+            let r4 = time_encode(&rgba, w, h, |enc| {
+                enc.set_subsampling(sub);
+            });
+            let r3 = time_encode_rgb(&rgb, w, h, |enc| {
+                enc.set_subsampling(sub);
+            });
+            print_row_fmt(label, "RGBA", &r4);
+            print_row_fmt(label, "RGB ", &r3);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// thread scaling
+// ---------------------------------------------------------------------------
+
+fn bench_threads() {
+    println!("\n=== thread scaling (q=80, 4:2:0, optimize-huffman=off) ===");
+    let thread_settings: &[(&str, u32)] = &[
+        ("threads=1", 1),
+        ("threads=2", 2),
+        ("threads=4", 4),
+        ("threads=8", 8),
+        ("threads=auto", 0),
+    ];
+    for &(label, w, h) in RES_THREADS {
+        println!("\n  {label}");
+        for &(t_label, t) in thread_settings {
+            let pixels = make_image(w, h);
+            let r = time_encode(&pixels, w, h, |enc| {
+                enc.set_subsampling(ChromaSubsampling::Yuv420);
+                enc.set_threads(t);
+            });
+            print_row(t_label, &r);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// optimize-huffman size + two-pass time
+// ---------------------------------------------------------------------------
+
+fn bench_optimize_huffman() {
+    println!("\n=== optimize-huffman size + two-pass time (threads=1) ===");
+    for &(sub_label, sub) in SUBSAMP_ALL {
+        for &q in &[70u8, 80, 90] {
+            println!("\n  subsampling: {sub_label}, q={q}");
+            for &(label, w, h) in RES_ALL {
+                let pixels = make_image(w, h);
+                let off = time_encode_q(&pixels, w, h, q, |enc| {
+                    enc.set_subsampling(sub);
+                });
+                let on = time_encode_q(&pixels, w, h, q, |enc| {
+                    enc.set_subsampling(sub);
+                    enc.set_optimize_huffman(true);
+                });
+                let delta_pct = (on.size as f64 - off.size as f64) / off.size as f64 * 100.0;
+                let time_factor = on.ms_per_iter / off.ms_per_iter;
+                println!(
+                    "    {label:<28}  off: {off_size:>9} B {off_ms:>7.2} ms  |  \
+                     on: {on_size:>9} B {on_ms:>7.2} ms  Δsize {delta:>+6.2}%  time {tf:>4.2}x",
+                    off_size = off.size,
+                    off_ms = off.ms_per_iter,
+                    on_size = on.size,
+                    on_ms = on.ms_per_iter,
+                    delta = delta_pct,
+                    tf = time_factor,
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// progressive (SOF0 baseline vs SOF2 progressive)
+// ---------------------------------------------------------------------------
+
+fn bench_progressive() {
+    println!(
+        "\n=== progressive: baseline (SOF0) vs progressive (SOF2) \
+         (q=80, 4:2:0, natural-like content) ==="
+    );
+    for &(label, w, h) in RES_ALL {
+        let pixels = make_natural_image(w, h);
+        let base = time_encode_q(&pixels, w, h, 80, |enc| {
+            enc.set_subsampling(ChromaSubsampling::Yuv420);
+        });
+        let prog = time_encode_q(&pixels, w, h, 80, |enc| {
+            enc.set_subsampling(ChromaSubsampling::Yuv420);
+            enc.set_progressive(true);
+        });
+        let time_factor = prog.ms_per_iter / base.ms_per_iter;
+        let size_factor = prog.size as f64 / base.size as f64;
+        println!(
+            "    {label:<28}  baseline: {b_size:>8} B {b_ms:>7.2} ms  |  \
+             progressive: {p_size:>8} B {p_ms:>7.2} ms  time {tf:>4.2}x  size {sf:>4.2}x",
+            b_size = base.size,
+            b_ms = base.ms_per_iter,
+            p_size = prog.size,
+            p_ms = prog.ms_per_iter,
+            tf = time_factor,
+            sf = size_factor,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// decode pipeline (synthetic / natural corpora)
+// ---------------------------------------------------------------------------
+
+fn bench_decode_synthetic() {
+    bench_decode_inner("decode pipeline (q=80, synthetic XOR)", make_image);
+}
+
+fn bench_decode_natural() {
+    bench_decode_inner(
+        "decode pipeline (q=80, procedural natural-like content)",
+        make_natural_image,
+    );
+}
+
+fn bench_decode_inner(title: &str, gen_pixels: fn(u32, u32) -> Vec<u8>) {
+    println!("\n=== {title} ===");
+    for &(sub_label, sub) in SUBSAMP_ALL {
+        println!("\n  subsampling: {sub_label}");
+        for &(label, w, h) in RES_ALL {
+            let pixels = gen_pixels(w, h);
+
+            // Encode once outside the timed loop; the JPEG bytes are
+            // deterministic, so we can reuse them across all iterations.
+            let mut jpeg = Vec::with_capacity((w as usize * h as usize * 3) / 2);
+            {
+                let mut enc = JpegEncoder::new_with_quality(&mut jpeg, 80);
+                enc.set_subsampling(sub);
+                enc.encode_rgba(&pixels, w, h).unwrap();
+            }
+
+            let r = time_decode(&jpeg, w, h);
+            let mp = (w as f64) * (h as f64) / 1_000_000.0;
+            let ms_per_mp = r.ms_per_iter / mp;
+            println!(
+                "    {label:<28}  {ms:>7.2} ms/iter   {ms_per_mp:>5.2} ms/MPx   \
+                 (JPEG {size} B → RGB {rgb_size} B)",
+                ms = r.ms_per_iter,
+                size = jpeg.len(),
+                rgb_size = r.size,
+            );
+        }
+    }
+}
+
+fn time_decode(jpeg: &[u8], w: u32, h: u32) -> BenchResult {
+    let rgb_size = (w as usize) * (h as usize) * 3;
+    let mut rgb = Vec::with_capacity(rgb_size);
+
+    // Warm-up.
+    for _ in 0..WARMUP {
+        rgb = decode::decode(jpeg, PixelFormat::Rgb).unwrap();
+        std::hint::black_box(&rgb);
+    }
+
+    let start = Instant::now();
+    for _ in 0..ITERATIONS {
+        rgb = decode::decode(jpeg, PixelFormat::Rgb).unwrap();
+        std::hint::black_box(&rgb);
+    }
+    let elapsed = start.elapsed();
+    let per_iter = elapsed / ITERATIONS as u32;
+    let mp = (w as f64) * (h as f64) / 1_000_000.0;
+    BenchResult {
+        ms_per_iter: per_iter.as_secs_f64() * 1000.0,
+        ms_per_mp: per_iter.as_secs_f64() * 1000.0 / mp,
+        size: rgb.len(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// shared helpers
+// ---------------------------------------------------------------------------
+
+struct BenchResult {
+    ms_per_iter: f64,
+    ms_per_mp: f64,
+    size: usize,
+}
+
+fn time_encode<F: Fn(&mut JpegEncoder<&mut Vec<u8>>)>(
+    pixels: &[u8],
+    w: u32,
+    h: u32,
+    configure: F,
+) -> BenchResult {
+    time_encode_q(pixels, w, h, 80, configure)
+}
+
+fn time_encode_q<F: Fn(&mut JpegEncoder<&mut Vec<u8>>)>(
+    pixels: &[u8],
+    w: u32,
+    h: u32,
+    quality: u8,
+    configure: F,
+) -> BenchResult {
+    let mut buf = Vec::with_capacity((w as usize * h as usize * 3) / 2);
+
+    for _ in 0..WARMUP {
+        buf.clear();
+        let mut enc = JpegEncoder::new_with_quality(&mut buf, quality);
+        configure(&mut enc);
+        enc.encode_rgba(pixels, w, h).unwrap();
+    }
+
+    let start = Instant::now();
+    for _ in 0..ITERATIONS {
+        buf.clear();
+        let mut enc = JpegEncoder::new_with_quality(&mut buf, quality);
+        configure(&mut enc);
+        enc.encode_rgba(pixels, w, h).unwrap();
+    }
+    let elapsed = start.elapsed();
+    let per_iter = elapsed / ITERATIONS as u32;
+    let mp = (w as f64) * (h as f64) / 1_000_000.0;
+    BenchResult {
+        ms_per_iter: per_iter.as_secs_f64() * 1000.0,
+        ms_per_mp: per_iter.as_secs_f64() * 1000.0 / mp,
+        size: buf.len(),
+    }
+}
+
+/// Encode timing for 3-byte RGB input (`encode_rgb`), mirroring
+/// `time_encode_q` which drives the 4-byte `encode_rgba` path. The two
+/// exist so the encode section can show both input formats: on x86 the
+/// AVX2 color kernel covers both 3- and 4-byte input; the split makes
+/// any per-format gap visible directly.
+fn time_encode_rgb<F: Fn(&mut JpegEncoder<&mut Vec<u8>>)>(
+    pixels: &[u8],
+    w: u32,
+    h: u32,
+    configure: F,
+) -> BenchResult {
+    let mut buf = Vec::with_capacity((w as usize * h as usize * 3) / 2);
+
+    for _ in 0..WARMUP {
+        buf.clear();
+        let mut enc = JpegEncoder::new_with_quality(&mut buf, 80);
+        configure(&mut enc);
+        enc.encode_rgb(pixels, w, h).unwrap();
+    }
+
+    let start = Instant::now();
+    for _ in 0..ITERATIONS {
+        buf.clear();
+        let mut enc = JpegEncoder::new_with_quality(&mut buf, 80);
+        configure(&mut enc);
+        enc.encode_rgb(pixels, w, h).unwrap();
+    }
+    let elapsed = start.elapsed();
+    let per_iter = elapsed / ITERATIONS as u32;
+    let mp = (w as f64) * (h as f64) / 1_000_000.0;
+    BenchResult {
+        ms_per_iter: per_iter.as_secs_f64() * 1000.0,
+        ms_per_mp: per_iter.as_secs_f64() * 1000.0 / mp,
+        size: buf.len(),
+    }
+}
+
+fn print_row(label: &str, r: &BenchResult) {
+    println!(
+        "    {label:<28}  {ms:>7.2} ms/iter   {mp:>5.2} ms/MPx   ({size} bytes)",
+        ms = r.ms_per_iter,
+        mp = r.ms_per_mp,
+        size = r.size,
+    );
+}
+
+fn print_row_fmt(label: &str, fmt: &str, r: &BenchResult) {
+    println!(
+        "    {label:<28} {fmt}  {ms:>7.2} ms/iter   {mp:>5.2} ms/MPx   ({size} bytes)",
+        ms = r.ms_per_iter,
+        mp = r.ms_per_mp,
+        size = r.size,
+    );
+}
+
+/// Synthesize a deterministic test image. An XOR / multiply pattern that
+/// keeps the AC histogram non-degenerate (every 8x8 block is full-AC), so
+/// the entropy coder isn't artificially fast and the IDCT sparse fast
+/// paths never fire — the Huffman-heavy worst case for both encode and
+/// decode. Pixel-identical across hosts for apples-to-apples comparison.
+fn make_image(w: u32, h: u32) -> Vec<u8> {
+    let mut v = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let r = ((x ^ y) & 0xFF) as u8;
+            let g = ((x.wrapping_add(y)) & 0xFF) as u8;
+            let b = (((x.wrapping_mul(7)) ^ (y.wrapping_mul(13))) & 0xFF) as u8;
+            v.push(r);
+            v.push(g);
+            v.push(b);
+            v.push(255);
+        }
+    }
+    v
+}
+
+/// 3-byte (RGB, no alpha) variant of [`make_image`], for the
+/// `encode_rgb` timing row. Same XOR/multiply pattern, byte-identical
+/// channel values to the 4-byte version minus the alpha byte.
+fn make_image_rgb(w: u32, h: u32) -> Vec<u8> {
+    let mut v = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let r = ((x ^ y) & 0xFF) as u8;
+            let g = ((x.wrapping_add(y)) & 0xFF) as u8;
+            let b = (((x.wrapping_mul(7)) ^ (y.wrapping_mul(13))) & 0xFF) as u8;
+            v.push(r);
+            v.push(g);
+            v.push(b);
+        }
+    }
+    v
+}
+
+/// Procedural natural-like RGBA image. The mix is intentionally
+/// photo-shaped: ~70% smooth gradient (sky / wall), ~20% low-AC
+/// texture (foliage / fabric), ~10% sharp edges (object boundary).
+///
+/// After quantize at q=80 the smooth regions produce many DC-only
+/// 8x8 blocks (= what the IDCT sparse fast path targets); the
+/// texture region produces low-AC blocks; the edge region produces
+/// full-AC blocks. The fraction roughly approximates a typical
+/// snapshot (skyline, portrait with bokeh, web hero image), and is
+/// the fairer proxy for real-world web/photo input.
+fn make_natural_image(w: u32, h: u32) -> Vec<u8> {
+    let mut v = Vec::with_capacity((w * h * 4) as usize);
+    // Smooth gradient region: top 70% of the image is sky-like
+    // (slow vertical color drift). Texture band: middle 20% with
+    // low-amplitude pseudo-noise. Edges: bottom 10% with two solid
+    // rectangles in contrasting colors.
+    let smooth_h = (h as u64 * 70) / 100;
+    let texture_h = (h as u64 * 20) / 100;
+    for y in 0..h {
+        let yu = y as u64;
+        for x in 0..w {
+            let xu = x as u64;
+            let (r, g, b);
+            if yu < smooth_h {
+                // Sky: B dominant, gentle horizontal + vertical drift.
+                let t = (yu * 80 / smooth_h.max(1)) as u8; // 0..80
+                r = 130u8.saturating_sub(t / 2);
+                g = 160u8.saturating_sub(t / 3);
+                b = 200u8.saturating_sub(t / 4);
+            } else if yu < smooth_h + texture_h {
+                // Texture band: base ~mid-gray + small high-frequency
+                // perturbation. Hash-based deterministic noise of
+                // amplitude ~8 LSB so the AC isn't completely flat.
+                let n = (xu.wrapping_mul(2654435761) ^ yu.wrapping_mul(40503)) & 0x0F; // 0..15
+                let base = 110u8;
+                r = base + (n as u8);
+                g = base + (((n * 3) & 0x0F) as u8);
+                b = base + (((n * 5) & 0x0F) as u8);
+            } else {
+                // Edge band: alternating wide bars of two colors.
+                let bar = (xu / 64) & 1;
+                if bar == 0 {
+                    r = 40;
+                    g = 60;
+                    b = 70;
+                } else {
+                    r = 230;
+                    g = 220;
+                    b = 200;
+                }
+            }
+            v.push(r);
+            v.push(g);
+            v.push(b);
+            v.push(255);
+        }
+    }
+    v
+}

@@ -1,0 +1,43 @@
+[package]
+name = "jpeg-rusturbo"
+version = "0.9.2"
+edition = "2024"
+rust-version = "1.85"   # edition 2024 stabilized in Rust 1.85.
+license = "MIT OR Apache-2.0"
+description = "SIMD-accelerated JPEG encoder (baseline + progressive SOF2, RGB / grayscale / CMYK, EXIF / ICC pass-through) and Huffman decoder with EXIF / ICC retrieval."
+repository = "https://github.com/naoto256/jpeg-rusturbo"
+readme = "README.md"
+keywords = ["jpeg", "encoder", "decoder", "simd", "neon"]
+categories = ["multimedia::images", "encoding"]
+# Slim the published package: consumers don't need CI configs or the
+# integration test crate. `tests/roundtrip.rs` uses the `image` crate
+# only as a dev-dependency for decode-side verification and is not
+# referenced from anything reachable via the public API.
+exclude = [
+    ".github/",
+    "tests/",
+]
+
+[lib]
+path = "src/lib.rs"
+
+# Plain `fn main()` printers (not libtest benches), so disable the
+# standard harness. Run with `cargo bench --bench <name>`.
+[[bench]]
+name = "pipeline"
+harness = false
+
+[[bench]]
+name = "vs_image"
+harness = false
+
+[features]
+# Force the scalar fallback even on aarch64. Used by the bench harness
+# to measure NEON speedup vs scalar without leaving the same binary.
+force-scalar = []
+
+[dependencies]
+rayon = "1"
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg"] }

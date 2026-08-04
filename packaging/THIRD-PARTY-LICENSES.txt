@@ -546,7 +546,7 @@ License: MIT OR Apache-2.0
 Source: https://github.com/dtolnay/itoa
 jpeg-rusturbo 0.9.2
 License: MIT OR Apache-2.0
-Source: https://github.com/naoto256/jpeg-rusturbo
+Source: https://github.com/hunterchen7/viewr/tree/main/thirdparty/jpeg-rusturbo (forked from https://github.com/naoto256/jpeg-rusturbo)
 jxl-bitstream 1.1.0
 License: MIT OR Apache-2.0
 Source: https://github.com/tirr-c/jxl-oxide.git

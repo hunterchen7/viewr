@@ -819,8 +819,6 @@ checksum = "b454d911ac55068f53495488d8ccd0646eaa540c033a28ee15b07838afafb01f"
 [[package]]
 name = "jpeg-rusturbo"
 version = "0.9.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f99890ec2a56818f0a1783cd6893794637a4fb6b61a3b4394e411d2f4693372f"
 dependencies = [
  "rayon",
 ]
