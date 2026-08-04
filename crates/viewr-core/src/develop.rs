@@ -48,9 +48,11 @@ pub enum Quality {
 /// encoding. Parallel stages are reported as elapsed wall time, not summed CPU
 /// time.
 pub struct DevelopTimings {
-    /// Black/white-level normalization of the CFA mosaic.
+    /// Separate CFA normalization, or optimized-path planning before a fused
+    /// normalization and demosaic traversal.
     pub rescale: Duration,
-    /// CFA-to-RGB demosaic.
+    /// CFA-to-RGB demosaic, including normalization when the Browse integer
+    /// fast path fuses both operations.
     pub demosaic: Duration,
     /// Optional white balance and camera-to-linear-sRGB color conversion.
     pub calibrate: Duration,
