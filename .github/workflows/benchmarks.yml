@@ -65,7 +65,7 @@ jobs:
             --argjson memory_bytes "$bench_memory" \
             --arg rayon_threads "${RAYON_NUM_THREADS:-default}" \
             '{
-              schema_version: 1,
+              schema_version: 2,
               commit: $commit,
               cargo_lock_sha256: $cargo_lock_sha256,
               rawler_commit: $rawler_commit,
