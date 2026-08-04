@@ -2,7 +2,25 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub(crate) fn build_owner_members(owners: &[Option<PathBuf>]) -> Vec<Option<Arc<[usize]>>> {
+use viewr_core::library::RatingLoad;
+
+pub(crate) type OwnerMembers = Vec<Option<Arc<[usize]>>>;
+
+pub(crate) struct GroupedRatingLoad {
+    pub(crate) ratings: HashMap<usize, u8>,
+    pub(crate) owner_members: OwnerMembers,
+}
+
+/// Consumes a rating snapshot and resolves its owner groups before publishing
+/// it to the UI thread.
+pub(crate) fn group_rating_load((ratings, owners): RatingLoad) -> GroupedRatingLoad {
+    GroupedRatingLoad {
+        ratings,
+        owner_members: build_owner_members(&owners),
+    }
+}
+
+pub(crate) fn build_owner_members(owners: &[Option<PathBuf>]) -> OwnerMembers {
     let mut first_by_owner: HashMap<&std::path::Path, usize> = HashMap::new();
     let mut duplicate_groups: HashMap<&std::path::Path, Vec<usize>> = HashMap::new();
     for (index, owner) in owners.iter().enumerate() {
@@ -47,6 +65,29 @@ pub(crate) fn install_rating_for_members(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grouped_rating_load_keeps_ratings_and_precomputes_shared_membership() {
+        let owner = PathBuf::from("/photos/photo.xmp");
+        let grouped = group_rating_load((
+            HashMap::from([(0, 5), (2, 3)]),
+            vec![
+                Some(owner.clone()),
+                Some(owner),
+                Some(PathBuf::from("/photos/other.xmp")),
+                None,
+            ],
+        ));
+
+        assert_eq!(grouped.ratings, HashMap::from([(0, 5), (2, 3)]));
+        assert_eq!(grouped.owner_members[0].as_deref(), Some([0, 1].as_slice()));
+        assert!(Arc::ptr_eq(
+            grouped.owner_members[0].as_ref().unwrap(),
+            grouped.owner_members[1].as_ref().unwrap()
+        ));
+        assert!(grouped.owner_members[2].is_none());
+        assert!(grouped.owner_members[3].is_none());
+    }
 
     #[test]
     fn owner_members_are_shared_and_unresolved_entries_stay_independent() {

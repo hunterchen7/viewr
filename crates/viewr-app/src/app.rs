@@ -20,7 +20,7 @@ use viewr_core::db::{Db, default_db_path};
 use viewr_core::folder::{FolderEntry, normalize_physical_path, scan};
 use viewr_core::jobs::{Engine, EngineOptions, Event, NavState, ViewHint};
 use viewr_core::library::{
-    Library, RatingLoad, load_ratings_with_owners, rating_owner_keys, try_load_ratings_with_owners,
+    Library, load_ratings_with_owners, rating_owner_keys, try_load_ratings_with_owners,
 };
 use viewr_core::meta::FileMeta;
 use viewr_core::types::Tier;
@@ -31,7 +31,10 @@ use crate::image_info;
 use crate::loupe::{self, LoupeResponse, Zoom};
 use crate::pixels::to_color_image;
 use crate::progressive_texture::{self, TileCoord};
-use crate::rating_groups::{build_owner_members, install_rating_for_members};
+use crate::rating_groups::{
+    GroupedRatingLoad, OwnerMembers, build_owner_members, group_rating_load,
+    install_rating_for_members,
+};
 use crate::settings::SettingsState;
 use crate::texture_lru::ByteLru;
 use crate::update::UpdateManager;
@@ -52,7 +55,7 @@ const THUMB_FAILURE_RETRY_AFTER: Duration = Duration::from_secs(2);
 const RATING_DB_REFRESH_POLL: Duration = Duration::from_millis(50);
 const RATING_DB_REFRESH_MAX_POLL: Duration = Duration::from_secs(5);
 
-type RatingRefreshResult = std::result::Result<RatingLoad, String>;
+type RatingRefreshResult = std::result::Result<GroupedRatingLoad, String>;
 
 fn ram_cache_budgets(total: u64) -> RamCacheBudgets {
     let thumbs = THUMB_BUDGET.min(total / 2);
@@ -363,7 +366,7 @@ struct Session {
     library: Library,
     ratings: HashMap<usize, u8>,
     explicit_ratings: HashMap<usize, u8>,
-    rating_members: Vec<Option<Arc<[usize]>>>,
+    rating_members: OwnerMembers,
     rating_refresh_pending: bool,
     rating_sources_blocked: bool,
     rating_refresh_after: Option<Instant>,
@@ -833,11 +836,14 @@ impl App {
             let session = self.session.as_mut().expect("checked session");
             session.rating_refresh_rx = None;
             match result {
-                Ok((ratings, owners)) => {
+                Ok(GroupedRatingLoad {
+                    ratings,
+                    owner_members,
+                }) => {
                     let ratings =
                         merge_refreshed_ratings(ratings, &session.metas, &session.explicit_ratings);
                     session.ratings = ratings;
-                    session.rating_members = build_owner_members(&owners);
+                    session.rating_members = owner_members;
                     session.rating_refresh_pending = false;
                     session.rating_sources_blocked = false;
                     session.rating_refresh_after = None;
@@ -878,6 +884,7 @@ impl App {
                         return Err("rating database migration is not complete".to_owned());
                     }
                     try_load_ratings_with_owners(&entries, Some(&db))
+                        .map(group_rating_load)
                         .map_err(|error| error.to_string())
                 })();
                 let _ = send.send(result);
