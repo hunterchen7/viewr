@@ -5,6 +5,10 @@ members = [
     "crates/viewr-app",
     "thirdparty/jpeg-rusturbo",
 ]
+# Rawler is a path dependency with its own reviewed workspace and lockfile.
+# Keep Cargo from treating its manifest as an unlisted member when release
+# source packaging synchronizes that independently locked dependency graph.
+exclude = ["thirdparty/dnglab/rawler"]
 
 [workspace.package]
 version = "0.5.0" # x-release-please-version
