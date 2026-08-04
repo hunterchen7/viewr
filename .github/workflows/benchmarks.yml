@@ -99,7 +99,7 @@ jobs:
           name: criterion-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             target/criterion
-            thirdparty/dnglab/target/criterion
+            thirdparty/dnglab/rawler/target/criterion
             tools/jpeg-bakeoff/target/criterion
             target/benchmark-metadata.json
           if-no-files-found: warn
