@@ -83,6 +83,35 @@ reduced binary size, but increased cold-build wall time by 12.3 and 79.4
 percent and peak build RSS by 79.9 and 171.5 percent without a confirmed
 complete-pipeline benefit.
 
+The frozen profile source was Viewr `5e60f7acb9f3dc4aebde579bd7804d4e6eec89c8`,
+Rawler `9bd77dc2b181f1778a09cc051d2626c625133e12`, and `Cargo.lock`
+SHA-256 `a2a89815fe13df14d563770349bbd8d5aee86766c1c88ea16d56719847adb13e`.
+Cold builds used `/usr/bin/time -l`, `CARGO_INCREMENTAL=0`, separate target
+directories, and these exact overrides:
+
+```sh
+env CARGO_TARGET_DIR=/tmp/thin-default CARGO_INCREMENTAL=0 \
+  cargo build --release --locked -p viewr --bin viewr --quiet
+env CARGO_TARGET_DIR=/tmp/thin-cgu1 CARGO_INCREMENTAL=0 \
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
+  cargo build --release --locked -p viewr --bin viewr --quiet
+env CARGO_TARGET_DIR=/tmp/fat-cgu1 CARGO_INCREMENTAL=0 \
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_LTO=fat \
+  cargo build --release --locked -p viewr --bin viewr --quiet
+```
+
+Each runtime sample unset `RAYON_NUM_THREADS`, started a fresh process, and
+ran `BINARY dev --json /path/to/HCA04875.ARW OUTPUT_DIRECTORY`. The first
+campaign repeated all six permutations of `(thin-default, thin-cgu1,
+fat-cgu1)` six times. The independent confirmation repeated those
+permutations in reverse order six times. Nine warm-ups were excluded.
+Validation compared the input, Browse RGBA, Full RGBA, Browse JPEG, and Full
+JPEG hashes plus dimensions and byte counts after every process. The analysis
+paired candidates by block, removed ties, and used a two-sided exact binomial
+sign test. It recorded external wall time and every `dev --json` pipeline
+stage. Aggregate results are retained here; individual sample rows and the
+private-fixture JPEG outputs are not release artifacts.
+
 ## Initial latency map
 
 These values are the isolated reference measurements collected before this
