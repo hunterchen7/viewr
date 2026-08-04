@@ -57,6 +57,14 @@ pub const CACHE_JPEG_QUALITY: u8 = DEFAULT_CACHE_JPEG_QUALITY;
 pub const MIN_CACHE_JPEG_QUALITY: u8 = 80;
 /// Highest cache JPEG quality exposed by the application preference.
 pub const MAX_CACHE_JPEG_QUALITY: u8 = 100;
+/// Edge length of one independently uploadable Full-resolution GPU tile.
+///
+/// The progressive develop scheduler snaps its first region to this grid so
+/// the first region-ready event can produce complete textures rather than a
+/// smaller rectangle that no texture upload can consume.
+pub const FULL_TEXTURE_TILE_EDGE: u32 = 1_024;
+/// Extra source pixels sampled around each Full-resolution texture tile.
+pub const FULL_TEXTURE_SAMPLE_GUTTER: u32 = 1;
 const MAX_JPEG_WORKERS: usize = 10;
 const PERSIST_WRITE_ATTEMPTS: usize = 3;
 const PERSIST_RETRY_BASE_DELAY: Duration = Duration::from_millis(2);
@@ -3002,9 +3010,6 @@ fn decode_jpeg_for_rehydrate(
     }
 }
 
-/// Extra pre-orient pixels developed around the visible viewport. Covers the
-/// UI tiles' one-pixel sampling gutter with slack for small pans.
-const PROGRESSIVE_VIEWPORT_MARGIN: u32 = 32;
 /// Row height of the full-width assembly bands developed after the visible
 /// region. Also the cancellation granularity of a progressive Full develop.
 const PROGRESSIVE_BAND_ROWS: u32 = 1024;
@@ -3035,19 +3040,39 @@ fn inverse_orient_rect(display: [u32; 4], orient: Orient, out_w: u32, out_h: u32
     }
 }
 
-/// Expands a rectangle by `margin` on every side and clamps it to the frame.
-fn expand_and_clamp(rect: [u32; 4], margin: u32, out_w: u32, out_h: u32) -> [u32; 4] {
-    let x = rect[0].saturating_sub(margin).min(out_w);
-    let y = rect[1].saturating_sub(margin).min(out_h);
-    let right = rect[0]
-        .saturating_add(rect[2])
-        .saturating_add(margin)
-        .min(out_w);
-    let bottom = rect[1]
-        .saturating_add(rect[3])
-        .saturating_add(margin)
-        .min(out_h);
-    [x, y, right.saturating_sub(x), bottom.saturating_sub(y)]
+/// Expands a visible display rectangle to the union of every texture sample
+/// rectangle its intersecting tile cores require.
+///
+/// Tile cores start at the display origin. Each sample extends by
+/// [`FULL_TEXTURE_SAMPLE_GUTTER`] and clamps at the image edge. A degenerate
+/// advisory viewport selects the tile under its clamped point so corrupt or
+/// transient layout input still yields useful progressive work.
+fn uploadable_visible_sample_rect(visible: [u32; 4], display_w: u32, display_h: u32) -> [u32; 4] {
+    let sample_span = |start: u32, length: u32, extent: u32| {
+        if extent == 0 {
+            return [0, 0];
+        }
+        let first_visible = start.min(extent - 1);
+        let visible_end = if length == 0 {
+            first_visible + 1
+        } else {
+            start.saturating_add(length).min(extent)
+        };
+        let core_start = first_visible / FULL_TEXTURE_TILE_EDGE * FULL_TEXTURE_TILE_EDGE;
+        let core_end = visible_end
+            .div_ceil(FULL_TEXTURE_TILE_EDGE)
+            .saturating_mul(FULL_TEXTURE_TILE_EDGE)
+            .min(extent);
+        let sample_start = core_start.saturating_sub(FULL_TEXTURE_SAMPLE_GUTTER);
+        let sample_end = core_end
+            .saturating_add(FULL_TEXTURE_SAMPLE_GUTTER)
+            .min(extent);
+        [sample_start, sample_end - sample_start]
+    };
+
+    let [x, width] = sample_span(visible[0], visible[2], display_w);
+    let [y, height] = sample_span(visible[1], visible[3], display_h);
+    [x, y, width, height]
 }
 
 /// Zoomed display viewport → the first developed pre-orient rectangle.
@@ -3058,8 +3083,8 @@ fn progressive_first_rect(uv: [f32; 4], orient: Orient, out_w: u32, out_h: u32) 
         (out_w, out_h)
     };
     let visible = visible_display_pixels(uv, display_w, display_h);
-    let out = inverse_orient_rect(visible, orient, out_w, out_h);
-    expand_and_clamp(out, PROGRESSIVE_VIEWPORT_MARGIN, out_w, out_h)
+    let uploadable = uploadable_visible_sample_rect(visible, display_w, display_h);
+    inverse_orient_rect(uploadable, orient, out_w, out_h)
 }
 
 /// Covers the out frame minus `first` exactly once: full-width bands of
@@ -6943,18 +6968,15 @@ mod tests {
     }
 
     #[test]
-    fn progressive_first_rect_expands_the_viewport_and_survives_degenerate_input() {
-        // A centered viewport expands by the margin and clamps to the frame.
-        // Expected values follow the deterministic f32 floor/ceil math of
-        // visible_display_pixels (0.6 * 3000 rounds up to 1801, for example).
+    fn progressive_first_rect_covers_complete_guttered_texture_tiles() {
         let uv = [0.4, 0.4, 0.6, 0.6];
         assert_eq!(
             progressive_first_rect(uv, Orient::R0, 4000, 3000),
-            [1568, 1168, 864, 665]
+            [1023, 1023, 2050, 1026]
         );
         assert_eq!(
             progressive_first_rect(uv, Orient::R90, 4000, 3000),
-            [1568, 1167, 864, 665]
+            [1023, 951, 2050, 1026]
         );
 
         // Off-frame viewport clamps to an edge but stays developable.
@@ -6970,6 +6992,122 @@ mod tests {
                 rect[0] + rect[2] <= 3000 && rect[1] + rect[3] <= 2000,
                 "{orient:?}"
             );
+        }
+    }
+
+    #[test]
+    fn uploadable_visible_samples_snap_across_seams_and_clamp_at_edges() {
+        let cases = [
+            // The top-left tile has no gutter outside the image.
+            ([0, 0, 1, 1], [0, 0, 1025, 1025]),
+            // One visible pixel on each side of both tile seams needs all
+            // four adjacent tile samples.
+            ([1023, 1023, 2, 2], [0, 0, 2049, 2049]),
+            // Starting exactly on a seam selects only the following tile.
+            ([1024, 1024, 1, 1], [1023, 1023, 1026, 1026]),
+            // The final partial tile clamps its outside gutter to the image.
+            ([2499, 2099, 1, 1], [2047, 2047, 453, 53]),
+        ];
+        for (visible, expected) in cases {
+            assert_eq!(
+                uploadable_visible_sample_rect(visible, 2_500, 2_100),
+                expected,
+                "visible {visible:?}"
+            );
+        }
+    }
+
+    fn display_rect_from_out(rect: [u32; 4], orient: Orient, out_w: u32, out_h: u32) -> [u32; 4] {
+        let [x, y, width, height] = rect;
+        match orient {
+            Orient::R0 => rect,
+            Orient::R90 => [out_h - y - height, x, height, width],
+            Orient::R180 => [out_w - x - width, out_h - y - height, width, height],
+            Orient::R270 => [y, out_w - x - width, height, width],
+        }
+    }
+
+    fn visible_texture_samples(
+        uv: [f32; 4],
+        display_w: u32,
+        display_h: u32,
+    ) -> Vec<ProgressiveRect> {
+        let [x, y, width, height] = visible_display_pixels(uv, display_w, display_h);
+        let visible = ProgressiveRect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let cols = display_w.div_ceil(FULL_TEXTURE_TILE_EDGE);
+        let rows = display_h.div_ceil(FULL_TEXTURE_TILE_EDGE);
+        let mut samples = Vec::new();
+        for row in 0..rows {
+            for col in 0..cols {
+                let core_x = col * FULL_TEXTURE_TILE_EDGE;
+                let core_y = row * FULL_TEXTURE_TILE_EDGE;
+                let core = ProgressiveRect {
+                    x: core_x,
+                    y: core_y,
+                    width: FULL_TEXTURE_TILE_EDGE.min(display_w - core_x),
+                    height: FULL_TEXTURE_TILE_EDGE.min(display_h - core_y),
+                };
+                if !core.intersects(visible) {
+                    continue;
+                }
+                let sample_x = core.x.saturating_sub(FULL_TEXTURE_SAMPLE_GUTTER);
+                let sample_y = core.y.saturating_sub(FULL_TEXTURE_SAMPLE_GUTTER);
+                let right = core
+                    .right()
+                    .saturating_add(FULL_TEXTURE_SAMPLE_GUTTER)
+                    .min(display_w);
+                let bottom = core
+                    .bottom()
+                    .saturating_add(FULL_TEXTURE_SAMPLE_GUTTER)
+                    .min(display_h);
+                samples.push(ProgressiveRect {
+                    x: sample_x,
+                    y: sample_y,
+                    width: right - sample_x,
+                    height: bottom - sample_y,
+                });
+            }
+        }
+        samples
+    }
+
+    #[test]
+    fn first_progressive_event_can_serve_every_visible_texture_tile() {
+        let (out_w, out_h) = (2_500, 2_100);
+        let viewports = [
+            [0.0, 0.0, 0.05, 0.06],
+            [0.39, 0.40, 0.43, 0.55],
+            [0.40, 0.45, 0.60, 0.55],
+            [0.91, 0.92, 1.0, 1.0],
+        ];
+        for orient in [Orient::R0, Orient::R90, Orient::R180, Orient::R270] {
+            let (display_w, display_h) = if orient.swaps_axes() {
+                (out_h, out_w)
+            } else {
+                (out_w, out_h)
+            };
+            for uv in viewports {
+                let first = progressive_first_rect(uv, orient, out_w, out_h);
+                let covered = [display_rect_from_out(first, orient, out_w, out_h)];
+                let samples = visible_texture_samples(uv, display_w, display_h);
+                assert!(!samples.is_empty(), "{orient:?} {uv:?}");
+                let ready_after_first_event = samples
+                    .iter()
+                    .filter(|&&sample| progressive_rect_fully_covered(sample, &covered))
+                    .count();
+                assert_eq!(
+                    ready_after_first_event,
+                    samples.len(),
+                    "first event served {ready_after_first_event}/{} visible tiles for {orient:?} {uv:?}; first display rect {:?}",
+                    samples.len(),
+                    covered[0]
+                );
+            }
         }
     }
 
@@ -7281,6 +7419,13 @@ mod tests {
                     // Every covered byte must already carry final-frame bytes.
                     let staging = shared.progressive.lock().unwrap();
                     let canvas = staging.as_ref().expect("staging present during regions");
+                    if region_events.get() == 1 {
+                        let samples = visible_texture_samples(uv, canvas.width, canvas.height);
+                        assert!(!samples.is_empty());
+                        assert!(samples.iter().all(|&sample| {
+                            progressive_rect_fully_covered(sample, &canvas.covered)
+                        }));
+                    }
                     let last = *canvas.covered.last().expect("covered rect recorded");
                     let stride = canvas.width as usize * 4;
                     for row in [0, last[3] as usize / 2, last[3] as usize - 1] {

@@ -4,8 +4,8 @@ use eframe::egui;
 use viewr_core::cache_ram::FullBand;
 use viewr_core::types::PixelBuf;
 
-pub(crate) const TILE_EDGE: u32 = 1_024;
-pub(crate) const SAMPLE_GUTTER: u32 = 1;
+pub(crate) const TILE_EDGE: u32 = viewr_core::jobs::FULL_TEXTURE_TILE_EDGE;
+pub(crate) const SAMPLE_GUTTER: u32 = viewr_core::jobs::FULL_TEXTURE_SAMPLE_GUTTER;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct TileCoord {
