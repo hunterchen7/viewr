@@ -48,9 +48,11 @@ pub enum Quality {
 /// encoding. Parallel stages are reported as elapsed wall time, not summed CPU
 /// time.
 pub struct DevelopTimings {
-    /// Black/white-level normalization of the CFA mosaic.
+    /// Separate CFA normalization, or optimized-path planning before a fused
+    /// normalization and demosaic traversal.
     pub rescale: Duration,
-    /// CFA-to-RGB demosaic.
+    /// CFA-to-RGB demosaic, including normalization when the Browse integer
+    /// fast path fuses both operations.
     pub demosaic: Duration,
     /// Optional white balance and camera-to-linear-sRGB color conversion.
     pub calibrate: Duration,
@@ -126,11 +128,34 @@ enum RegionLayout {
     Copied,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BrowseIntegerMode {
+    Fused,
+    #[cfg(any(test, feature = "benchmarks"))]
+    Materialized,
+}
+
 fn develop_with_layout(
     raw: RawImage,
     quality: Quality,
     gamma_mode: GammaMode,
     region_layout: RegionLayout,
+) -> Result<(PixelBuf, DevelopTimings), DevelopError> {
+    develop_with_layout_and_browse_mode(
+        raw,
+        quality,
+        gamma_mode,
+        region_layout,
+        BrowseIntegerMode::Fused,
+    )
+}
+
+fn develop_with_layout_and_browse_mode(
+    raw: RawImage,
+    quality: Quality,
+    gamma_mode: GammaMode,
+    region_layout: RegionLayout,
+    browse_integer_mode: BrowseIntegerMode,
 ) -> Result<(PixelBuf, DevelopTimings), DevelopError> {
     let mut timings = DevelopTimings::default();
 
@@ -146,29 +171,68 @@ fn develop_with_layout(
 
     let calibration = derive_calibration(&raw);
 
-    // Convert and normalize integer mosaics in one traversal. rawler's
-    // RawImage::apply_scaling first writes a complete f32 copy and then
-    // revisits it for black/white correction; development consumes the raw,
-    // so the intermediate unscaled f32 frame is unnecessary.
+    // Full development and noncanonical Browse inputs materialize one
+    // normalized f32 mosaic. The common integer-Bayer Browse path instead
+    // normalizes the four samples while producing each RGB superpixel, so it
+    // never allocates the full sensor-sized f32 mosaic.
     let t = Instant::now();
     let width = raw.width;
     let height = raw.height;
     let blacklevel = raw.blacklevel.as_bayer_array();
     let whitelevel = raw.whitelevel.as_bayer_array();
+    let active = raw
+        .active_area
+        .unwrap_or(Rect::new(Point::zero(), Dim2::new(width, height)));
     // Move the mosaic plane out instead of cloning it (~120MB at 61MP).
-    let data = scale_cfa_data(raw.data, width, height, blacklevel, whitelevel);
-    let mosaic = PixF32::new_with(data, width, height);
-    timings.rescale = t.elapsed();
+    let data = raw.data;
+    let direct_plan = (quality == Quality::Browse
+        && browse_integer_mode == BrowseIntegerMode::Fused)
+        .then(|| {
+            direct_integer_superpixel_plan(
+                &data,
+                Dim2::new(width, height),
+                blacklevel,
+                whitelevel,
+                &config.cfa,
+                active,
+            )
+        })
+        .flatten();
 
-    // Demosaic over the active (non-masked) sensor area.
-    let t = Instant::now();
-    let active = raw.active_area.unwrap_or(mosaic.rect());
-    let mut image: Color2D<f32, 3> = match quality {
-        Quality::Browse => superpixel_demosaic(&mosaic, &config.cfa, &config.colors, active),
-        Quality::Full => PPGDemosaic::new().demosaic(&mosaic, &config.cfa, &config.colors, active),
+    let mut image: Color2D<f32, 3> = if let Some(plan) = direct_plan {
+        // Planning is the only distinct rescale work. Per-sample normalization
+        // is fused into, and therefore timed with, the demosaic traversal.
+        timings.rescale = t.elapsed();
+        let t = Instant::now();
+        let RawImageData::Integer(data) = data else {
+            unreachable!("a direct integer plan requires integer CFA data")
+        };
+        let image =
+            direct_integer_superpixel_demosaic(&data, Dim2::new(width, height), plan, active);
+        drop(data);
+        timings.demosaic = t.elapsed();
+        image
+    } else {
+        // Convert and normalize integer mosaics in one traversal. rawler's
+        // RawImage::apply_scaling first writes a complete f32 copy and then
+        // revisits it for black/white correction; development consumes the
+        // raw, so the intermediate unscaled f32 frame is unnecessary.
+        let data = scale_cfa_data(data, width, height, blacklevel, whitelevel);
+        let mosaic = PixF32::new_with(data, width, height);
+        timings.rescale = t.elapsed();
+
+        // Demosaic over the active (non-masked) sensor area.
+        let t = Instant::now();
+        let image = match quality {
+            Quality::Browse => superpixel_demosaic(&mosaic, &config.cfa, &config.colors, active),
+            Quality::Full => {
+                PPGDemosaic::new().demosaic(&mosaic, &config.cfa, &config.colors, active)
+            }
+        };
+        drop(mosaic);
+        timings.demosaic = t.elapsed();
+        image
     };
-    drop(mosaic);
-    timings.demosaic = t.elapsed();
 
     // Keep the demosaiced frame in place. Calibration and packing operate only
     // on this region, avoiding Color2D::crop's second full output allocation
@@ -213,14 +277,7 @@ fn develop_with_layout(
     }
     timings.gamma_pack = t.elapsed();
 
-    Ok((
-        PixelBuf {
-            width: out_w,
-            height: out_h,
-            rgba,
-        },
-        timings,
-    ))
+    Ok((PixelBuf::new_opaque(out_w, out_h, rgba), timings))
 }
 
 fn scale_cfa_data(
@@ -237,7 +294,10 @@ fn scale_cfa_data(
         }
         RawImageData::Integer(data) => data,
     };
-    assert_eq!(data.len(), width * height);
+    let expected_len = width
+        .checked_mul(height)
+        .expect("CFA dimensions overflow addressable memory");
+    assert_eq!(data.len(), expected_len);
     let output_len = data.len();
     if output_len == 0 {
         return Vec::new();
@@ -257,7 +317,9 @@ fn scale_cfa_data(
     let mut output = Vec::<f32>::with_capacity(output_len);
     {
         let spare = &mut output.spare_capacity_mut()[..output_len];
-        let row_pair_samples = width * 2;
+        let row_pair_samples = width
+            .checked_mul(2)
+            .expect("a CFA row pair overflows addressable memory");
         let paired_samples = data.len() / row_pair_samples * row_pair_samples;
         let fill_pair = |input: &[u16], output: &mut [std::mem::MaybeUninit<f32>]| {
             let (input_top, input_bottom) = input.split_at(width);
@@ -329,6 +391,24 @@ pub fn benchmark_scale_cfa_legacy(mut raw: RawImage) -> Vec<f32> {
         RawImageData::Float(data) => data,
         RawImageData::Integer(_) => unreachable!("apply_scaling always produces f32 samples"),
     }
+}
+
+#[cfg(feature = "benchmarks")]
+#[doc(hidden)]
+/// Runs Browse development through the materialized normalized-f32 mosaic.
+///
+/// This is a benchmark reference for the former production path. Normal
+/// callers must use [`develop`].
+pub fn benchmark_develop_browse_materialized(
+    raw: RawImage,
+) -> Result<(PixelBuf, DevelopTimings), DevelopError> {
+    develop_with_layout_and_browse_mode(
+        raw,
+        Quality::Browse,
+        GammaMode::Lut,
+        RegionLayout::Strided,
+        BrowseIntegerMode::Materialized,
+    )
 }
 
 /// Derives the white-balance and camera→sRGB calibration used by the
@@ -702,54 +782,208 @@ pub fn total(timings: &DevelopTimings) -> Duration {
     timings.rescale + timings.demosaic + timings.calibrate + timings.gamma_pack
 }
 
-/// Equivalent to rawler's three-channel superpixel demosaic, but writes each
-/// output pixel directly into its final allocation. Rawler currently builds a
-/// temporary `Vec` for every output row and then copies all rows into another
-/// `Vec`; that extra allocation and full-frame copy dominate Browse demosaic on
-/// large sensors.
-fn superpixel_demosaic(
-    mosaic: &PixF32,
+#[derive(Clone, Copy)]
+struct DirectIntegerSuperpixelPlan {
+    /// Positions of R, G, G, and B within one row-major 2x2 input quad.
+    channels: [usize; 4],
+    /// Black/white-level channels for the four absolute sensor positions.
+    sample_channels: [usize; 4],
+    blacklevel: [f32; 4],
+    maximum: [f32; 4],
+}
+
+fn superpixel_channels(cfa: &CFA, roi: Rect) -> Option<[usize; 4]> {
+    let shifted = cfa.shift(roi.x(), roi.y());
+    match shifted.name.as_str() {
+        "RGGB" => Some([0, 1, 2, 3]),
+        "BGGR" => Some([3, 1, 2, 0]),
+        "GBRG" => Some([2, 0, 3, 1]),
+        "GRBG" => Some([1, 0, 3, 2]),
+        _ => None,
+    }
+}
+
+fn direct_integer_superpixel_plan(
+    data: &RawImageData,
+    dimensions: Dim2,
+    blacklevel: [f32; 4],
+    whitelevel: [f32; 4],
     cfa: &CFA,
-    colors: &PlaneColor,
+    roi: Rect,
+) -> Option<DirectIntegerSuperpixelPlan> {
+    let RawImageData::Integer(data) = data else {
+        return None;
+    };
+    assert_eq!(data.len(), dimensions.w * dimensions.h);
+
+    // Preserve the materialized path for corrupt geometry instead of making
+    // the optimized reader's indexing contract broader than production RAWs.
+    if roi.x().checked_add(roi.width())? > dimensions.w
+        || roi.y().checked_add(roi.height())? > dimensions.h
+    {
+        return None;
+    }
+
+    let maximum = [
+        whitelevel[0] - blacklevel[0],
+        whitelevel[1] - blacklevel[1],
+        whitelevel[2] - blacklevel[2],
+        whitelevel[3] - blacklevel[3],
+    ];
+    if !blacklevel.iter().all(|value| value.is_finite())
+        || !whitelevel.iter().all(|value| value.is_finite())
+        || !maximum
+            .iter()
+            .all(|value| value.is_finite() && *value > 0.0)
+    {
+        return None;
+    }
+
+    Some(DirectIntegerSuperpixelPlan {
+        channels: superpixel_channels(cfa, roi)?,
+        sample_channels: [
+            (roi.y() & 1) * 2 + (roi.x() & 1),
+            (roi.y() & 1) * 2 + ((roi.x() + 1) & 1),
+            ((roi.y() + 1) & 1) * 2 + (roi.x() & 1),
+            ((roi.y() + 1) & 1) * 2 + ((roi.x() + 1) & 1),
+        ],
+        blacklevel,
+        maximum,
+    })
+}
+
+#[inline(always)]
+fn normalized_integer_cfa_value(value: u16, blacklevel: f32, maximum: f32) -> f32 {
+    let value = f32::from(value) - blacklevel;
+    (if value.is_sign_negative() { 0.0 } else { value }) / maximum
+}
+
+#[inline]
+fn normalized_integer_cfa_sample(
+    data: &[u16],
+    dimensions: Dim2,
+    x: usize,
+    y: usize,
+    plan: DirectIntegerSuperpixelPlan,
+) -> f32 {
+    let width = dimensions.w;
+    let height = dimensions.h;
+    let value = f32::from(data[y * width + x]);
+    // `correct_blacklevel_cfa` works in exact 2-row and 2-column chunks.
+    // Preserve its observable behavior for an odd final sensor row/column.
+    if x >= width & !1 || y >= height & !1 {
+        return value;
+    }
+    let channel = (y & 1) * 2 + (x & 1);
+    normalized_integer_cfa_value(
+        data[y * width + x],
+        plan.blacklevel[channel],
+        plan.maximum[channel],
+    )
+}
+
+fn direct_integer_superpixel_demosaic(
+    data: &[u16],
+    dimensions: Dim2,
+    plan: DirectIntegerSuperpixelPlan,
     roi: Rect,
 ) -> Color2D<f32, 3> {
     let out_width = (roi.width() & !1) / 2;
     let out_height = (roi.height() & !1) / 2;
-    let out_len = out_width * out_height;
+    let [red, green_a, green_b, blue] = plan.channels;
+
+    // Production sensors and active rectangles are even-sized. Hoist odd-tail
+    // compatibility out of that hot loop; the uncommon edge case retains the
+    // exact per-sample oracle below.
+    let used_width = out_width * 2;
+    let used_height = out_height * 2;
+    if roi.x() + used_width <= dimensions.w & !1 && roi.y() + used_height <= dimensions.h & !1 {
+        let [channel_0, channel_1, channel_2, channel_3] = plan.sample_channels;
+        let black = [
+            plan.blacklevel[channel_0],
+            plan.blacklevel[channel_1],
+            plan.blacklevel[channel_2],
+            plan.blacklevel[channel_3],
+        ];
+        let maximum = [
+            plan.maximum[channel_0],
+            plan.maximum[channel_1],
+            plan.maximum[channel_2],
+            plan.maximum[channel_3],
+        ];
+        return collect_superpixels(
+            out_width,
+            out_height,
+            |out_y| {
+                let top = (roi.y() + out_y * 2) * dimensions.w + roi.x();
+                let bottom = top + dimensions.w;
+                (
+                    &data[top..top + used_width],
+                    &data[bottom..bottom + used_width],
+                )
+            },
+            |(top, bottom), out_x| {
+                let input_x = out_x * 2;
+                let values = [
+                    normalized_integer_cfa_value(top[input_x], black[0], maximum[0]),
+                    normalized_integer_cfa_value(top[input_x + 1], black[1], maximum[1]),
+                    normalized_integer_cfa_value(bottom[input_x], black[2], maximum[2]),
+                    normalized_integer_cfa_value(bottom[input_x + 1], black[3], maximum[3]),
+                ];
+                [
+                    values[red],
+                    (values[green_a] + values[green_b]) / 2.0,
+                    values[blue],
+                ]
+            },
+        );
+    }
+
+    collect_superpixels(
+        out_width,
+        out_height,
+        |out_y| roi.y() + out_y * 2,
+        |y, out_x| {
+            let x = roi.x() + out_x * 2;
+            let values = [
+                normalized_integer_cfa_sample(data, dimensions, x, *y, plan),
+                normalized_integer_cfa_sample(data, dimensions, x + 1, *y, plan),
+                normalized_integer_cfa_sample(data, dimensions, x, *y + 1, plan),
+                normalized_integer_cfa_sample(data, dimensions, x + 1, *y + 1, plan),
+            ];
+            [
+                values[red],
+                (values[green_a] + values[green_b]) / 2.0,
+                values[blue],
+            ]
+        },
+    )
+}
+
+/// Builds a superpixel frame directly in its final allocation.
+///
+/// Keeping initialization here gives both the f32-mosaic and fused-integer
+/// readers the same safe interface and one auditable `MaybeUninit` boundary.
+fn collect_superpixels<Row>(
+    out_width: usize,
+    out_height: usize,
+    row: impl Fn(usize) -> Row + Sync,
+    pixel: impl Fn(&Row, usize) -> [f32; 3] + Sync,
+) -> Color2D<f32, 3> {
+    let out_len = out_width
+        .checked_mul(out_height)
+        .expect("superpixel dimensions overflow addressable memory");
     if out_len == 0 {
         return Color2D::new_with(Vec::new(), out_width, out_height);
     }
-
-    // A two-pixel step keeps the shifted 2x2 Bayer pattern constant across
-    // the output, so resolve the channel positions once outside the hot loop.
-    let shifted = cfa.shift(roi.x(), roi.y());
-    let [red, green_a, green_b, blue] = match shifted.name.as_str() {
-        "RGGB" => [0, 1, 2, 3],
-        "BGGR" => [3, 1, 2, 0],
-        "GBRG" => [2, 0, 3, 1],
-        "GRBG" => [1, 0, 3, 2],
-        _ => return Superpixel3Channel::new().demosaic(mosaic, cfa, colors, roi),
-    };
 
     let mut output = Vec::<[f32; 3]>::with_capacity(out_len);
     {
         let spare = &mut output.spare_capacity_mut()[..out_len];
         let fill_row = |out_y: usize, out_row: &mut [std::mem::MaybeUninit<[f32; 3]>]| {
-            let top_start = (roi.y() + out_y * 2) * mosaic.width + roi.x();
-            let bottom_start = top_start + mosaic.width;
-            let top = &mosaic.data[top_start..top_start + out_width * 2];
-            let bottom = &mosaic.data[bottom_start..bottom_start + out_width * 2];
-
-            for (out, (top_pair, bottom_pair)) in out_row
-                .iter_mut()
-                .zip(top.chunks_exact(2).zip(bottom.chunks_exact(2)))
-            {
-                let values = [top_pair[0], top_pair[1], bottom_pair[0], bottom_pair[1]];
-                out.write([
-                    values[red],
-                    (values[green_a] + values[green_b]) / 2.0,
-                    values[blue],
-                ]);
+            let row = row(out_y);
+            for (out_x, out) in out_row.iter_mut().enumerate() {
+                out.write(pixel(&row, out_x));
             }
         };
         #[cfg(not(miri))]
@@ -766,10 +1000,58 @@ fn superpixel_demosaic(
             .for_each(|(out_y, out_row)| fill_row(out_y, out_row));
     }
 
-    // SAFETY: `spare` covers exactly `out_len` slots and the row traversal
-    // initializes each slot once before the vector length becomes observable.
+    // SAFETY: the exact `out_len` spare slots are split into complete rows.
+    // Every row writes one value to every slot before the length is exposed.
     unsafe { output.set_len(out_len) };
     Color2D::new_with(output, out_width, out_height)
+}
+
+/// Equivalent to rawler's three-channel superpixel demosaic, but writes each
+/// output pixel directly into its final allocation. Rawler currently builds a
+/// temporary `Vec` for every output row and then copies all rows into another
+/// `Vec`; that extra allocation and full-frame copy dominate Browse demosaic on
+/// large sensors.
+fn superpixel_demosaic(
+    mosaic: &PixF32,
+    cfa: &CFA,
+    colors: &PlaneColor,
+    roi: Rect,
+) -> Color2D<f32, 3> {
+    let out_width = (roi.width() & !1) / 2;
+    let out_height = (roi.height() & !1) / 2;
+    // A two-pixel step keeps the shifted 2x2 Bayer pattern constant across
+    // the output, so resolve the channel positions once outside the hot loop.
+    let [red, green_a, green_b, blue] = match superpixel_channels(cfa, roi) {
+        Some(channels) => channels,
+        _ => return Superpixel3Channel::new().demosaic(mosaic, cfa, colors, roi),
+    };
+
+    collect_superpixels(
+        out_width,
+        out_height,
+        |out_y| {
+            let top = (roi.y() + out_y * 2) * mosaic.width + roi.x();
+            let bottom = top + mosaic.width;
+            (
+                &mosaic.data[top..top + out_width * 2],
+                &mosaic.data[bottom..bottom + out_width * 2],
+            )
+        },
+        |(top, bottom), out_x| {
+            let input_x = out_x * 2;
+            let values = [
+                top[input_x],
+                top[input_x + 1],
+                bottom[input_x],
+                bottom[input_x + 1],
+            ];
+            [
+                values[red],
+                (values[green_a] + values[green_b]) / 2.0,
+                values[blue],
+            ]
+        },
+    )
 }
 
 /// Fixed "camera-standard-ish" rendering: a highlight-preserving exposure
@@ -841,9 +1123,13 @@ mod tests {
     };
     use rawler::CFA;
     use rawler::cfa::PlaneColor;
+    use rawler::decoders::{Camera, Orientation};
     use rawler::imgop::sensor::bayer::{Demosaic, superpixel::Superpixel3Channel};
     use rawler::imgop::{Dim2, Point, Rect};
     use rawler::pixarray::PixF32;
+    use rawler::rawimage::{
+        BlackLevel, CFAConfig, RawImage, RawImageData, RawPhotometricInterpretation, WhiteLevel,
+    };
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
@@ -854,6 +1140,83 @@ mod tests {
                 Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("../../testdata/real-raw-corpus/HCA04875.ARW")
             })
+    }
+
+    fn synthetic_bayer_raw(
+        pattern: &str,
+        width: usize,
+        height: usize,
+        data: RawImageData,
+        active_area: Option<Rect>,
+        crop_area: Option<Rect>,
+        levels: ([u32; 4], [u32; 4]),
+    ) -> RawImage {
+        let (blacklevel, whitelevel) = levels;
+        let cfa = CFA::new(pattern);
+        let colors = PlaneColor::new("RGB");
+        let camera = Camera {
+            cfa: cfa.clone(),
+            plane_color: colors.clone(),
+            ..Camera::default()
+        };
+        RawImage {
+            camera,
+            make: "synthetic".into(),
+            model: "synthetic".into(),
+            clean_make: "synthetic".into(),
+            clean_model: "synthetic".into(),
+            width,
+            height,
+            cpp: 1,
+            bps: 16,
+            wb_coeffs: [1.0; 4],
+            whitelevel: WhiteLevel::new(whitelevel.to_vec()),
+            blacklevel: BlackLevel::new(&blacklevel, 2, 2, 1),
+            xyz_to_cam: [[0.0; 3]; 4],
+            photometric: RawPhotometricInterpretation::Cfa(CFAConfig::new(&cfa, &colors)),
+            active_area,
+            crop_area,
+            blackareas: Vec::new(),
+            orientation: Orientation::Normal,
+            data,
+            color_matrix: Default::default(),
+            dng_tags: Default::default(),
+        }
+    }
+
+    fn deterministic_integer_mosaic(width: usize, height: usize) -> Vec<u16> {
+        (0..width * height)
+            .map(|index| {
+                let mixed = index
+                    .wrapping_mul(4_099)
+                    .wrapping_add(index.rotate_left(7))
+                    .wrapping_add(17);
+                mixed as u16
+            })
+            .collect()
+    }
+
+    fn materialized_integer_superpixel(
+        data: Vec<u16>,
+        width: usize,
+        height: usize,
+        blacklevel: [f32; 4],
+        whitelevel: [f32; 4],
+        cfa: &CFA,
+        roi: Rect,
+    ) -> super::Color2D<f32, 3> {
+        let mosaic = PixF32::new_with(
+            super::scale_cfa_data(
+                RawImageData::Integer(data),
+                width,
+                height,
+                blacklevel,
+                whitelevel,
+            ),
+            width,
+            height,
+        );
+        super::superpixel_demosaic(&mosaic, cfa, &PlaneColor::new("RGB"), roi)
     }
 
     #[test]
@@ -875,6 +1238,24 @@ mod tests {
         ] {
             assert_eq!(sanitize_white_balance(invalid), [1.0; 4]);
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "CFA dimensions overflow addressable memory")]
+    fn cfa_scaling_rejects_overflowing_dimensions_before_initialization() {
+        let _ = super::scale_cfa_data(
+            RawImageData::Integer(Vec::new()),
+            usize::MAX,
+            2,
+            [0.0; 4],
+            [1.0; 4],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "superpixel dimensions overflow addressable memory")]
+    fn superpixel_collection_rejects_overflowing_dimensions_before_initialization() {
+        let _ = super::collect_superpixels(usize::MAX, 2, |_| (), |_: &(), _| [0.0_f32; 3]);
     }
 
     #[test]
@@ -919,6 +1300,333 @@ mod tests {
             );
             assert_eq!(actual, expected, "{width}x{height}");
         }
+    }
+
+    #[test]
+    fn fused_integer_superpixel_matches_materialized_path_for_bayer_properties() {
+        let blacklevel = [64.0, 511.0, 1_023.0, 2_047.0];
+        let whitelevel = [4_095.0, 8_191.0, 16_383.0, 65_535.0];
+
+        for pattern in ["RGGB", "BGGR", "GBRG", "GRBG"] {
+            let cfa = CFA::new(pattern);
+            for width in 2..=17 {
+                for height in 2..=15 {
+                    let data = deterministic_integer_mosaic(width, height);
+                    for (x, y) in [(0, 0), (usize::from(width > 3), usize::from(height > 3))] {
+                        let roi = Rect::new(Point::new(x, y), Dim2::new(width - x, height - y));
+                        let plan = super::direct_integer_superpixel_plan(
+                            &RawImageData::Integer(data.clone()),
+                            Dim2::new(width, height),
+                            blacklevel,
+                            whitelevel,
+                            &cfa,
+                            roi,
+                        )
+                        .expect("every 2x2 Bayer layout has a direct plan");
+                        let actual = super::direct_integer_superpixel_demosaic(
+                            &data,
+                            Dim2::new(width, height),
+                            plan,
+                            roi,
+                        );
+                        let expected = materialized_integer_superpixel(
+                            data.clone(),
+                            width,
+                            height,
+                            blacklevel,
+                            whitelevel,
+                            &cfa,
+                            roi,
+                        );
+                        assert_eq!(
+                            (actual.width, actual.height),
+                            (expected.width, expected.height),
+                            "{pattern} {width}x{height} roi {roi:?}",
+                        );
+                        assert_eq!(
+                            actual.data, expected.data,
+                            "{pattern} {width}x{height} roi {roi:?}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fused_integer_superpixel_preserves_shifted_active_crop_and_odd_tails() {
+        let width = 15;
+        let height = 13;
+        let active = Rect::new(Point::new(1, 1), Dim2::new(14, 12));
+        let crop = Rect::new(Point::new(3, 5), Dim2::new(8, 6));
+        let blacklevel = [64.0, 511.0, 1_023.0, 2_047.0];
+        let whitelevel = [4_095.0, 8_191.0, 16_383.0, 65_535.0];
+        let data = deterministic_integer_mosaic(width, height);
+
+        for pattern in ["RGGB", "BGGR", "GBRG", "GRBG"] {
+            let cfa = CFA::new(pattern);
+            let plan = super::direct_integer_superpixel_plan(
+                &RawImageData::Integer(data.clone()),
+                Dim2::new(width, height),
+                blacklevel,
+                whitelevel,
+                &cfa,
+                active,
+            )
+            .expect("shifted Bayer active area has a direct plan");
+            let actual = super::direct_integer_superpixel_demosaic(
+                &data,
+                Dim2::new(width, height),
+                plan,
+                active,
+            );
+            let expected = materialized_integer_superpixel(
+                data.clone(),
+                width,
+                height,
+                blacklevel,
+                whitelevel,
+                &cfa,
+                active,
+            );
+            assert_eq!(actual.data, expected.data, "{pattern} active pixels");
+
+            let crop_region = super::develop_region(
+                actual.dim(),
+                Some(crop),
+                Some(active),
+                super::Quality::Browse,
+            );
+            assert_eq!(
+                actual.crop(crop_region).data,
+                expected.crop(crop_region).data,
+                "{pattern} cropped pixels",
+            );
+        }
+
+        // The bottom-right quad touches both the unnormalized odd sensor
+        // column and the unnormalized odd final row.
+        let tail_roi = Rect::new(Point::new(13, 11), Dim2::new(2, 2));
+        let cfa = CFA::new("RGGB");
+        let plan = super::direct_integer_superpixel_plan(
+            &RawImageData::Integer(data.clone()),
+            Dim2::new(width, height),
+            blacklevel,
+            whitelevel,
+            &cfa,
+            tail_roi,
+        )
+        .expect("odd tail quad has a direct plan");
+        assert_eq!(
+            super::direct_integer_superpixel_demosaic(
+                &data,
+                Dim2::new(width, height),
+                plan,
+                tail_roi,
+            )
+            .data,
+            materialized_integer_superpixel(
+                data, width, height, blacklevel, whitelevel, &cfa, tail_roi,
+            )
+            .data,
+        );
+    }
+
+    #[test]
+    fn direct_integer_superpixel_falls_back_for_noncanonical_inputs() {
+        let width = 8;
+        let height = 6;
+        let roi = Rect::new(Point::zero(), Dim2::new(width, height));
+        let integer = RawImageData::Integer(deterministic_integer_mosaic(width, height));
+        let valid_black = [64.0, 72.0, 80.0, 96.0];
+        let valid_white = [4_095.0, 4_000.0, 3_900.0, 3_800.0];
+        let bayer = CFA::new("RGGB");
+
+        let float = RawImageData::Float(vec![0.25; width * height]);
+        assert!(
+            super::direct_integer_superpixel_plan(
+                &float,
+                Dim2::new(width, height),
+                valid_black,
+                valid_white,
+                &bayer,
+                roi,
+            )
+            .is_none()
+        );
+
+        let unusual_rgb = CFA::new("RGBRGBRGBRGBRGBRGBRGBRGBRGBRGBRGBRGB");
+        assert!(unusual_rgb.is_rgb());
+        assert!(
+            super::direct_integer_superpixel_plan(
+                &integer,
+                Dim2::new(width, height),
+                valid_black,
+                valid_white,
+                &unusual_rgb,
+                roi,
+            )
+            .is_none()
+        );
+
+        for (blacklevel, whitelevel) in [
+            ([f32::NAN; 4], valid_white),
+            (valid_black, [f32::INFINITY; 4]),
+            (valid_black, valid_black),
+            ([5_000.0; 4], [4_095.0; 4]),
+        ] {
+            assert!(
+                super::direct_integer_superpixel_plan(
+                    &integer,
+                    Dim2::new(width, height),
+                    blacklevel,
+                    whitelevel,
+                    &bayer,
+                    roi,
+                )
+                .is_none(),
+                "malformed levels must retain the materialized fallback",
+            );
+        }
+    }
+
+    #[test]
+    fn production_browse_fusion_matches_materialized_rgba_exactly() {
+        let width = 15;
+        let height = 13;
+        let active = Rect::new(Point::new(1, 1), Dim2::new(14, 12));
+        let crop = Rect::new(Point::new(3, 5), Dim2::new(8, 6));
+
+        for pattern in ["RGGB", "BGGR", "GBRG", "GRBG"] {
+            for data in [
+                RawImageData::Integer(deterministic_integer_mosaic(width, height)),
+                RawImageData::Float(
+                    deterministic_integer_mosaic(width, height)
+                        .into_iter()
+                        .map(f32::from)
+                        .collect(),
+                ),
+            ] {
+                let raw = synthetic_bayer_raw(
+                    pattern,
+                    width,
+                    height,
+                    data,
+                    Some(active),
+                    Some(crop),
+                    ([64, 511, 1_023, 2_047], [4_095, 8_191, 16_383, 65_535]),
+                );
+                let (expected, _) = super::develop_with_layout_and_browse_mode(
+                    raw.clone(),
+                    super::Quality::Browse,
+                    super::GammaMode::Lut,
+                    super::RegionLayout::Strided,
+                    super::BrowseIntegerMode::Materialized,
+                )
+                .expect("materialized Browse develops");
+                let (actual, _) = super::develop_with_layout_and_browse_mode(
+                    raw,
+                    super::Quality::Browse,
+                    super::GammaMode::Lut,
+                    super::RegionLayout::Strided,
+                    super::BrowseIntegerMode::Fused,
+                )
+                .expect("production Browse develops");
+                assert_eq!(
+                    (actual.width, actual.height),
+                    (expected.width, expected.height)
+                );
+                assert_eq!(actual.rgba(), expected.rgba(), "{pattern}");
+            }
+        }
+
+        // Reverse black/white levels are intentionally not normalized by the
+        // direct path; their legacy output remains byte-identical.
+        let raw = synthetic_bayer_raw(
+            "RGGB",
+            width,
+            height,
+            RawImageData::Integer(deterministic_integer_mosaic(width, height)),
+            Some(active),
+            Some(crop),
+            ([5_000; 4], [4_095; 4]),
+        );
+        let (expected, _) = super::develop_with_layout_and_browse_mode(
+            raw.clone(),
+            super::Quality::Browse,
+            super::GammaMode::Lut,
+            super::RegionLayout::Strided,
+            super::BrowseIntegerMode::Materialized,
+        )
+        .expect("malformed-level reference develops");
+        let (actual, _) = super::develop_with_layout_and_browse_mode(
+            raw,
+            super::Quality::Browse,
+            super::GammaMode::Lut,
+            super::RegionLayout::Strided,
+            super::BrowseIntegerMode::Fused,
+        )
+        .expect("malformed-level fallback develops");
+        assert_eq!(actual.rgba(), expected.rgba());
+    }
+
+    #[test]
+    #[ignore = "requires the pinned public-domain Sony RAW fixture or VIEWR_TEST_RAW"]
+    fn real_sony_browse_fusion_matches_materialized_rgba_exactly() {
+        let path = real_sony_raw_fixture();
+        let raw = crate::decode::load(&path).expect("fixture decodes").raw;
+        super::warm_gamma_lut();
+        let run = |raw, mode| {
+            let start = Instant::now();
+            let output = super::develop_with_layout_and_browse_mode(
+                raw,
+                super::Quality::Browse,
+                super::GammaMode::Lut,
+                super::RegionLayout::Strided,
+                mode,
+            )
+            .expect("Browse develops");
+            (start.elapsed(), output)
+        };
+
+        let mut materialized_walls = Vec::new();
+        let mut fused_walls = Vec::new();
+        let mut digest = None;
+        for pair in 0..15 {
+            let first = raw.clone();
+            let second = raw.clone();
+            let ((materialized_wall, (expected, _)), (fused_wall, (actual, _))) = if pair % 2 == 0 {
+                (
+                    run(first, super::BrowseIntegerMode::Materialized),
+                    run(second, super::BrowseIntegerMode::Fused),
+                )
+            } else {
+                let fused = run(first, super::BrowseIntegerMode::Fused);
+                let materialized = run(second, super::BrowseIntegerMode::Materialized);
+                (materialized, fused)
+            };
+            assert_eq!(
+                (actual.width, actual.height),
+                (expected.width, expected.height)
+            );
+            assert_eq!(actual.rgba(), expected.rgba());
+            digest.get_or_insert_with(|| blake3::hash(actual.rgba()));
+            materialized_walls.push(materialized_wall);
+            fused_walls.push(fused_wall);
+        }
+        let fused_wins = materialized_walls
+            .iter()
+            .zip(&fused_walls)
+            .filter(|(materialized, fused)| fused < materialized)
+            .count();
+        materialized_walls.sort_unstable();
+        fused_walls.sort_unstable();
+        eprintln!(
+            "Browse RGBA BLAKE3 {}, 15-pair materialized median {:?}, fused median {:?}, fused wins {fused_wins}/15",
+            digest.expect("at least one pair ran"),
+            materialized_walls[materialized_walls.len() / 2],
+            fused_walls[fused_walls.len() / 2],
+        );
     }
 
     #[test]
@@ -1216,11 +1924,11 @@ mod tests {
 
         for orient in [Orient::R0, Orient::R90, Orient::R180, Orient::R270] {
             let reference = crate::resize::apply_orient(
-                crate::types::PixelBuf {
-                    width: width as u32,
-                    height: height as u32,
-                    rgba: reference_flat.clone(),
-                },
+                crate::types::PixelBuf::new_opaque(
+                    width as u32,
+                    height as u32,
+                    reference_flat.clone(),
+                ),
                 orient,
             );
             let (dw, dh) = if orient.swaps_axes() {
@@ -1308,11 +2016,7 @@ mod tests {
             assert_eq!(canvas, reference.rgba, "{orient:?} assembled bytes");
 
             // Identical input bytes must produce identical cache JPEG objects.
-            let assembled = crate::types::PixelBuf {
-                width: dw,
-                height: dh,
-                rgba: canvas,
-            };
+            let assembled = crate::types::PixelBuf::new_opaque(dw, dh, canvas);
             let assembled_jpeg = crate::jobs::encode_jpeg(&assembled, 90).expect("jpeg encodes");
             let reference_jpeg = crate::jobs::encode_jpeg(&reference, 90).expect("jpeg encodes");
             assert_eq!(assembled_jpeg, reference_jpeg, "{orient:?} jpeg bytes");

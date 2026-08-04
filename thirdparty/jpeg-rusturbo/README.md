@@ -1,0 +1,520 @@
+# jpeg-rusturbo
+
+[![CI](https://github.com/naoto256/jpeg-rusturbo/actions/workflows/ci.yml/badge.svg)](https://github.com/naoto256/jpeg-rusturbo/actions/workflows/ci.yml)
+[![Release](https://github.com/naoto256/jpeg-rusturbo/actions/workflows/release.yml/badge.svg)](https://github.com/naoto256/jpeg-rusturbo/actions/workflows/release.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
+**SIMD-accelerated JPEG encoder (baseline SOF0 + progressive
+SOF2 + EXIF / ICC metadata pass-through) and Huffman decoder
+(baseline + progressive), with libjpeg-turbo-derived kernels.**
+Both sides ship NEON-on-aarch64 and AVX2-on-x86_64 kernels;
+non-SIMD targets fall through to a bit-exact scalar reference.
+Drop-in for `image::codecs::jpeg::JpegEncoder` on the encode side;
+standalone decoder under `jpeg_rusturbo::decode`.
+
+```rust
+use jpeg_rusturbo::{JpegEncoder, PixelFormat, decode};
+
+// Encode
+let mut out = Vec::new();
+let mut enc = JpegEncoder::new_with_quality(&mut out, 80);
+enc.encode_rgba(&pixels, width, height)?;
+
+// Decode (back to RGB bytes)
+let rgb = decode::decode(&out, PixelFormat::Rgb)?;
+```
+
+The encoder ships SIMD kernels for color convert, FDCT, quantize +
+zig-zag, chroma downsample, and Huffman nonzero bitmap. The decoder
+reads baseline (SOF0) and progressive (SOF2) Huffman streams with
+SIMD IDCT, color convert (YCC → RGB), and fancy (interpolating)
+chroma upsample on the standard 4:2:0 / 4:2:2 / 4:4:0 layouts. The
+Huffman entropy decoder stays scalar by design — the bit-reader +
+canonical-table walk has a serial dependency on per-symbol code
+length that doesn't reshape into vector SIMD — but 0.7.0 landed two
+scalar bit-ops refinements (combined run/size + magnitude LUT, and
+a SWAR 32-bit bit-reader refill) on top of the per-stage SIMD
+kernels.
+
+## Why
+
+This crate exists because a real workload needed a **fast JPEG
+encoder in pure Rust** — `image`'s bundled encoder is solid but
+purely scalar and 4:2:0-only, which leaves throughput on the table
+for pipelines that emit a lot of JPEGs. The SIMD encoder here
+lifts whole-pipeline throughput roughly **9–10× on Apple Silicon**
+and **6.6–6.9× on Intel Cascade Lake** versus `image`'s encoder at
+4:2:0 with `threads=auto` (single-thread remains ~5× / ~5.6×). The
+0.8.0 encoder hot-path pass and the 0.9.x RGB front-half work push the
+single-thread path well past 4×, and MCU-row threading adds the practical
+throughput win on multi-core hosts. It supports
+4:4:4 / 4:2:2 / 4:2:0, **progressive (SOF2) output**
+alongside baseline, **single-byte grayscale and 4-byte CMYK
+pass-through** alongside the eight RGB-family pixel formats,
+**EXIF / ICC pass-through** for re-encode pipelines,
+multi-threaded MCU-row encode, optimized (two-pass) Huffman tables
+(composes with progressive — `EOBn` run-packing + per-scan custom
+tables make optimized-progressive output smaller than the baseline
+SOF0 equivalent), restart markers, and custom quantization tables.
+**Encode speed is the headline.**
+
+The decoder is bundled for API symmetry — read your own JPEGs back
+without reaching for another crate — rather than as a speed play.
+It gained per-stage SIMD kernels in 0.6.0 (IDCT / color convert /
+fancy upsample) and progressively closed the gap to `image`'s SIMD
+decoder over 0.7.x; **as of 0.7.5 we are faster than `image` at 4K
+on both microarchitectures and both corpora** (~1.03–1.10× on
+synthetic Huffman-heavy content, ~1.18–1.22× on natural-content),
+while matching coverage — baseline + progressive Huffman with
+fancy chroma upsample, output in any of ten pixel layouts (the
+eight RGB-flavoured layouts plus single-byte `Gray` and 4-byte
+`Cmyk` pass-through, both added in 0.9.0), and the same EXIF / ICC
+**retrieval** API as the encoder's pass-through — the 0.9.0 cycle
+closed the decode → operate → re-encode loop both ways. The
+smaller-resolution fixed-cost overhead means we trail by only
+~2–3% at 1592×1124 on Cascade Lake (at parity or ahead from 1080p
+up). The decoder side wasn't reopened in 0.8.0 (the encoder cycle)
+and the small Cascade Lake gap remains an open item; 0.9.0 added
+coverage, not new decode SIMD.
+
+## Performance
+
+50-iteration single-batch timings from `benches/pipeline.rs` and
+`benches/vs_image.rs`, q=80. Two hosts: Apple M-series (NEON) and Intel
+Xeon Platinum 8272CL (Cascade Lake, AVX2). Encode-side numbers were
+refreshed on 2026-06-08 after the 0.9.x encoder hot-path work; decode
+numbers are retained because the decoder was not changed in this cycle.
+Full per-section breakdown in [BENCH.md](BENCH.md).
+
+### vs `image` crate — encode (RGB → JPEG)
+
+`image`'s encoder is scalar end to end and 4:2:0-only; jpeg-rusturbo
+runs SIMD across the whole encode front end — color convert, forward
+DCT, quantize + zig-zag, chroma downsample — plus a SIMD nonzero-bitmap
+Huffman path. Both encoders are fed identical 3-byte RGB and timed on
+the same harness (`benches/vs_image.rs`). That structural
+difference — vectorized pipeline vs scalar — is the gap below.
+`image` only emits 4:2:0, so the 4:2:0 rows are the apples-to-apples
+comparison; 4K 4:2:2 / 4:4:4 rows are reference rows with denser chroma.
+Both `threads=1` and `threads=auto` are shown; the headline throughput
+claim uses `threads=auto`.
+
+**Apple M-series (NEON)**
+
+| Threads | Subsampling / resolution   | jpeg-rusturbo | image    | ratio |
+| ------- | -------------------------- | ------------: | -------: | ----: |
+| t=1     | 4:2:0  1592 × 1124         |       3.06 ms | 15.58 ms | 5.10× |
+| t=1     | 4:2:0  1920 × 1080         |       3.49 ms | 17.72 ms | 5.08× |
+| t=1     | 4:2:0  3840 × 2160         |      13.41 ms | 67.61 ms | 5.04× |
+| auto    | 4:2:0  1592 × 1124         |       1.76 ms | 15.98 ms | 9.10× |
+| auto    | 4:2:0  1920 × 1080         |       1.89 ms | 17.91 ms | 9.49× |
+| auto    | 4:2:0  3840 × 2160         |       6.83 ms | 68.47 ms | 10.02× |
+| auto    | 4:2:2  3840 × 2160         |       9.99 ms | 68.82 ms | 6.89× |
+| auto    | 4:4:4  3840 × 2160         |      14.13 ms | 68.49 ms | 4.85× |
+
+**Intel Xeon (Cascade Lake, AVX2)**
+
+| Threads | Subsampling / resolution   | jpeg-rusturbo | image     | ratio |
+| ------- | -------------------------- | ------------: | --------: | ----: |
+| t=1     | 4:2:0  1592 × 1124         |      12.73 ms |  70.04 ms | 5.50× |
+| t=1     | 4:2:0  1920 × 1080         |      14.57 ms |  80.75 ms | 5.54× |
+| t=1     | 4:2:0  3840 × 2160         |      57.27 ms | 320.93 ms | 5.60× |
+| auto    | 4:2:0  1592 × 1124         |      10.28 ms |  70.03 ms | 6.81× |
+| auto    | 4:2:0  1920 × 1080         |      12.29 ms |  80.75 ms | 6.57× |
+| auto    | 4:2:0  3840 × 2160         |      46.77 ms | 320.95 ms | 6.86× |
+| auto    | 4:2:2  3840 × 2160         |      61.73 ms | 321.28 ms | 5.20× |
+| auto    | 4:4:4  3840 × 2160         |      85.10 ms | 320.83 ms | 3.77× |
+
+The single-thread lead is **~5× on Apple M** and **~5.5–5.6× on Cascade
+Lake** at 4:2:0; `threads=auto` lifts that to **9–10×** and **6.6–6.9×**
+respectively. The Cascade figure runs higher than Apple's mainly because
+`image`'s scalar encoder is slower on that CPU; read each ratio as "vs
+`image` on this host." Per-item breakdown in [BENCH.md](BENCH.md).
+
+### vs `image` crate — decode (JPEG → RGB)
+
+`image` 0.25 ships `zune-jpeg` as its JPEG decoder, also fully
+SIMD-accelerated. Our decoder gained per-stage SIMD kernels in
+0.6.0 (IDCT / color convert / fancy upsample). 0.7.0 added AVX2
+IDCT sparse parity, a combined AC/DC Huffman LUT, and a SWAR
+32-bit Huffman bit-reader refill. 0.7.5 fuses dequantize into
+the entropy-decode block loop (eliminating the per-block dequant
+pass) and replaces an x86_64 scalar RGB-interleave loop with a
+PSHUFB shuffle kernel. This Viewr fork restores zero-initialization
+for per-decode plane and output vectors because `Vec::set_len`
+requires all newly exposed elements to be initialized.
+
+Both decoders are timed on the same harness
+(`benches/vs_image.rs`) against two corpora: the synthetic
+XOR pattern used everywhere else in the docs (Huffman-heavy worst
+case — every block is full-AC) and a procedural natural-content
+image (smooth sky + low-AC texture + edge bars) that is the fairer
+proxy for typical web/photo input.
+
+**Apple M-series (NEON)**
+
+| Corpus / resolution     | jpeg-rusturbo | image    | ratio |
+| ----------------------- | ------------: | -------: | ----: |
+| synthetic  1592 × 1124  |       4.22 ms |  4.39 ms | 1.04× |
+| synthetic  1080p        |       4.59 ms |  5.03 ms | 1.10× |
+| synthetic  4K           |      19.06 ms | 19.65 ms | 1.03× |
+| natural    1592 × 1124  |       1.35 ms |  1.55 ms | 1.15× |
+| natural    1080p        |       1.55 ms |  1.86 ms | 1.20× |
+| natural    4K           |       5.93 ms |  7.00 ms | 1.18× |
+
+**Intel Xeon (Cascade Lake, AVX2)**
+
+| Corpus / resolution     | jpeg-rusturbo | image    | ratio |
+| ----------------------- | ------------: | -------: | ----: |
+| synthetic  1592 × 1124  |      13.12 ms | 12.90 ms | 0.98× |
+| synthetic  1080p        |      14.94 ms | 15.04 ms | 1.01× |
+| synthetic  4K           |      62.94 ms | 69.11 ms | 1.10× |
+| natural    1592 × 1124  |       5.21 ms |  5.07 ms | 0.97× |
+| natural    1080p        |       5.83 ms |  5.97 ms | 1.02× |
+| natural    4K           |      28.01 ms | 34.26 ms | 1.22× |
+
+(ratio > 1 means jpeg-rusturbo is faster)
+
+At 4K — the resolution that dominates real workloads — we sit
+ahead of `image` on both microarchitectures and on both corpora:
+1.03×–1.10× on synthetic Huffman-heavy content and 1.18×–1.22×
+on natural-content. At smaller resolutions Cascade Lake is roughly
+at parity — within ~2–3% at 1592×1124, level or ahead from 1080p
+up — because the per-decode fixed-cost overhead is a larger
+fraction of total time there; the relative gain from the 0.7.5
+hot-path changes (entropy + dequant fusion and AVX2 RGB interleave)
+scales with the amount of per-pixel work and so
+shows up most strongly at 4K. Apple M's lower fixed-cost overhead
+means even small-resolution decode comes out ahead.
+
+These decoder figures predate the Viewr fork's zero-initialization safety
+correction described above. Viewr does not use this decoder in production.
+
+### Threading and optimized Huffman
+
+`set_threads(n)` partitions encode across MCU rows; `threads=auto`
+picks `available_parallelism()`. Bit-identical output across thread
+counts.
+
+**Apple M-series (8 cores)**
+
+| Resolution | threads=1 | threads=auto | auto vs t=1 |
+| ---------- | --------: | -----------: | ----------: |
+| 1080p      |   3.98 ms |      2.09 ms |       1.90× |
+| 4K         |  16.34 ms |      7.35 ms |       2.22× |
+
+**Intel Xeon (Cascade Lake, 4 vCPU)**
+
+| Resolution | threads=1 | threads=auto | auto vs t=1 |
+| ---------- | --------: | -----------: | ----------: |
+| 1080p      |  16.20 ms |     15.31 ms |       1.06× |
+| 4K         |  64.88 ms |     53.29 ms |       1.22× |
+
+`set_optimize_huffman(true)` enables a per-image two-pass Huffman
+build (T.81 K.2/K.3). Typical size reduction ~5% across
+subsampling × quality on synthetic content (4–10% on natural
+photos), at roughly 1.7× encode wall-clock on AVX2 and ~2.3× on
+NEON (the second, largely scalar, pass weighs more where the first
+pass is faster). Opt-in for when bandwidth matters more than CPU.
+
+## Quick start
+
+```toml
+# Cargo.toml
+[dependencies]
+jpeg-rusturbo = "0.9"
+```
+
+### Encode
+
+```rust
+use jpeg_rusturbo::{ChromaSubsampling, JpegEncoder, PixelFormat};
+use std::fs::File;
+use std::io::BufWriter;
+
+fn save(path: &str, rgba: &[u8], w: u32, h: u32) -> std::io::Result<()> {
+    let f = BufWriter::new(File::create(path)?);
+    let mut enc = JpegEncoder::new_with_quality(f, 80);
+    enc.set_subsampling(ChromaSubsampling::Yuv420); // default; explicit for clarity
+    enc.encode_rgba(rgba, w, h)
+}
+
+// Non-RGB[A] byte layouts go through the generic `encode` entry point.
+fn save_bgra(path: &str, bgra: &[u8], w: u32, h: u32) -> std::io::Result<()> {
+    let f = BufWriter::new(File::create(path)?);
+    let mut enc = JpegEncoder::new_with_quality(f, 80);
+    enc.encode(bgra, w, h, PixelFormat::Bgra)
+}
+
+// Single-component (grayscale) input — 1 byte/pixel, no chroma planes.
+fn save_gray(path: &str, gray: &[u8], w: u32, h: u32) -> std::io::Result<()> {
+    let f = BufWriter::new(File::create(path)?);
+    let mut enc = JpegEncoder::new_with_quality(f, 80);
+    enc.encode_grayscale(gray, w, h)
+}
+
+// CMYK pass-through input — 4 bytes/pixel (C, M, Y, K), 4-component
+// JPEG output. No CMYK↔RGB conversion is performed.
+fn save_cmyk(path: &str, cmyk: &[u8], w: u32, h: u32) -> std::io::Result<()> {
+    let f = BufWriter::new(File::create(path)?);
+    let mut enc = JpegEncoder::new_with_quality(f, 80);
+    enc.encode_cmyk(cmyk, w, h)
+}
+```
+
+The encoder accepts `&[u8]` in any of eight color pixel layouts —
+`Rgb`, `Bgr`, `Rgba`, `Bgra`, `Argb`, `Abgr`, `Rgbx`, `Bgrx` (alpha
+or pad byte dropped) — plus single-byte grayscale via
+`encode_grayscale` (or `PixelFormat::Gray` through the generic
+`encode`), plus 4-byte CMYK pass-through via `encode_cmyk` (or
+`PixelFormat::Cmyk` through the generic `encode`). Quality is
+clamped to `1..=100`; subsampling defaults to 4:2:0, with 4:2:2 and
+4:4:4 available via `set_subsampling` (no-op on grayscale and CMYK,
+neither of which has chroma to subsample).
+
+### Decode
+
+```rust
+use jpeg_rusturbo::{decode, PixelFormat};
+
+let jpeg_bytes: &[u8] = /* … */;
+let rgb = decode::decode(jpeg_bytes, PixelFormat::Rgb)?;
+// `rgb.len() == width * height * 3`
+
+// Inspect dimensions without decoding:
+let dec = decode::Decoder::new(jpeg_bytes)?;
+let info = dec.info();
+println!("{}x{}, {} components", info.width, info.height, info.components);
+let pixels = dec.decode(PixelFormat::Rgba)?;
+```
+
+Output can be requested in any of the eight color pixel layouts,
+plus `PixelFormat::Gray` (1 byte/pixel luma extraction from either
+1- or 3-component sources) and `PixelFormat::Cmyk` (4 bytes/pixel
+pass-through, only against a 4-component CMYK source). Both
+**baseline (SOF0) and progressive (SOF2)** Huffman streams are
+accepted; arithmetic-coded (SOF9-15), hierarchical, and lossless
+modes return `DecodeError::Unsupported`. Decoding a CMYK source
+into any non-CMYK `PixelFormat` likewise returns `Unsupported` —
+this crate does not perform CMYK→RGB conversion.
+
+## Features
+
+### Encoder
+
+- **NEON on AArch64** — color convert, FDCT, quantize + zig-zag,
+  4:2:0 / 4:2:2 chroma downsample, and the Huffman nonzero bitmap.
+- **AVX2 on x86_64** — color convert, FDCT, quantize + zig-zag, 4:2:0
+  / 4:2:2 chroma downsample. Runtime `is_x86_feature_detected!` falls
+  back to scalar on non-AVX2 CPUs.
+- **SSE2 on x86_64** — Huffman nonzero bitmap
+  (`pcmpeqw + packsswb + pmovmskb`, translated from
+  `jchuff-sse2.asm`). SSE2 is the x86_64 baseline, no runtime gate.
+- **Eight input pixel layouts** — `Rgb`, `Bgr`, `Rgba`, `Bgra`,
+  `Argb`, `Abgr`, `Rgbx`, `Bgrx` via the generic
+  `JpegEncoder::encode` entry point.
+- **Three chroma modes** — 4:4:4, 4:2:2, 4:2:0.
+- **Grayscale (1-component) encode** — `encode_grayscale` takes a
+  single-byte-per-pixel buffer and emits a luma-only JPEG (no chroma
+  DQT / DHT / SOF / SOS overhead, no RGB→YCbCr step). Composes with
+  optimized Huffman, restart markers, custom quant tables, EXIF / ICC
+  pass-through. `PixelFormat::Gray` is also accepted by the generic
+  `encode`. Progressive grayscale is not yet implemented (returns
+  `Unsupported` if combined with `set_progressive(true)`).
+- **CMYK (4-component) encode** — `encode_cmyk` takes a
+  4-byte-per-pixel (C, M, Y, K) buffer and emits a plain (non-Adobe-
+  YCCK) 4-component baseline JPEG with sampling 1:1:1:1, all four
+  channels sharing the luma quantization table and one luma-DC +
+  one luma-AC Huffman table. Pass-through, **not** CMYK↔RGB
+  conversion — that transform is downstream responsibility. No APP14
+  marker is emitted. Composes with optimized Huffman (one shared
+  optimal DC + one shared optimal AC table), restart markers,
+  custom quant (luma only — chroma argument silently ignored),
+  EXIF / ICC pass-through. `set_subsampling` and `set_threads` are
+  silently no-ops on the CMYK path. Progressive CMYK is not
+  implemented (returns `Unsupported` if combined with
+  `set_progressive(true)`).
+- **Progressive (SOF2) output** — `set_progressive(true)` emits an
+  8-scan successive-approximation progressive JPEG (DC interleaved
+  first + per-component AC first at `Al=1`, then DC interleaved
+  refine + per-component AC refine at `Al=0`). All four T.81 Annex G
+  scan types implemented. Decodable by every conforming progressive
+  decoder including the one in this crate. Default off — baseline
+  output is bit-identical to pre-0.8.0 when this setter isn't called.
+  Composes with `set_optimize_huffman(true)`: enabling both turns on
+  EOBn run-packing + per-scan custom Huffman tables, eliminating the
+  size cost the standard-tables progressive path normally carries vs
+  baseline SOF0.
+- **EXIF / ICC metadata pass-through** — `set_exif(Option<Vec<u8>>)`
+  / `set_icc_profile(Option<Vec<u8>>)` route raw blobs through as
+  APP1 / APP2 segments immediately after the JFIF APP0. ICC profiles
+  larger than ~65 KB are split across multiple APP2 segments per
+  the ICC.1 multi-segment embedding convention. Use case: decode →
+  operate → re-encode pipelines that would otherwise drop the
+  camera EXIF / color profile.
+- **Multi-threaded MCU-row encode** — `set_threads(n)` (or `0` =
+  `available_parallelism()`) partitions quantize + AC bitmap work
+  across rayon workers. Serial when `n == 1`. Bit-identical output
+  across thread counts.
+- **Optimized (two-pass) Huffman** — `set_optimize_huffman(true)`
+  builds canonical Huffman tables (T.81 K.2/K.3) from per-image
+  symbol frequencies. Typical ~5% (synthetic) / 4–10% (natural)
+  size reduction at ~1.7× (AVX2) / ~2.3× (NEON) encode cost.
+  Composes with `set_progressive(true)`: in progressive mode the
+  count-then-emit pass runs per scan, builds per-scan custom tables
+  (including the `EOBn` symbols absent from the Annex K reference),
+  emits per-scan DHT segments, and packs multi-block end-of-band
+  runs — collapsing the size cost progressive normally carries vs
+  baseline SOF0.
+- **Restart markers** — `set_restart_interval(n)` emits RSTm every
+  `n` MCUs (DRI segment + interleaved RSTm), for error resilience or
+  parallel decode by downstream readers.
+- **Custom quantization tables** — `set_quant_tables(luma, chroma)`
+  accepts two `[u8; 64]` arrays in natural (row-major) order; entries
+  must be in `1..=255` (zero is rejected at encode time with
+  `InvalidInput` — a zero divisor is invalid per T.81). Bypasses the
+  built-in quality-driven Annex K scaling.
+- **Scalar fallback** — on every target, opt-in via the `force-scalar`
+  Cargo feature, or used automatically on architectures without a
+  SIMD backend.
+- **Bit-exact across backends** — cross-check tests assert that NEON,
+  scalar, and AVX2 / SSE2 produce byte-identical JPEG output.
+
+### Decoder
+
+- **Baseline (SOF0) + Progressive (SOF2) Huffman** — full scan loop
+  with DC first / DC refine / AC first / AC refine bands, EOBRUN
+  bookkeeping, multi-SOS streams (per-component baseline scans
+  included), and restart-marker (RSTn) handling.
+- **Fancy (interpolating) chroma upsample** — libjpeg-turbo's
+  `h2v2_fancy` / `h2v1_fancy` 2-tap (3 center, 1 neighbor) filter on
+  the standard 4:2:0 / 4:2:2 / 4:4:0 layouts, with NEON / AVX2 SIMD
+  kernels. Wider sampling factors (4:1:1 etc.) fall back to box
+  replication.
+- **`jidctint`-style IDCT** — bit-exact against libjpeg-turbo's
+  integer reference, with NEON and AVX2 ported kernels. Scalar
+  fallback retained for `force-scalar` and non-SIMD targets.
+  Includes **DC-only and sparse-row fast paths** that detect blocks
+  with rows 4–7 (or all AC) zero — common on smooth regions in
+  natural photographs — and skip the corresponding butterflies. Worth
+  +11–19% of total decode time on natural content; see
+  [BENCH.md](BENCH.md) (Decode chapter).
+- **NEON / AVX2 YCC → RGB color convert** — per-row converter ported
+  from libjpeg-turbo, runtime-dispatched alongside IDCT and upsample.
+- **Scalar Huffman entropy decoder** — bit-reader + canonical-table
+  walk; the serial dependency on per-symbol code length doesn't
+  reshape into vector SIMD, so the entropy decoder is scalar by
+  design. 0.7.0 landed two scalar bit-ops refinements on top: a
+  combined run/size + magnitude LUT (table-driven path, ~97% slot
+  coverage on standard JPEG tables) for both AC and DC terms,
+  including the progressive DC-first and AC-first scans; and a SWAR
+  32-bit bit-reader refill that fills the `u64` accumulator four
+  bytes at a time when no `0xFF` byte stuffing is present (checked
+  via `(y - 0x0101_0101) & !y & 0x8080_8080`). The SWAR refill
+  delivers +4–7% on natural 4K content across both NEON and AVX2;
+  the combined LUT is at the noise floor at q=80 on Cascade Lake
+  and Apple M but is retained as a table-driven foundation —
+  bit-exact, zero runtime cost on misses, and the canonical
+  approach used by libjpeg-turbo and zune-jpeg.
+- **Eight output pixel layouts** via the same `PixelFormat` enum the
+  encoder accepts, plus `PixelFormat::Gray` (1 byte/pixel) — extracts
+  the Y plane directly, skipping chroma upsample and color convert.
+  Works for both grayscale source JPEGs and color source JPEGs (a
+  fast Luma-extraction shortcut). Plus `PixelFormat::Cmyk` (4
+  bytes/pixel) — pass-through C/M/Y/K read-back from a 4-component
+  source JPEG, no CMYK→RGB conversion (out of scope; convert
+  downstream if needed). Adobe-flavoured YCCK (APP14-signalled) is
+  intentionally treated as plain CMYK regardless of the APP14
+  transform byte.
+- **EXIF / ICC metadata retrieval** — `Decoder::exif()` returns the
+  raw EXIF payload (with the 6-byte `Exif\0\0` identifier stripped)
+  borrowed zero-copy from the source buffer; `Decoder::icc_profile()`
+  returns the reassembled ICC profile bytes — per-segment APP2 chunks
+  concatenated in `seq_num` order with the 14-byte `ICC_PROFILE\0` +
+  seq + total header stripped. Symmetric with the encoder's
+  `JpegEncoder::set_exif` / `set_icc_profile` so a decode → operate →
+  re-encode pipeline can preserve camera EXIF and color profile
+  end-to-end. ICC reassembly is lazy + cached on first access.
+  Malformed metadata (missing seq, mismatched `total`, seq = 0 or
+  > total) returns `None` from the accessor; pixel decode is
+  unaffected. Other APP1 flavours (Adobe XMP etc.) and APP3..APP15 /
+  COM segments are intentionally out of scope.
+- **Cross-decoder validation** — `tests/comparison_progressive.rs`
+  asserts per-channel agreement with `image`'s decoder (≤ 3 / channel,
+  ≥ 40 dB PSNR) on a vendored 5-fixture corpus (baseline grayscale,
+  baseline 4:2:0 odd-size, progressive 4:2:0, two progressive 4:4:4
+  sizes).
+- **Known gaps** — arithmetic / hierarchical / lossless decode are
+  not in scope.
+
+The encoder's Huffman AC scan is bitmap-driven: a `u64` nonzero
+bitmap collapses zero runs into a single `trailing_zeros` jump per
+nonzero. The bitmap itself is SIMD on both architectures (NEON / SSE2);
+the per-nonzero symbol emission stays scalar. See [BENCH.md](BENCH.md)
+for the per-stage breakdown.
+
+## Architecture (brief)
+
+The crate's surface is intentionally small. Encode side:
+`JpegEncoder`, `ChromaSubsampling`, `PixelFormat`, `encode`,
+`encode_rgb`, `encode_rgba`, `encode_grayscale`, `encode_cmyk`. Decode side:
+`decode::Decoder`, `decode::decode`, `decode::ImageInfo`,
+`decode::DecodeError`.
+Per-architecture kernels live behind `arch::backend::*`, selected at
+compile time:
+
+```
+aarch64 + !force-scalar  →  arch::neon
+x86_64  + !force-scalar  →  arch::x86_64   (AVX2; runtime fallback to scalar)
+otherwise                →  arch::scalar
+```
+
+Adding a new backend (e.g. WebAssembly SIMD) is "drop a new file with
+the kernel modules + add a `cfg` arm in `arch/mod.rs`"; see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full layout.
+
+## Status
+
+Pre-1.0, single-author project. The encoder produces standard
+baseline and progressive JPEG that decodes round-trip-equivalent
+through any conforming decoder; the decoder reads baseline and
+progressive Huffman JPEGs that conform to ITU-T T.81 (verified against
+`image`'s decoder on a vendored fixture corpus). Public API has
+settled but `0.x` reserves the right to evolve before `1.0`.
+
+The current release, **0.9.2**, is an encoder hot-path and benchmark
+refresh on top of the 0.9.x coverage cycle. 0.9.0 added
+optimized-Huffman progressive (EOBn run-packing + per-scan custom
+tables collapse the size cost the standard-tables SOF2 path normally
+carries vs baseline SOF0), grayscale encode and CMYK encode + decode as
+first-class pixel formats (`PixelFormat::Gray` / `PixelFormat::Cmyk`),
+and decode-side `Decoder::exif()` / `icc_profile()` accessors that close
+the decode → operate → re-encode loop with the 0.8.0 encoder-side
+`set_exif` / `set_icc_profile`. 0.9.1 closes input-validation gaps
+without kernel changes. 0.9.2 tightens RGB-family encode hot paths and
+refreshes benchmark reporting: current figures show 9–10× on Apple M and
+6.6–6.9× on Cascade Lake versus `image` at 4:2:0 with `threads=auto`
+(single-thread remains ~5× / ~5.6×). Default behaviour is byte-identical
+to 0.8.0 for inputs accepted by 0.8.0. The 0.6.0 / 0.7.x cycles before
+that built out the decoder SIMD path. Full per-release history is in
+[CHANGELOG.md](CHANGELOG.md).
+
+Still under consideration for a later release: **trellis quantization**
+(mozjpeg-style RDO per-block search). Vector-SIMD Huffman decode stays
+out of scope — the bit-reader + canonical-table walk has a serial
+per-symbol code-length dependency that doesn't vectorize.
+
+A few SIMD micro-optimizations were tried and **measured no gain**, so
+they were not shipped (and aren't pending work): AVX2 ports of the
+encode-side zig-zag scatter and `ac_magnitudes` precompute (NEON's
+`vqtbl4q` / per-lane CLZ have no AVX2 equivalent, and the kernels aren't
+a hot-enough share of encode time), and a decode-side dequant skip-zero
+pass. See [BENCH.md](BENCH.md) "Out of scope" for the measurements.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the issue / PR policy.
+
+## License
+
+Licensed under either of [MIT](LICENSE-MIT) or
+[Apache-2.0](LICENSE-APACHE) at your option. Third-party attributions
+(libjpeg-turbo, image) are listed in [NOTICE.md](NOTICE.md).

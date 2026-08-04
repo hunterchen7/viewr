@@ -36,3 +36,4 @@ lto = "thin"
 # compile during release source validation.
 [patch.crates-io]
 rawler = { path = "../../thirdparty/dnglab/rawler" }
+jpeg-rusturbo = { path = "../../thirdparty/jpeg-rusturbo" }

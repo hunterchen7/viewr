@@ -50,11 +50,14 @@ cargo about generate \
 # them so macOS and Linux generate the same byte-for-byte inventory.
 LC_ALL=C perl -pi -e 's/\r\n?/\n/g' "$generated_licenses"
 
-# cargo-about excludes path-dependency crates, but the in-tree rawler fork
-# (thirdparty/dnglab, bit-identical performance fusion of upstream 0.7.2) still
-# ships under LGPL-2.1 and must stay in the inventory. Re-insert its overview
-# entry (alphabetically before rayon) and its LGPL used-by attribution.
+# cargo-about excludes path-dependency crates. The reviewed in-tree rawler and
+# jpeg-rusturbo forks still ship in Viewr and must stay in the inventory.
+# Re-insert their overview and used-by entries deterministically.
 LC_ALL=C perl -0pi -e '
+  s/^(jxl-bitstream [0-9])/jpeg-rusturbo 0.9.2\nLicense: MIT OR Apache-2.0\nSource: https:\/\/github.com\/hunterchen7\/viewr\/tree\/main\/thirdparty\/jpeg-rusturbo (forked from https:\/\/github.com\/naoto256\/jpeg-rusturbo)\n$1/m
+    or die "missing jxl-bitstream overview anchor for the jpeg-rusturbo license entry";
+  s/(^- as-raw-xcb-connection [^\n]+\n)/$1- jpeg-rusturbo 0.9.2\n/m
+    or die "missing Apache used-by anchor for the jpeg-rusturbo license entry";
   s/^(rayon [0-9])/rawler 0.7.2\nLicense: LGPL-2.1\nSource: https:\/\/github.com\/hunterchen7\/dnglab\n$1/m
     or die "missing rayon overview anchor for the rawler license entry";
   s/(GNU Lesser General Public License v2\.1 only\n\nUsed by:\n)/$1- rawler 0.7.2\n/

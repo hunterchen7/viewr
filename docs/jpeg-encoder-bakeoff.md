@@ -313,6 +313,55 @@ in 1.35 s wall, 1.20 s user CPU, and 208,486,400 bytes peak RSS. This single
 deployment comparison showed no reason to trade reproducibility for a system
 dependency.
 
+## Production restart-row follow-up — 2026-08-04
+
+The original threaded encoder parallelized color conversion, DCT, and
+quantization. It retained all quantized blocks and then ran Huffman emission on
+one thread. Viewr already places a restart marker after each 4:4:4 MCU row so
+the decoder can split cache objects by row. Those restart rows also make the
+encoder DC predictors and byte stream independent at every row boundary.
+
+The reviewed fork at `thirdparty/jpeg-rusturbo` now encodes contiguous groups
+of restart rows end to end on the JPEG pool. It joins the byte-stuffed groups
+in raster order and writes the completed entropy segment once. The fast path
+is limited to Viewr's RGBA, baseline 4:4:4, row-restart shape. Every other
+shape uses the upstream path.
+
+An alternating-order, 21-pair Full q97 comparison on the Apple M5 produced:
+
+| Path | Median Full encode | Relative result |
+|---|---:|---:|
+| Serial row-restart control | 155.945 ms | 1.00× |
+| 10-worker restart-row encoder | 27.152 ms | 5.743× faster |
+
+The parallel result was faster in all 21 pairs. A two-sided sign test gives
+`p < 0.000001`. Both paths produced exactly 20,157,604 bytes, and every byte
+matched. The production Criterion check measured Browse at 8.604 ms and Full
+at 28.346 ms. Criterion reported a significant improvement for both tiers.
+
+The first parallel prototype returned one allocation per MCU row. It was fast,
+but repeated encodes raised allocator high-water memory. The accepted design
+uses one caller-owned output stripe per worker and buffers the ordered entropy
+segment before one destination write. A fresh 20-image Full q97 stress run
+measured:
+
+| Path | Wall time | Total CPU | Peak RSS | Total encoded bytes |
+|---|---:|---:|---:|---:|
+| Upstream no-restart threaded path | 2.26 s | 3.75 s | 435,912,704 bytes | 403,140,500 |
+| Restart-row threaded path | 0.61 s | 4.15 s | 199,540,736 bytes | 403,152,080 |
+
+The accepted path reduced wall time by 73% and peak RSS by 54%. It used 11%
+more total CPU. The small output-size increase is the standard DRI segment and
+restart markers; decoded pixels do not change.
+
+Fork-local tests cover odd and partial MCUs, qualities 1, 50, 97, and 100,
+automatic and fixed thread pools, RST7-to-RST0 wraparound, and a release-mode
+guard against joining a segment while entropy bits are pending. Viewr also
+checks byte equality between strict one-thread and production pools on a
+1023×769 textured input. The change adds no unsafe code or inline assembly.
+[`VIEWR-PATCHES.md`](../thirdparty/jpeg-rusturbo/VIEWR-PATCHES.md) records the
+fork source, checksum, contract, and update procedure.
+
 ## Architecture and safety
 
 The JPEG integration adds no handwritten `unsafe` or FFI and the selected
@@ -379,6 +428,12 @@ Resource comparison:
 ```sh
 /usr/bin/time -lp tools/jpeg-bakeoff/target/release/viewr-jpeg-bakeoff \
   stress libjpeg-turbo-c-reused 10 97
+
+tools/jpeg-bakeoff/target/release/viewr-jpeg-bakeoff \
+  restart-compare 10 21 97
+
+/usr/bin/time -lp tools/jpeg-bakeoff/target/release/viewr-jpeg-bakeoff \
+  stress jpeg-rusturbo-rows-auto 20 97
 ```
 
 The resource numbers used five fresh processes per finalist:

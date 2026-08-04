@@ -18,9 +18,9 @@ use viewr_core::cache_disk::DiskCache;
 use viewr_core::cache_ram::{RamCache, RamCacheBudgets};
 use viewr_core::db::{Db, default_db_path};
 use viewr_core::folder::{FolderEntry, normalize_physical_path, scan};
-use viewr_core::jobs::{Engine, EngineOptions, Event, NavState, ViewHint};
+use viewr_core::jobs::{Engine, EngineOptions, Event, EventReceiver, NavState, ViewHint};
 use viewr_core::library::{
-    Library, RatingLoad, load_ratings_with_owners, rating_owner_keys, try_load_ratings_with_owners,
+    Library, load_ratings_with_owners, rating_owner_keys, try_load_ratings_with_owners,
 };
 use viewr_core::meta::FileMeta;
 use viewr_core::types::Tier;
@@ -31,7 +31,10 @@ use crate::image_info;
 use crate::loupe::{self, LoupeResponse, Zoom};
 use crate::pixels::to_color_image;
 use crate::progressive_texture::{self, TileCoord};
-use crate::rating_groups::{build_owner_members, install_rating_for_members};
+use crate::rating_groups::{
+    GroupedRatingLoad, OwnerMembers, build_owner_members, group_rating_load,
+    install_rating_for_members,
+};
 use crate::settings::SettingsState;
 use crate::texture_lru::ByteLru;
 use crate::update::UpdateManager;
@@ -49,10 +52,20 @@ const BACKGROUND_FULL_TILE_UPLOADS_PER_FRAME: usize = 1;
 const THUMB_REQUEST_POLL_AFTER: Duration = Duration::from_millis(16);
 const THUMB_REQUEST_STALE_AFTER: Duration = Duration::from_millis(500);
 const THUMB_FAILURE_RETRY_AFTER: Duration = Duration::from_secs(2);
+/// Progressive regions and image completions should preempt metadata, but a
+/// corrupt-file or region-publication storm must not make one frame unbounded.
+/// A full batch explicitly schedules the next frame, preserving per-lane FIFO
+/// order while guaranteeing that every queued foreground event makes progress.
+const FOREGROUND_EVENTS_PER_FRAME: usize = 256;
+/// Folder-wide metadata is useful but never urgent enough to monopolize one
+/// UI frame. The synthetic receiver-plus-map benchmark keeps this bounded
+/// batch below a millisecond on the reference host; production metadata
+/// effects are covered by correctness tests but are not part of that timing.
+const BACKGROUND_EVENTS_PER_FRAME: usize = 4_096;
 const RATING_DB_REFRESH_POLL: Duration = Duration::from_millis(50);
 const RATING_DB_REFRESH_MAX_POLL: Duration = Duration::from_secs(5);
 
-type RatingRefreshResult = std::result::Result<RatingLoad, String>;
+type RatingRefreshResult = std::result::Result<GroupedRatingLoad, String>;
 
 fn ram_cache_budgets(total: u64) -> RamCacheBudgets {
     let thumbs = THUMB_BUDGET.min(total / 2);
@@ -264,6 +277,32 @@ fn full_tile_should_be_kept(
     zoomed && (index == current || Some(index) == next_ahead)
 }
 
+fn take_band_tile_keys_for_index(
+    keys: &mut HashSet<(usize, TileCoord)>,
+    index: usize,
+) -> Vec<(usize, TileCoord)> {
+    let mut removed = Vec::new();
+    keys.retain(|key| {
+        if key.0 == index {
+            removed.push(*key);
+            false
+        } else {
+            true
+        }
+    });
+    removed
+}
+
+fn record_band_tile_key(
+    keys: &mut HashSet<(usize, TileCoord)>,
+    key: (usize, TileCoord),
+    from_band: bool,
+) {
+    if from_band {
+        keys.insert(key);
+    }
+}
+
 fn install_metadata(
     ratings: &mut HashMap<usize, u8>,
     metas: &mut HashMap<usize, FileMeta>,
@@ -332,12 +371,12 @@ struct Session {
     dir: PathBuf,
     entries: Arc<Vec<FolderEntry>>,
     engine: Engine,
-    events: Receiver<Event>,
+    events: EventReceiver,
     cache: Arc<RamCache>,
     library: Library,
     ratings: HashMap<usize, u8>,
     explicit_ratings: HashMap<usize, u8>,
-    rating_members: Vec<Option<Arc<[usize]>>>,
+    rating_members: OwnerMembers,
     rating_refresh_pending: bool,
     rating_sources_blocked: bool,
     rating_refresh_after: Option<Instant>,
@@ -366,6 +405,95 @@ struct Session {
     /// races (install-then-clear between the two cache probes, or a cancelled
     /// straggler overwriting the band slot) cannot drop still-valid tiles.
     band_tile_miss_frames: u8,
+}
+
+#[derive(Default)]
+struct EventDrainEffects {
+    replan: bool,
+    filter_dirty: bool,
+    star_markers_dirty: bool,
+}
+
+#[derive(Clone, Copy)]
+struct EventDrainContext {
+    current: usize,
+    mode: Mode,
+    zoom: Zoom,
+    filter: Filter,
+    accept_metadata_ratings: bool,
+}
+
+fn apply_engine_event(
+    session: &mut Session,
+    status: &mut Status,
+    event: Event,
+    context: EventDrainContext,
+    effects: &mut EventDrainEffects,
+) {
+    match event {
+        Event::ThumbReady { index, meta } => {
+            // Pixels stay in the byte-bounded RAM ring until a visible
+            // viewport asks to upload them. If they were already evicted,
+            // the demand path safely queues a replacement decode.
+            session.thumb_requests.remove(&index);
+            session.thumb_retry_after.remove(&index);
+            let old_rating = session.ratings.get(&index).copied().unwrap_or(0);
+            effects.filter_dirty |= install_metadata(
+                &mut session.ratings,
+                &mut session.metas,
+                index,
+                *meta,
+                context.filter,
+                context.accept_metadata_ratings,
+            );
+            let new_rating = session.ratings.get(&index).copied().unwrap_or(0);
+            effects.star_markers_dirty |= (old_rating > 0) != (new_rating > 0);
+        }
+        Event::MetadataReady { index, meta } => {
+            let old_rating = session.ratings.get(&index).copied().unwrap_or(0);
+            effects.filter_dirty |= install_metadata(
+                &mut session.ratings,
+                &mut session.metas,
+                index,
+                *meta,
+                context.filter,
+                context.accept_metadata_ratings,
+            );
+            let new_rating = session.ratings.get(&index).copied().unwrap_or(0);
+            effects.star_markers_dirty |= (old_rating > 0) != (new_rating > 0);
+        }
+        Event::ImageReady { .. } => effects.replan = true,
+        // Progress ping only: the staged rects are read from the engine's
+        // snapshot during painting, and publication already requested this
+        // repaint. No replan.
+        Event::ImageRegionReady { .. } => {}
+        Event::FullBandInvalidated { index } => {
+            for key in take_band_tile_keys_for_index(&mut session.full_tiles_from_band, index) {
+                session.full_tiles.remove(&key);
+            }
+            session.band_tile_miss_frames = 0;
+        }
+        Event::ImageFailed { index, tier, error } => {
+            if tier == Tier::Thumb && session.thumb_requests.remove(&index).is_some() {
+                session
+                    .thumb_retry_after
+                    .insert(index, Instant::now() + THUMB_FAILURE_RETRY_AFTER);
+            } else if image_failure_is_visible(
+                context.current,
+                context.mode,
+                context.zoom,
+                index,
+                tier,
+            ) {
+                *status = Status::Error(format!("error: {error}"));
+            } else {
+                eprintln!("job failed {index}/{tier:?}: {error}");
+            }
+        }
+        Event::MetadataFailed { index, error } => {
+            eprintln!("metadata failed {index}: {error}");
+        }
+    }
 }
 
 pub struct App {
@@ -581,16 +709,20 @@ impl App {
 
     fn replan(&self) {
         if let Some(session) = &self.session {
-            // Publish the hint before the plan so a rehydrate claimed right
-            // after set_plan already sees the framing it decodes for. The
-            // hint is advisory and outside job identity: updating it cannot
-            // cancel in-flight work, and staleness only costs latency.
-            session.engine.set_view_hint(self.view_hint(session));
-            session.engine.navigate(NavState {
+            let demand = self.view_demand(session);
+            let nav = NavState {
                 current: self.current,
                 direction: self.direction,
                 zoomed: full_resolution_is_urgent(self.mode, self.zoom),
-            });
+            };
+            // Publish both viewport forms inside the engine's navigation
+            // transaction so a promoted Full worker observes either the old
+            // demand or the complete new demand.
+            session.engine.navigate_with_view_demand(
+                nav,
+                demand.map(|(hint, _)| hint),
+                demand.map(|(_, uv)| uv),
+            );
         }
     }
 
@@ -599,7 +731,7 @@ impl App {
     /// Zoom framing is retained across navigation, so the previous logical
     /// size reproduces the new image's visible rows for burst sequences; a
     /// dimension mismatch only degrades the advisory band, never the output.
-    fn view_hint(&self, session: &Session) -> Option<ViewHint> {
+    fn view_demand(&self, session: &Session) -> Option<(ViewHint, [f32; 4])> {
         if !full_resolution_is_urgent(self.mode, self.zoom) {
             return None;
         }
@@ -610,13 +742,16 @@ impl App {
             .map(|buf| vec2(buf.width as f32, buf.height as f32))
             .or(self.last_logical)?;
         let uv = loupe::visible_uv_for(rect, img_size, self.zoom);
-        Some(ViewHint {
-            index: self.current,
-            uv_y0: uv.min.y,
-            uv_y1: uv.max.y,
-            align_px: progressive_texture::TILE_EDGE,
-            gutter_px: progressive_texture::SAMPLE_GUTTER,
-        })
+        Some((
+            ViewHint {
+                index: self.current,
+                uv_y0: uv.min.y,
+                uv_y1: uv.max.y,
+                align_px: progressive_texture::TILE_EDGE,
+                gutter_px: progressive_texture::SAMPLE_GUTTER,
+            },
+            [uv.min.x, uv.min.y, uv.max.x, uv.max.y],
+        ))
     }
 
     /// Position of `current` within the visible sequence (nearest if the
@@ -702,73 +837,42 @@ impl App {
     }
 
     fn drain_events(&mut self) {
-        let current = self.current;
-        let mode = self.mode;
-        let zoom = self.zoom;
         let Some(session) = &mut self.session else {
             return;
         };
-        let mut replan = false;
-        let mut filter_dirty = false;
-        let mut star_markers_dirty = false;
-        let accept_metadata_ratings = !session.rating_sources_blocked;
-        while let Ok(event) = session.events.try_recv() {
-            match event {
-                Event::ThumbReady { index, meta } => {
-                    // Pixels stay in the byte-bounded RAM ring until a visible
-                    // viewport asks to upload them. If they were already evicted,
-                    // the demand path below safely queues a replacement decode.
-                    session.thumb_requests.remove(&index);
-                    session.thumb_retry_after.remove(&index);
-                    let old_rating = session.ratings.get(&index).copied().unwrap_or(0);
-                    filter_dirty |= install_metadata(
-                        &mut session.ratings,
-                        &mut session.metas,
-                        index,
-                        *meta,
-                        self.filter,
-                        accept_metadata_ratings,
-                    );
-                    let new_rating = session.ratings.get(&index).copied().unwrap_or(0);
-                    star_markers_dirty |= (old_rating > 0) != (new_rating > 0);
-                }
-                Event::MetadataReady { index, meta } => {
-                    let old_rating = session.ratings.get(&index).copied().unwrap_or(0);
-                    filter_dirty |= install_metadata(
-                        &mut session.ratings,
-                        &mut session.metas,
-                        index,
-                        *meta,
-                        self.filter,
-                        accept_metadata_ratings,
-                    );
-                    let new_rating = session.ratings.get(&index).copied().unwrap_or(0);
-                    star_markers_dirty |= (old_rating > 0) != (new_rating > 0);
-                }
-                Event::ImageReady { .. } => replan = true,
-                // Progress ping only: the staged rects are read from the
-                // engine's snapshot during painting, and the notify callback
-                // already requested this repaint. No replan.
-                Event::ImageRegionReady { .. } => {}
-                Event::ImageFailed { index, tier, error } => {
-                    if tier == Tier::Thumb && session.thumb_requests.remove(&index).is_some() {
-                        session
-                            .thumb_retry_after
-                            .insert(index, Instant::now() + THUMB_FAILURE_RETRY_AFTER);
-                    } else if image_failure_is_visible(current, mode, zoom, index, tier) {
-                        self.status = Status::Error(format!("error: {error}"));
-                    } else {
-                        eprintln!("job failed {index}/{tier:?}: {error}");
-                    }
-                }
-                Event::MetadataFailed { index, error } => {
-                    eprintln!("metadata failed {index}: {error}");
-                }
-            }
+        let mut effects = EventDrainEffects::default();
+        let context = EventDrainContext {
+            current: self.current,
+            mode: self.mode,
+            zoom: self.zoom,
+            filter: self.filter,
+            accept_metadata_ratings: !session.rating_sources_blocked,
+        };
+        let mut foreground_events = 0;
+        while foreground_events < FOREGROUND_EVENTS_PER_FRAME
+            && let Ok(event) = session.events.try_recv_foreground()
+        {
+            foreground_events += 1;
+            apply_engine_event(session, &mut self.status, event, context, &mut effects);
         }
-        self.filter_dirty |= filter_dirty;
-        self.star_markers_dirty |= star_markers_dirty;
-        if replan {
+        let mut background_events = 0;
+        while background_events < BACKGROUND_EVENTS_PER_FRAME
+            && let Ok(event) = session.events.try_recv_background()
+        {
+            background_events += 1;
+            apply_engine_event(session, &mut self.status, event, context, &mut effects);
+        }
+        // A full batch conservatively schedules one more frame. If the queue
+        // became empty exactly at the boundary, that frame is a cheap no-op;
+        // otherwise it guarantees progress even after the producers stop.
+        if foreground_events == FOREGROUND_EVENTS_PER_FRAME
+            || background_events == BACKGROUND_EVENTS_PER_FRAME
+        {
+            self.ctx.request_repaint();
+        }
+        self.filter_dirty |= effects.filter_dirty;
+        self.star_markers_dirty |= effects.star_markers_dirty;
+        if effects.replan {
             self.replan();
         }
     }
@@ -792,11 +896,14 @@ impl App {
             let session = self.session.as_mut().expect("checked session");
             session.rating_refresh_rx = None;
             match result {
-                Ok((ratings, owners)) => {
+                Ok(GroupedRatingLoad {
+                    ratings,
+                    owner_members,
+                }) => {
                     let ratings =
                         merge_refreshed_ratings(ratings, &session.metas, &session.explicit_ratings);
                     session.ratings = ratings;
-                    session.rating_members = build_owner_members(&owners);
+                    session.rating_members = owner_members;
                     session.rating_refresh_pending = false;
                     session.rating_sources_blocked = false;
                     session.rating_refresh_after = None;
@@ -837,6 +944,7 @@ impl App {
                         return Err("rating database migration is not complete".to_owned());
                     }
                     try_load_ratings_with_owners(&entries, Some(&db))
+                        .map(group_rating_load)
                         .map_err(|error| error.to_string())
                 })();
                 let _ = send.send(result);
@@ -1067,7 +1175,7 @@ impl App {
                 OverlaySource::Full(buf)
             } else if let Some((width, height)) = session
                 .engine
-                .with_progressive_full(current, |width, height, _, _| (width, height))
+                .progressive_full_size(current)
                 .filter(|&(width, height)| width > 0 && height > 0)
             {
                 OverlaySource::Staging { width, height }
@@ -1084,7 +1192,9 @@ impl App {
                     return false;
                 };
                 if session.band_tile_miss_frames >= 1 {
-                    for key in session.full_tiles_from_band.drain() {
+                    for key in
+                        take_band_tile_keys_for_index(&mut session.full_tiles_from_band, current)
+                    {
                         session.full_tiles.remove(&key);
                     }
                 } else {
@@ -1103,6 +1213,7 @@ impl App {
             OverlaySource::Band(band) => (band.full_width, band.full_height),
             OverlaySource::Staging { width, height } => (*width, *height),
         };
+        let source_is_band = matches!(&source, OverlaySource::Band(_));
         let order =
             progressive_texture::priority_order(image_width, image_height, response.visible_uv);
         let visible_count = progressive_texture::visible_prefix_len(
@@ -1147,17 +1258,31 @@ impl App {
                 Some(image) => TileImage::Ready(image),
                 None => TileImage::NotCovered,
             },
-            OverlaySource::Staging { .. } => match engine
-                .with_progressive_full(current, |width, height, rgba, covered| {
-                    progressive_texture::color_image_from_staging(
-                        width, height, rgba, covered, tile,
-                    )
-                })
-                .flatten()
-            {
-                Some(image) => TileImage::Ready(image),
-                None => TileImage::NotCovered,
-            },
+            OverlaySource::Staging { width, height } => {
+                let Some(sample) = progressive_texture::sample_rect(*width, *height, tile) else {
+                    return TileImage::Invalid;
+                };
+                let Some(pixel_count) = usize::try_from(sample.width).ok().and_then(|width| {
+                    usize::try_from(sample.height)
+                        .ok()
+                        .and_then(|height| width.checked_mul(height))
+                }) else {
+                    return TileImage::Invalid;
+                };
+                let mut pixels = vec![egui::Color32::TRANSPARENT; pixel_count];
+                if engine.copy_progressive_full_region_into(
+                    current,
+                    [sample.x, sample.y, sample.width, sample.height],
+                    bytemuck::cast_slice_mut(&mut pixels),
+                ) {
+                    TileImage::Ready(egui::ColorImage::new(
+                        [sample.width as usize, sample.height as usize],
+                        pixels,
+                    ))
+                } else {
+                    TileImage::NotCovered
+                }
+            }
         };
         if missing_visible > 0 {
             for &tile in &order {
@@ -1182,17 +1307,14 @@ impl App {
                     egui::TextureOptions::LINEAR,
                 );
                 session.full_tiles.insert(key, texture);
-                if matches!(source, OverlaySource::Band(_)) {
-                    session.full_tiles_from_band.insert(key);
-                }
+                record_band_tile_key(&mut session.full_tiles_from_band, key, source_is_band);
                 uploaded += 1;
             }
         }
-        if matches!(source, OverlaySource::Full(_)) {
-            // The finished buffer contains the same bytes the band carried;
-            // its tiles are no longer provisional.
-            session.full_tiles_from_band.clear();
-        }
+        // Keep band provenance after Full arrives. An invalidation event can
+        // already be queued behind this frame's event drain; retaining the
+        // key lets that delayed event conservatively remove and re-upload the
+        // texture from the authoritative Full buffer on the next frame.
         // With the visible rect complete, the background budget goes first to
         // the next-ahead warm below — an imminent zoomed navigation values the
         // neighbor's visible tiles above this image's off-screen remainder —
@@ -1308,6 +1430,7 @@ impl App {
                     egui::TextureOptions::LINEAR,
                 );
                 session.full_tiles.insert(key, texture);
+                record_band_tile_key(&mut session.full_tiles_from_band, key, source_is_band);
                 uploaded += 1;
             }
         }
@@ -1545,6 +1668,7 @@ fn purge_disk_cache() {
 
 impl eframe::App for App {
     fn on_exit(&mut self) {
+        self.config.save_and_flush();
         if !self.config.clear_disk_cache_on_exit {
             return;
         }
@@ -2192,6 +2316,19 @@ mod tests {
         assert!(full_resolution_is_urgent(Mode::Loupe, anchored));
         assert!(!full_resolution_is_urgent(Mode::Grid, Zoom::Fit));
         assert!(!full_resolution_is_urgent(Mode::Grid, anchored));
+    }
+
+    #[test]
+    fn band_invalidation_removes_only_the_failed_images_tiles() {
+        let tile_a = TileCoord { col: 1, row: 2 };
+        let tile_b = TileCoord { col: 3, row: 4 };
+        let mut keys = HashSet::from([(7, tile_a), (8, tile_a)]);
+        record_band_tile_key(&mut keys, (7, tile_b), true);
+        record_band_tile_key(&mut keys, (9, tile_a), false);
+        let mut removed = take_band_tile_keys_for_index(&mut keys, 7);
+        removed.sort_by_key(|(_, tile)| (tile.row, tile.col));
+        assert_eq!(removed, vec![(7, tile_a), (7, tile_b)]);
+        assert_eq!(keys, HashSet::from([(8, tile_a)]));
     }
 
     #[test]

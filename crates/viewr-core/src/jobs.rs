@@ -17,8 +17,8 @@
 
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, TryLockError};
 use std::time::Duration;
 
@@ -57,6 +57,14 @@ pub const CACHE_JPEG_QUALITY: u8 = DEFAULT_CACHE_JPEG_QUALITY;
 pub const MIN_CACHE_JPEG_QUALITY: u8 = 80;
 /// Highest cache JPEG quality exposed by the application preference.
 pub const MAX_CACHE_JPEG_QUALITY: u8 = 100;
+/// Edge length of one independently uploadable Full-resolution GPU tile.
+///
+/// The progressive develop scheduler snaps its first region to this grid so
+/// the first region-ready event can produce complete textures rather than a
+/// smaller rectangle that no texture upload can consume.
+pub const FULL_TEXTURE_TILE_EDGE: u32 = 1_024;
+/// Extra source pixels sampled around each Full-resolution texture tile.
+pub const FULL_TEXTURE_SAMPLE_GUTTER: u32 = 1;
 const MAX_JPEG_WORKERS: usize = 10;
 const PERSIST_WRITE_ATTEMPTS: usize = 3;
 const PERSIST_RETRY_BASE_DELAY: Duration = Duration::from_millis(2);
@@ -137,7 +145,8 @@ pub enum Event {
     /// canvas.
     ///
     /// A payload-free progress ping: the covered rectangles live in the
-    /// staging snapshot read through [`Engine::with_progressive_full`].
+    /// staging snapshot read through
+    /// [`Engine::copy_progressive_full_region_into`].
     /// Receivers need no replan — the accompanying notify callback already
     /// requests a repaint.
     ImageRegionReady {
@@ -145,6 +154,13 @@ pub enum Event {
         index: usize,
         /// Tier being staged (always [`Tier::Full`] today).
         tier: Tier,
+    },
+    /// A provisional Full JPEG band was invalidated after the source object
+    /// failed validation. Receivers must discard textures derived from that
+    /// band before RAW fallback pixels can replace them.
+    FullBandInvalidated {
+        /// Index whose provisional JPEG pixels are no longer valid.
+        index: usize,
     },
     /// An image decode, development, or rehydration attempt failed.
     ImageFailed {
@@ -162,6 +178,101 @@ pub enum Event {
         /// Human-readable underlying error.
         error: String,
     },
+}
+
+/// Ordered engine results split into independent foreground-image and
+/// background-metadata lanes.
+///
+/// Each lane preserves publication order. Keeping the lanes separate lets the
+/// UI handle image readiness and visible failures promptly while applying a
+/// deterministic per-frame bound to folder-wide metadata work.
+pub struct EventReceiver {
+    foreground: Receiver<Event>,
+    background: Receiver<Event>,
+}
+
+impl EventReceiver {
+    /// Receives the next foreground image result without waiting.
+    pub fn try_recv_foreground(&self) -> Result<Event, TryRecvError> {
+        self.foreground.try_recv()
+    }
+
+    /// Receives the next background metadata result without waiting.
+    pub fn try_recv_background(&self) -> Result<Event, TryRecvError> {
+        self.background.try_recv()
+    }
+
+    /// Receives the next result without waiting, preferring foreground work.
+    ///
+    /// This compatibility method is useful to non-UI consumers that do not
+    /// need a frame budget.
+    pub fn try_recv(&self) -> Result<Event, TryRecvError> {
+        match self.foreground.try_recv() {
+            Ok(event) => Ok(event),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => self.background.try_recv(),
+        }
+    }
+
+    /// Iterates over all results currently available without waiting.
+    pub fn try_iter(&self) -> impl Iterator<Item = Event> + '_ {
+        std::iter::from_fn(|| self.try_recv().ok())
+    }
+}
+
+struct EventSender {
+    foreground: Sender<Event>,
+    background: Sender<Event>,
+}
+
+impl EventSender {
+    fn send(&self, event: Event) -> bool {
+        let sender = if event_is_foreground(&event) {
+            &self.foreground
+        } else {
+            &self.background
+        };
+        sender.send(event).is_ok()
+    }
+}
+
+fn event_channel() -> (EventSender, EventReceiver) {
+    let (foreground, foreground_rx) = std::sync::mpsc::channel();
+    let (background, background_rx) = std::sync::mpsc::channel();
+    (
+        EventSender {
+            foreground,
+            background,
+        },
+        EventReceiver {
+            foreground: foreground_rx,
+            background: background_rx,
+        },
+    )
+}
+
+/// Builds a preloaded event receiver for the headless UI-backlog benchmark.
+#[cfg(feature = "benchmarks")]
+#[doc(hidden)]
+pub fn benchmark_event_receiver(events: impl IntoIterator<Item = Event>) -> EventReceiver {
+    let (sender, receiver) = event_channel();
+    for event in events {
+        let _ = sender.send(event);
+    }
+    receiver
+}
+
+fn event_is_foreground(event: &Event) -> bool {
+    // ThumbReady carries metadata. Keep it in the background FIFO so a
+    // viewport thumbnail cannot overtake an earlier metadata-only result for
+    // the same file and change which snapshot the UI retains. Failures carry
+    // no metadata and are safe to prioritize for prompt retry/status handling.
+    matches!(
+        event,
+        Event::ImageReady { .. }
+            | Event::ImageRegionReady { .. }
+            | Event::FullBandInvalidated { .. }
+            | Event::ImageFailed { .. }
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,14 +338,12 @@ enum Action {
 
 impl Action {
     fn compatible_with(self, requested: Self) -> bool {
+        // A speculative Full uses monolithic/no-event/no-persistence behavior.
+        // Once that image becomes required display work it must be replaced,
+        // not treated as equivalent, so the live generation can use viewport-
+        // first staging and publish readiness. Exact-action replans still keep
+        // their existing generation.
         self == requested
-            || matches!(
-                (self, requested),
-                (
-                    Self::PrefetchFull,
-                    Self::Develop(Quality::Full) | Self::Rehydrate
-                )
-            )
     }
 
     fn is_speculative_full(self) -> bool {
@@ -621,7 +730,22 @@ impl JobQueue {
     /// (not a zoom toggle); it also cancels active background generations so
     /// newly interactive work reaches a worker at the next cancellation
     /// point, and grants failed speculative targets a retry.
-    fn set_plan(&self, mut plan: Vec<(JobId, u8, u32, Action)>, navigation_changed: bool) {
+    #[cfg(any(test, feature = "benchmarks"))]
+    fn set_plan(&self, plan: Vec<(JobId, u8, u32, Action)>, navigation_changed: bool) {
+        self.set_plan_with_restarts(plan, navigation_changed, [None, None]);
+    }
+
+    /// Replaces the interactive plan and restarts up to two still-wanted
+    /// jobs whose execution mode depends on a navigation transition. This is
+    /// used for the new zoomed current Full and for a displaced progressive
+    /// owner; both must observe the new viewport/staging ownership even when
+    /// their action enum itself remains unchanged.
+    fn set_plan_with_restarts(
+        &self,
+        mut plan: Vec<(JobId, u8, u32, Action)>,
+        navigation_changed: bool,
+        force_restart: [Option<JobId>; 2],
+    ) {
         let mut state = self.state.lock().unwrap();
         if state.closed {
             return;
@@ -662,13 +786,18 @@ impl JobQueue {
             }
         }
         for (id, running) in &state.in_flight {
+            let forced = force_restart
+                .into_iter()
+                .flatten()
+                .any(|forced| forced == *id);
             let is_background = state
                 .background_in_flight
                 .get(id)
                 .is_some_and(|background| Arc::ptr_eq(&background.token, &running.token));
             let wanted_action = state.queued.get(id).map(|wanted| wanted.action);
-            if (!is_background
-                && !wanted_action.is_some_and(|action| running.action.compatible_with(action)))
+            if forced
+                || (!is_background
+                    && !wanted_action.is_some_and(|action| running.action.compatible_with(action)))
                 || (is_background
                     && wanted_action.is_some_and(|action| !running.action.compatible_with(action)))
             {
@@ -684,9 +813,15 @@ impl JobQueue {
         for (id, class, eff_dist, action) in plan {
             // Skip only if a LIVE instance is already running; a cancelled
             // in-flight instance won't publish, so queue a fresh one.
-            if state.in_flight.get(&id).is_some_and(|running| {
-                running.action.compatible_with(action) && !running.token.cancelled()
-            }) {
+            let forced = force_restart
+                .into_iter()
+                .flatten()
+                .any(|forced| forced == id);
+            if !forced
+                && state.in_flight.get(&id).is_some_and(|running| {
+                    running.action.compatible_with(action) && !running.token.cancelled()
+                })
+            {
                 state.queued.remove(&id);
                 continue;
             }
@@ -915,7 +1050,7 @@ impl JobQueue {
         &self,
         id: JobId,
         token: &Arc<CancelToken>,
-        events: &Sender<Event>,
+        events: &EventSender,
         event: Event,
     ) -> bool {
         let state = self.state.lock().unwrap();
@@ -944,7 +1079,7 @@ impl JobQueue {
         id: JobId,
         token: &Arc<CancelToken>,
         completion: JobCompletion,
-        publication: Option<(&Sender<Event>, Event)>,
+        publication: Option<(&EventSender, Event)>,
     ) -> bool {
         let mut state = self.state.lock().unwrap();
         let publishable = state
@@ -1060,6 +1195,13 @@ struct NavigationOrder {
     /// values under one mutex makes a sequence change atomically invalidate
     /// the cancellation generation.
     last_nav: Option<NavState>,
+    /// Monotonic identity for publications tied to one navigation state.
+    /// Unlike the scheduler's position-change result, this also advances for
+    /// zoom transitions so a stale zoomed callback cannot become valid again
+    /// after an intervening Fit view. Same-state hint and viewport updates do
+    /// not advance it on every pan frame; band publication separately matches
+    /// the exact captured hint against the latest mailbox value.
+    generation: u64,
 }
 
 impl NavigationOrder {
@@ -1074,6 +1216,9 @@ impl NavigationOrder {
         let position_changed = self
             .last_nav
             .is_none_or(|last| (last.current, last.direction) != (nav.current, nav.direction));
+        if self.last_nav != Some(nav) {
+            self.generation = self.generation.wrapping_add(1);
+        }
         self.last_nav = Some(nav);
         position_changed
     }
@@ -1099,7 +1244,16 @@ impl NavigationOrder {
             }
         }
         self.last_nav = None;
+        self.generation = self.generation.wrapping_add(1);
     }
+}
+
+fn restart_current_full_for_view_transition(
+    previous: Option<NavState>,
+    next: NavState,
+    position_changed: bool,
+) -> bool {
+    next.zoomed && (position_changed || previous.is_none_or(|previous| !previous.zoomed))
 }
 
 /// Decoded CFA mosaic and metadata shared between paired develop jobs.
@@ -1179,6 +1333,41 @@ enum RawShareJoin<'share, T> {
     Shared(Arc<T>),
     /// Decode independently: waiting was cancelled or the leader failed.
     OwnDecode,
+}
+
+/// Result of resolving a raw-share join at the decode-call boundary.
+/// `Cancelled` is checked after a follower may have waited, so an OwnDecode
+/// wake-up caused by cancellation cannot accidentally start a fresh RAW
+/// decode. A live OwnDecode caused by leader failure still executes the
+/// supplied recovery loader.
+enum RawShareDecode<'share, T, D> {
+    Shared(Arc<T>),
+    Decoded {
+        lead: Option<RawShareLead<'share, T>>,
+        output: D,
+    },
+    Cancelled,
+}
+
+fn decode_after_raw_share_join<'share, T, D>(
+    join: RawShareJoin<'share, T>,
+    token: &CancelToken,
+    decode: impl FnOnce() -> D,
+) -> RawShareDecode<'share, T, D> {
+    if token.cancelled() {
+        return RawShareDecode::Cancelled;
+    }
+    match join {
+        RawShareJoin::Shared(shared) => RawShareDecode::Shared(shared),
+        RawShareJoin::Lead(lead) => RawShareDecode::Decoded {
+            lead: Some(lead),
+            output: decode(),
+        },
+        RawShareJoin::OwnDecode => RawShareDecode::Decoded {
+            lead: None,
+            output: decode(),
+        },
+    }
 }
 
 struct RawShareLead<'share, T> {
@@ -1342,7 +1531,7 @@ struct Shared {
     entries: Arc<Vec<FolderEntry>>,
     cache: Arc<RamCache>,
     disk: Option<DiskCache>,
-    events: Sender<Event>,
+    events: EventSender,
     notify: Arc<dyn Fn() + Send + Sync>,
     /// A fixed user limit owns the pool that contains CPU-heavy work, its
     /// source/cache reads, every nested Rayon operation, and cache JPEG
@@ -1375,6 +1564,9 @@ struct Shared {
     /// develop. `in_flight` guarantees one writer per (index, Full); a
     /// replacing generation reinstalls the entry and cancellation clears it.
     progressive: Mutex<Option<ProgressiveCanvas>>,
+    /// Monotonic identity for progressive staging ownership. An old worker
+    /// can never publish into or clear a replacement generation.
+    progressive_generation: AtomicU64,
 }
 
 /// Display-space staging canvas assembled region by region by a progressive
@@ -1382,11 +1574,104 @@ struct Shared {
 /// retain references.
 struct ProgressiveCanvas {
     index: usize,
+    generation: u64,
     width: u32,
     height: u32,
     rgba: Vec<u8>,
     /// Display rectangles (`[x, y, width, height]`) already blitted.
     covered: Vec<[u32; 4]>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProgressiveRect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+impl ProgressiveRect {
+    fn right(self) -> u32 {
+        self.x + self.width
+    }
+
+    fn bottom(self) -> u32 {
+        self.y + self.height
+    }
+
+    fn intersects(self, other: Self) -> bool {
+        self.x < other.right()
+            && other.x < self.right()
+            && self.y < other.bottom()
+            && other.y < self.bottom()
+    }
+}
+
+/// Returns whether the union of `covered` contains all of `target`.
+fn progressive_rect_fully_covered(target: ProgressiveRect, covered: &[[u32; 4]]) -> bool {
+    if target.width == 0 || target.height == 0 {
+        return true;
+    }
+    let mut remaining = vec![target];
+    for &[x, y, width, height] in covered {
+        if width == 0 || height == 0 {
+            continue;
+        }
+        if remaining.is_empty() {
+            break;
+        }
+        let cover = ProgressiveRect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let mut next = Vec::with_capacity(remaining.len() + 3);
+        for rect in remaining {
+            if !rect.intersects(cover) {
+                next.push(rect);
+                continue;
+            }
+            let overlap_top = rect.y.max(cover.y);
+            let overlap_bottom = rect.bottom().min(cover.bottom());
+            let overlap_left = rect.x.max(cover.x);
+            let overlap_right = rect.right().min(cover.right());
+            if rect.y < overlap_top {
+                next.push(ProgressiveRect {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: overlap_top - rect.y,
+                });
+            }
+            if overlap_bottom < rect.bottom() {
+                next.push(ProgressiveRect {
+                    x: rect.x,
+                    y: overlap_bottom,
+                    width: rect.width,
+                    height: rect.bottom() - overlap_bottom,
+                });
+            }
+            if rect.x < overlap_left {
+                next.push(ProgressiveRect {
+                    x: rect.x,
+                    y: overlap_top,
+                    width: overlap_left - rect.x,
+                    height: overlap_bottom - overlap_top,
+                });
+            }
+            if overlap_right < rect.right() {
+                next.push(ProgressiveRect {
+                    x: overlap_right,
+                    y: overlap_top,
+                    width: rect.right() - overlap_right,
+                    height: overlap_bottom - overlap_top,
+                });
+            }
+        }
+        remaining = next;
+    }
+    remaining.is_empty()
 }
 
 /// Construction options for an image-processing [`Engine`].
@@ -1535,7 +1820,7 @@ impl Engine {
         cache: Arc<RamCache>,
         disk: Option<DiskCache>,
         notify: Arc<dyn Fn() + Send + Sync>,
-    ) -> (Self, Receiver<Event>) {
+    ) -> (Self, EventReceiver) {
         Self::new_with_options(
             entries,
             start,
@@ -1558,7 +1843,7 @@ impl Engine {
         disk: Option<DiskCache>,
         jpeg_quality: u8,
         notify: Arc<dyn Fn() + Send + Sync>,
-    ) -> (Self, Receiver<Event>) {
+    ) -> (Self, EventReceiver) {
         Self::new_with_options(
             entries,
             start,
@@ -1589,8 +1874,8 @@ impl Engine {
         disk: Option<DiskCache>,
         options: EngineOptions,
         notify: Arc<dyn Fn() + Send + Sync>,
-    ) -> (Self, Receiver<Event>) {
-        let (events, rx) = std::sync::mpsc::channel();
+    ) -> (Self, EventReceiver) {
+        let (events, rx) = event_channel();
         let processing_pool = options
             .worker_threads
             .map(build_processing_pool)
@@ -1620,6 +1905,7 @@ impl Engine {
                 view_hint: Mutex::new(None),
                 full_viewport: Mutex::new(None),
                 progressive: Mutex::new(None),
+                progressive_generation: AtomicU64::new(1),
             }),
             workers: Vec::with_capacity(HEAVY_WORKERS + LIGHT_WORKERS),
             persistence_worker: None,
@@ -1667,6 +1953,28 @@ impl Engine {
     /// mode raises the current Full job's priority. The first call with a disk
     /// cache also installs the one-shot folder-wide Browse warm lane.
     pub fn navigate(&self, nav: NavState) {
+        self.navigate_inner(nav, None);
+    }
+
+    /// Recomputes navigation while publishing its matching zoom demand in the
+    /// same transaction. Workers snapshot navigation before either mailbox,
+    /// so they observe the old state or the complete new state, never a new
+    /// viewport paired with the previous current image.
+    pub fn navigate_with_view_demand(
+        &self,
+        nav: NavState,
+        hint: Option<ViewHint>,
+        viewport: Option<[f32; 4]>,
+    ) {
+        let viewport = viewport.filter(|uv| uv.iter().all(|value| value.is_finite()));
+        self.navigate_inner(nav, Some((hint, viewport)));
+    }
+
+    fn navigate_inner(
+        &self,
+        nav: NavState,
+        view_demand: Option<(Option<ViewHint>, Option<[f32; 4]>)>,
+    ) {
         let len = self.shared.entries.len();
         if len == 0 {
             return;
@@ -1676,12 +1984,6 @@ impl Engine {
             direction: if nav.direction < 0 { -1 } else { 1 },
             zoomed: nav.zoomed,
         };
-        // Leaving zoom retires the viewport mailbox so later Full develops
-        // take the monolithic path; while zoomed the app republishes the
-        // viewport for the new current image every loupe frame.
-        if !nav.zoomed {
-            *self.shared.full_viewport.lock().unwrap() = None;
-        }
         let current = nav.current;
         let cache = &self.shared.cache;
         // Keep navigation generation, cache admission, and queue replacement
@@ -1690,7 +1992,38 @@ impl Engine {
         // snapshots inside this transaction also keeps a waiting navigate call
         // from extending the copy-on-write observation window.
         let mut navigation = self.shared.navigation.lock().unwrap();
+        if let Some((hint, viewport)) = view_demand {
+            *self.shared.view_hint.lock().unwrap() = hint;
+            *self.shared.full_viewport.lock().unwrap() = viewport.map(|uv| (current, uv));
+        } else if !nav.zoomed {
+            // Preserve the legacy standalone setters for callers of
+            // `navigate`, but always retire a viewport when leaving zoom.
+            *self.shared.full_viewport.lock().unwrap() = None;
+        }
+        let previous_nav = navigation.last_nav;
         let position_changed = navigation.update_navigation(nav);
+        let (retired_progressive, retired_progressive_id) = if position_changed {
+            let mut staging = lock_progressive(&self.shared);
+            if staging
+                .as_ref()
+                .is_some_and(|canvas| canvas.index != current)
+            {
+                let retired = staging.take();
+                let id = retired.as_ref().map(|canvas| (canvas.index, Tier::Full));
+                (retired, id)
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+        // Provisional JPEG rows are display state for exactly the zoomed
+        // current image, not generic Full-working-set residency. Holding the
+        // navigation mutex across this clear makes it atomic with guarded
+        // callback publication below: a callback either publishes before the
+        // change and is cleared here, or observes the new generation and is
+        // rejected.
+        cache.retain_full_band_for_current(nav.zoomed.then_some(current));
         let current_position = navigation.current_position(current);
         let (full_snapshot, browse_snapshot) = cache.prefetch_snapshots();
         let prefetch_budgets = NavigationPrefetchBudgets::new(
@@ -1787,13 +2120,28 @@ impl Engine {
         }
         drop(persistence_known_present);
 
-        self.shared.heavy.set_plan(plan, position_changed);
+        // A new zoomed current must restart even when it was already a Full
+        // display neighbor: its old worker chose monolithic behavior before
+        // it became current. A displaced staging owner is also restarted so
+        // retiring its canvas cannot silently consume still-wanted work.
+        let restart_current =
+            restart_current_full_for_view_transition(previous_nav, nav, position_changed)
+                .then_some((current, Tier::Full));
+        self.shared.heavy.set_plan_with_restarts(
+            plan,
+            position_changed,
+            [restart_current, retired_progressive_id],
+        );
         if disk.is_some() {
             self.shared
                 .heavy
                 .initialize_background(|| background_warm_jobs(len, current));
         }
         drop(navigation);
+        // Retiring the old generation before queue replacement lets the new
+        // current image reserve staging immediately. Release its potentially
+        // large allocation after every scheduler/cache lock is gone.
+        drop(retired_progressive);
     }
 
     /// Sets the display order followed by navigation and pinning.
@@ -1805,6 +2153,9 @@ impl Engine {
     pub fn set_sequence(&self, sequence: Vec<usize>) {
         let mut navigation = self.shared.navigation.lock().unwrap();
         navigation.replace_indices(self.shared.entries.len(), sequence);
+        // Until the caller applies the next navigation, there is no current
+        // generation against which a provisional band can remain valid.
+        self.shared.cache.retain_full_band_for_current(None);
     }
 
     /// Replace the thumbnail viewport demand lane. It is intentionally
@@ -1857,27 +2208,110 @@ impl Engine {
         *self.shared.full_viewport.lock().unwrap() = Some((index, uv));
     }
 
-    /// Reads the progressive Full staging canvas for `index`, if one is being
-    /// assembled.
+    /// Returns the display dimensions of an in-progress Full staging canvas.
+    pub fn progressive_full_size(&self, index: usize) -> Option<(u32, u32)> {
+        let staging = lock_progressive(&self.shared);
+        let canvas = staging.as_ref().filter(|canvas| canvas.index == index)?;
+        Some((canvas.width, canvas.height))
+    }
+
+    /// Copies one fully covered display-space region from an in-progress Full
+    /// staging canvas into caller-owned tightly packed RGBA8 storage.
     ///
-    /// `f` receives the display-space canvas dimensions, its RGBA bytes, and
-    /// the covered display rectangles (`[x, y, width, height]`), all under
-    /// the staging lock: copy what you need and return quickly. Covered bytes
-    /// are identical to the finished Full buffer, so anything uploaded from
-    /// here never needs re-uploading after `ImageReady`.
-    pub fn with_progressive_full<R>(
+    /// `rect` is `[x, y, width, height]`. `output` must contain exactly
+    /// `width * height * 4` bytes. Callers allocate final texture storage
+    /// before this method. The staging lock protects only coverage validation
+    /// and row copies. Covered bytes are identical to the finished Full
+    /// buffer. Returns `false` if the canvas, coverage, dimensions, or storage
+    /// do not match.
+    pub fn copy_progressive_full_region_into(
         &self,
         index: usize,
-        f: impl FnOnce(u32, u32, &[u8], &[[u32; 4]]) -> R,
-    ) -> Option<R> {
-        let staging = self.shared.progressive.lock().unwrap();
-        let canvas = staging.as_ref().filter(|canvas| canvas.index == index)?;
-        Some(f(
-            canvas.width,
-            canvas.height,
-            &canvas.rgba,
-            &canvas.covered,
-        ))
+        rect: [u32; 4],
+        output: &mut [u8],
+    ) -> bool {
+        let [x, y, width, height] = rect;
+        if width == 0 || height == 0 {
+            return false;
+        }
+        let Some(right) = x.checked_add(width) else {
+            return false;
+        };
+        let Some(bottom) = y.checked_add(height) else {
+            return false;
+        };
+        let Ok(width_usize) = usize::try_from(width) else {
+            return false;
+        };
+        let Some(row_bytes) = width_usize.checked_mul(4) else {
+            return false;
+        };
+        let Ok(height_usize) = usize::try_from(height) else {
+            return false;
+        };
+        let Some(output_len) = row_bytes.checked_mul(height_usize) else {
+            return false;
+        };
+        if output.len() != output_len {
+            return false;
+        }
+
+        let staging = lock_progressive(&self.shared);
+        let Some(canvas) = staging.as_ref().filter(|canvas| canvas.index == index) else {
+            return false;
+        };
+        if right > canvas.width || bottom > canvas.height {
+            return false;
+        }
+        let target = ProgressiveRect {
+            x,
+            y,
+            width,
+            height,
+        };
+        if !progressive_rect_fully_covered(target, &canvas.covered) {
+            return false;
+        }
+        let Ok(canvas_width) = usize::try_from(canvas.width) else {
+            return false;
+        };
+        let Some(stride) = canvas_width.checked_mul(4) else {
+            return false;
+        };
+        let Ok(canvas_height) = usize::try_from(canvas.height) else {
+            return false;
+        };
+        let Some(expected_len) = stride.checked_mul(canvas_height) else {
+            return false;
+        };
+        if canvas.rgba.len() != expected_len {
+            return false;
+        }
+        let Ok(x_usize) = usize::try_from(x) else {
+            return false;
+        };
+        let Some(first_x) = x_usize.checked_mul(4) else {
+            return false;
+        };
+        for (row, destination) in (y..bottom).zip(output.chunks_exact_mut(row_bytes)) {
+            let Ok(row) = usize::try_from(row) else {
+                return false;
+            };
+            let Some(start) = row
+                .checked_mul(stride)
+                .and_then(|start| start.checked_add(first_x))
+            else {
+                return false;
+            };
+            let Some(end) = start.checked_add(row_bytes) else {
+                return false;
+            };
+            let Some(source) = canvas.rgba.get(start..end) else {
+                return false;
+            };
+            destination.copy_from_slice(source);
+        }
+        true
     }
 }
 
@@ -1893,7 +2327,8 @@ impl Drop for Engine {
             let _ = worker.join();
         }
         // Workers have joined: any staging canvas is abandoned for certain.
-        *self.shared.progressive.lock().unwrap() = None;
+        let abandoned = lock_progressive(&self.shared).take();
+        drop(abandoned);
     }
 }
 
@@ -2075,7 +2510,7 @@ fn execute_claimed_job(
     action: Action,
     token: &Arc<CancelToken>,
     run: impl FnOnce() -> JobCompletion,
-    events: &Sender<Event>,
+    events: &EventSender,
     notify: impl FnOnce(),
 ) -> Option<usize> {
     let (completion, panic_payload) =
@@ -2135,7 +2570,6 @@ fn worker_panic_event(
     }
 }
 
-#[cfg(test)]
 fn publish(shared: &Shared, event: Event) {
     let _ = shared.events.send(event);
     notify_safely(shared.notify.as_ref());
@@ -2449,6 +2883,127 @@ fn complete_thumb_attempt(
     }
 }
 
+/// Snapshots a current image's viewport under the same lock order used by
+/// navigation publication. The navigation mutex is the transaction fence.
+#[cfg(test)]
+fn current_full_viewport(shared: &Shared, index: usize) -> Option<[f32; 4]> {
+    let navigation = shared.navigation.lock().unwrap();
+    if !navigation
+        .last_nav
+        .is_some_and(|nav| nav.current == index && nav.zoomed)
+    {
+        return None;
+    }
+    let viewport = *shared.full_viewport.lock().unwrap();
+    viewport
+        .filter(|(viewport_index, _)| *viewport_index == index)
+        .map(|(_, uv)| uv)
+}
+
+/// Validates the zoomed current image, snapshots its matching viewport, and
+/// reserves the sole progressive canvas as one navigation transaction.
+///
+/// Lock order is navigation -> viewport mailbox -> progressive staging, the
+/// same order used by navigation publication. Therefore a current-image
+/// change cannot land after validation but before the reservation becomes
+/// visible for retirement.
+fn reserve_current_progressive<'a>(
+    shared: &'a Shared,
+    index: usize,
+    token: &CancelToken,
+) -> Option<(ProgressiveLease<'a>, [f32; 4])> {
+    reserve_current_progressive_with_hook(shared, index, token, || {})
+}
+
+fn reserve_current_progressive_with_hook<'a, F>(
+    shared: &'a Shared,
+    index: usize,
+    token: &CancelToken,
+    after_validation: F,
+) -> Option<(ProgressiveLease<'a>, [f32; 4])>
+where
+    F: FnOnce(),
+{
+    let navigation = shared.navigation.lock().unwrap();
+    if token.cancelled()
+        || !navigation
+            .last_nav
+            .is_some_and(|nav| nav.current == index && nav.zoomed)
+    {
+        return None;
+    }
+    let viewport = shared.full_viewport.lock().unwrap();
+    let uv = viewport
+        .filter(|(viewport_index, _)| *viewport_index == index)
+        .map(|(_, uv)| uv)?;
+    // Test-only callers use this point to hold the exact historical race
+    // window open. Production passes a zero-sized no-op closure.
+    after_validation();
+    if token.cancelled() {
+        return None;
+    }
+    let (lease, replaced) = ProgressiveLease::acquire_with_deferred_drop(shared, index)?;
+    drop(viewport);
+    drop(navigation);
+    // Replacing a same-image generation can release a full-resolution
+    // allocation. Keep that allocator work outside all three transaction
+    // locks.
+    drop(replaced);
+    Some((lease, uv))
+}
+
+/// Snapshots the matching prioritized JPEG band request using navigation as
+/// the transaction fence.
+#[derive(Debug, Clone, Copy)]
+struct FullBandAdmission {
+    hint: ViewHint,
+    navigation_generation: u64,
+}
+
+fn current_view_hint(shared: &Shared, index: usize) -> Option<FullBandAdmission> {
+    let navigation = shared.navigation.lock().unwrap();
+    if !navigation
+        .last_nav
+        .is_some_and(|nav| nav.current == index && nav.zoomed)
+    {
+        return None;
+    }
+    let hint = *shared.view_hint.lock().unwrap();
+    hint.filter(|hint| hint.index == index)
+        .map(|hint| FullBandAdmission {
+            hint,
+            navigation_generation: navigation.generation,
+        })
+}
+
+/// Publishes a provisional band only while its admitting navigation remains
+/// the zoomed current generation and its exact visible-band hint is still the
+/// latest mailbox value. Holding navigation and then the hint mailbox through
+/// the band-slot write makes the check and publication indivisible with both
+/// navigation's band retirement and a same-image pan update.
+fn publish_current_full_band(
+    shared: &Shared,
+    index: usize,
+    admission: FullBandAdmission,
+    token: &CancelToken,
+    band: FullBand,
+) -> bool {
+    let navigation = shared.navigation.lock().unwrap();
+    let current_hint = shared.view_hint.lock().unwrap();
+    if token.cancelled()
+        || admission.hint.index != index
+        || navigation.generation != admission.navigation_generation
+        || *current_hint != Some(admission.hint)
+        || !navigation
+            .last_nav
+            .is_some_and(|nav| nav.current == index && nav.zoomed)
+    {
+        return false;
+    }
+    shared.cache.publish_full_band(index, band);
+    true
+}
+
 fn run_develop(
     shared: &Shared,
     index: usize,
@@ -2475,8 +3030,10 @@ fn run_develop(
     // image reuses this decode instead of re-opening and entropy-decoding
     // the identical RAW.
     let join = shared.raw_share.join(index, token);
-    let (mut raw, meta) = match join {
-        RawShareJoin::Shared(shared_raw) => {
+    let decode = decode_after_raw_share_join(join, token, || decode::load(path));
+    let (raw, meta) = match decode {
+        RawShareDecode::Cancelled => return DevelopCompletion::Cancelled,
+        RawShareDecode::Shared(shared_raw) => {
             let meta = FileMeta::from_metadata(&shared_raw.metadata);
             // The publisher cloned for exactly one follower, so sole
             // ownership is the common case and the mosaic moves out.
@@ -2486,12 +3043,11 @@ fn run_develop(
             };
             (raw, meta)
         }
-        other => {
-            let lead = match other {
-                RawShareJoin::Lead(lead) => Some(lead),
-                _ => None,
-            };
-            let decoded = match decode::load(path) {
+        RawShareDecode::Decoded {
+            lead,
+            output: decoded,
+        } => {
+            let decoded = match decoded {
                 Ok(d) => d,
                 Err(e) => {
                     // A held lead marks the share entry failed on drop.
@@ -2541,31 +3097,19 @@ fn run_develop(
         && tier == Tier::Full
         && quality == Quality::Full
         && supports_region_develop(&raw)
+        && let Some((lease, uv)) = reserve_current_progressive(shared, index, token)
     {
-        let viewport = *shared.full_viewport.lock().unwrap();
-        let is_navigation_current = shared
-            .navigation
-            .lock()
-            .unwrap()
-            .last_nav
-            .is_some_and(|nav| nav.current == index);
-        if is_navigation_current
-            && let Some((_, uv)) = viewport.filter(|(viewport_index, _)| *viewport_index == index)
-        {
-            match run_progressive_full_develop(
-                shared,
-                index,
-                tier,
-                raw,
-                meta.orient,
-                uv,
-                token,
-                emit,
-            ) {
-                Ok(completion) => return completion,
-                Err(declined) => raw = *declined,
-            }
-        }
+        return run_progressive_full_develop(
+            shared,
+            lease,
+            index,
+            tier,
+            raw,
+            meta.orient,
+            uv,
+            token,
+            emit,
+        );
     }
     let (buf, _) = match develop(raw, quality) {
         Ok(r) => r,
@@ -2655,23 +3199,39 @@ fn decode_jpeg_for_rehydrate(
     mode: DevelopMode,
     bytes: &[u8],
 ) -> DecodeOutcome {
-    let band = if mode == DevelopMode::Display && tier == Tier::Full {
-        let hint = *shared.view_hint.lock().unwrap();
-        hint.filter(|hint| hint.index == index)
-            .map(|hint| BandRequest {
-                uv_y0: hint.uv_y0,
-                uv_y1: hint.uv_y1,
-                align_px: hint.align_px,
-                gutter_px: hint.gutter_px,
-            })
+    decode_jpeg_for_rehydrate_with_hook(shared, index, tier, token, mode, bytes, || {})
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_jpeg_for_rehydrate_with_hook<F>(
+    shared: &Shared,
+    index: usize,
+    tier: Tier,
+    token: &CancelToken,
+    mode: DevelopMode,
+    bytes: &[u8],
+    before_band_publish: F,
+) -> DecodeOutcome
+where
+    F: Fn(),
+{
+    let admission = if mode == DevelopMode::Display && tier == Tier::Full {
+        current_view_hint(shared, index)
     } else {
         None
     };
+    let band = admission.map(|admission| BandRequest {
+        uv_y0: admission.hint.uv_y0,
+        uv_y1: admission.hint.uv_y1,
+        align_px: admission.hint.align_px,
+        gutter_px: admission.hint.gutter_px,
+    });
     let outcome = crate::jpeg_restart::try_decode_prioritized(
         bytes,
         band,
         &|| token.cancelled(),
         &mut |band_pixels| {
+            before_band_publish();
             if token.cancelled() {
                 return;
             }
@@ -2680,22 +3240,30 @@ fn decode_jpeg_for_rehydrate(
                 return;
             }
             let band_height = band_pixels.rows.len() / row_bytes;
-            shared.cache.publish_full_band(
+            let Some(admission) = admission else {
+                return;
+            };
+            let published = publish_current_full_band(
+                shared,
                 index,
+                admission,
+                token,
                 FullBand {
                     full_width: band_pixels.full_width,
                     full_height: band_pixels.full_height,
                     y0: band_pixels.y0,
-                    buf: PixelBuf {
-                        width: band_pixels.full_width,
-                        height: band_height as u32,
-                        rgba: band_pixels.rows.to_vec(),
-                    },
+                    buf: PixelBuf::new_opaque(
+                        band_pixels.full_width,
+                        band_height as u32,
+                        band_pixels.rows.to_vec(),
+                    ),
                 },
             );
             // No dedicated event: the UI polls the band slot each frame, so a
             // repaint request is enough to reach it.
-            notify_safely(shared.notify.as_ref());
+            if published {
+                notify_safely(shared.notify.as_ref());
+            }
         },
     );
     match outcome {
@@ -2708,9 +3276,6 @@ fn decode_jpeg_for_rehydrate(
     }
 }
 
-/// Extra pre-orient pixels developed around the visible viewport. Covers the
-/// UI tiles' one-pixel sampling gutter with slack for small pans.
-const PROGRESSIVE_VIEWPORT_MARGIN: u32 = 32;
 /// Row height of the full-width assembly bands developed after the visible
 /// region. Also the cancellation granularity of a progressive Full develop.
 const PROGRESSIVE_BAND_ROWS: u32 = 1024;
@@ -2741,19 +3306,39 @@ fn inverse_orient_rect(display: [u32; 4], orient: Orient, out_w: u32, out_h: u32
     }
 }
 
-/// Expands a rectangle by `margin` on every side and clamps it to the frame.
-fn expand_and_clamp(rect: [u32; 4], margin: u32, out_w: u32, out_h: u32) -> [u32; 4] {
-    let x = rect[0].saturating_sub(margin).min(out_w);
-    let y = rect[1].saturating_sub(margin).min(out_h);
-    let right = rect[0]
-        .saturating_add(rect[2])
-        .saturating_add(margin)
-        .min(out_w);
-    let bottom = rect[1]
-        .saturating_add(rect[3])
-        .saturating_add(margin)
-        .min(out_h);
-    [x, y, right.saturating_sub(x), bottom.saturating_sub(y)]
+/// Expands a visible display rectangle to the union of every texture sample
+/// rectangle its intersecting tile cores require.
+///
+/// Tile cores start at the display origin. Each sample extends by
+/// [`FULL_TEXTURE_SAMPLE_GUTTER`] and clamps at the image edge. A degenerate
+/// advisory viewport selects the tile under its clamped point so corrupt or
+/// transient layout input still yields useful progressive work.
+fn uploadable_visible_sample_rect(visible: [u32; 4], display_w: u32, display_h: u32) -> [u32; 4] {
+    let sample_span = |start: u32, length: u32, extent: u32| {
+        if extent == 0 {
+            return [0, 0];
+        }
+        let first_visible = start.min(extent - 1);
+        let visible_end = if length == 0 {
+            first_visible + 1
+        } else {
+            start.saturating_add(length).min(extent)
+        };
+        let core_start = first_visible / FULL_TEXTURE_TILE_EDGE * FULL_TEXTURE_TILE_EDGE;
+        let core_end = visible_end
+            .div_ceil(FULL_TEXTURE_TILE_EDGE)
+            .saturating_mul(FULL_TEXTURE_TILE_EDGE)
+            .min(extent);
+        let sample_start = core_start.saturating_sub(FULL_TEXTURE_SAMPLE_GUTTER);
+        let sample_end = core_end
+            .saturating_add(FULL_TEXTURE_SAMPLE_GUTTER)
+            .min(extent);
+        [sample_start, sample_end - sample_start]
+    };
+
+    let [x, width] = sample_span(visible[0], visible[2], display_w);
+    let [y, height] = sample_span(visible[1], visible[3], display_h);
+    [x, y, width, height]
 }
 
 /// Zoomed display viewport → the first developed pre-orient rectangle.
@@ -2764,8 +3349,8 @@ fn progressive_first_rect(uv: [f32; 4], orient: Orient, out_w: u32, out_h: u32) 
         (out_w, out_h)
     };
     let visible = visible_display_pixels(uv, display_w, display_h);
-    let out = inverse_orient_rect(visible, orient, out_w, out_h);
-    expand_and_clamp(out, PROGRESSIVE_VIEWPORT_MARGIN, out_w, out_h)
+    let uploadable = uploadable_visible_sample_rect(visible, display_w, display_h);
+    inverse_orient_rect(uploadable, orient, out_w, out_h)
 }
 
 /// Covers the out frame minus `first` exactly once: full-width bands of
@@ -2836,11 +3421,84 @@ fn rect_distance_key(rect: [u32; 4], target: [u32; 4]) -> (u64, u64) {
     (gap_x * gap_x + gap_y * gap_y, dx * dx + dy * dy)
 }
 
-/// Drops the staging canvas if this develop still owns it.
-fn clear_progressive(shared: &Shared, index: usize) {
-    let mut staging = shared.progressive.lock().unwrap();
-    if staging.as_ref().is_some_and(|canvas| canvas.index == index) {
-        *staging = None;
+/// Takes the staging canvas only when both its image and worker generation
+/// match. The potentially large allocation is returned so its final drop can
+/// happen after releasing the mutex.
+fn lock_progressive(shared: &Shared) -> std::sync::MutexGuard<'_, Option<ProgressiveCanvas>> {
+    shared
+        .progressive
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn take_progressive(shared: &Shared, index: usize, generation: u64) -> Option<ProgressiveCanvas> {
+    let mut staging = lock_progressive(shared);
+    let canvas = if staging
+        .as_ref()
+        .is_some_and(|canvas| canvas.index == index && canvas.generation == generation)
+    {
+        staging.take()
+    } else {
+        None
+    };
+    drop(staging);
+    canvas
+}
+
+/// RAII ownership for the single progressive staging slot. It makes every
+/// return and unwind clear only this worker's generation.
+struct ProgressiveLease<'a> {
+    shared: &'a Shared,
+    index: usize,
+    generation: u64,
+}
+
+impl<'a> ProgressiveLease<'a> {
+    #[cfg(test)]
+    fn acquire(shared: &'a Shared, index: usize) -> Option<Self> {
+        let (lease, replaced) = Self::acquire_with_deferred_drop(shared, index)?;
+        drop(replaced);
+        Some(lease)
+    }
+
+    fn acquire_with_deferred_drop(
+        shared: &'a Shared,
+        index: usize,
+    ) -> Option<(Self, Option<ProgressiveCanvas>)> {
+        let generation = shared
+            .progressive_generation
+            .fetch_add(1, Ordering::Relaxed);
+        let mut staging = lock_progressive(shared);
+        if staging.as_ref().is_some_and(|canvas| canvas.index != index) {
+            return None;
+        }
+        let replaced = staging.replace(ProgressiveCanvas {
+            index,
+            generation,
+            width: 0,
+            height: 0,
+            rgba: Vec::new(),
+            covered: Vec::new(),
+        });
+        drop(staging);
+        Some((
+            Self {
+                shared,
+                index,
+                generation,
+            },
+            replaced,
+        ))
+    }
+
+    fn owns(&self, canvas: &ProgressiveCanvas) -> bool {
+        canvas.index == self.index && canvas.generation == self.generation
+    }
+}
+
+impl Drop for ProgressiveLease<'_> {
+    fn drop(&mut self) {
+        drop(take_progressive(self.shared, self.index, self.generation));
     }
 }
 
@@ -2852,11 +3510,11 @@ fn clear_progressive(shared: &Shared, index: usize) {
 /// and disk objects are unchanged. Cancellation is honored at every region
 /// boundary and clears the staging entry.
 #[allow(clippy::too_many_arguments)]
-/// Runs the visible-region-first Full develop, or returns the untouched
-/// mosaic in `Err` when the single staging slot is occupied by another
-/// image's mid-assembly develop (the caller then develops monolithically).
+/// Runs the visible-region-first Full develop after the caller atomically
+/// validated current ownership and reserved the staging slot.
 fn run_progressive_full_develop(
     shared: &Shared,
+    lease: ProgressiveLease<'_>,
     index: usize,
     tier: Tier,
     raw: rawler::RawImage,
@@ -2864,27 +3522,11 @@ fn run_progressive_full_develop(
     initial_uv: [f32; 4],
     token: &CancelToken,
     emit: &dyn Fn(Event),
-) -> Result<DevelopCompletion, Box<rawler::RawImage>> {
-    // Reserve the staging slot atomically before any expensive work: at most
-    // one canvas exists, and stealing an active one would discard a
-    // near-complete assembly whose job stays wanted as a neighbor.
-    {
-        let mut staging = shared.progressive.lock().unwrap();
-        if staging.as_ref().is_some_and(|canvas| canvas.index != index) {
-            return Err(Box::new(raw));
-        }
-        *staging = Some(ProgressiveCanvas {
-            index,
-            width: 0,
-            height: 0,
-            rgba: Vec::new(),
-            covered: Vec::new(),
-        });
-    }
+) -> DevelopCompletion {
+    debug_assert_eq!(lease.index, index);
     let plan = match plan_full_develop(raw) {
         Ok(plan) => plan,
         Err(e) => {
-            clear_progressive(shared, index);
             if !token.cancelled() {
                 emit(Event::ImageFailed {
                     index,
@@ -2892,26 +3534,49 @@ fn run_progressive_full_develop(
                     error: e.to_string(),
                 });
             }
-            return Ok(if token.cancelled() {
+            return if token.cancelled() {
                 DevelopCompletion::Cancelled
             } else {
                 DevelopCompletion::Finished
-            });
+            };
         }
     };
     let (display_w, display_h) = plan.display_size(orient);
     let (out_w, out_h) = plan.output_size();
+    if token.cancelled() {
+        return DevelopCompletion::Cancelled;
+    }
+
+    let Some(canvas_len) = (display_w as usize)
+        .checked_mul(display_h as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+    else {
+        emit(Event::ImageFailed {
+            index,
+            tier,
+            error: "progressive Full dimensions overflow addressable memory".into(),
+        });
+        return DevelopCompletion::Finished;
+    };
+    let rgba = vec![0; canvas_len];
+    if token.cancelled() {
+        return DevelopCompletion::Cancelled;
+    }
 
     // Fill in the reserved staging canvas; `in_flight` guarantees a single
     // writer per (index, Full), and the reservation above guarantees the
     // slot is ours.
     {
-        let mut staging = shared.progressive.lock().unwrap();
+        let mut staging = lock_progressive(shared);
+        if !staging.as_ref().is_some_and(|canvas| lease.owns(canvas)) {
+            return DevelopCompletion::Cancelled;
+        }
         *staging = Some(ProgressiveCanvas {
             index,
+            generation: lease.generation,
             width: display_w,
             height: display_h,
-            rgba: vec![0; display_w as usize * display_h as usize * 4],
+            rgba,
             covered: Vec::new(),
         });
     }
@@ -2921,7 +3586,6 @@ fn run_progressive_full_develop(
     let mut scratch: Vec<u8> = Vec::new();
     let develop_one = |rect: [u32; 4], scratch: &mut Vec<u8>| -> Option<DevelopCompletion> {
         if token.cancelled() {
-            clear_progressive(shared, index);
             return Some(DevelopCompletion::Cancelled);
         }
         let out_rect = Rect::new(
@@ -2929,7 +3593,6 @@ fn run_progressive_full_develop(
             Dim2::new(rect[2] as usize, rect[3] as usize),
         );
         let display = plan.display_rect(out_rect, orient);
-        scratch.clear();
         scratch.resize(display[2] as usize * display[3] as usize * 4, 0);
         plan.develop_region_into(
             out_rect,
@@ -2938,9 +3601,12 @@ fn run_progressive_full_develop(
             display[2],
             [display[0], display[1]],
         );
+        if token.cancelled() {
+            return Some(DevelopCompletion::Cancelled);
+        }
         let row_bytes = display[2] as usize * 4;
-        let mut staging = shared.progressive.lock().unwrap();
-        let Some(canvas) = staging.as_mut().filter(|canvas| canvas.index == index) else {
+        let mut staging = lock_progressive(shared);
+        let Some(canvas) = staging.as_mut().filter(|canvas| lease.owns(canvas)) else {
             // A replacing generation owns the staging slot; this generation's
             // publication would be rejected anyway.
             return Some(DevelopCompletion::Cancelled);
@@ -2964,7 +3630,7 @@ fn run_progressive_full_develop(
         && first[3] > 0
         && let Some(done) = develop_one(first, &mut scratch)
     {
-        return Ok(done);
+        return done;
     }
     while !remaining.is_empty() {
         // Ordering only: a moved viewport re-prioritizes the remaining bands
@@ -2981,7 +3647,7 @@ fn run_progressive_full_develop(
             .expect("remaining is non-empty");
         let rect = remaining.swap_remove(nearest);
         if let Some(done) = develop_one(rect, &mut scratch) {
-            return Ok(done);
+            return done;
         }
     }
     drop(scratch);
@@ -2992,26 +3658,23 @@ fn run_progressive_full_develop(
     // inside the critical section takes the staging lock again (the cache
     // ring has its own mutex and never calls back), so no cycle exists.
     let (buf, retained) = {
-        let mut staging = shared.progressive.lock().unwrap();
+        let mut staging = lock_progressive(shared);
         if token.cancelled() {
-            if staging.as_ref().is_some_and(|canvas| canvas.index == index) {
-                *staging = None;
-            }
-            return Ok(DevelopCompletion::Cancelled);
+            return DevelopCompletion::Cancelled;
         }
-        let taken = if staging.as_ref().is_some_and(|canvas| canvas.index == index) {
+        let taken = if staging.as_ref().is_some_and(|canvas| lease.owns(canvas)) {
             staging.take()
         } else {
             None
         };
         let Some(canvas) = taken else {
-            return Ok(DevelopCompletion::Cancelled);
+            return DevelopCompletion::Cancelled;
         };
-        let buf = Arc::new(PixelBuf {
-            width: canvas.width,
-            height: canvas.height,
-            rgba: canvas.rgba,
-        });
+        let buf = Arc::new(PixelBuf::new_opaque(
+            canvas.width,
+            canvas.height,
+            canvas.rgba,
+        ));
         let retained = shared
             .cache
             .insert_rgba_if_desired((index, tier), buf.clone());
@@ -3019,7 +3682,7 @@ fn run_progressive_full_develop(
     };
     // From here on: exactly the monolithic Display-mode tail.
     if !retained {
-        return Ok(DevelopCompletion::Finished);
+        return DevelopCompletion::Finished;
     }
     emit(Event::ImageReady { index, tier });
     if !shared.cache.has_jpeg((index, tier)) {
@@ -3036,12 +3699,21 @@ fn run_progressive_full_develop(
                 shared.persistence.pending_budget_bytes
             );
         }
-        return Ok(DevelopCompletion::Persistence {
+        return DevelopCompletion::Persistence {
             outcome: enqueue,
             retained_bytes,
-        });
+        };
     }
-    Ok(DevelopCompletion::Finished)
+    DevelopCompletion::Finished
+}
+
+fn invalidate_full_band(shared: &Shared, index: usize) {
+    if shared.cache.clear_full_band(index) {
+        // Cache invalidation is authoritative shared state, not a result owned
+        // by the rehydrate generation. Once pixels disappear, the matching UI
+        // event must survive cancellation so no stale GPU tiles outlive them.
+        publish(shared, Event::FullBandInvalidated { index });
+    }
 }
 
 fn run_rehydrate(
@@ -3073,7 +3745,7 @@ fn run_rehydrate(
                 if tier == Tier::Full {
                     // A band decoded from the corrupt object must not
                     // outlive it: the fallback re-develops from RAW.
-                    shared.cache.clear_full_band(index);
+                    invalidate_full_band(shared, index);
                 }
             }
         }
@@ -3102,7 +3774,7 @@ fn run_rehydrate(
                 DecodeOutcome::Corrupt => {}
             }
             if tier == Tier::Full {
-                shared.cache.clear_full_band(index);
+                invalidate_full_band(shared, index);
             }
             if let Err(error) = disk.remove(&key) {
                 eprintln!("failed to remove corrupt disk cache object: {error}");
@@ -3344,11 +4016,10 @@ fn decode_jpeg_serial(bytes: &[u8]) -> Result<PixelBuf, String> {
     let (w, h) = decoder
         .dimensions()
         .ok_or_else(|| "no dimensions".to_string())?;
-    Ok(PixelBuf {
-        width: w as u32,
-        height: h as u32,
-        rgba: pixels,
-    })
+    // zune-jpeg accepts some truncated streams and can leave their undecoded
+    // alpha bytes at zero. Classify once on this worker so valid JPEGs avoid a
+    // later UI-thread scan while malformed output keeps the exact fallback.
+    Ok(PixelBuf::new_scanned(w as u32, h as u32, pixels))
 }
 
 #[cfg(feature = "benchmarks")]
@@ -3380,8 +4051,7 @@ pub fn benchmark_encode_jpeg_plain(buf: &PixelBuf, quality: u8) -> Result<Vec<u8
 mod tests {
     use super::*;
 
-    /// Unwraps the progressive develop's slot-decline channel for tests that
-    /// start with a free staging slot.
+    /// Reserves the progressive slot for tests that bypass navigation.
     #[allow(clippy::too_many_arguments)]
     fn run_progressive_full_develop_ok(
         shared: &Shared,
@@ -3393,11 +4063,128 @@ mod tests {
         token: &CancelToken,
         emit: &dyn Fn(Event),
     ) -> DevelopCompletion {
-        run_progressive_full_develop(shared, index, tier, raw, orient, initial_uv, token, emit)
-            .unwrap_or_else(|_| panic!("staging slot unexpectedly occupied"))
+        let lease = ProgressiveLease::acquire(shared, index)
+            .unwrap_or_else(|| panic!("staging slot unexpectedly occupied"));
+        run_progressive_full_develop(
+            shared, lease, index, tier, raw, orient, initial_uv, token, emit,
+        )
     }
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn event_lanes_prioritize_display_results_and_preserve_each_lanes_order() {
+        let (events, receiver) = event_channel();
+        assert!(events.send(Event::MetadataReady {
+            index: 0,
+            meta: Box::new(FileMeta::default()),
+        }));
+        assert!(events.send(Event::ThumbReady {
+            index: 1,
+            meta: Box::new(FileMeta::default()),
+        }));
+        assert!(events.send(Event::ImageFailed {
+            index: 2,
+            tier: Tier::Thumb,
+            error: "thumb".into(),
+        }));
+        assert!(events.send(Event::ImageReady {
+            index: 3,
+            tier: Tier::Browse,
+        }));
+        assert!(events.send(Event::ImageFailed {
+            index: 4,
+            tier: Tier::Full,
+            error: "full".into(),
+        }));
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::ImageFailed {
+                index: 2,
+                tier: Tier::Thumb,
+                ..
+            })
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::ImageReady {
+                index: 3,
+                tier: Tier::Browse
+            })
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::ImageFailed {
+                index: 4,
+                tier: Tier::Full,
+                ..
+            })
+        ));
+        assert!(matches!(
+            receiver.try_recv_background(),
+            Ok(Event::MetadataReady { index: 0, .. })
+        ));
+        assert!(matches!(
+            receiver.try_recv_background(),
+            Ok(Event::ThumbReady { index: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn event_lanes_bound_a_metadata_frame_without_delaying_foreground() {
+        const BACKLOG: usize = 100_000;
+        const FRAME_BUDGET: usize = 4_096;
+
+        let (events, receiver) = event_channel();
+        for index in 0..BACKLOG {
+            assert!(events.send(Event::MetadataReady {
+                index,
+                meta: Box::new(FileMeta::default()),
+            }));
+        }
+        assert!(events.send(Event::ImageReady {
+            index: 7,
+            tier: Tier::Full,
+        }));
+
+        assert!(matches!(
+            receiver.try_recv_foreground(),
+            Ok(Event::ImageReady {
+                index: 7,
+                tier: Tier::Full
+            })
+        ));
+        for expected in 0..FRAME_BUDGET {
+            assert!(matches!(
+                receiver.try_recv_background(),
+                Ok(Event::MetadataReady { index, .. }) if index == expected
+            ));
+        }
+        assert!(matches!(
+            receiver.try_recv_background(),
+            Ok(Event::MetadataReady {
+                index: FRAME_BUDGET,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn dropping_event_receiver_disconnects_both_publication_lanes() {
+        let (events, receiver) = event_channel();
+        drop(receiver);
+
+        assert!(!events.send(Event::MetadataFailed {
+            index: 0,
+            error: "metadata".into(),
+        }));
+        assert!(!events.send(Event::ImageFailed {
+            index: 0,
+            tier: Tier::Full,
+            error: "image".into(),
+        }));
+    }
 
     #[test]
     fn raw_share_leader_publishes_to_a_waiting_follower() {
@@ -3525,6 +4312,41 @@ mod tests {
         let cancelled = CancelToken::default();
         cancelled.cancel();
         assert!(matches!(share.join(5, &cancelled), RawShareJoin::OwnDecode));
+    }
+
+    #[test]
+    fn cancelled_raw_share_fallback_skips_decode_but_leader_failure_does_not() {
+        let share: RawDecodeShare<usize> = RawDecodeShare::new();
+        let live = CancelToken::default();
+        let lead = match share.join(5, &live) {
+            RawShareJoin::Lead(lead) => lead,
+            _ => panic!("first caller leads"),
+        };
+        let cancelled = CancelToken::default();
+        cancelled.cancel();
+        let calls = AtomicUsize::new(0);
+
+        let cancelled_result =
+            decode_after_raw_share_join(share.join(5, &cancelled), &cancelled, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                41
+            });
+        assert!(matches!(cancelled_result, RawShareDecode::Cancelled));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // Dropping the leader marks the same entry Failed. A live follower
+        // then receives OwnDecode for recovery and must still invoke its
+        // loader exactly once.
+        drop(lead);
+        let recovery = decode_after_raw_share_join(share.join(5, &live), &live, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            42
+        });
+        let RawShareDecode::Decoded { lead: None, output } = recovery else {
+            panic!("failed leader falls back to an independent decode");
+        };
+        assert_eq!(output, 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -3920,7 +4742,7 @@ mod tests {
             (failed_id, failed_action),
             ((3, Tier::Thumb), Action::Metadata)
         );
-        let (events, receiver) = std::sync::mpsc::channel();
+        let (events, receiver) = event_channel();
         let notifications = AtomicUsize::new(0);
         let deferred = execute_claimed_job(
             &queue,
@@ -4000,7 +4822,7 @@ mod tests {
         queue.extend([((3, Tier::Thumb), 0, 0, Action::Metadata)]);
         let (id, action, token) = queue.pop().unwrap();
         token.cancel();
-        let (events, receiver) = std::sync::mpsc::channel();
+        let (events, receiver) = event_channel();
 
         execute_claimed_job(
             &queue,
@@ -4025,7 +4847,7 @@ mod tests {
         let id = (3, Tier::Thumb);
         queue.extend([(id, 0, 0, Action::Metadata)]);
         let (claimed_id, action, token) = queue.pop().unwrap();
-        let (events, receiver) = std::sync::mpsc::channel();
+        let (events, receiver) = event_channel();
         let mut notified = false;
 
         execute_claimed_job(
@@ -4065,7 +4887,7 @@ mod tests {
         let id = (3, Tier::Browse);
         queue.extend([(id, 0, 0, Action::Metadata)]);
         let (claimed_id, _, token) = queue.pop().unwrap();
-        let (events, receiver) = std::sync::mpsc::channel();
+        let (events, receiver) = event_channel();
         let notified = Arc::new(AtomicBool::new(false));
         let notify_unlocked = Arc::new(AtomicBool::new(false));
         let notify_queue = queue.clone();
@@ -4093,6 +4915,7 @@ mod tests {
             view_hint: Mutex::new(None),
             full_viewport: Mutex::new(None),
             progressive: Mutex::new(None),
+            progressive_generation: AtomicU64::new(1),
         };
 
         publish_claimed(
@@ -4133,7 +4956,7 @@ mod tests {
         queue.extend([(id, 0, 0, Action::Metadata)]);
         let (claimed_id, _, stale_token) = queue.pop().unwrap();
         queue.set_plan(vec![(id, 0, 0, Action::Develop(Quality::Browse))], false);
-        let (events, receiver) = std::sync::mpsc::channel();
+        let (events, receiver) = event_channel();
 
         assert!(stale_token.cancelled());
         assert!(!queue.enqueue_current_event(
@@ -4201,11 +5024,7 @@ mod tests {
                 ]);
             }
         }
-        PixelBuf {
-            width,
-            height,
-            rgba,
-        }
+        PixelBuf::new_opaque(width, height, rgba)
     }
 
     fn textured_buf(width: u32, height: u32) -> PixelBuf {
@@ -4224,11 +5043,7 @@ mod tests {
                 ]);
             }
         }
-        PixelBuf {
-            width,
-            height,
-            rgba,
-        }
+        PixelBuf::new_opaque(width, height, rgba)
     }
 
     fn jpeg_has_444_sampling(bytes: &[u8]) -> bool {
@@ -4350,7 +5165,7 @@ mod tests {
         jpeg_quality: u8,
         fixed_processing_limit: bool,
     ) -> Arc<Shared> {
-        let (events, _receiver) = std::sync::mpsc::channel();
+        let (events, _receiver) = event_channel();
         Arc::new(Shared {
             entries: Arc::new(entries),
             cache,
@@ -4368,6 +5183,7 @@ mod tests {
             view_hint: Mutex::new(None),
             full_viewport: Mutex::new(None),
             progressive: Mutex::new(None),
+            progressive_generation: AtomicU64::new(1),
         })
     }
 
@@ -4455,8 +5271,16 @@ mod tests {
         disk: Option<DiskCache>,
         notify: Arc<dyn Fn() + Send + Sync>,
         hint: Option<ViewHint>,
-    ) -> (Shared, Receiver<Event>) {
-        let (events, receiver) = std::sync::mpsc::channel();
+    ) -> (Shared, EventReceiver) {
+        let (events, receiver) = event_channel();
+        let mut navigation = NavigationOrder::default();
+        if let Some(hint) = hint {
+            navigation.update_navigation(NavState {
+                current: hint.index,
+                direction: 1,
+                zoomed: true,
+            });
+        }
         (
             Shared {
                 entries: Arc::new(entries),
@@ -4470,11 +5294,12 @@ mod tests {
                 persistence: PersistenceQueue::new(),
                 persistence_known_present: Mutex::new(HashSet::new()),
                 jpeg_quality: CACHE_JPEG_QUALITY,
-                navigation: Mutex::new(NavigationOrder::default()),
+                navigation: Mutex::new(navigation),
                 raw_share: RawDecodeShare::new(),
                 view_hint: Mutex::new(hint),
                 full_viewport: Mutex::new(None),
                 progressive: Mutex::new(None),
+                progressive_generation: AtomicU64::new(1),
             },
             receiver,
         )
@@ -4619,6 +5444,240 @@ mod tests {
     }
 
     #[test]
+    fn navigation_during_prioritized_callback_cannot_publish_a_neighbor_band() {
+        let encoded = band_capable_jpeg();
+        let cache = Arc::new(RamCache::new(RamCacheBudgets::new(
+            0,
+            0,
+            64 * 1024 * 1024,
+            16 * 1024 * 1024,
+        )));
+        // Keep both images in the Full working set. Cache admission alone
+        // must not let the displaced current publish a provisional band.
+        cache.set_navigation_policy([], [(0, Tier::Full), (1, Tier::Full)]);
+        let (shared, _receiver) = band_shared(
+            vec![entry("old-current.arw", 1), entry("new-current.arw", 1)],
+            cache.clone(),
+            None,
+            Arc::new(|| {}),
+            Some(mid_band_hint(0)),
+        );
+        let engine = Engine {
+            shared: Arc::new(shared),
+            workers: Vec::new(),
+            persistence_worker: None,
+        };
+        let shared = engine.shared.clone();
+        let token = CancelToken::default();
+        let callback_entered = Arc::new(std::sync::Barrier::new(2));
+        let resume_callback = Arc::new(std::sync::Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            let worker_shared = shared.clone();
+            let entered = callback_entered.clone();
+            let resume = resume_callback.clone();
+            let worker_token = &token;
+            let worker_bytes = &encoded;
+            let decode = scope.spawn(move || {
+                decode_jpeg_for_rehydrate_with_hook(
+                    &worker_shared,
+                    0,
+                    Tier::Full,
+                    worker_token,
+                    DevelopMode::Display,
+                    worker_bytes,
+                    || {
+                        entered.wait();
+                        resume.wait();
+                    },
+                )
+            });
+
+            callback_entered.wait();
+            engine.navigate_with_view_demand(
+                NavState {
+                    current: 1,
+                    direction: 1,
+                    zoomed: true,
+                },
+                Some(mid_band_hint(1)),
+                Some([0.2, 0.2, 0.8, 0.8]),
+            );
+            assert!(
+                cache.insert_rgba_if_desired((0, Tier::Full), Arc::new(patterned_buf(2, 2))),
+                "the displaced image remains an admitted Full neighbor"
+            );
+            let new_current = current_view_hint(&shared, 1).expect("new current admission");
+            assert!(publish_current_full_band(
+                &shared,
+                1,
+                new_current,
+                &token,
+                FullBand {
+                    full_width: 2,
+                    full_height: 2,
+                    y0: 0,
+                    buf: patterned_buf(2, 1),
+                },
+            ));
+            resume_callback.wait();
+
+            assert!(matches!(decode.join().unwrap(), DecodeOutcome::Pixels(_)));
+        });
+
+        assert!(cache.get_full_band(0).is_none());
+        assert_eq!(
+            cache
+                .get_full_band(1)
+                .expect("new current keeps ownership")
+                .full_width,
+            2
+        );
+    }
+
+    #[test]
+    fn old_navigation_generation_cannot_overwrite_a_revisited_current_band() {
+        let cache = Arc::new(RamCache::new(RamCacheBudgets::new(0, 0, 64, 0)));
+        cache.set_navigation_policy([], [(0, Tier::Full), (1, Tier::Full)]);
+        let (shared, _receiver) = band_shared(
+            Vec::new(),
+            cache.clone(),
+            None,
+            Arc::new(|| {}),
+            Some(mid_band_hint(0)),
+        );
+        let token = CancelToken::default();
+        let old = current_view_hint(&shared, 0).expect("initial admission");
+        {
+            let mut navigation = shared.navigation.lock().unwrap();
+            navigation.update_navigation(NavState {
+                current: 1,
+                direction: 1,
+                zoomed: true,
+            });
+            navigation.update_navigation(NavState {
+                current: 0,
+                direction: -1,
+                zoomed: true,
+            });
+            *shared.view_hint.lock().unwrap() = Some(mid_band_hint(0));
+            shared.cache.retain_full_band_for_current(Some(0));
+        }
+        let current = current_view_hint(&shared, 0).expect("revisited admission");
+        assert!(publish_current_full_band(
+            &shared,
+            0,
+            current,
+            &token,
+            FullBand {
+                full_width: 2,
+                full_height: 2,
+                y0: 0,
+                buf: patterned_buf(2, 1),
+            },
+        ));
+        assert!(!publish_current_full_band(
+            &shared,
+            0,
+            old,
+            &token,
+            FullBand {
+                full_width: 3,
+                full_height: 3,
+                y0: 0,
+                buf: patterned_buf(3, 1),
+            },
+        ));
+        assert_eq!(cache.get_full_band(0).unwrap().full_width, 2);
+    }
+
+    #[test]
+    fn same_navigation_stale_hint_cannot_overwrite_the_newer_band() {
+        let cache = Arc::new(RamCache::new(RamCacheBudgets::new(0, 0, 64, 0)));
+        cache.set_navigation_policy([], [(0, Tier::Full)]);
+        let old_hint = mid_band_hint(0);
+        let (shared, _receiver) = band_shared(
+            Vec::new(),
+            cache.clone(),
+            None,
+            Arc::new(|| {}),
+            Some(old_hint),
+        );
+        let token = CancelToken::default();
+        let old = current_view_hint(&shared, 0).expect("initial demand");
+        let new_hint = ViewHint {
+            uv_y0: 0.1,
+            uv_y1: 0.3,
+            ..old_hint
+        };
+        *shared.view_hint.lock().unwrap() = Some(new_hint);
+        let current = current_view_hint(&shared, 0).expect("moved demand");
+        assert_eq!(
+            old.navigation_generation, current.navigation_generation,
+            "mailbox-only pans deliberately avoid navigation-generation churn"
+        );
+
+        assert!(publish_current_full_band(
+            &shared,
+            0,
+            current,
+            &token,
+            FullBand {
+                full_width: 2,
+                full_height: 2,
+                y0: 0,
+                buf: patterned_buf(2, 1),
+            },
+        ));
+        assert!(!publish_current_full_band(
+            &shared,
+            0,
+            old,
+            &token,
+            FullBand {
+                full_width: 3,
+                full_height: 3,
+                y0: 0,
+                buf: patterned_buf(3, 1),
+            },
+        ));
+        assert_eq!(cache.get_full_band(0).unwrap().full_width, 2);
+    }
+
+    #[test]
+    fn cancellation_during_prioritized_callback_suppresses_the_band() {
+        let encoded = band_capable_jpeg();
+        let cache = Arc::new(RamCache::new(RamCacheBudgets::new(
+            0,
+            0,
+            64 * 1024 * 1024,
+            16 * 1024 * 1024,
+        )));
+        cache.set_navigation_policy([], [(0, Tier::Full)]);
+        let (shared, _receiver) = band_shared(
+            Vec::new(),
+            cache.clone(),
+            None,
+            Arc::new(|| {}),
+            Some(mid_band_hint(0)),
+        );
+        let token = CancelToken::default();
+
+        let outcome = decode_jpeg_for_rehydrate_with_hook(
+            &shared,
+            0,
+            Tier::Full,
+            &token,
+            DevelopMode::Display,
+            &encoded,
+            || token.cancel(),
+        );
+
+        assert!(matches!(outcome, DecodeOutcome::Cancelled));
+        assert!(cache.get_full_band(0).is_none());
+    }
+
+    #[test]
     fn published_band_is_cleared_by_the_full_install() {
         let encoded = band_capable_jpeg();
         let cache = Arc::new(RamCache::new(RamCacheBudgets::new(
@@ -4669,6 +5728,32 @@ mod tests {
                 index: 0,
                 tier: Tier::Full
             }]
+        ));
+    }
+
+    #[test]
+    fn corrupt_band_invalidation_emits_once_and_clears_the_pixels() {
+        let cache = Arc::new(RamCache::new(RamCacheBudgets::new(0, 0, 64, 0)));
+        cache.publish_full_band(
+            4,
+            FullBand {
+                full_width: 2,
+                full_height: 2,
+                y0: 0,
+                buf: patterned_buf(2, 1),
+            },
+        );
+        let (shared, receiver) =
+            band_shared(Vec::new(), cache.clone(), None, Arc::new(|| {}), None);
+
+        invalidate_full_band(&shared, 4);
+        invalidate_full_band(&shared, 4);
+
+        assert!(cache.get_full_band(4).is_none());
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert!(matches!(
+            events.as_slice(),
+            [Event::FullBandInvalidated { index: 4 }]
         ));
     }
 
@@ -4963,6 +6048,42 @@ mod tests {
     }
 
     #[test]
+    fn entering_zoom_or_moving_while_zoomed_restarts_the_current_full_worker() {
+        let fit = NavState {
+            current: 4,
+            direction: 1,
+            zoomed: false,
+        };
+        let zoomed = NavState {
+            zoomed: true,
+            ..fit
+        };
+        assert!(restart_current_full_for_view_transition(
+            Some(fit),
+            zoomed,
+            false
+        ));
+        assert!(!restart_current_full_for_view_transition(
+            Some(zoomed),
+            zoomed,
+            false
+        ));
+        assert!(restart_current_full_for_view_transition(
+            Some(zoomed),
+            NavState {
+                current: 5,
+                ..zoomed
+            },
+            true
+        ));
+        assert!(!restart_current_full_for_view_transition(
+            Some(zoomed),
+            NavState { current: 5, ..fit },
+            true
+        ));
+    }
+
+    #[test]
     fn navigation_order_normalizes_filtered_indices_once() {
         let mut order = NavigationOrder::default();
         order.replace_indices(10, vec![usize::MAX, 4, 5, 5, 6, usize::MAX - 1]);
@@ -5019,11 +6140,7 @@ mod tests {
                 if !cache.has_rgba((target.index, Tier::Browse)) {
                     cache.insert_rgba(
                         (target.index, Tier::Browse),
-                        Arc::new(PixelBuf {
-                            width: 1,
-                            height: 1,
-                            rgba: vec![0; 100],
-                        }),
+                        Arc::new(PixelBuf::new(1, 1, vec![0; 100])),
                     );
                 }
             }
@@ -5524,6 +6641,29 @@ mod tests {
     }
 
     #[test]
+    fn forced_restart_requeues_a_still_wanted_live_generation() {
+        let q = JobQueue::new();
+        let id = (7, Tier::Full);
+        let plan = vec![(id, 0, 0, Action::Develop(Quality::Full))];
+        q.set_plan(plan.clone(), true);
+        let (_, _, stale) = q.pop().unwrap();
+
+        q.set_plan_with_restarts(plan, true, [Some(id), None]);
+        assert!(stale.cancelled());
+        assert!(
+            q.try_pop().is_none(),
+            "one id cannot run twice concurrently"
+        );
+
+        q.finish(id, &stale);
+        let (replacement_id, replacement_action, replacement) = q.try_pop().unwrap();
+        assert_eq!(replacement_id, id);
+        assert_eq!(replacement_action, Action::Develop(Quality::Full));
+        assert!(!Arc::ptr_eq(&stale, &replacement));
+        q.finish(id, &replacement);
+    }
+
+    #[test]
     fn speculative_full_uses_one_worker_and_yields_to_lower_priority_foreground() {
         let q = JobQueue::new();
         q.set_plan(
@@ -5643,16 +6783,20 @@ mod tests {
     }
 
     #[test]
-    fn live_speculative_full_can_be_promoted_without_restart() {
+    fn live_speculative_full_restarts_with_display_semantics_on_promotion() {
         let q = JobQueue::new();
         let id = (7, Tier::Full);
         q.set_plan(vec![(id, 5, 1, Action::PrefetchFull)], true);
         let (_, _, token) = q.pop().unwrap();
 
         q.set_plan(vec![(id, 0, 0, Action::Develop(Quality::Full))], true);
-        assert!(!token.cancelled());
+        assert!(token.cancelled());
         assert!(q.try_pop().is_none());
         q.finish(id, &token);
+        let (_, action, display_token) = q.try_pop().unwrap();
+        assert_eq!(action, Action::Develop(Quality::Full));
+        assert!(!display_token.cancelled());
+        q.finish(id, &display_token);
     }
 
     #[test]
@@ -5777,7 +6921,7 @@ mod tests {
         let disk = DiskCache::open_at(dir.path().join("cache"));
         let key = DiskCache::key(&entry, Tier::Browse);
         disk.put(&key, b"already warm").unwrap();
-        let (events, receiver) = std::sync::mpsc::channel();
+        let (events, receiver) = event_channel();
         let shared = Shared {
             entries: Arc::new(vec![entry]),
             cache: Arc::new(test_cache(0, 0, 0)),
@@ -5795,6 +6939,7 @@ mod tests {
             view_hint: Mutex::new(None),
             full_viewport: Mutex::new(None),
             progressive: Mutex::new(None),
+            progressive_generation: AtomicU64::new(1),
         };
 
         run_warm_develop(
@@ -6196,7 +7341,7 @@ mod tests {
 
         let cache = Arc::new(test_cache(0, 0, 1024));
         cache.insert_jpeg((0, Tier::Browse), Arc::new(b"not a jpeg".to_vec()));
-        let (events, receiver) = std::sync::mpsc::channel();
+        let (events, receiver) = event_channel();
         let shared = Shared {
             entries: Arc::new(vec![raw_entry]),
             cache: cache.clone(),
@@ -6214,6 +7359,7 @@ mod tests {
             view_hint: Mutex::new(None),
             full_viewport: Mutex::new(None),
             progressive: Mutex::new(None),
+            progressive_generation: AtomicU64::new(1),
         };
 
         run_rehydrate(
@@ -6250,6 +7396,7 @@ mod tests {
         );
         assert_eq!(decoded.rgba.len(), source.rgba.len());
         assert!(decoded.rgba.chunks_exact(4).all(|pixel| pixel[3] == 255));
+        assert!(decoded.is_opaque());
 
         let total_error: u64 = source
             .rgba
@@ -6283,11 +7430,7 @@ mod tests {
                 rgba.extend_from_slice(&[value, value, value, 255]);
             }
         }
-        let source = PixelBuf {
-            width,
-            height,
-            rgba,
-        };
+        let source = PixelBuf::new_opaque(width, height, rgba);
         let squared_error = |quality| {
             let encoded = encode_jpeg(&source, quality).expect("gradient must encode");
             let decoded = decode_jpeg(&encoded).expect("gradient must decode");
@@ -6320,23 +7463,11 @@ mod tests {
         let valid = patterned_buf(8, 8);
         assert!(encode_jpeg(&valid, 0).is_err());
         assert!(encode_jpeg(&valid, 101).is_err());
-        let zero_width = PixelBuf {
-            width: 0,
-            height: 1,
-            rgba: Vec::new(),
-        };
+        let zero_width = PixelBuf::new(0, 1, Vec::new());
         assert!(encode_jpeg(&zero_width, 90).is_err());
-        let malformed = PixelBuf {
-            width: 2,
-            height: 2,
-            rgba: vec![0; 15],
-        };
+        let malformed = PixelBuf::new(2, 2, vec![0; 15]);
         assert!(encode_jpeg(&malformed, 90).is_err());
-        let too_wide = PixelBuf {
-            width: u16::MAX as u32 + 1,
-            height: 1,
-            rgba: Vec::new(),
-        };
+        let too_wide = PixelBuf::new(u16::MAX as u32 + 1, 1, Vec::new());
         assert!(encode_jpeg(&too_wide, 90).is_err());
     }
 
@@ -6345,11 +7476,7 @@ mod tests {
         let valid = patterned_buf(8, 6);
         assert_eq!(validate_jpeg_input(&valid, 97), Ok((8, 6, 32)));
 
-        let malformed = PixelBuf {
-            width: 8,
-            height: 6,
-            rgba: vec![0; 8 * 6 * 4 - 1],
-        };
+        let malformed = PixelBuf::new(8, 6, vec![0; 8 * 6 * 4 - 1]);
         assert!(validate_jpeg_input(&malformed, 97).is_err());
         assert!(validate_jpeg_input(&valid, 0).is_err());
         assert!(validate_jpeg_input(&valid, 101).is_err());
@@ -6467,18 +7594,15 @@ mod tests {
     }
 
     #[test]
-    fn progressive_first_rect_expands_the_viewport_and_survives_degenerate_input() {
-        // A centered viewport expands by the margin and clamps to the frame.
-        // Expected values follow the deterministic f32 floor/ceil math of
-        // visible_display_pixels (0.6 * 3000 rounds up to 1801, for example).
+    fn progressive_first_rect_covers_complete_guttered_texture_tiles() {
         let uv = [0.4, 0.4, 0.6, 0.6];
         assert_eq!(
             progressive_first_rect(uv, Orient::R0, 4000, 3000),
-            [1568, 1168, 864, 665]
+            [1023, 1023, 2050, 1026]
         );
         assert_eq!(
             progressive_first_rect(uv, Orient::R90, 4000, 3000),
-            [1568, 1167, 864, 665]
+            [1023, 951, 2050, 1026]
         );
 
         // Off-frame viewport clamps to an edge but stays developable.
@@ -6497,8 +7621,124 @@ mod tests {
         }
     }
 
-    fn staging_test_shared() -> (Shared, Receiver<Event>) {
-        let (events, receiver) = std::sync::mpsc::channel();
+    #[test]
+    fn uploadable_visible_samples_snap_across_seams_and_clamp_at_edges() {
+        let cases = [
+            // The top-left tile has no gutter outside the image.
+            ([0, 0, 1, 1], [0, 0, 1025, 1025]),
+            // One visible pixel on each side of both tile seams needs all
+            // four adjacent tile samples.
+            ([1023, 1023, 2, 2], [0, 0, 2049, 2049]),
+            // Starting exactly on a seam selects only the following tile.
+            ([1024, 1024, 1, 1], [1023, 1023, 1026, 1026]),
+            // The final partial tile clamps its outside gutter to the image.
+            ([2499, 2099, 1, 1], [2047, 2047, 453, 53]),
+        ];
+        for (visible, expected) in cases {
+            assert_eq!(
+                uploadable_visible_sample_rect(visible, 2_500, 2_100),
+                expected,
+                "visible {visible:?}"
+            );
+        }
+    }
+
+    fn display_rect_from_out(rect: [u32; 4], orient: Orient, out_w: u32, out_h: u32) -> [u32; 4] {
+        let [x, y, width, height] = rect;
+        match orient {
+            Orient::R0 => rect,
+            Orient::R90 => [out_h - y - height, x, height, width],
+            Orient::R180 => [out_w - x - width, out_h - y - height, width, height],
+            Orient::R270 => [y, out_w - x - width, height, width],
+        }
+    }
+
+    fn visible_texture_samples(
+        uv: [f32; 4],
+        display_w: u32,
+        display_h: u32,
+    ) -> Vec<ProgressiveRect> {
+        let [x, y, width, height] = visible_display_pixels(uv, display_w, display_h);
+        let visible = ProgressiveRect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let cols = display_w.div_ceil(FULL_TEXTURE_TILE_EDGE);
+        let rows = display_h.div_ceil(FULL_TEXTURE_TILE_EDGE);
+        let mut samples = Vec::new();
+        for row in 0..rows {
+            for col in 0..cols {
+                let core_x = col * FULL_TEXTURE_TILE_EDGE;
+                let core_y = row * FULL_TEXTURE_TILE_EDGE;
+                let core = ProgressiveRect {
+                    x: core_x,
+                    y: core_y,
+                    width: FULL_TEXTURE_TILE_EDGE.min(display_w - core_x),
+                    height: FULL_TEXTURE_TILE_EDGE.min(display_h - core_y),
+                };
+                if !core.intersects(visible) {
+                    continue;
+                }
+                let sample_x = core.x.saturating_sub(FULL_TEXTURE_SAMPLE_GUTTER);
+                let sample_y = core.y.saturating_sub(FULL_TEXTURE_SAMPLE_GUTTER);
+                let right = core
+                    .right()
+                    .saturating_add(FULL_TEXTURE_SAMPLE_GUTTER)
+                    .min(display_w);
+                let bottom = core
+                    .bottom()
+                    .saturating_add(FULL_TEXTURE_SAMPLE_GUTTER)
+                    .min(display_h);
+                samples.push(ProgressiveRect {
+                    x: sample_x,
+                    y: sample_y,
+                    width: right - sample_x,
+                    height: bottom - sample_y,
+                });
+            }
+        }
+        samples
+    }
+
+    #[test]
+    fn first_progressive_event_can_serve_every_visible_texture_tile() {
+        let (out_w, out_h) = (2_500, 2_100);
+        let viewports = [
+            [0.0, 0.0, 0.05, 0.06],
+            [0.39, 0.40, 0.43, 0.55],
+            [0.40, 0.45, 0.60, 0.55],
+            [0.91, 0.92, 1.0, 1.0],
+        ];
+        for orient in [Orient::R0, Orient::R90, Orient::R180, Orient::R270] {
+            let (display_w, display_h) = if orient.swaps_axes() {
+                (out_h, out_w)
+            } else {
+                (out_w, out_h)
+            };
+            for uv in viewports {
+                let first = progressive_first_rect(uv, orient, out_w, out_h);
+                let covered = [display_rect_from_out(first, orient, out_w, out_h)];
+                let samples = visible_texture_samples(uv, display_w, display_h);
+                assert!(!samples.is_empty(), "{orient:?} {uv:?}");
+                let ready_after_first_event = samples
+                    .iter()
+                    .filter(|&&sample| progressive_rect_fully_covered(sample, &covered))
+                    .count();
+                assert_eq!(
+                    ready_after_first_event,
+                    samples.len(),
+                    "first event served {ready_after_first_event}/{} visible tiles for {orient:?} {uv:?}; first display rect {:?}",
+                    samples.len(),
+                    covered[0]
+                );
+            }
+        }
+    }
+
+    fn staging_test_shared() -> (Shared, EventReceiver) {
+        let (events, receiver) = event_channel();
         let shared = Shared {
             entries: Arc::new(Vec::new()),
             cache: Arc::new(test_cache(0, 0, 0)),
@@ -6516,24 +7756,286 @@ mod tests {
             view_hint: Mutex::new(None),
             full_viewport: Mutex::new(None),
             progressive: Mutex::new(None),
+            progressive_generation: AtomicU64::new(1),
         };
         (shared, receiver)
     }
 
     #[test]
-    fn progressive_staging_is_cleared_only_by_its_owning_index() {
+    fn progressive_staging_is_cleared_only_by_its_owning_generation() {
         let (shared, _receiver) = staging_test_shared();
         *shared.progressive.lock().unwrap() = Some(ProgressiveCanvas {
             index: 3,
+            generation: 7,
             width: 2,
             height: 1,
             rgba: vec![0; 8],
             covered: vec![[0, 0, 1, 1]],
         });
-        clear_progressive(&shared, 5);
+        assert!(take_progressive(&shared, 5, 7).is_none());
         assert!(shared.progressive.lock().unwrap().is_some());
-        clear_progressive(&shared, 3);
+        assert!(take_progressive(&shared, 3, 8).is_none());
+        assert!(shared.progressive.lock().unwrap().is_some());
+        assert!(take_progressive(&shared, 3, 7).is_some());
         assert!(shared.progressive.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn progressive_lease_cleans_up_on_unwind_without_clearing_a_replacement() {
+        let (shared, _receiver) = staging_test_shared();
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _lease = ProgressiveLease::acquire(&shared, 3).unwrap();
+            let _staging = lock_progressive(&shared);
+            panic!("injected progressive worker panic");
+        }));
+        assert!(unwind.is_err());
+        assert!(lock_progressive(&shared).is_none());
+
+        let old = ProgressiveLease::acquire(&shared, 3).unwrap();
+        let replacement = ProgressiveLease::acquire(&shared, 3).unwrap();
+        let replacement_generation = replacement.generation;
+        drop(old);
+        assert_eq!(
+            lock_progressive(&shared)
+                .as_ref()
+                .map(|canvas| canvas.generation),
+            Some(replacement_generation)
+        );
+        assert!(ProgressiveLease::acquire(&shared, 4).is_none());
+        drop(replacement);
+        assert!(lock_progressive(&shared).is_none());
+    }
+
+    #[test]
+    fn cancelled_worker_waiting_on_navigation_cannot_reserve_progressive_staging() {
+        let cache = Arc::new(RamCache::new(RamCacheBudgets::new(0, 0, 1024, 0)));
+        let (shared, _receiver) = band_shared(
+            vec![entry("current.arw", 1)],
+            cache,
+            None,
+            Arc::new(|| {}),
+            Some(mid_band_hint(0)),
+        );
+        let shared = Arc::new(shared);
+        *shared.full_viewport.lock().unwrap() = Some((0, [0.1, 0.2, 0.7, 0.8]));
+        let token = CancelToken::default();
+        let worker_started = Arc::new(std::sync::Barrier::new(2));
+        let navigation = shared.navigation.lock().unwrap();
+
+        std::thread::scope(|scope| {
+            let worker_shared = shared.clone();
+            let started = worker_started.clone();
+            let worker_token = &token;
+            let worker = scope.spawn(move || {
+                started.wait();
+                reserve_current_progressive(&worker_shared, 0, worker_token).is_none()
+            });
+
+            worker_started.wait();
+            // This models queue cancellation performed by a navigation that
+            // owns the transaction mutex before the stale worker reaches it.
+            token.cancel();
+            drop(navigation);
+            assert!(worker.join().unwrap());
+        });
+        assert!(lock_progressive(&shared).is_none());
+    }
+
+    #[test]
+    fn current_validation_and_progressive_reservation_are_one_navigation_transaction() {
+        let cache = Arc::new(RamCache::new(RamCacheBudgets::new(0, 0, 1024, 0)));
+        let (shared, _receiver) = band_shared(
+            vec![entry("old-current.arw", 1), entry("new-current.arw", 1)],
+            cache,
+            None,
+            Arc::new(|| {}),
+            None,
+        );
+        let engine = Engine {
+            shared: Arc::new(shared),
+            workers: Vec::new(),
+            persistence_worker: None,
+        };
+        let old_uv = [0.1, 0.2, 0.7, 0.8];
+        let new_uv = [0.2, 0.3, 0.8, 0.9];
+        engine.navigate_with_view_demand(
+            NavState {
+                current: 0,
+                direction: 1,
+                zoomed: true,
+            },
+            Some(mid_band_hint(0)),
+            Some(old_uv),
+        );
+
+        let validated = Arc::new(std::sync::Barrier::new(2));
+        let allow_reservation = Arc::new(std::sync::Barrier::new(2));
+        let old_lease_live = Arc::new(std::sync::Barrier::new(2));
+        let allow_old_drop = Arc::new(std::sync::Barrier::new(2));
+        let token = CancelToken::default();
+
+        std::thread::scope(|scope| {
+            let shared = engine.shared.clone();
+            let worker_validated = validated.clone();
+            let worker_allow_reservation = allow_reservation.clone();
+            let worker_lease_live = old_lease_live.clone();
+            let worker_allow_old_drop = allow_old_drop.clone();
+            let worker_token = &token;
+            let old_worker = scope.spawn(move || {
+                let (lease, uv) =
+                    reserve_current_progressive_with_hook(&shared, 0, worker_token, || {
+                        // Both the navigation and viewport locks are still
+                        // held here. Navigation cannot retire a canvas that
+                        // has not yet become visible in the progressive slot.
+                        worker_validated.wait();
+                        worker_allow_reservation.wait();
+                    })
+                    .expect("old current reserves staging");
+                assert_eq!(uv, old_uv);
+                worker_lease_live.wait();
+                worker_allow_old_drop.wait();
+                drop(lease);
+            });
+
+            validated.wait();
+            let navigator = scope.spawn(|| {
+                engine.navigate_with_view_demand(
+                    NavState {
+                        current: 1,
+                        direction: 1,
+                        zoomed: true,
+                    },
+                    Some(mid_band_hint(1)),
+                    Some(new_uv),
+                );
+            });
+            allow_reservation.wait();
+            old_lease_live.wait();
+            navigator.join().unwrap();
+
+            assert!(
+                lock_progressive(&engine.shared).is_none(),
+                "navigation retires the old current's reserved generation"
+            );
+            let (new_lease, captured) = reserve_current_progressive(&engine.shared, 1, &token)
+                .expect("new current must not be forced into monolithic develop");
+            assert_eq!(captured, new_uv);
+
+            allow_old_drop.wait();
+            old_worker.join().unwrap();
+            assert_eq!(
+                lock_progressive(&engine.shared)
+                    .as_ref()
+                    .map(|canvas| (canvas.index, canvas.generation)),
+                Some((1, new_lease.generation)),
+                "dropping the retired lease cannot clear the new current"
+            );
+            drop(new_lease);
+        });
+    }
+
+    #[test]
+    fn progressive_coverage_matches_a_per_pixel_reference() {
+        let mut state = 0xC0FF_EE00_D15E_A5E5_u64;
+        let mut next = move |bound: u32| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as u32) % bound
+        };
+        let (grid_w, grid_h) = (24_u32, 18_u32);
+        for case in 0..500 {
+            let mut target = ProgressiveRect {
+                x: next(grid_w - 1),
+                y: next(grid_h - 1),
+                width: 1 + next(8),
+                height: 1 + next(8),
+            };
+            target.width = target.width.min(grid_w - target.x);
+            target.height = target.height.min(grid_h - target.y);
+            let covered: Vec<[u32; 4]> = (0..next(7))
+                .map(|_| {
+                    let x = next(grid_w);
+                    let y = next(grid_h);
+                    [x, y, next(10), next(10)]
+                })
+                .collect();
+
+            let mut expected = true;
+            'outer: for y in target.y..target.bottom() {
+                for x in target.x..target.right() {
+                    let inside_any = covered
+                        .iter()
+                        .any(|&[cx, cy, cw, ch]| x >= cx && x < cx + cw && y >= cy && y < cy + ch);
+                    if !inside_any {
+                        expected = false;
+                        break 'outer;
+                    }
+                }
+            }
+            assert_eq!(
+                progressive_rect_fully_covered(target, &covered),
+                expected,
+                "case {case}: target {target:?} covered {covered:?}"
+            );
+        }
+
+        let sample = ProgressiveRect {
+            x: 3,
+            y: 2,
+            width: 6,
+            height: 5,
+        };
+        assert!(progressive_rect_fully_covered(sample, &[[3, 2, 6, 5]]));
+        assert!(progressive_rect_fully_covered(
+            sample,
+            &[[0, 0, 24, 4], [0, 4, 24, 14]]
+        ));
+        assert!(!progressive_rect_fully_covered(
+            sample,
+            &[[3, 2, 6, 4], [3, 6, 5, 1]]
+        ));
+    }
+
+    #[test]
+    fn progressive_region_copy_releases_callers_from_canvas_storage() {
+        let (shared, _receiver) = staging_test_shared();
+        let source = (0_u8..48).collect::<Vec<_>>();
+        *shared.progressive.lock().unwrap() = Some(ProgressiveCanvas {
+            index: 3,
+            generation: 9,
+            width: 4,
+            height: 3,
+            rgba: source.clone(),
+            covered: vec![[0, 0, 2, 3], [2, 0, 2, 2]],
+        });
+        let engine = Engine {
+            shared: Arc::new(shared),
+            workers: Vec::new(),
+            persistence_worker: None,
+        };
+
+        assert_eq!(engine.progressive_full_size(3), Some((4, 3)));
+        let mut copied = vec![0; 12];
+        assert!(engine.copy_progressive_full_region_into(3, [1, 1, 3, 1], &mut copied));
+        assert_eq!(copied, source[20..32]);
+
+        assert!(
+            !engine.copy_progressive_full_region_into(3, [1, 2, 3, 1], &mut copied),
+            "the bottom-right pixels are not covered"
+        );
+        assert!(
+            !engine.copy_progressive_full_region_into(4, [1, 1, 3, 1], &mut copied),
+            "a different generation cannot read this canvas"
+        );
+        assert!(
+            !engine.copy_progressive_full_region_into(3, [u32::MAX, 0, 3, 1], &mut copied),
+            "coordinate overflow is rejected"
+        );
+        assert!(
+            !engine.copy_progressive_full_region_into(3, [1, 1, 3, 1], &mut copied[..8]),
+            "the destination length must be exact"
+        );
     }
 
     #[test]
@@ -6552,21 +8054,44 @@ mod tests {
             *engine.shared.full_viewport.lock().unwrap(),
             Some((0, [0.25, 0.25, 0.75, 0.75]))
         );
-        assert!(engine.with_progressive_full(0, |_, _, _, _| ()).is_none());
+        assert!(engine.progressive_full_size(0).is_none());
 
-        engine.navigate(NavState {
-            current: 0,
-            direction: 1,
-            zoomed: true,
-        });
-        assert!(engine.shared.full_viewport.lock().unwrap().is_some());
+        let hint = ViewHint {
+            index: 0,
+            uv_y0: 0.25,
+            uv_y1: 0.75,
+            align_px: 512,
+            gutter_px: 1,
+        };
+        engine.navigate_with_view_demand(
+            NavState {
+                current: 0,
+                direction: 1,
+                zoomed: true,
+            },
+            Some(hint),
+            Some([0.25, 0.25, 0.75, 0.75]),
+        );
+        assert_eq!(
+            current_full_viewport(&engine.shared, 0),
+            Some([0.25, 0.25, 0.75, 0.75])
+        );
+        assert_eq!(
+            current_view_hint(&engine.shared, 0).map(|admission| admission.hint),
+            Some(hint)
+        );
 
-        engine.navigate(NavState {
-            current: 0,
-            direction: 1,
-            zoomed: false,
-        });
+        engine.navigate_with_view_demand(
+            NavState {
+                current: 0,
+                direction: 1,
+                zoomed: false,
+            },
+            None,
+            None,
+        );
         assert!(engine.shared.full_viewport.lock().unwrap().is_none());
+        assert!(engine.shared.view_hint.lock().unwrap().is_none());
     }
 
     fn real_sony_raw_fixture() -> std::path::PathBuf {
@@ -6578,8 +8103,8 @@ mod tests {
             })
     }
 
-    fn progressive_fixture_shared(path: &std::path::Path) -> (Shared, Receiver<Event>) {
-        let (events, receiver) = std::sync::mpsc::channel();
+    fn progressive_fixture_shared(path: &std::path::Path) -> (Shared, EventReceiver) {
+        let (events, receiver) = event_channel();
         let shared = Shared {
             entries: Arc::new(vec![FolderEntry {
                 path: path.to_path_buf(),
@@ -6605,6 +8130,7 @@ mod tests {
             view_hint: Mutex::new(None),
             full_viewport: Mutex::new(None),
             progressive: Mutex::new(None),
+            progressive_generation: AtomicU64::new(1),
         };
         shared
             .cache
@@ -6650,6 +8176,13 @@ mod tests {
                     // Every covered byte must already carry final-frame bytes.
                     let staging = shared.progressive.lock().unwrap();
                     let canvas = staging.as_ref().expect("staging present during regions");
+                    if region_events.get() == 1 {
+                        let samples = visible_texture_samples(uv, canvas.width, canvas.height);
+                        assert!(!samples.is_empty());
+                        assert!(samples.iter().all(|&sample| {
+                            progressive_rect_fully_covered(sample, &canvas.covered)
+                        }));
+                    }
                     let last = *canvas.covered.last().expect("covered rect recorded");
                     let stride = canvas.width as usize * 4;
                     for row in [0, last[3] as usize / 2, last[3] as usize - 1] {
@@ -6834,11 +8367,7 @@ mod tests {
     #[test]
     fn jpeg_encoder_recovers_after_a_bad_request_and_quality_change() {
         let valid = patterned_buf(96, 64);
-        let malformed = PixelBuf {
-            width: 96,
-            height: 64,
-            rgba: vec![0; 17],
-        };
+        let malformed = PixelBuf::new(96, 64, vec![0; 17]);
         let first = encode_jpeg(&valid, 97).unwrap();
         assert!(encode_jpeg(&malformed, 97).is_err());
         let recovered = encode_jpeg(&valid, 97).unwrap();

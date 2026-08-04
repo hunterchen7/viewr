@@ -491,8 +491,8 @@ pub struct FullBand {
 /// visible rows of the Full decode currently in flight. The slot is outside
 /// every ring budget (bounded to one band, lifetime ≈ the tail of one
 /// decode): it is replaced by the next publication, cleared when the matching
-/// Full RGBA entry is installed, and cleared when its image leaves the
-/// desired Full working set.
+/// Full RGBA entry is installed, cleared when navigation changes the current
+/// image, and cleared when its image leaves the desired Full working set.
 ///
 /// All ring operations serialize through one mutex; the band slot has its
 /// own. When both are taken the order is always ring mutex → band mutex. A
@@ -757,9 +757,28 @@ impl RamCache {
         drop(removed_pixels);
         if retained && key.1 == Tier::Full {
             // The resident full frame supersedes its provisional band.
-            self.clear_full_band(key.0);
+            let _ = self.clear_full_band(key.0);
         }
         retained
+    }
+
+    /// Retains a provisional Full band only when it belongs to the current
+    /// image. The jobs layer calls this while holding its navigation mutex, so
+    /// a generation-fenced publication cannot race a current-image change.
+    ///
+    /// The removed allocation is dropped after releasing the band mutex.
+    pub(crate) fn retain_full_band_for_current(&self, current: Option<usize>) {
+        let mut slot = self.band.lock().unwrap();
+        let removed = if slot
+            .as_ref()
+            .is_some_and(|(owner, _)| Some(*owner) != current)
+        {
+            slot.take()
+        } else {
+            None
+        };
+        drop(slot);
+        drop(removed);
     }
 
     /// Publishes the provisional visible band of an in-progress Full decode,
@@ -768,7 +787,7 @@ impl RamCache {
     /// The slot is deliberately outside the ring byte budgets: it is bounded
     /// to one band whose lifetime spans only the tail of one decode. See
     /// [`get_full_band`](Self::get_full_band) for the read side.
-    pub fn publish_full_band(&self, index: usize, band: FullBand) {
+    pub(crate) fn publish_full_band(&self, index: usize, band: FullBand) {
         let replaced = self.band.lock().unwrap().replace((index, Arc::new(band)));
         drop(replaced);
     }
@@ -784,11 +803,17 @@ impl RamCache {
     }
 
     /// Clears the band slot when it belongs to `index`.
-    pub(crate) fn clear_full_band(&self, index: usize) {
+    pub(crate) fn clear_full_band(&self, index: usize) -> bool {
         let mut band = self.band.lock().unwrap();
-        if band.as_ref().is_some_and(|(owner, _)| *owner == index) {
-            *band = None;
-        }
+        let removed = if band.as_ref().is_some_and(|(owner, _)| *owner == index) {
+            band.take()
+        } else {
+            None
+        };
+        drop(band);
+        let existed = removed.is_some();
+        drop(removed);
+        existed
     }
 
     /// Inserts or replaces an encoded JPEG entry and enforces the JPEG budget.
@@ -933,11 +958,7 @@ mod tests {
     }
 
     fn buf(bytes: usize) -> Arc<PixelBuf> {
-        Arc::new(PixelBuf {
-            width: 1,
-            height: 1,
-            rgba: vec![0; bytes],
-        })
+        Arc::new(PixelBuf::new(1, 1, vec![0; bytes]))
     }
 
     fn browse_cache(thumb_bytes: u64, browse_bytes: u64, jpeg_bytes: u64) -> RamCache {
@@ -1362,11 +1383,7 @@ mod tests {
             full_width: 4,
             full_height: 8,
             y0: index,
-            buf: PixelBuf {
-                width: 4,
-                height: 2,
-                rgba: vec![index as u8; 4 * 2 * 4],
-            },
+            buf: PixelBuf::new(4, 2, vec![index as u8; 4 * 2 * 4]),
         }
     }
 
@@ -1384,12 +1401,12 @@ mod tests {
         assert!(cache.get_full_band(3).is_none());
         assert_eq!(cache.get_full_band(4).map(|band| band.y0), Some(4));
 
-        cache.clear_full_band(3);
+        let _ = cache.clear_full_band(3);
         assert!(
             cache.get_full_band(4).is_some(),
             "mismatched clear is a no-op"
         );
-        cache.clear_full_band(4);
+        let _ = cache.clear_full_band(4);
         assert!(cache.get_full_band(4).is_none());
     }
 

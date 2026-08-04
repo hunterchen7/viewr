@@ -2219,9 +2219,8 @@ dependencies = [
 [[package]]
 name = "jpeg-rusturbo"
 version = "0.9.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f99890ec2a56818f0a1783cd6893794637a4fb6b61a3b4394e411d2f4693372f"
 dependencies = [
+ "image",
  "rayon",
 ]
 

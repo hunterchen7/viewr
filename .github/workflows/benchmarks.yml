@@ -47,12 +47,16 @@ jobs:
           bench_cores="$(nproc)"
           bench_memory="$(awk '/MemTotal/ {print $2 * 1024; exit}' /proc/meminfo)"
           bench_lock_hash="$(sha256sum Cargo.lock | awk '{print $1}')"
+          rawler_commit="$(git -C thirdparty/dnglab rev-parse HEAD)"
+          rawler_lock_hash="$(sha256sum thirdparty/dnglab/Cargo.lock | awk '{print $1}')"
           jpeg_bakeoff_lock_hash="$(
             sha256sum tools/jpeg-bakeoff/Cargo.lock | awk '{print $1}'
           )"
           jq -n \
             --arg commit "$bench_commit" \
             --arg cargo_lock_sha256 "$bench_lock_hash" \
+            --arg rawler_commit "$rawler_commit" \
+            --arg rawler_cargo_lock_sha256 "$rawler_lock_hash" \
             --arg jpeg_bakeoff_lock_sha256 "$jpeg_bakeoff_lock_hash" \
             --arg rustc "$bench_rust" \
             --arg os "$bench_os" \
@@ -61,9 +65,11 @@ jobs:
             --argjson memory_bytes "$bench_memory" \
             --arg rayon_threads "${RAYON_NUM_THREADS:-default}" \
             '{
-              schema_version: 1,
+              schema_version: 2,
               commit: $commit,
               cargo_lock_sha256: $cargo_lock_sha256,
+              rawler_commit: $rawler_commit,
+              rawler_cargo_lock_sha256: $rawler_cargo_lock_sha256,
               jpeg_bakeoff_lock_sha256: $jpeg_bakeoff_lock_sha256,
               rustc: $rustc,
               os: $os,
@@ -80,6 +86,12 @@ jobs:
         run: cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- --noplot
       - name: Run filmstrip scaling benchmarks
         run: cargo bench -p viewr --features benchmarks --bench filmstrip_scaling --locked -- --noplot
+      - name: Run application event-backlog benchmarks
+        run: cargo bench -p viewr --features benchmarks --bench event_backlog --locked -- --noplot
+      - name: Run generic RAW pipeline benchmarks
+        env:
+          CRITERION_HOME: ${{ github.workspace }}/target/criterion-rawler
+        run: cargo bench --manifest-path thirdparty/dnglab/rawler/Cargo.toml --locked --bench perf -- --noplot
       - name: Run JPEG codec bake-off
         run: cargo bench --manifest-path tools/jpeg-bakeoff/Cargo.toml --locked --bench encode -- --noplot
       - name: Upload Criterion results
@@ -89,6 +101,7 @@ jobs:
           name: criterion-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             target/criterion
+            target/criterion-rawler
             tools/jpeg-bakeoff/target/criterion
             target/benchmark-metadata.json
           if-no-files-found: warn

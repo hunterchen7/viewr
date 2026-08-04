@@ -17,16 +17,21 @@ cargo build --release --locked --offline
 The executable is in `target/release`. On Windows, the file name is
 `viewr.exe`.
 
-The rawler library that Viewr builds is the in-tree fork at
-`thirdparty/dnglab/rawler`. `Cargo.toml` already patches the crates.io
-dependency to that path, so its files are directly editable:
+The rawler and jpeg-rusturbo libraries that Viewr builds are reviewed in-tree
+forks at `thirdparty/dnglab/rawler` and `thirdparty/jpeg-rusturbo`. Source
+archive validation also runs Rawler's library tests from its own locked
+workspace, so submodule-only safety tests cannot disappear behind Viewr's path
+dependency build.
+`Cargo.toml` already patches the crates.io dependencies to those paths, so
+their files are directly editable:
 
 1. Edit files in `thirdparty/dnglab/rawler`.
+   You can also edit files in `thirdparty/jpeg-rusturbo`.
 2. Run `cargo build --release --locked --offline`.
 
 Do not edit other `vendor/` directories. Cargo verifies those against
-`.cargo-checksum.json`. Both workspaces — Viewr and the vendored JPEG
-bake-off — resolve rawler from the same in-tree fork.
+`.cargo-checksum.json`. Both workspaces — Viewr and the JPEG bake-off —
+resolve rawler and jpeg-rusturbo from the same in-tree forks.
 
 The project README lists the required Linux packages, including
 `build-essential` and `pkg-config`. The macOS build requires Xcode

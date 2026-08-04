@@ -65,6 +65,7 @@ git -C "$repo_root/thirdparty/dnglab" archive HEAD | tar -xf - -C "$source_root/
     --locked \
     --versioned-dirs \
     --sync tools/jpeg-bakeoff/Cargo.toml \
+    --sync thirdparty/dnglab/rawler/Cargo.toml \
     vendor >.cargo/config.toml
 )
 

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use rawler::imgop::{Dim2, Point, Rect};
 use viewr_core::cache_disk::DiskCache;
 use viewr_core::cache_ram::{RamCache, RamCacheBudgets};
 use viewr_core::db::{
@@ -58,11 +59,7 @@ fn synthetic_photo(width: u32, height: u32) -> PixelBuf {
         }
     }
 
-    PixelBuf {
-        width,
-        height,
-        rgba,
-    }
+    PixelBuf::try_new_opaque(width, height, rgba).expect("synthetic photo is opaque")
 }
 
 fn bench_outward_order(c: &mut Criterion) {
@@ -1651,11 +1648,7 @@ fn bench_ram_cache(c: &mut Criterion) {
 }
 
 fn bench_ram_cache_eviction_scaling(c: &mut Criterion) {
-    let payload = Arc::new(PixelBuf {
-        width: 1,
-        height: 1,
-        rgba: vec![0; 4],
-    });
+    let payload = Arc::new(PixelBuf::new(1, 1, vec![0; 4]));
     let mut group = c.benchmark_group("ram_cache_eviction_scaling");
     group.sample_size(20);
     group.warm_up_time(Duration::from_millis(300));
@@ -1687,13 +1680,7 @@ fn bench_ram_cache_eviction_scaling(c: &mut Criterion) {
 }
 
 fn bench_full_cache_policy(c: &mut Criterion) {
-    let payload = || {
-        Arc::new(PixelBuf {
-            width: 1,
-            height: 1,
-            rgba: vec![0; 4],
-        })
-    };
+    let payload = || Arc::new(PixelBuf::new(1, 1, vec![0; 4]));
     let cache = RamCache::new(RamCacheBudgets::new(0, 0, 8 * 4, 0));
     let first: Vec<_> = (0..8).map(|index| (index, Tier::Full)).collect();
     let second: Vec<_> = (8..16).map(|index| (index, Tier::Full)).collect();
@@ -1746,22 +1733,14 @@ fn bench_full_cache_policy(c: &mut Criterion) {
                 for index in 0..8 {
                     cache.insert_rgba(
                         (index, Tier::Full),
-                        Arc::new(PixelBuf {
-                            width: 1,
-                            height: 1,
-                            rgba: vec![0; EVICTION_PAYLOAD_BYTES],
-                        }),
+                        Arc::new(PixelBuf::new(1, 1, vec![0; EVICTION_PAYLOAD_BYTES])),
                     );
                 }
                 let replacements: Vec<_> = (8..16)
                     .map(|index| {
                         (
                             (index, Tier::Full),
-                            Arc::new(PixelBuf {
-                                width: 1,
-                                height: 1,
-                                rgba: vec![0; EVICTION_PAYLOAD_BYTES],
-                            }),
+                            Arc::new(PixelBuf::new(1, 1, vec![0; EVICTION_PAYLOAD_BYTES])),
                         )
                     })
                     .collect();
@@ -1778,11 +1757,7 @@ fn bench_full_cache_policy(c: &mut Criterion) {
     });
 
     group.throughput(Throughput::Bytes(EVICTION_PAYLOAD_BYTES as u64));
-    let replacement = Arc::new(PixelBuf {
-        width: 1,
-        height: 1,
-        rgba: vec![0; EVICTION_PAYLOAD_BYTES],
-    });
+    let replacement = Arc::new(PixelBuf::new(1, 1, vec![0; EVICTION_PAYLOAD_BYTES]));
     group.bench_function("insert_evicts_one_16mib_final_owner", |b| {
         b.iter_batched_ref(
             || {
@@ -1797,11 +1772,7 @@ fn bench_full_cache_policy(c: &mut Criterion) {
                 for index in 0..8 {
                     cache.insert_rgba(
                         (index, Tier::Full),
-                        Arc::new(PixelBuf {
-                            width: 1,
-                            height: 1,
-                            rgba: vec![0; EVICTION_PAYLOAD_BYTES],
-                        }),
+                        Arc::new(PixelBuf::new(1, 1, vec![0; EVICTION_PAYLOAD_BYTES])),
                     );
                 }
                 cache
@@ -1825,11 +1796,7 @@ fn bench_full_cache_policy(c: &mut Criterion) {
             let bytes = if larger_observation { 8 } else { 4 };
             snapshot_cache.insert_rgba(
                 (10_000, Tier::Browse),
-                Arc::new(PixelBuf {
-                    width: 1,
-                    height: 1,
-                    rgba: vec![0; bytes],
-                }),
+                Arc::new(PixelBuf::new(1, 1, vec![0; bytes])),
             );
             larger_observation = !larger_observation;
             black_box(snapshots)
@@ -2054,6 +2021,53 @@ fn bench_opt_in_raw(c: &mut Criterion) {
         });
     }
 
+    // Keep the former materialized-f32 Browse path beside production so a
+    // fixture run measures the end-to-end benefit and checks exact pixels
+    // before timing either implementation.
+    let comparison_raw = decode::load(&raw_path)
+        .expect("RAW decoded for Browse-path comparison")
+        .raw;
+    let (browse_materialized, _) =
+        develop::benchmark_develop_browse_materialized(comparison_raw.clone())
+            .expect("materialized Browse reference develops");
+    let (browse_production, _) =
+        develop::develop(comparison_raw, Quality::Browse).expect("production Browse path develops");
+    assert_eq!(
+        (browse_production.width, browse_production.height),
+        (browse_materialized.width, browse_materialized.height),
+    );
+    assert_eq!(browse_production.rgba(), browse_materialized.rgba());
+    drop((browse_materialized, browse_production));
+
+    group.throughput(Throughput::Elements(sensor_pixels));
+    group.bench_function("develop_browse/materialized_f32", |b| {
+        b.iter_batched(
+            || {
+                decode::load(&raw_path)
+                    .expect("RAW decoded during benchmark setup")
+                    .raw
+            },
+            |raw| {
+                black_box(develop::benchmark_develop_browse_materialized(black_box(
+                    raw,
+                )))
+                .unwrap()
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    group.bench_function("develop_browse/production_fused", |b| {
+        b.iter_batched(
+            || {
+                decode::load(&raw_path)
+                    .expect("RAW decoded during benchmark setup")
+                    .raw
+            },
+            |raw| black_box(develop::develop(black_box(raw), Quality::Browse)).unwrap(),
+            BatchSize::PerIteration,
+        );
+    });
+
     for quality in [Quality::Browse, Quality::Full] {
         group.throughput(Throughput::Elements(sensor_pixels));
         group.bench_with_input(
@@ -2072,6 +2086,38 @@ fn bench_opt_in_raw(c: &mut Criterion) {
             },
         );
     }
+
+    group.throughput(Throughput::Elements(sensor_pixels));
+    group.bench_function("develop_region/full_width_1024", |b| {
+        b.iter_batched(
+            || {
+                let raw = decode::load(&raw_path)
+                    .expect("RAW decoded during benchmark setup")
+                    .raw;
+                let plan =
+                    develop::plan_full_develop(raw).expect("RAW planned during benchmark setup");
+                let (width, height) = plan.output_size();
+                let band_height = height.min(1_024);
+                let region = Rect::new(
+                    Point::new(0, ((height - band_height) / 2) as usize),
+                    Dim2::new(width as usize, band_height as usize),
+                );
+                let canvas = vec![0_u8; width as usize * band_height as usize * 4];
+                let origin = plan.display_rect(region, Orient::R0);
+                (plan, region, canvas, width, [origin[0], origin[1]])
+            },
+            |(plan, region, mut canvas, width, origin)| {
+                black_box(plan.develop_region_into(
+                    black_box(region),
+                    Orient::R0,
+                    black_box(&mut canvas),
+                    width,
+                    origin,
+                ))
+            },
+            BatchSize::PerIteration,
+        );
+    });
 
     group.finish();
 }

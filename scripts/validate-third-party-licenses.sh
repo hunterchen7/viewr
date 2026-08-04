@@ -6,7 +6,6 @@ readonly RUST_TOOLCHAIN_CHANNEL="1.96"
 readonly JPEG_RUSTURBO_VERSION="0.9.2"
 readonly JPEG_RUSTURBO_NOTICE_SHA256="fe5e4bf805fbfb2f4f5443decec492c801722a1b4376eb4878d7edf99cc697eb"
 readonly JPEG_RUSTURBO_NOTICE_MARKER="----- BEGIN EXACT jpeg-rusturbo 0.9.2 NOTICE.md -----"
-readonly CRATES_IO_SOURCE="registry+https://github.com/rust-lang/crates.io-index"
 
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 temporary_directory="$(mktemp -d "${TMPDIR:-/tmp}/viewr-license-validation.XXXXXX")"
@@ -97,7 +96,7 @@ cargo metadata \
 jpeg_rusturbo_manifest="$(
     jq -er \
         --arg expected_version "$JPEG_RUSTURBO_VERSION" \
-        --arg expected_source "$CRATES_IO_SOURCE" \
+        --arg expected_manifest "${repository_root}/thirdparty/jpeg-rusturbo/Cargo.toml" \
         '
         [.packages[] | select(.name == "jpeg-rusturbo")] as $packages
         | if ($packages | length) != 1 then
@@ -109,8 +108,10 @@ jpeg_rusturbo_manifest="$(
               + ", found "
               + $packages[0].version
             )
-          elif $packages[0].source != $expected_source then
-            error("jpeg-rusturbo must resolve from crates.io")
+          elif $packages[0].source != null
+            or $packages[0].manifest_path != $expected_manifest
+          then
+            error("jpeg-rusturbo must resolve from the reviewed in-tree fork")
           else
             $packages[0].manifest_path
           end
@@ -151,9 +152,12 @@ cargo about generate \
 # Match the platform-independent output produced by the generation script.
 LC_ALL=C perl -pi -e 's/\r\n?/\n/g' "$generated_licenses"
 
-# Mirror generate-third-party-licenses.sh: cargo-about excludes the in-tree
-# path-dependency rawler fork, whose LGPL-2.1 entries must stay inventoried.
+# Mirror generate-third-party-licenses.sh for both reviewed path dependencies.
 LC_ALL=C perl -0pi -e '
+  s/^(jxl-bitstream [0-9])/jpeg-rusturbo 0.9.2\nLicense: MIT OR Apache-2.0\nSource: https:\/\/github.com\/hunterchen7\/viewr\/tree\/main\/thirdparty\/jpeg-rusturbo (forked from https:\/\/github.com\/naoto256\/jpeg-rusturbo)\n$1/m
+    or die "missing jxl-bitstream overview anchor for the jpeg-rusturbo license entry";
+  s/(^- as-raw-xcb-connection [^\n]+\n)/$1- jpeg-rusturbo 0.9.2\n/m
+    or die "missing Apache used-by anchor for the jpeg-rusturbo license entry";
   s/^(rayon [0-9])/rawler 0.7.2\nLicense: LGPL-2.1\nSource: https:\/\/github.com\/hunterchen7\/dnglab\n$1/m
     or die "missing rayon overview anchor for the rawler license entry";
   s/(GNU Lesser General Public License v2\.1 only\n\nUsed by:\n)/$1- rawler 0.7.2\n/

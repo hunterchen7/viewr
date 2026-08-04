@@ -51,6 +51,11 @@ fn read_segment_length(bytes: &[u8], pos: usize) -> Option<usize> {
     (len >= 2 && pos + len <= bytes.len()).then_some(len)
 }
 
+fn decoder_accepts_dimensions(width: usize, height: usize) -> bool {
+    let limits = DecoderOptions::default();
+    width <= limits.max_width() && height <= limits.max_height()
+}
+
 /// Parses the header segments and locates every restart-separated MCU row.
 ///
 /// Returns `None` for any stream this module does not prove splittable: the
@@ -141,7 +146,10 @@ fn parse_layout(bytes: &[u8]) -> Option<ScanLayout> {
     };
 
     let (width, height, max_h, max_v, sof_height_offset) = sof?;
-    if width == 0 || height == 0 {
+    // Match the decoder's own header limits before scanning restart rows or
+    // allocating the shared RGBA output. A forged SOF can otherwise request
+    // several GiB here even though every chunk decoder would reject it.
+    if width == 0 || height == 0 || !decoder_accepts_dimensions(width, height) {
         return None;
     }
     let mcu_row_px = 8 * max_v;
@@ -421,11 +429,7 @@ pub(crate) fn try_decode_prioritized(
         if run_tasks(bytes, &layout, tasks).is_err() {
             return PrioritizedDecode::Unsupported;
         }
-        return PrioritizedDecode::Done(PixelBuf {
-            width,
-            height,
-            rgba,
-        });
+        return PrioritizedDecode::Done(PixelBuf::new_opaque(width, height, rgba));
     };
 
     // Chunk targets proportional to each region's entropy bytes, so phase
@@ -500,11 +504,7 @@ pub(crate) fn try_decode_prioritized(
         }
     }
 
-    PrioritizedDecode::Done(PixelBuf {
-        width,
-        height,
-        rgba,
-    })
+    PrioritizedDecode::Done(PixelBuf::new_opaque(width, height, rgba))
 }
 
 #[cfg(test)]
@@ -535,11 +535,7 @@ mod tests {
                 ]);
             }
         }
-        PixelBuf {
-            width,
-            height,
-            rgba,
-        }
+        PixelBuf::new_opaque(width, height, rgba)
     }
 
     fn serial_reference(bytes: &[u8]) -> PixelBuf {
@@ -550,11 +546,7 @@ mod tests {
         let mut decoder = JpegDecoder::new_with_options(std::io::Cursor::new(bytes), options);
         let pixels = decoder.decode().expect("reference decode succeeds");
         let (w, h) = decoder.dimensions().expect("reference has dimensions");
-        PixelBuf {
-            width: w as u32,
-            height: h as u32,
-            rgba: pixels,
-        }
+        PixelBuf::new_opaque(w as u32, h as u32, pixels)
     }
 
     #[test]
@@ -567,6 +559,7 @@ mod tests {
                 Some(parallel) => {
                     assert_eq!((parallel.width, parallel.height), (width, height));
                     assert_eq!(parallel.rgba, serial.rgba, "{width}x{height} pixels");
+                    assert!(parallel.is_opaque());
                 }
                 // Small payloads legitimately fall below the parallel
                 // threshold; the public decode still uses the serial path.
@@ -577,6 +570,7 @@ mod tests {
             }
             let public = decode_jpeg(&encoded).expect("public decode succeeds");
             assert_eq!(public.rgba, serial.rgba);
+            assert!(public.is_opaque());
         }
     }
 
@@ -619,6 +613,7 @@ mod tests {
             };
             assert_eq!((parallel.width, parallel.height), (width, height));
             assert_eq!(parallel.rgba, serial.rgba, "{name}: final pixels");
+            assert!(parallel.is_opaque());
 
             let (y0, rows) = band_seen.expect("a mid-frame band must publish");
             let y0 = y0 as usize;
@@ -910,7 +905,19 @@ mod tests {
         for cut in [0, 1, 2, 3, 16, encoded.len() / 2, encoded.len() - 1] {
             let truncated = &encoded[..cut];
             assert!(super::try_decode(truncated).is_none(), "truncated at {cut}");
-            let _ = decode_jpeg(truncated);
+            if let Ok(decoded) = decode_jpeg(truncated) {
+                let expected_len = decoded.width as usize * decoded.height as usize * 4;
+                let actually_opaque = decoded.rgba.len() == expected_len
+                    && decoded
+                        .rgba
+                        .chunks_exact(4)
+                        .all(|pixel| pixel[3] == u8::MAX);
+                assert_eq!(
+                    decoded.is_opaque(),
+                    actually_opaque,
+                    "truncated output at {cut} must carry exact alpha provenance"
+                );
+            }
         }
 
         // Corrupting the DRI interval must refuse the split rather than
@@ -922,6 +929,51 @@ mod tests {
             .expect("production encode carries DRI");
         wrong_interval[dri + 4] ^= 0x01;
         assert!(parse_layout(&wrong_interval).is_none());
+    }
+
+    #[test]
+    fn oversized_sof_dimensions_fall_back_before_output_allocation() {
+        let mut encoded =
+            encode_jpeg(&textured_photo(1024, 768), 97).expect("restart-row fixture encodes");
+        let original = parse_layout(&encoded).expect("fixture qualifies for the split path");
+        let limits = zune_jpeg::zune_core::options::DecoderOptions::default();
+        assert!(
+            limits.max_width() < usize::from(u16::MAX),
+            "the regression fixture needs one representable width above the decoder limit"
+        );
+        assert!(!super::decoder_accepts_dimensions(
+            limits.max_width() + 1,
+            1
+        ));
+        assert!(!super::decoder_accepts_dimensions(
+            1,
+            limits.max_height() + 1
+        ));
+
+        let dri = encoded
+            .windows(2)
+            .position(|pair| pair == [0xFF, 0xDD])
+            .expect("production encode carries DRI");
+        let width_offset = original.sof_height_offset + 2;
+        fn patch_width(encoded: &mut [u8], width_offset: usize, dri: usize, width: usize) {
+            encoded[width_offset..width_offset + 2].copy_from_slice(&(width as u16).to_be_bytes());
+            encoded[dri + 4..dri + 6].copy_from_slice(&(width.div_ceil(8) as u16).to_be_bytes());
+        }
+
+        // Keep the restart geometry internally consistent so the control
+        // reaches the dimension gate rather than failing for another reason.
+        patch_width(&mut encoded, width_offset, dri, limits.max_width());
+        assert!(parse_layout(&encoded).is_some(), "at-limit control parses");
+
+        patch_width(&mut encoded, width_offset, dri, limits.max_width() + 1);
+        assert!(
+            parse_layout(&encoded).is_none(),
+            "oversized SOF must fall back"
+        );
+        assert!(
+            try_decode(&encoded).is_none(),
+            "oversized SOF must not allocate"
+        );
     }
 
     #[test]

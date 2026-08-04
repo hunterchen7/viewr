@@ -220,9 +220,15 @@ fn experimental_visible_tiles(
             for y in sample_y..sample_bottom {
                 let row_start = (y as usize * source.width as usize + sample_x as usize) * 4;
                 let row_end = row_start + sample_width as usize * 4;
-                pixels.extend(source.rgba[row_start..row_end].chunks_exact(4).map(|rgba| {
-                    egui::Color32::from_rgba_unmultiplied(rgba[0], rgba[1], rgba[2], rgba[3])
-                }));
+                pixels.extend(
+                    source.rgba()[row_start..row_end]
+                        .chunks_exact(4)
+                        .map(|rgba| {
+                            egui::Color32::from_rgba_unmultiplied(
+                                rgba[0], rgba[1], rgba[2], rgba[3],
+                            )
+                        }),
+                );
             }
             images.push(egui::ColorImage::new(
                 [sample_width as usize, sample_height as usize],
@@ -233,26 +239,46 @@ fn experimental_visible_tiles(
     images
 }
 
+/// Mirrors the progressive staging path after its worker-lock fix: allocate
+/// the final Color32 storage, then copy covered RGBA rows directly into it.
+fn staging_tile_copy(source: &PixelBuf, tile: progressive_texture::TileCoord) -> egui::ColorImage {
+    let sample = progressive_texture::sample_rect(source.width, source.height, tile)
+        .expect("the benchmark tile is valid");
+    let pixel_count = sample.width as usize * sample.height as usize;
+    let mut pixels = vec![egui::Color32::TRANSPARENT; pixel_count];
+    let output = bytemuck::cast_slice_mut::<egui::Color32, u8>(&mut pixels);
+    let source_stride = source.width as usize * 4;
+    let row_bytes = sample.width as usize * 4;
+    for (row, destination) in (sample.y..sample.bottom()).zip(output.chunks_exact_mut(row_bytes)) {
+        let start = row as usize * source_stride + sample.x as usize * 4;
+        destination.copy_from_slice(&source.rgba()[start..start + row_bytes]);
+    }
+    egui::ColorImage::new([sample.width as usize, sample.height as usize], pixels)
+}
+
 fn bench_full_texture_first_visible(c: &mut Criterion) {
     const WIDTH: u32 = 6_000;
     const HEIGHT: u32 = 4_000;
     // The all-127 fill keeps a translucent alpha, exercising the exact
     // per-pixel premultiply fallback. Production photo pixels are opaque, so
     // the paired opaque source measures the representative bulk-copy path.
-    let source = PixelBuf {
-        width: WIDTH,
-        height: HEIGHT,
-        rgba: vec![127; WIDTH as usize * HEIGHT as usize * 4],
-    };
-    let opaque_source = {
-        let mut rgba = source.rgba.clone();
-        rgba.iter_mut().skip(3).step_by(4).for_each(|a| *a = 255);
-        PixelBuf {
-            width: WIDTH,
-            height: HEIGHT,
-            rgba,
-        }
-    };
+    let source = PixelBuf::new(
+        WIDTH,
+        HEIGHT,
+        vec![127; WIDTH as usize * HEIGHT as usize * 4],
+    );
+    let mut opaque_rgba = source.rgba().to_vec();
+    opaque_rgba
+        .iter_mut()
+        .skip(3)
+        .step_by(4)
+        .for_each(|alpha| *alpha = 255);
+    // The unknown copy measures the pre-contract alpha-scan path. The proven
+    // copy pays the validation scan once outside the timed conversion and then
+    // exercises the production direct-copy path on every iteration.
+    let unknown_opaque_source = PixelBuf::new(WIDTH, HEIGHT, opaque_rgba.clone());
+    let opaque_source =
+        PixelBuf::try_new_opaque(WIDTH, HEIGHT, opaque_rgba).expect("benchmark source is opaque");
     let visible_uv = egui::Rect::from_center_size(egui::pos2(0.5, 0.5), egui::vec2(0.25, 0.2375));
     let order = progressive_texture::priority_order(WIDTH, HEIGHT, visible_uv);
     let visible_count = progressive_texture::visible_prefix_len(WIDTH, HEIGHT, visible_uv, &order);
@@ -275,7 +301,7 @@ fn bench_full_texture_first_visible(c: &mut Criterion) {
         b.iter(|| {
             black_box(egui::ColorImage::from_rgba_unmultiplied(
                 [WIDTH as usize, HEIGHT as usize],
-                black_box(&source.rgba),
+                black_box(source.rgba()),
             ));
         });
     });
@@ -294,6 +320,16 @@ fn bench_full_texture_first_visible(c: &mut Criterion) {
             black_box(pixels::to_color_image(black_box(&opaque_source)));
         });
     });
+    group.bench_function("production_full_24mp_translucent_fallback", |b| {
+        b.iter(|| {
+            black_box(pixels::to_color_image(black_box(&source)));
+        });
+    });
+    group.bench_function("production_full_24mp_unknown_opaque_scan", |b| {
+        b.iter(|| {
+            black_box(pixels::to_color_image(black_box(&unknown_opaque_source)));
+        });
+    });
     group.bench_function("progressive_visible_four_tiles_opaque", |b| {
         b.iter(|| {
             for &tile in &visible_tiles {
@@ -301,6 +337,29 @@ fn bench_full_texture_first_visible(c: &mut Criterion) {
                     progressive_texture::color_image(black_box(&opaque_source), black_box(tile))
                         .expect("valid benchmark tile"),
                 );
+            }
+        });
+    });
+    group.bench_function("progressive_visible_four_tiles_unknown_opaque_scan", |b| {
+        b.iter(|| {
+            for &tile in &visible_tiles {
+                black_box(
+                    progressive_texture::color_image(
+                        black_box(&unknown_opaque_source),
+                        black_box(tile),
+                    )
+                    .expect("valid benchmark tile"),
+                );
+            }
+        });
+    });
+    group.bench_function("progressive_visible_four_tiles_staging_copy", |b| {
+        b.iter(|| {
+            for &tile in &visible_tiles {
+                black_box(staging_tile_copy(
+                    black_box(&opaque_source),
+                    black_box(tile),
+                ));
             }
         });
     });
