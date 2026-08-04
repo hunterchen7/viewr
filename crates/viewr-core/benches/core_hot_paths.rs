@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use rawler::imgop::{Dim2, Point, Rect};
 use viewr_core::cache_disk::DiskCache;
 use viewr_core::cache_ram::{RamCache, RamCacheBudgets};
 use viewr_core::db::{
@@ -2072,6 +2073,38 @@ fn bench_opt_in_raw(c: &mut Criterion) {
             },
         );
     }
+
+    group.throughput(Throughput::Elements(sensor_pixels));
+    group.bench_function("develop_region/full_width_1024", |b| {
+        b.iter_batched(
+            || {
+                let raw = decode::load(&raw_path)
+                    .expect("RAW decoded during benchmark setup")
+                    .raw;
+                let plan =
+                    develop::plan_full_develop(raw).expect("RAW planned during benchmark setup");
+                let (width, height) = plan.output_size();
+                let band_height = height.min(1_024);
+                let region = Rect::new(
+                    Point::new(0, ((height - band_height) / 2) as usize),
+                    Dim2::new(width as usize, band_height as usize),
+                );
+                let canvas = vec![0_u8; width as usize * band_height as usize * 4];
+                let origin = plan.display_rect(region, Orient::R0);
+                (plan, region, canvas, width, [origin[0], origin[1]])
+            },
+            |(plan, region, mut canvas, width, origin)| {
+                black_box(plan.develop_region_into(
+                    black_box(region),
+                    Orient::R0,
+                    black_box(&mut canvas),
+                    width,
+                    origin,
+                ))
+            },
+            BatchSize::PerIteration,
+        );
+    });
 
     group.finish();
 }
