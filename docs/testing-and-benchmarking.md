@@ -280,6 +280,39 @@ Use `viewr dev` in a new process for a cold-path inspection:
 cargo run --release --locked -p viewr -- dev /absolute/path/photo.ARW
 ```
 
+Use structured output for a repeatable comparison:
+
+```sh
+cargo build --release --locked -p viewr --bin viewr
+target/release/viewr dev --json /absolute/path/photo.ARW /tmp/viewr-dev-output
+```
+
+The command writes one JSON object to standard output. The command writes the
+Browse and Full JPEG files to the output directory.
+
+The `pipeline_total_us` value stops after both JPEG files are written. The
+command calculates correctness hashes after that point. Thus,
+`audit_overhead_us` does not change the pipeline result.
+
+The record includes these items:
+
+- The input SHA-256 digest and byte count.
+- The camera model and RAW dimensions.
+- The available logical CPU count and the Rayon environment value.
+- The decode, develop, encode, and write times in microseconds.
+- The Browse and Full RGBA and JPEG SHA-256 digests.
+- A cache-condition label.
+
+Run each control and candidate at least three times. Alternate the control and
+candidate runs when the system load is not stable. Compare only records that
+have equal input and output digests.
+
+This command starts a new Viewr process. It does not clear the operating-system
+page cache. Record the first run separately from later runs.
+
+The record uses performance result schema 1. Add a new schema version when a
+field changes its meaning or unit.
+
 Use a private corpus for camera coverage.
 Include 24, 33, and 61-megapixel files when they are available.
 Include compressed ARW, lossless ARW, DNG, landscape, and portrait files.

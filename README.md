@@ -65,6 +65,7 @@ curve. This pipeline gives a useful culling image without changing the RAW file.
 viewr <folder|file.arw>        browse a folder of raws
 viewr --pick-folder            choose a folder in a native dialog
 viewr dev <file.arw> [out]     decode one file, print per-stage timings
+viewr dev --json <file> [out]  write one structured performance record
 ```
 
 | Key | Action |
