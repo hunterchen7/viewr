@@ -139,9 +139,10 @@ SIMD-accelerated. Our decoder gained per-stage SIMD kernels in
 IDCT sparse parity, a combined AC/DC Huffman LUT, and a SWAR
 32-bit Huffman bit-reader refill. 0.7.5 fuses dequantize into
 the entropy-decode block loop (eliminating the per-block dequant
-pass), replaces an x86_64 scalar RGB-interleave loop with a
-PSHUFB shuffle kernel, and skips zero-fill on the per-decode
-plane / output Vec allocations.
+pass) and replaces an x86_64 scalar RGB-interleave loop with a
+PSHUFB shuffle kernel. This Viewr fork restores zero-initialization
+for per-decode plane and output vectors because `Vec::set_len`
+requires all newly exposed elements to be initialized.
 
 Both decoders are timed on the same harness
 (`benches/vs_image.rs`) against two corpora: the synthetic
@@ -181,10 +182,13 @@ on natural-content. At smaller resolutions Cascade Lake is roughly
 at parity — within ~2–3% at 1592×1124, level or ahead from 1080p
 up — because the per-decode fixed-cost overhead is a larger
 fraction of total time there; the relative gain from the 0.7.5
-hot-path changes (entropy + dequant fusion, AVX2 RGB interleave,
-uninit-alloc) scales with the amount of per-pixel work and so
+hot-path changes (entropy + dequant fusion and AVX2 RGB interleave)
+scales with the amount of per-pixel work and so
 shows up most strongly at 4K. Apple M's lower fixed-cost overhead
 means even small-resolution decode comes out ahead.
+
+These decoder figures predate the Viewr fork's zero-initialization safety
+correction described above. Viewr does not use this decoder in production.
 
 ### Threading and optimized Huffman
 

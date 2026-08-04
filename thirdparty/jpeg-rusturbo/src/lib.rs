@@ -103,9 +103,9 @@
 //! The decoder is bundled for API symmetry — read your own JPEGs
 //! back without reaching for another crate — rather than as a speed
 //! play. It gained per-stage SIMD kernels in 0.6.0 (IDCT, YCC → RGB
-//! color convert, and fancy chroma upsample in NEON + AVX2). As of
-//! 0.7.5 (entropy + dequant fusion, AVX2 PSHUFB RGB interleave,
-//! uninit `Vec` allocation) it sits ahead of `image` at 4K on both
+//! color convert, and fancy chroma upsample in NEON + AVX2). Upstream
+//! 0.7.5 reported that entropy + dequant fusion and AVX2 PSHUFB RGB
+//! interleave put it ahead of `image` at 4K on both
 //! microarchitectures and both corpora (~1.03–1.10× on synthetic
 //! Huffman-heavy content, ~1.18–1.22× on natural-content), while
 //! matching coverage — baseline + progressive Huffman, fancy chroma
@@ -128,6 +128,12 @@
 //! and is retained as a
 //! bit-exact foundation. See [`BENCH.md`] in the repository for
 //! detailed numbers.
+//!
+//! This Viewr fork zero-initializes decoder plane and output vectors.
+//! The upstream uninitialized-`Vec` optimization violated
+//! [`Vec::set_len`]'s initialized-element requirement; encoder behavior
+//! and performance are unaffected. The historical decoder figures above
+//! predate this safety correction.
 //!
 //! [`BENCH.md`]: https://github.com/naoto256/jpeg-rusturbo/blob/main/BENCH.md
 //!

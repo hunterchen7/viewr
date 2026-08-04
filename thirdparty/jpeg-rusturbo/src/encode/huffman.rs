@@ -195,8 +195,8 @@ impl<W: io::Write> BitWriter<W> {
         let mut written: usize = 0;
         // Safety: we just reserved 8 bytes; `written ∈ 0..=8` after the
         // loop (each byte writes 1 byte, optionally +1 for stuffing).
-        // `u8` is plain-old-data so writing through `*mut u8` and then
-        // `set_len` is sound.
+        // Every element in `len..len + written` is assigned through `dst`
+        // before `set_len` exposes it, so the extended vector is initialized.
         unsafe {
             let dst = self.buf.as_mut_ptr().add(len);
             for &b in &[
@@ -314,8 +314,8 @@ impl LocalBitWriter<'_> {
         let mut written: usize = 0;
         // Safety: we just reserved 8 bytes; `written ∈ 0..=8` after the
         // loop (each byte writes 1 byte, optionally +1 for stuffing).
-        // `u8` is plain-old-data so writing through `*mut u8` and then
-        // `set_len` is sound.
+        // Every element in `len..len + written` is assigned through `dst`
+        // before `set_len` exposes it, so the extended vector is initialized.
         unsafe {
             let dst = self.buf.as_mut_ptr().add(len);
             for &b in &[

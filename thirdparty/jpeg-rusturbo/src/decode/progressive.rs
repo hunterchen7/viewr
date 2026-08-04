@@ -634,16 +634,10 @@ fn finalize_to_planes(
         let qt = qt_by_id[comp.qt as usize].ok_or(DecodeError::Malformed(
             "frame component refers to undefined quant table",
         ))?;
-        // See `decode::baseline::allocate_planes` for the safety
-        // argument. In short: bytes inside `plane_width *
-        // plane_height` are covered by per-block `place_block`
-        // writes; bytes in the stride / padded-height slack may stay
-        // uninitialized but are never read (compose_output trims).
-        let mut samples: Vec<u8> = Vec::with_capacity(stride * padded_height);
-        #[allow(clippy::uninit_vec)]
-        unsafe {
-            samples.set_len(stride * padded_height);
-        }
+        // `Vec<u8>` requires every element below `len` to be initialized.
+        // Unusual sampling geometry can leave block-aligned row padding
+        // untouched, so initialize the complete allocation first.
+        let mut samples = vec![0u8; stride * padded_height];
 
         let mut nat_coef = [0i16; 64];
         let mut block = [0u8; 64];
@@ -678,4 +672,44 @@ fn finalize_to_planes(
         height: frame.height as u32,
         components: planes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finalize_initializes_unwritten_plane_padding() {
+        let component = Component {
+            id: 1,
+            h: 2,
+            v: 2,
+            qt: 0,
+        };
+        let frame = FrameHeader {
+            precision: 8,
+            width: 17,
+            height: 9,
+            components: vec![component],
+            progressive: true,
+        };
+        let coeffs = vec![CoeffComponent {
+            component,
+            blocks_x: 3,
+            blocks_y: 2,
+            blocks: vec![[0i16; 64]; 6],
+        }];
+        let quant = vec![QuantTable {
+            id: 0,
+            values: [1u16; 64],
+        }];
+
+        let planes = finalize_to_planes(&frame, &coeffs, &quant).expect("valid plane geometry");
+        let plane = &planes.components[0];
+        assert_eq!((plane.stride, plane.padded_height), (32, 16));
+        for row in plane.samples.chunks_exact(plane.stride) {
+            assert!(row[..24].iter().all(|&sample| sample == 128));
+            assert!(row[24..].iter().all(|&sample| sample == 0));
+        }
+    }
 }

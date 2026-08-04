@@ -80,27 +80,10 @@ pub fn allocate_planes(frame: &super::markers::FrameHeader) -> Vec<DecodedPlane>
         let ph = (frame.height as u32 * comp.v as u32).div_ceil(v_max as u32) as usize;
         let stride = (mcus_x as usize) * (comp.h as usize) * 8;
         let padded_height = (mcus_y as usize) * (comp.v as usize) * 8;
-        // Skip the per-decode zero-fill. Block-aligned coverage:
-        // every byte INSIDE the `plane_width × plane_height` image
-        // rectangle is overwritten by exactly one `place_block` write
-        // during the scan. Bytes in the stride / padded-height slack
-        // (right / bottom edges for non-aligned widths and components
-        // whose `plane_width` does not equal `stride`) may remain
-        // uninitialized — that's sound because `compose_output` only
-        // reads within `plane_width` / `plane_height` (see
-        // `decode::mod::copy_plane_row` and `upsample_chroma_row`).
-        // For 4K 4:2:0 this saves ~12 MB of zero-fill page-fault
-        // cost per decode.
-        // Safety: `u8` has no validity invariants, so `set_len` on a
-        // freshly allocated Vec<u8> without initialization is sound;
-        // soundness rests on consumers (compose_output) reading only
-        // within `plane_width` / `plane_height`, not on every byte
-        // having been written.
-        let mut samples: Vec<u8> = Vec::with_capacity(stride * padded_height);
-        #[allow(clippy::uninit_vec)]
-        unsafe {
-            samples.set_len(stride * padded_height);
-        }
+        // `Vec<u8>` requires every element below `len` to be initialized.
+        // Some block-aligned right/bottom padding is never overwritten, so
+        // initialize the complete allocation before exposing it as bytes.
+        let samples = vec![0u8; stride * padded_height];
         planes.push(DecodedPlane {
             component: *comp,
             stride,
@@ -469,7 +452,30 @@ pub fn index_quant_tables<'a>(qts: &'a [QuantTable]) -> [Option<&'a QuantTable>;
 
 #[cfg(test)]
 mod tests {
+    use super::super::markers::FrameHeader;
     use super::*;
+
+    #[test]
+    fn allocate_planes_initializes_block_padding() {
+        let frame = FrameHeader {
+            precision: 8,
+            width: 9,
+            height: 7,
+            components: vec![Component {
+                id: 1,
+                h: 1,
+                v: 1,
+                qt: 0,
+            }],
+            progressive: false,
+        };
+
+        let planes = allocate_planes(&frame);
+        assert_eq!(planes.len(), 1);
+        let plane = &planes[0];
+        assert_eq!((plane.stride, plane.padded_height), (16, 8));
+        assert!(plane.samples.iter().all(|&sample| sample == 0));
+    }
 
     /// Regression: previously, `handle_restart` swallowed `Err` from
     /// `get_bits(8)` with `let _ = …`, which let a truncated JPEG (no
