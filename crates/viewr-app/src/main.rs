@@ -373,8 +373,8 @@ fn spike(input: &Path, out_dir: &Path, output: DevelopOutput) -> Result<()> {
     // remains comparable to human-mode fresh-process measurements.
     let t_audit = Instant::now();
     let input_sha256 = sha256_file(input)?;
-    let browse_rgba_sha256 = sha256_bytes(&browse.rgba);
-    let full_rgba_sha256 = sha256_bytes(&full.rgba);
+    let browse_rgba_sha256 = sha256_bytes(browse.rgba());
+    let full_rgba_sha256 = sha256_bytes(full.rgba());
     let browse_jpeg_sha256 = sha256_bytes(&browse_jpeg);
     let full_jpeg_sha256 = sha256_bytes(&full_jpeg);
     let audit_overhead = t_audit.elapsed();

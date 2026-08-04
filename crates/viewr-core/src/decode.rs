@@ -108,11 +108,7 @@ pub fn thumb_and_meta(path: &Path, max_edge: u32) -> Result<ThumbResult, DecodeE
         }
         other => {
             let rgba = other.into_rgba8();
-            let buf = PixelBuf {
-                width: rgba.width(),
-                height: rgba.height(),
-                rgba: rgba.into_raw(),
-            };
+            let buf = PixelBuf::new(rgba.width(), rgba.height(), rgba.into_raw());
             resize::downscale_to_fit(buf, max_edge)?
         }
     };

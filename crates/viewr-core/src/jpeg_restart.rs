@@ -421,11 +421,7 @@ pub(crate) fn try_decode_prioritized(
         if run_tasks(bytes, &layout, tasks).is_err() {
             return PrioritizedDecode::Unsupported;
         }
-        return PrioritizedDecode::Done(PixelBuf {
-            width,
-            height,
-            rgba,
-        });
+        return PrioritizedDecode::Done(PixelBuf::new_opaque(width, height, rgba));
     };
 
     // Chunk targets proportional to each region's entropy bytes, so phase
@@ -500,11 +496,7 @@ pub(crate) fn try_decode_prioritized(
         }
     }
 
-    PrioritizedDecode::Done(PixelBuf {
-        width,
-        height,
-        rgba,
-    })
+    PrioritizedDecode::Done(PixelBuf::new_opaque(width, height, rgba))
 }
 
 #[cfg(test)]
@@ -535,11 +527,7 @@ mod tests {
                 ]);
             }
         }
-        PixelBuf {
-            width,
-            height,
-            rgba,
-        }
+        PixelBuf::new_opaque(width, height, rgba)
     }
 
     fn serial_reference(bytes: &[u8]) -> PixelBuf {
@@ -550,11 +538,7 @@ mod tests {
         let mut decoder = JpegDecoder::new_with_options(std::io::Cursor::new(bytes), options);
         let pixels = decoder.decode().expect("reference decode succeeds");
         let (w, h) = decoder.dimensions().expect("reference has dimensions");
-        PixelBuf {
-            width: w as u32,
-            height: h as u32,
-            rgba: pixels,
-        }
+        PixelBuf::new_opaque(w as u32, h as u32, pixels)
     }
 
     #[test]
@@ -567,6 +551,7 @@ mod tests {
                 Some(parallel) => {
                     assert_eq!((parallel.width, parallel.height), (width, height));
                     assert_eq!(parallel.rgba, serial.rgba, "{width}x{height} pixels");
+                    assert!(parallel.is_opaque());
                 }
                 // Small payloads legitimately fall below the parallel
                 // threshold; the public decode still uses the serial path.
@@ -577,6 +562,7 @@ mod tests {
             }
             let public = decode_jpeg(&encoded).expect("public decode succeeds");
             assert_eq!(public.rgba, serial.rgba);
+            assert!(public.is_opaque());
         }
     }
 
@@ -619,6 +605,7 @@ mod tests {
             };
             assert_eq!((parallel.width, parallel.height), (width, height));
             assert_eq!(parallel.rgba, serial.rgba, "{name}: final pixels");
+            assert!(parallel.is_opaque());
 
             let (y0, rows) = band_seen.expect("a mid-frame band must publish");
             let y0 = y0 as usize;
@@ -910,7 +897,19 @@ mod tests {
         for cut in [0, 1, 2, 3, 16, encoded.len() / 2, encoded.len() - 1] {
             let truncated = &encoded[..cut];
             assert!(super::try_decode(truncated).is_none(), "truncated at {cut}");
-            let _ = decode_jpeg(truncated);
+            if let Ok(decoded) = decode_jpeg(truncated) {
+                let expected_len = decoded.width as usize * decoded.height as usize * 4;
+                let actually_opaque = decoded.rgba.len() == expected_len
+                    && decoded
+                        .rgba
+                        .chunks_exact(4)
+                        .all(|pixel| pixel[3] == u8::MAX);
+                assert_eq!(
+                    decoded.is_opaque(),
+                    actually_opaque,
+                    "truncated output at {cut} must carry exact alpha provenance"
+                );
+            }
         }
 
         // Corrupting the DRI interval must refuse the split rather than

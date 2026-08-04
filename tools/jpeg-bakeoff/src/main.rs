@@ -167,7 +167,7 @@ fn dedicated_contention(args: &[String]) -> anyhow::Result<()> {
             name: "raw_full_pixels",
             width: jpeg_pixels.width,
             height: jpeg_pixels.height,
-            rgba: jpeg_pixels.rgba,
+            rgba: jpeg_pixels.into_rgba(),
         };
         return run_contention(
             &encoder,
@@ -183,11 +183,12 @@ fn dedicated_contention(args: &[String]) -> anyhow::Result<()> {
         );
     }
 
-    let foreground_source = viewr_core::types::PixelBuf {
-        width: synthetic_fixture.width,
-        height: synthetic_fixture.height,
-        rgba: synthetic_fixture.rgba.clone(),
-    };
+    let foreground_source = viewr_core::types::PixelBuf::try_new_opaque(
+        synthetic_fixture.width,
+        synthetic_fixture.height,
+        synthetic_fixture.rgba.clone(),
+    )
+    .expect("the synthetic RGBA fixture is opaque and tightly packed");
     run_contention(
         &encoder,
         &synthetic_fixture,
@@ -320,10 +321,10 @@ where
 
 fn pixel_checksum(pixels: &viewr_core::types::PixelBuf) -> u64 {
     let mut checksum = u64::from(pixels.width) << 32 | u64::from(pixels.height);
-    for byte in pixels.rgba.iter().step_by(4_099) {
+    for byte in pixels.rgba().iter().step_by(4_099) {
         checksum = checksum.rotate_left(7) ^ u64::from(*byte);
     }
-    checksum ^ pixels.rgba.len() as u64
+    checksum ^ pixels.rgba().len() as u64
 }
 
 fn median(mut values: Vec<Duration>) -> Duration {

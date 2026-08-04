@@ -59,11 +59,7 @@ fn synthetic_photo(width: u32, height: u32) -> PixelBuf {
         }
     }
 
-    PixelBuf {
-        width,
-        height,
-        rgba,
-    }
+    PixelBuf::try_new_opaque(width, height, rgba).expect("synthetic photo is opaque")
 }
 
 fn bench_outward_order(c: &mut Criterion) {
@@ -1652,11 +1648,7 @@ fn bench_ram_cache(c: &mut Criterion) {
 }
 
 fn bench_ram_cache_eviction_scaling(c: &mut Criterion) {
-    let payload = Arc::new(PixelBuf {
-        width: 1,
-        height: 1,
-        rgba: vec![0; 4],
-    });
+    let payload = Arc::new(PixelBuf::new(1, 1, vec![0; 4]));
     let mut group = c.benchmark_group("ram_cache_eviction_scaling");
     group.sample_size(20);
     group.warm_up_time(Duration::from_millis(300));
@@ -1688,13 +1680,7 @@ fn bench_ram_cache_eviction_scaling(c: &mut Criterion) {
 }
 
 fn bench_full_cache_policy(c: &mut Criterion) {
-    let payload = || {
-        Arc::new(PixelBuf {
-            width: 1,
-            height: 1,
-            rgba: vec![0; 4],
-        })
-    };
+    let payload = || Arc::new(PixelBuf::new(1, 1, vec![0; 4]));
     let cache = RamCache::new(RamCacheBudgets::new(0, 0, 8 * 4, 0));
     let first: Vec<_> = (0..8).map(|index| (index, Tier::Full)).collect();
     let second: Vec<_> = (8..16).map(|index| (index, Tier::Full)).collect();
@@ -1747,22 +1733,14 @@ fn bench_full_cache_policy(c: &mut Criterion) {
                 for index in 0..8 {
                     cache.insert_rgba(
                         (index, Tier::Full),
-                        Arc::new(PixelBuf {
-                            width: 1,
-                            height: 1,
-                            rgba: vec![0; EVICTION_PAYLOAD_BYTES],
-                        }),
+                        Arc::new(PixelBuf::new(1, 1, vec![0; EVICTION_PAYLOAD_BYTES])),
                     );
                 }
                 let replacements: Vec<_> = (8..16)
                     .map(|index| {
                         (
                             (index, Tier::Full),
-                            Arc::new(PixelBuf {
-                                width: 1,
-                                height: 1,
-                                rgba: vec![0; EVICTION_PAYLOAD_BYTES],
-                            }),
+                            Arc::new(PixelBuf::new(1, 1, vec![0; EVICTION_PAYLOAD_BYTES])),
                         )
                     })
                     .collect();
@@ -1779,11 +1757,7 @@ fn bench_full_cache_policy(c: &mut Criterion) {
     });
 
     group.throughput(Throughput::Bytes(EVICTION_PAYLOAD_BYTES as u64));
-    let replacement = Arc::new(PixelBuf {
-        width: 1,
-        height: 1,
-        rgba: vec![0; EVICTION_PAYLOAD_BYTES],
-    });
+    let replacement = Arc::new(PixelBuf::new(1, 1, vec![0; EVICTION_PAYLOAD_BYTES]));
     group.bench_function("insert_evicts_one_16mib_final_owner", |b| {
         b.iter_batched_ref(
             || {
@@ -1798,11 +1772,7 @@ fn bench_full_cache_policy(c: &mut Criterion) {
                 for index in 0..8 {
                     cache.insert_rgba(
                         (index, Tier::Full),
-                        Arc::new(PixelBuf {
-                            width: 1,
-                            height: 1,
-                            rgba: vec![0; EVICTION_PAYLOAD_BYTES],
-                        }),
+                        Arc::new(PixelBuf::new(1, 1, vec![0; EVICTION_PAYLOAD_BYTES])),
                     );
                 }
                 cache
@@ -1826,11 +1796,7 @@ fn bench_full_cache_policy(c: &mut Criterion) {
             let bytes = if larger_observation { 8 } else { 4 };
             snapshot_cache.insert_rgba(
                 (10_000, Tier::Browse),
-                Arc::new(PixelBuf {
-                    width: 1,
-                    height: 1,
-                    rgba: vec![0; bytes],
-                }),
+                Arc::new(PixelBuf::new(1, 1, vec![0; bytes])),
             );
             larger_observation = !larger_observation;
             black_box(snapshots)

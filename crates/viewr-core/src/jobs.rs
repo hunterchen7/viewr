@@ -3083,11 +3083,11 @@ fn decode_jpeg_for_rehydrate(
                     full_width: band_pixels.full_width,
                     full_height: band_pixels.full_height,
                     y0: band_pixels.y0,
-                    buf: PixelBuf {
-                        width: band_pixels.full_width,
-                        height: band_height as u32,
-                        rgba: band_pixels.rows.to_vec(),
-                    },
+                    buf: PixelBuf::new_opaque(
+                        band_pixels.full_width,
+                        band_height as u32,
+                        band_pixels.rows.to_vec(),
+                    ),
                 },
             );
             // No dedicated event: the UI polls the band slot each frame, so a
@@ -3492,11 +3492,11 @@ fn run_progressive_full_develop(
         let Some(canvas) = taken else {
             return Ok(DevelopCompletion::Cancelled);
         };
-        let buf = Arc::new(PixelBuf {
-            width: canvas.width,
-            height: canvas.height,
-            rgba: canvas.rgba,
-        });
+        let buf = Arc::new(PixelBuf::new_opaque(
+            canvas.width,
+            canvas.height,
+            canvas.rgba,
+        ));
         let retained = shared
             .cache
             .insert_rgba_if_desired((index, tier), buf.clone());
@@ -3838,11 +3838,10 @@ fn decode_jpeg_serial(bytes: &[u8]) -> Result<PixelBuf, String> {
     let (w, h) = decoder
         .dimensions()
         .ok_or_else(|| "no dimensions".to_string())?;
-    Ok(PixelBuf {
-        width: w as u32,
-        height: h as u32,
-        rgba: pixels,
-    })
+    // zune-jpeg accepts some truncated streams and can leave their undecoded
+    // alpha bytes at zero. Classify once on this worker so valid JPEGs avoid a
+    // later UI-thread scan while malformed output keeps the exact fallback.
+    Ok(PixelBuf::new_scanned(w as u32, h as u32, pixels))
 }
 
 #[cfg(feature = "benchmarks")]
@@ -4810,11 +4809,7 @@ mod tests {
                 ]);
             }
         }
-        PixelBuf {
-            width,
-            height,
-            rgba,
-        }
+        PixelBuf::new_opaque(width, height, rgba)
     }
 
     fn textured_buf(width: u32, height: u32) -> PixelBuf {
@@ -4833,11 +4828,7 @@ mod tests {
                 ]);
             }
         }
-        PixelBuf {
-            width,
-            height,
-            rgba,
-        }
+        PixelBuf::new_opaque(width, height, rgba)
     }
 
     fn jpeg_has_444_sampling(bytes: &[u8]) -> bool {
@@ -5700,11 +5691,7 @@ mod tests {
                 if !cache.has_rgba((target.index, Tier::Browse)) {
                     cache.insert_rgba(
                         (target.index, Tier::Browse),
-                        Arc::new(PixelBuf {
-                            width: 1,
-                            height: 1,
-                            rgba: vec![0; 100],
-                        }),
+                        Arc::new(PixelBuf::new(1, 1, vec![0; 100])),
                     );
                 }
             }
@@ -6960,6 +6947,7 @@ mod tests {
         );
         assert_eq!(decoded.rgba.len(), source.rgba.len());
         assert!(decoded.rgba.chunks_exact(4).all(|pixel| pixel[3] == 255));
+        assert!(decoded.is_opaque());
 
         let total_error: u64 = source
             .rgba
@@ -6993,11 +6981,7 @@ mod tests {
                 rgba.extend_from_slice(&[value, value, value, 255]);
             }
         }
-        let source = PixelBuf {
-            width,
-            height,
-            rgba,
-        };
+        let source = PixelBuf::new_opaque(width, height, rgba);
         let squared_error = |quality| {
             let encoded = encode_jpeg(&source, quality).expect("gradient must encode");
             let decoded = decode_jpeg(&encoded).expect("gradient must decode");
@@ -7030,23 +7014,11 @@ mod tests {
         let valid = patterned_buf(8, 8);
         assert!(encode_jpeg(&valid, 0).is_err());
         assert!(encode_jpeg(&valid, 101).is_err());
-        let zero_width = PixelBuf {
-            width: 0,
-            height: 1,
-            rgba: Vec::new(),
-        };
+        let zero_width = PixelBuf::new(0, 1, Vec::new());
         assert!(encode_jpeg(&zero_width, 90).is_err());
-        let malformed = PixelBuf {
-            width: 2,
-            height: 2,
-            rgba: vec![0; 15],
-        };
+        let malformed = PixelBuf::new(2, 2, vec![0; 15]);
         assert!(encode_jpeg(&malformed, 90).is_err());
-        let too_wide = PixelBuf {
-            width: u16::MAX as u32 + 1,
-            height: 1,
-            rgba: Vec::new(),
-        };
+        let too_wide = PixelBuf::new(u16::MAX as u32 + 1, 1, Vec::new());
         assert!(encode_jpeg(&too_wide, 90).is_err());
     }
 
@@ -7055,11 +7027,7 @@ mod tests {
         let valid = patterned_buf(8, 6);
         assert_eq!(validate_jpeg_input(&valid, 97), Ok((8, 6, 32)));
 
-        let malformed = PixelBuf {
-            width: 8,
-            height: 6,
-            rgba: vec![0; 8 * 6 * 4 - 1],
-        };
+        let malformed = PixelBuf::new(8, 6, vec![0; 8 * 6 * 4 - 1]);
         assert!(validate_jpeg_input(&malformed, 97).is_err());
         assert!(validate_jpeg_input(&valid, 0).is_err());
         assert!(validate_jpeg_input(&valid, 101).is_err());
@@ -7819,11 +7787,7 @@ mod tests {
     #[test]
     fn jpeg_encoder_recovers_after_a_bad_request_and_quality_change() {
         let valid = patterned_buf(96, 64);
-        let malformed = PixelBuf {
-            width: 96,
-            height: 64,
-            rgba: vec![0; 17],
-        };
+        let malformed = PixelBuf::new(96, 64, vec![0; 17]);
         let first = encode_jpeg(&valid, 97).unwrap();
         assert!(encode_jpeg(&malformed, 97).is_err());
         let recovered = encode_jpeg(&valid, 97).unwrap();

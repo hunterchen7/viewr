@@ -939,11 +939,7 @@ mod tests {
     }
 
     fn buf(bytes: usize) -> Arc<PixelBuf> {
-        Arc::new(PixelBuf {
-            width: 1,
-            height: 1,
-            rgba: vec![0; bytes],
-        })
+        Arc::new(PixelBuf::new(1, 1, vec![0; bytes]))
     }
 
     fn browse_cache(thumb_bytes: u64, browse_bytes: u64, jpeg_bytes: u64) -> RamCache {
@@ -1368,11 +1364,7 @@ mod tests {
             full_width: 4,
             full_height: 8,
             y0: index,
-            buf: PixelBuf {
-                width: 4,
-                height: 2,
-                rgba: vec![index as u8; 4 * 2 * 4],
-            },
+            buf: PixelBuf::new(4, 2, vec![index as u8; 4 * 2 * 4]),
         }
     }
 

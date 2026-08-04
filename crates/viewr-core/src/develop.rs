@@ -213,14 +213,7 @@ fn develop_with_layout(
     }
     timings.gamma_pack = t.elapsed();
 
-    Ok((
-        PixelBuf {
-            width: out_w,
-            height: out_h,
-            rgba,
-        },
-        timings,
-    ))
+    Ok((PixelBuf::new_opaque(out_w, out_h, rgba), timings))
 }
 
 fn scale_cfa_data(
@@ -1216,11 +1209,11 @@ mod tests {
 
         for orient in [Orient::R0, Orient::R90, Orient::R180, Orient::R270] {
             let reference = crate::resize::apply_orient(
-                crate::types::PixelBuf {
-                    width: width as u32,
-                    height: height as u32,
-                    rgba: reference_flat.clone(),
-                },
+                crate::types::PixelBuf::new_opaque(
+                    width as u32,
+                    height as u32,
+                    reference_flat.clone(),
+                ),
                 orient,
             );
             let (dw, dh) = if orient.swaps_axes() {
@@ -1308,11 +1301,7 @@ mod tests {
             assert_eq!(canvas, reference.rgba, "{orient:?} assembled bytes");
 
             // Identical input bytes must produce identical cache JPEG objects.
-            let assembled = crate::types::PixelBuf {
-                width: dw,
-                height: dh,
-                rgba: canvas,
-            };
+            let assembled = crate::types::PixelBuf::new_opaque(dw, dh, canvas);
             let assembled_jpeg = crate::jobs::encode_jpeg(&assembled, 90).expect("jpeg encodes");
             let reference_jpeg = crate::jobs::encode_jpeg(&reference, 90).expect("jpeg encodes");
             assert_eq!(assembled_jpeg, reference_jpeg, "{orient:?} jpeg bytes");

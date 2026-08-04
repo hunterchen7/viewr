@@ -92,10 +92,20 @@ fn expand_rgb8(width: u32, height: u32, rgb: &[u8]) -> PixelBuf {
         rgb.chunks_exact(3)
             .flat_map(|px| [px[0], px[1], px[2], 255]),
     );
-    PixelBuf {
-        width,
-        height,
-        rgba,
+    let expected_len = usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(3));
+    if expected_len == Some(rgb.len()) {
+        PixelBuf::new_opaque(width, height, rgba)
+    } else {
+        // Preserve the historical no-op behavior for malformed RGB input,
+        // but never attach trusted provenance to inconsistent dimensions.
+        PixelBuf::new(width, height, rgba)
     }
 }
 
@@ -110,9 +120,10 @@ fn expand_rgb8(width: u32, height: u32, rgb: &[u8]) -> PixelBuf {
 /// Returns [`ResizeError::Fir`] when the source storage does not match its
 /// dimensions or `fast_image_resize` rejects the operation.
 pub fn resize_exact(buf: PixelBuf, dst_w: u32, dst_h: u32) -> Result<PixelBuf, ResizeError> {
-    let src =
-        fir::images::Image::from_vec_u8(buf.width, buf.height, buf.rgba, fir::PixelType::U8x4)
-            .map_err(|e| ResizeError::Fir(e.to_string()))?;
+    let (src_width, src_height) = (buf.width, buf.height);
+    let (rgba, alpha) = buf.into_parts();
+    let src = fir::images::Image::from_vec_u8(src_width, src_height, rgba, fir::PixelType::U8x4)
+        .map_err(|e| ResizeError::Fir(e.to_string()))?;
     let mut dst = fir::images::Image::new(dst_w, dst_h, fir::PixelType::U8x4);
     let options = fir::ResizeOptions::new()
         .resize_alg(fir::ResizeAlg::Convolution(fir::FilterType::CatmullRom))
@@ -120,11 +131,7 @@ pub fn resize_exact(buf: PixelBuf, dst_w: u32, dst_h: u32) -> Result<PixelBuf, R
     RESIZER
         .with(|resizer| resizer.borrow_mut().resize(&src, &mut dst, &options))
         .map_err(|e| ResizeError::Fir(e.to_string()))?;
-    Ok(PixelBuf {
-        width: dst_w,
-        height: dst_h,
-        rgba: dst.into_vec(),
-    })
+    Ok(PixelBuf::from_parts(dst_w, dst_h, dst.into_vec(), alpha))
 }
 
 /// Rotates a buffer to display orientation, consuming its allocation.
@@ -141,25 +148,18 @@ pub fn apply_orient(buf: PixelBuf, orient: Orient) -> PixelBuf {
     match orient {
         Orient::R0 => buf,
         Orient::R180 => {
-            let mut rgba = buf.rgba;
+            let (width, height) = (buf.width, buf.height);
+            let (mut rgba, alpha) = buf.into_parts();
             let px: &mut [[u8; 4]] = bytemuck_cast(&mut rgba);
             px.reverse();
-            PixelBuf {
-                width: buf.width,
-                height: buf.height,
-                rgba,
-            }
+            PixelBuf::from_parts(width, height, rgba, alpha)
         }
         Orient::R90 | Orient::R270 => {
             let (sw, sh) = (buf.width as usize, buf.height as usize);
             let (dw, dh) = (sh, sw);
-            let src = buf.rgba;
+            let (src, alpha) = buf.into_parts();
             if dw == 0 || dh == 0 {
-                return PixelBuf {
-                    width: dw as u32,
-                    height: dh as u32,
-                    rgba: src,
-                };
+                return PixelBuf::from_parts(dw as u32, dh as u32, src, alpha);
             }
             let mut dst = vec![0u8; src.len()];
             let rotate_row = |yd: usize, row: &mut [u8]| {
@@ -210,11 +210,7 @@ pub fn apply_orient(buf: PixelBuf, orient: Orient) -> PixelBuf {
                     .enumerate()
                     .for_each(|(yd, row)| rotate_row(yd, row));
             }
-            PixelBuf {
-                width: dw as u32,
-                height: dh as u32,
-                rgba: dst,
-            }
+            PixelBuf::from_parts(dw as u32, dh as u32, dst, alpha)
         }
     }
 }
@@ -234,22 +230,14 @@ mod tests {
 
     fn pix(vals: &[u8]) -> PixelBuf {
         // 2x1 image, pixels A=[1,1,1,1], B=[2,2,2,2] style helpers below.
-        PixelBuf {
-            width: 2,
-            height: 1,
-            rgba: vals.to_vec(),
-        }
+        PixelBuf::new(2, 1, vals.to_vec())
     }
 
     fn labelled(width: u32, height: u32) -> PixelBuf {
         let rgba = (1..=width * height)
             .flat_map(|value| [value as u8, value as u8, value as u8, 255])
             .collect();
-        PixelBuf {
-            width,
-            height,
-            rgba,
-        }
+        PixelBuf::new_opaque(width, height, rgba)
     }
 
     fn labels(buf: &PixelBuf) -> Vec<u8> {
@@ -280,15 +268,7 @@ mod tests {
                 .flat_map(|px| [px[0], px[1], px[2], 255])
                 .collect();
 
-            let via_rgba = downscale_to_fit(
-                PixelBuf {
-                    width: w,
-                    height: h,
-                    rgba,
-                },
-                max_edge,
-            )
-            .unwrap();
+            let via_rgba = downscale_to_fit(PixelBuf::new_opaque(w, h, rgba), max_edge).unwrap();
             let via_rgb = downscale_rgb8_to_rgba_fit(w, h, rgb, max_edge).unwrap();
 
             assert_eq!(
@@ -296,6 +276,8 @@ mod tests {
                 (via_rgba.width, via_rgba.height)
             );
             assert!(via_rgba.rgba.chunks_exact(4).all(|px| px[3] == 255));
+            assert!(via_rgba.is_opaque());
+            assert!(via_rgb.is_opaque());
             assert_eq!(via_rgb.rgba, via_rgba.rgba, "{w}x{h} fit {max_edge}");
         }
     }
@@ -331,14 +313,17 @@ mod tests {
         let r90 = apply_orient(source.clone(), Orient::R90);
         assert_eq!((r90.width, r90.height), (2, 3));
         assert_eq!(labels(&r90), vec![4, 1, 5, 2, 6, 3]);
+        assert!(r90.is_opaque());
 
         let r180 = apply_orient(source.clone(), Orient::R180);
         assert_eq!((r180.width, r180.height), (3, 2));
         assert_eq!(labels(&r180), vec![6, 5, 4, 3, 2, 1]);
+        assert!(r180.is_opaque());
 
         let r270 = apply_orient(source, Orient::R270);
         assert_eq!((r270.width, r270.height), (2, 3));
         assert_eq!(labels(&r270), vec![3, 6, 2, 5, 1, 4]);
+        assert!(r270.is_opaque());
     }
 
     #[test]
@@ -355,11 +340,7 @@ mod tests {
                 (state >> 24) as u8
             })
             .collect();
-        let source = PixelBuf {
-            width,
-            height,
-            rgba,
-        };
+        let source = PixelBuf::new(width, height, rgba);
         assert!((width * height) >= 256 * 256);
 
         for orient in [Orient::R90, Orient::R270] {
@@ -407,10 +388,12 @@ mod tests {
         let source = labelled(20, 10);
         let oriented = apply_orient(source.clone(), Orient::R0);
         assert_eq!(oriented.rgba, source.rgba);
+        assert!(oriented.is_opaque());
 
         let fitted = downscale_to_fit(source.clone(), 20).unwrap();
         assert_eq!((fitted.width, fitted.height), (20, 10));
         assert_eq!(fitted.rgba, source.rgba);
+        assert!(fitted.is_opaque());
     }
 
     #[test]
@@ -418,19 +401,33 @@ mod tests {
         let fitted = downscale_to_fit(labelled(40, 20), 13).unwrap();
         assert_eq!((fitted.width, fitted.height), (13, 7));
         assert_eq!(fitted.rgba.len(), 13 * 7 * 4);
+        assert!(fitted.is_opaque());
 
         let portrait = downscale_to_fit(labelled(20, 40), 13).unwrap();
         assert_eq!((portrait.width, portrait.height), (7, 13));
         assert_eq!(portrait.rgba.len(), 7 * 13 * 4);
+        assert!(portrait.is_opaque());
+    }
+
+    #[test]
+    fn transforms_never_upgrade_unknown_alpha_provenance() {
+        let opaque = labelled(8, 6);
+        let unknown = PixelBuf::new(opaque.width, opaque.height, opaque.rgba.clone());
+
+        assert!(!apply_orient(unknown.clone(), Orient::R90).is_opaque());
+        assert!(!resize_exact(unknown, 4, 3).unwrap().is_opaque());
+    }
+
+    #[test]
+    fn malformed_no_op_rgb_expansion_is_never_marked_opaque() {
+        let malformed = downscale_rgb8_to_rgba_fit(2, 2, vec![1, 2, 3], 8).unwrap();
+        assert_eq!(malformed.rgba, vec![1, 2, 3, 255]);
+        assert!(!malformed.is_opaque());
     }
 
     #[test]
     fn resize_rejects_malformed_pixel_storage() {
-        let malformed = PixelBuf {
-            width: 2,
-            height: 2,
-            rgba: vec![0; 15],
-        };
+        let malformed = PixelBuf::new(2, 2, vec![0; 15]);
         assert!(resize_exact(malformed, 1, 1).is_err());
     }
 }

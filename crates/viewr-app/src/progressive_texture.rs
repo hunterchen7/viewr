@@ -170,14 +170,19 @@ pub(crate) fn color_image(buf: &PixelBuf, tile: TileCoord) -> Option<egui::Color
         .ok()?
         .checked_mul(usize::try_from(buf.height).ok()?)?
         .checked_mul(4)?;
-    if buf.rgba.len() != expected_len {
+    if buf.rgba().len() != expected_len {
         return None;
     }
     let sample = sample_rect(buf.width, buf.height, tile)?;
-    extract_sample(buf.width, &buf.rgba, sample)
+    extract_sample(buf.width, buf.rgba(), sample, buf.is_opaque())
 }
 
-fn extract_sample(width: u32, rgba: &[u8], sample: PixelRect) -> Option<egui::ColorImage> {
+fn extract_sample(
+    width: u32,
+    rgba: &[u8],
+    sample: PixelRect,
+    opaque: bool,
+) -> Option<egui::ColorImage> {
     let pixel_count = usize::try_from(sample.width)
         .ok()?
         .checked_mul(usize::try_from(sample.height).ok()?)?;
@@ -191,7 +196,11 @@ fn extract_sample(width: u32, rgba: &[u8], sample: PixelRect) -> Option<egui::Co
             .checked_mul(source_stride)?
             .checked_add(first_x)?;
         let row = rgba.get(row_start..row_start.checked_add(row_bytes)?)?;
-        crate::pixels::extend_from_rgba(&mut pixels, row);
+        if opaque {
+            crate::pixels::extend_from_opaque_rgba(&mut pixels, row);
+        } else {
+            crate::pixels::extend_from_rgba(&mut pixels, row);
+        }
     }
     Some(egui::ColorImage::new(
         [
@@ -216,7 +225,7 @@ pub(crate) fn color_image_band(band: &FullBand, tile: TileCoord) -> Option<egui:
     }
     let source_stride = usize::try_from(band.full_width).ok()?.checked_mul(4)?;
     let expected_len = source_stride.checked_mul(usize::try_from(band.buf.height).ok()?)?;
-    if band.buf.rgba.len() != expected_len {
+    if band.buf.rgba().len() != expected_len {
         return None;
     }
     let sample = sample_rect(band.full_width, band.full_height, tile)?;
@@ -235,9 +244,13 @@ pub(crate) fn color_image_band(band: &FullBand, tile: TileCoord) -> Option<egui:
         let row_start = local_row.checked_mul(source_stride)?.checked_add(first_x)?;
         let row = band
             .buf
-            .rgba
+            .rgba()
             .get(row_start..row_start.checked_add(row_bytes)?)?;
-        crate::pixels::extend_from_rgba(&mut pixels, row);
+        if band.buf.is_opaque() {
+            crate::pixels::extend_from_opaque_rgba(&mut pixels, row);
+        } else {
+            crate::pixels::extend_from_rgba(&mut pixels, row);
+        }
     }
     Some(egui::ColorImage::new(
         [
@@ -342,11 +355,7 @@ mod tests {
                 rgba.extend_from_slice(&[x as u8, y as u8, (x + y) as u8, 255]);
             }
         }
-        PixelBuf {
-            width,
-            height,
-            rgba,
-        }
+        PixelBuf::try_new_opaque(width, height, rgba).expect("synthetic pixels are opaque")
     }
 
     #[test]
@@ -418,9 +427,29 @@ mod tests {
         assert_eq!(image.pixels[0], egui::Color32::from_rgb(0, 0, 0));
         assert_eq!(image.pixels[3 * 5 + 4], egui::Color32::from_rgb(4, 3, 7));
 
-        let mut malformed = source;
-        malformed.rgba.pop();
+        let (width, height) = (source.width, source.height);
+        let mut rgba = source.into_rgba();
+        rgba.pop();
+        let malformed = PixelBuf::new(width, height, rgba);
         assert!(color_image(&malformed, TileCoord { col: 0, row: 0 }).is_none());
+    }
+
+    #[test]
+    fn opaque_contract_and_unknown_fallback_are_differentially_exact() {
+        let opaque = synthetic(17, 9);
+        let unknown = PixelBuf::new(opaque.width, opaque.height, opaque.rgba().to_vec());
+        let tile = TileCoord { col: 0, row: 0 };
+        let direct = color_image(&opaque, tile).expect("known-opaque tile");
+        let scanned = color_image(&unknown, tile).expect("unknown tile");
+        assert_eq!(direct, scanned);
+
+        let mut translucent = opaque.rgba().to_vec();
+        translucent[3] = 127;
+        translucent[4 * 23 + 3] = 0;
+        let expected = egui::ColorImage::from_rgba_unmultiplied([17, 9], &translucent);
+        let actual = color_image(&PixelBuf::new(17, 9, translucent), tile)
+            .expect("translucent fallback tile");
+        assert_eq!(actual, expected);
     }
 
     fn band_of(full: &PixelBuf, y0: u32, height: u32) -> FullBand {
@@ -429,12 +458,12 @@ mod tests {
             full_width: full.width,
             full_height: full.height,
             y0,
-            buf: PixelBuf {
-                width: full.width,
+            buf: PixelBuf::try_new_opaque(
+                full.width,
                 height,
-                rgba: full.rgba[y0 as usize * row_bytes..(y0 + height) as usize * row_bytes]
-                    .to_vec(),
-            },
+                full.rgba()[y0 as usize * row_bytes..(y0 + height) as usize * row_bytes].to_vec(),
+            )
+            .expect("synthetic band is opaque"),
         }
     }
 
@@ -478,7 +507,10 @@ mod tests {
         let tile = TileCoord { col: 0, row: 0 };
 
         let mut truncated = band_of(&full, 0, TILE_EDGE + SAMPLE_GUTTER);
-        truncated.buf.rgba.pop();
+        let (width, height) = (truncated.buf.width, truncated.buf.height);
+        let mut rgba = truncated.buf.into_rgba();
+        rgba.pop();
+        truncated.buf = PixelBuf::new(width, height, rgba);
         assert!(color_image_band(&truncated, tile).is_none());
 
         let mut wrong_width = band_of(&full, 0, TILE_EDGE + SAMPLE_GUTTER);
