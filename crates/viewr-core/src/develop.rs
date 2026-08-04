@@ -294,7 +294,10 @@ fn scale_cfa_data(
         }
         RawImageData::Integer(data) => data,
     };
-    assert_eq!(data.len(), width * height);
+    let expected_len = width
+        .checked_mul(height)
+        .expect("CFA dimensions overflow addressable memory");
+    assert_eq!(data.len(), expected_len);
     let output_len = data.len();
     if output_len == 0 {
         return Vec::new();
@@ -314,7 +317,9 @@ fn scale_cfa_data(
     let mut output = Vec::<f32>::with_capacity(output_len);
     {
         let spare = &mut output.spare_capacity_mut()[..output_len];
-        let row_pair_samples = width * 2;
+        let row_pair_samples = width
+            .checked_mul(2)
+            .expect("a CFA row pair overflows addressable memory");
         let paired_samples = data.len() / row_pair_samples * row_pair_samples;
         let fill_pair = |input: &[u16], output: &mut [std::mem::MaybeUninit<f32>]| {
             let (input_top, input_bottom) = input.split_at(width);
@@ -965,7 +970,9 @@ fn collect_superpixels<Row>(
     row: impl Fn(usize) -> Row + Sync,
     pixel: impl Fn(&Row, usize) -> [f32; 3] + Sync,
 ) -> Color2D<f32, 3> {
-    let out_len = out_width * out_height;
+    let out_len = out_width
+        .checked_mul(out_height)
+        .expect("superpixel dimensions overflow addressable memory");
     if out_len == 0 {
         return Color2D::new_with(Vec::new(), out_width, out_height);
     }
@@ -1231,6 +1238,24 @@ mod tests {
         ] {
             assert_eq!(sanitize_white_balance(invalid), [1.0; 4]);
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "CFA dimensions overflow addressable memory")]
+    fn cfa_scaling_rejects_overflowing_dimensions_before_initialization() {
+        let _ = super::scale_cfa_data(
+            RawImageData::Integer(Vec::new()),
+            usize::MAX,
+            2,
+            [0.0; 4],
+            [1.0; 4],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "superpixel dimensions overflow addressable memory")]
+    fn superpixel_collection_rejects_overflowing_dimensions_before_initialization() {
+        let _ = super::collect_superpixels(usize::MAX, 2, |_| (), |_: &(), _| [0.0_f32; 3]);
     }
 
     #[test]
