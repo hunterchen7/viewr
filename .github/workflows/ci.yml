@@ -64,9 +64,23 @@ jobs:
           cargo fmt --all --check
           cargo fmt --manifest-path thirdparty/dnglab/rawler/Cargo.toml -- --check
       - name: Lint all targets and features
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+          cargo clippy \
+            --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
+            --all-targets \
+            --all-features \
+            --locked \
+            -- \
+            -D warnings
       - name: Check documentation
-        run: cargo doc --workspace --no-deps --all-features --locked
+        run: |
+          cargo doc --workspace --no-deps --all-features --locked
+          cargo doc \
+            --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
+            --no-deps \
+            --all-features \
+            --locked
         env:
           RUSTDOCFLAGS: -D warnings
       - name: Build release and benchmark targets
@@ -144,6 +158,54 @@ jobs:
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/viewr-miri-target
         run: cargo +nightly-2026-07-21 miri test -p viewr-core --lib jobs::tests::jpeg_input_validation_is_independent_of_the_encoding_pool --locked
+      - name: Check optimized pixel and entropy kernels with Miri
+        if: ${{ !cancelled() && steps.miri_toolchain.outcome == 'success' }}
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/viewr-miri-target
+        run: |
+          cargo +nightly-2026-07-21 miri test \
+            -p viewr-core \
+            --lib \
+            develop::tests::fused_integer_superpixel_preserves_shifted_active_crop_and_odd_tails \
+            --locked
+          cargo +nightly-2026-07-21 miri test \
+            -p jpeg-rusturbo \
+            --features force-scalar \
+            --lib \
+            encode::huffman::tests::bitwriter_stuffs_ff_during_high32_drain \
+            --locked
+          cargo +nightly-2026-07-21 miri test \
+            -p jpeg-rusturbo \
+            --features force-scalar \
+            --lib \
+            encode::huffman::tests::equiv_full_random \
+            --locked
+      - name: Check vendored Rawler unsafe boundaries with Miri
+        if: ${{ !cancelled() && steps.miri_toolchain.outcome == 'success' }}
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/viewr-miri-target
+          MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-strict-provenance -Zmiri-ignore-leaks
+        run: |
+          cargo +nightly-2026-07-21 miri test \
+            --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
+            --lib \
+            tiles::tests::tile_rows_retain_complete_allocation_provenance \
+            --locked
+          cargo +nightly-2026-07-21 miri test \
+            --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
+            --lib \
+            imgop::sensor::bayer::ppg::tests::small_frame_raw_pointer_kernels_are_finite \
+            --locked
+          cargo +nightly-2026-07-21 miri test \
+            --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
+            --lib \
+            decoders::arw::tests::direct_output_rows_are_disjoint_strided_and_bounded \
+            --locked
+          cargo +nightly-2026-07-21 miri test \
+            --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
+            --lib \
+            decompressors::ljpeg::decompressors::tests::sony_arw_scatter_stays_inside_each_destination_row \
+            --locked
 
   macos-compatibility:
     name: Compatibility (macOS latest)
