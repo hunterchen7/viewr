@@ -87,7 +87,7 @@ impl SettingsState {
         if !self.open {
             self.listening = None;
             if self.was_open {
-                config.save_and_flush();
+                config.save_and_request_flush();
                 self.was_open = false;
             }
             return actions;
@@ -450,7 +450,7 @@ impl SettingsState {
             config.save();
         }
         if !open {
-            config.save_and_flush();
+            config.save_and_request_flush();
             self.was_open = false;
         }
         actions

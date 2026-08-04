@@ -524,9 +524,20 @@ impl Config {
         config_writer().save(self.serialized());
     }
 
+    /// Saves the current state and queues a durability barrier without waiting
+    /// for filesystem I/O. Preferences-close paths use this so dismissing the
+    /// window cannot stall the UI thread.
+    pub fn save_and_request_flush(&self) {
+        if !config_writer().save_and_request_flush(self.serialized()) {
+            eprintln!("failed to queue configuration flush; exit will retry it");
+        }
+    }
+
     /// Saves the current state and waits until the durable replacement is
-    /// complete. Window-close and process-exit paths use this barrier. Normal
-    /// UI changes use [`save`](Self::save) and never wait for filesystem I/O.
+    /// complete. Process exit uses this barrier. Normal UI changes use
+    /// [`save`](Self::save), and Preferences close uses
+    /// [`save_and_request_flush`](Self::save_and_request_flush), so neither
+    /// waits for filesystem I/O.
     pub fn save_and_flush(&self) {
         let serialized = self.serialized();
         if !config_writer().save_and_flush(serialized) {
@@ -616,6 +627,15 @@ impl ConfigWriter {
             };
             save_config_now(serialized);
         }
+    }
+
+    fn save_and_request_flush(&self, serialized: String) -> bool {
+        let Some(sender) = &self.sender else {
+            return false;
+        };
+        let (done, _wait) = mpsc::channel();
+        sender.send(ConfigWrite::Save(serialized)).is_ok()
+            && sender.send(ConfigWrite::Flush(done)).is_ok()
     }
 
     fn save_and_flush(&self, serialized: String) -> bool {
@@ -827,6 +847,67 @@ jpeg_quality = 97
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preferences_close_flush_is_queued_without_waiting() {
+        let (sender, receiver) = mpsc::channel();
+        let writer = ConfigWriter {
+            sender: Some(sender.clone()),
+        };
+        let (returned, return_wait) = mpsc::channel();
+        let request = std::thread::spawn(move || {
+            returned
+                .send(writer.save_and_request_flush("closed".into()))
+                .unwrap();
+        });
+
+        assert_eq!(
+            return_wait.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(true),
+            "queueing a Preferences-close barrier must not wait for persistence"
+        );
+        request.join().unwrap();
+
+        sender
+            .send(ConfigWrite::Save("later change".into()))
+            .unwrap();
+        drop(sender);
+        let mut writes = Vec::new();
+        config_writer_loop(receiver, |serialized| writes.push(serialized));
+        assert_eq!(writes, ["closed", "later change"]);
+    }
+
+    #[test]
+    fn exit_flush_waits_for_durable_persistence() {
+        let (sender, receiver) = mpsc::channel();
+        let writer = ConfigWriter {
+            sender: Some(sender),
+        };
+        let (persisting, persistence_started) = mpsc::channel();
+        let (release_persistence, release) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            config_writer_loop(receiver, |serialized| {
+                assert_eq!(serialized, "exit");
+                persisting.send(()).unwrap();
+                release.recv().unwrap();
+            });
+        });
+        let (returned, return_wait) = mpsc::channel();
+        let request = std::thread::spawn(move || {
+            returned.send(writer.save_and_flush("exit".into())).unwrap();
+        });
+
+        persistence_started.recv().unwrap();
+        assert_eq!(
+            return_wait.try_recv(),
+            Err(mpsc::TryRecvError::Empty),
+            "the process-exit barrier must wait until persistence completes"
+        );
+        release_persistence.send(()).unwrap();
+        assert!(return_wait.recv().unwrap());
+        request.join().unwrap();
+        worker.join().unwrap();
+    }
 
     #[test]
     fn config_writer_coalesces_changes_before_a_flush_barrier() {
