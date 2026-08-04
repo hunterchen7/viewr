@@ -9,8 +9,10 @@ Run these commands before each commit:
 
 ```sh
 cargo fmt --all --check
+cargo fmt --manifest-path thirdparty/dnglab/rawler/Cargo.toml -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --locked
+cargo test --manifest-path thirdparty/dnglab/rawler/Cargo.toml --lib --release --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
 ```
 
@@ -28,9 +30,9 @@ CI reports five checks. It uses one shared Linux quality check, one current
 macOS compatibility check, and one installer check for each release platform.
 The full test suite runs on current macOS, Windows, and Linux. The macOS and
 Windows checks also compile all-feature benchmark targets. The quality check
-runs formatting, Clippy, Rustdoc, the release build, release tests, pinned
-public-domain Sony RAW tests, both optimized benchmark smoke tests, and the
-focused Miri checks.
+runs formatting, Clippy, Rustdoc, the release build, release tests, vendored
+Rawler release tests, pinned public-domain Sony RAW tests, every optimized
+benchmark smoke test, and the focused Miri checks.
 
 Windows-specific database tests recreate ordinary drive-path rows from the
 released ownerless schemas and from the pre-v8 owner schema. They verify clean
@@ -40,10 +42,12 @@ drive-root-relative spellings, raw drive-case path/owner tombstones, duplicate
 component-equivalent keys, lossless non-Unicode round-tripping, and fail-closed
 malformed native-path handling.
 
-The quality check builds the application and both benchmark harnesses with one
+The quality check builds the application and its three benchmark harnesses with one
 release-profile Cargo invocation using
-`--bins --benches --all-features`. It then runs the complete workspace test
-suite in release mode and executes both Criterion harnesses in smoke-test mode.
+`--bins --benches --all-features`. It then runs the complete workspace and
+vendored Rawler test suites in release mode and executes every Criterion
+harness, including the two separately locked benchmark workspaces, in
+smoke-test mode.
 These checks are intentional: optimized-only parallel paths, code hidden behind
 `debug_assert!`, and benchmark runtime setup must execute in CI, not merely
 compile.
@@ -78,6 +82,9 @@ Run the full benchmark suite:
 ```sh
 cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked
 cargo bench -p viewr --features benchmarks --bench filmstrip_scaling --locked
+cargo bench -p viewr --features benchmarks --bench event_backlog --locked
+cargo bench --manifest-path thirdparty/dnglab/rawler/Cargo.toml --locked --bench perf
+cargo bench --manifest-path tools/jpeg-bakeoff/Cargo.toml --locked --bench encode
 ```
 
 Use a filter when you work on one subsystem:
@@ -151,6 +158,14 @@ The suite measures these workloads:
   rating map at 1,000, 10,000, and 100,000 entries. The installation primitive
   runs a threshold-filter transition predicate; it does not include event,
   persistence, repaint, or full-session costs.
+- A 100,000-item application event backlog, comparing unbounded FIFO drain
+  with foreground-priority delivery plus one bounded 4,096-item background
+  batch. This times receiver and metadata-map work; production rating,
+  filtering, marker, and repaint effects remain correctness-tested but are not
+  included in the synthetic latency claim.
+- Rawler lossless-JPEG encode/copy kernels and a 2,048 by 1,366 four-channel
+  bilinear demosaic. The latter keeps generic non-Sony pixel-access changes in
+  the controlled benchmark surface.
 
 Criterion stores reports in `target/criterion`.
 Git ignores this directory.

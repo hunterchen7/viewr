@@ -58,8 +58,9 @@ const THUMB_FAILURE_RETRY_AFTER: Duration = Duration::from_secs(2);
 /// order while guaranteeing that every queued foreground event makes progress.
 const FOREGROUND_EVENTS_PER_FRAME: usize = 256;
 /// Folder-wide metadata is useful but never urgent enough to monopolize one
-/// UI frame. At the measured 100,000-event cost this keeps the drain below a
-/// millisecond while clearing a fully synthetic backlog in 25 frames.
+/// UI frame. The synthetic receiver-plus-map benchmark keeps this bounded
+/// batch below a millisecond on the reference host; production metadata
+/// effects are covered by correctness tests but are not part of that timing.
 const BACKGROUND_EVENTS_PER_FRAME: usize = 4_096;
 const RATING_DB_REFRESH_POLL: Duration = Duration::from_millis(50);
 const RATING_DB_REFRESH_MAX_POLL: Duration = Duration::from_secs(5);

@@ -60,7 +60,9 @@ jobs:
           scripts/test-verify-release-assets.sh
           scripts/test-verify-remote-release-assets.sh
       - name: Format
-        run: cargo fmt --all --check
+        run: |
+          cargo fmt --all --check
+          cargo fmt --manifest-path thirdparty/dnglab/rawler/Cargo.toml -- --check
       - name: Lint all targets and features
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Check documentation
@@ -73,6 +75,9 @@ jobs:
       - name: Test workspace release behavior
         if: ${{ !cancelled() }}
         run: cargo test --workspace --release --locked
+      - name: Test vendored Rawler release behavior
+        if: ${{ !cancelled() }}
+        run: cargo test --manifest-path thirdparty/dnglab/rawler/Cargo.toml --lib --release --locked
       - name: Test public-domain Sony RAW fixture
         if: ${{ !cancelled() }}
         env:
@@ -113,8 +118,10 @@ jobs:
         run: |
           cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- --test
           cargo bench -p viewr --features benchmarks --bench filmstrip_scaling --locked -- --test
+          cargo bench -p viewr --features benchmarks --bench event_backlog --locked -- --test
           cargo test --manifest-path tools/jpeg-bakeoff/Cargo.toml --locked
           cargo bench --manifest-path tools/jpeg-bakeoff/Cargo.toml --locked --bench encode -- --test
+          cargo bench --manifest-path thirdparty/dnglab/rawler/Cargo.toml --locked --bench perf -- --test
       - name: Install pinned nightly Miri toolchain
         id: miri_toolchain
         if: ${{ !cancelled() }}
