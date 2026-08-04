@@ -1067,7 +1067,7 @@ impl App {
                 OverlaySource::Full(buf)
             } else if let Some((width, height)) = session
                 .engine
-                .with_progressive_full(current, |width, height, _, _| (width, height))
+                .progressive_full_size(current)
                 .filter(|&(width, height)| width > 0 && height > 0)
             {
                 OverlaySource::Staging { width, height }
@@ -1147,17 +1147,31 @@ impl App {
                 Some(image) => TileImage::Ready(image),
                 None => TileImage::NotCovered,
             },
-            OverlaySource::Staging { .. } => match engine
-                .with_progressive_full(current, |width, height, rgba, covered| {
-                    progressive_texture::color_image_from_staging(
-                        width, height, rgba, covered, tile,
-                    )
-                })
-                .flatten()
-            {
-                Some(image) => TileImage::Ready(image),
-                None => TileImage::NotCovered,
-            },
+            OverlaySource::Staging { width, height } => {
+                let Some(sample) = progressive_texture::sample_rect(*width, *height, tile) else {
+                    return TileImage::Invalid;
+                };
+                let Some(pixel_count) = usize::try_from(sample.width).ok().and_then(|width| {
+                    usize::try_from(sample.height)
+                        .ok()
+                        .and_then(|height| width.checked_mul(height))
+                }) else {
+                    return TileImage::Invalid;
+                };
+                let mut pixels = vec![egui::Color32::TRANSPARENT; pixel_count];
+                if engine.copy_progressive_full_region_into(
+                    current,
+                    [sample.x, sample.y, sample.width, sample.height],
+                    bytemuck::cast_slice_mut(&mut pixels),
+                ) {
+                    TileImage::Ready(egui::ColorImage::new(
+                        [sample.width as usize, sample.height as usize],
+                        pixels,
+                    ))
+                } else {
+                    TileImage::NotCovered
+                }
+            }
         };
         if missing_visible > 0 {
             for &tile in &order {

@@ -233,6 +233,23 @@ fn experimental_visible_tiles(
     images
 }
 
+/// Mirrors the progressive staging path after its worker-lock fix: allocate
+/// the final Color32 storage, then copy covered RGBA rows directly into it.
+fn staging_tile_copy(source: &PixelBuf, tile: progressive_texture::TileCoord) -> egui::ColorImage {
+    let sample = progressive_texture::sample_rect(source.width, source.height, tile)
+        .expect("the benchmark tile is valid");
+    let pixel_count = sample.width as usize * sample.height as usize;
+    let mut pixels = vec![egui::Color32::TRANSPARENT; pixel_count];
+    let output = bytemuck::cast_slice_mut::<egui::Color32, u8>(&mut pixels);
+    let source_stride = source.width as usize * 4;
+    let row_bytes = sample.width as usize * 4;
+    for (row, destination) in (sample.y..sample.bottom()).zip(output.chunks_exact_mut(row_bytes)) {
+        let start = row as usize * source_stride + sample.x as usize * 4;
+        destination.copy_from_slice(&source.rgba[start..start + row_bytes]);
+    }
+    egui::ColorImage::new([sample.width as usize, sample.height as usize], pixels)
+}
+
 fn bench_full_texture_first_visible(c: &mut Criterion) {
     const WIDTH: u32 = 6_000;
     const HEIGHT: u32 = 4_000;
@@ -301,6 +318,16 @@ fn bench_full_texture_first_visible(c: &mut Criterion) {
                     progressive_texture::color_image(black_box(&opaque_source), black_box(tile))
                         .expect("valid benchmark tile"),
                 );
+            }
+        });
+    });
+    group.bench_function("progressive_visible_four_tiles_staging_copy", |b| {
+        b.iter(|| {
+            for &tile in &visible_tiles {
+                black_box(staging_tile_copy(
+                    black_box(&opaque_source),
+                    black_box(tile),
+                ));
             }
         });
     });

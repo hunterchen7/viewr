@@ -137,7 +137,8 @@ pub enum Event {
     /// canvas.
     ///
     /// A payload-free progress ping: the covered rectangles live in the
-    /// staging snapshot read through [`Engine::with_progressive_full`].
+    /// staging snapshot read through
+    /// [`Engine::copy_progressive_full_region_into`].
     /// Receivers need no replan — the accompanying notify callback already
     /// requests a repaint.
     ImageRegionReady {
@@ -1389,6 +1390,98 @@ struct ProgressiveCanvas {
     covered: Vec<[u32; 4]>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ProgressiveRect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+impl ProgressiveRect {
+    fn right(self) -> u32 {
+        self.x + self.width
+    }
+
+    fn bottom(self) -> u32 {
+        self.y + self.height
+    }
+
+    fn intersects(self, other: Self) -> bool {
+        self.x < other.right()
+            && other.x < self.right()
+            && self.y < other.bottom()
+            && other.y < self.bottom()
+    }
+}
+
+/// Returns whether the union of `covered` contains all of `target`.
+fn progressive_rect_fully_covered(target: ProgressiveRect, covered: &[[u32; 4]]) -> bool {
+    if target.width == 0 || target.height == 0 {
+        return true;
+    }
+    let mut remaining = vec![target];
+    for &[x, y, width, height] in covered {
+        if width == 0 || height == 0 {
+            continue;
+        }
+        if remaining.is_empty() {
+            break;
+        }
+        let cover = ProgressiveRect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let mut next = Vec::with_capacity(remaining.len() + 3);
+        for rect in remaining {
+            if !rect.intersects(cover) {
+                next.push(rect);
+                continue;
+            }
+            let overlap_top = rect.y.max(cover.y);
+            let overlap_bottom = rect.bottom().min(cover.bottom());
+            let overlap_left = rect.x.max(cover.x);
+            let overlap_right = rect.right().min(cover.right());
+            if rect.y < overlap_top {
+                next.push(ProgressiveRect {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: overlap_top - rect.y,
+                });
+            }
+            if overlap_bottom < rect.bottom() {
+                next.push(ProgressiveRect {
+                    x: rect.x,
+                    y: overlap_bottom,
+                    width: rect.width,
+                    height: rect.bottom() - overlap_bottom,
+                });
+            }
+            if rect.x < overlap_left {
+                next.push(ProgressiveRect {
+                    x: rect.x,
+                    y: overlap_top,
+                    width: overlap_left - rect.x,
+                    height: overlap_bottom - overlap_top,
+                });
+            }
+            if overlap_right < rect.right() {
+                next.push(ProgressiveRect {
+                    x: overlap_right,
+                    y: overlap_top,
+                    width: rect.right() - overlap_right,
+                    height: overlap_bottom - overlap_top,
+                });
+            }
+        }
+        remaining = next;
+    }
+    remaining.is_empty()
+}
+
 /// Construction options for an image-processing [`Engine`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineOptions {
@@ -1857,27 +1950,110 @@ impl Engine {
         *self.shared.full_viewport.lock().unwrap() = Some((index, uv));
     }
 
-    /// Reads the progressive Full staging canvas for `index`, if one is being
-    /// assembled.
-    ///
-    /// `f` receives the display-space canvas dimensions, its RGBA bytes, and
-    /// the covered display rectangles (`[x, y, width, height]`), all under
-    /// the staging lock: copy what you need and return quickly. Covered bytes
-    /// are identical to the finished Full buffer, so anything uploaded from
-    /// here never needs re-uploading after `ImageReady`.
-    pub fn with_progressive_full<R>(
-        &self,
-        index: usize,
-        f: impl FnOnce(u32, u32, &[u8], &[[u32; 4]]) -> R,
-    ) -> Option<R> {
+    /// Returns the display dimensions of an in-progress Full staging canvas.
+    pub fn progressive_full_size(&self, index: usize) -> Option<(u32, u32)> {
         let staging = self.shared.progressive.lock().unwrap();
         let canvas = staging.as_ref().filter(|canvas| canvas.index == index)?;
-        Some(f(
-            canvas.width,
-            canvas.height,
-            &canvas.rgba,
-            &canvas.covered,
-        ))
+        Some((canvas.width, canvas.height))
+    }
+
+    /// Copies one fully covered display-space region from an in-progress Full
+    /// staging canvas into caller-owned tightly packed RGBA8 storage.
+    ///
+    /// `rect` is `[x, y, width, height]`. `output` must contain exactly
+    /// `width * height * 4` bytes. Callers allocate final texture storage
+    /// before this method. The staging lock protects only coverage validation
+    /// and row copies. Covered bytes are identical to the finished Full
+    /// buffer. Returns `false` if the canvas, coverage, dimensions, or storage
+    /// do not match.
+    pub fn copy_progressive_full_region_into(
+        &self,
+        index: usize,
+        rect: [u32; 4],
+        output: &mut [u8],
+    ) -> bool {
+        let [x, y, width, height] = rect;
+        if width == 0 || height == 0 {
+            return false;
+        }
+        let Some(right) = x.checked_add(width) else {
+            return false;
+        };
+        let Some(bottom) = y.checked_add(height) else {
+            return false;
+        };
+        let Ok(width_usize) = usize::try_from(width) else {
+            return false;
+        };
+        let Some(row_bytes) = width_usize.checked_mul(4) else {
+            return false;
+        };
+        let Ok(height_usize) = usize::try_from(height) else {
+            return false;
+        };
+        let Some(output_len) = row_bytes.checked_mul(height_usize) else {
+            return false;
+        };
+        if output.len() != output_len {
+            return false;
+        }
+
+        let staging = self.shared.progressive.lock().unwrap();
+        let Some(canvas) = staging.as_ref().filter(|canvas| canvas.index == index) else {
+            return false;
+        };
+        if right > canvas.width || bottom > canvas.height {
+            return false;
+        }
+        let target = ProgressiveRect {
+            x,
+            y,
+            width,
+            height,
+        };
+        if !progressive_rect_fully_covered(target, &canvas.covered) {
+            return false;
+        }
+        let Ok(canvas_width) = usize::try_from(canvas.width) else {
+            return false;
+        };
+        let Some(stride) = canvas_width.checked_mul(4) else {
+            return false;
+        };
+        let Ok(canvas_height) = usize::try_from(canvas.height) else {
+            return false;
+        };
+        let Some(expected_len) = stride.checked_mul(canvas_height) else {
+            return false;
+        };
+        if canvas.rgba.len() != expected_len {
+            return false;
+        }
+        let Ok(x_usize) = usize::try_from(x) else {
+            return false;
+        };
+        let Some(first_x) = x_usize.checked_mul(4) else {
+            return false;
+        };
+        for (row, destination) in (y..bottom).zip(output.chunks_exact_mut(row_bytes)) {
+            let Ok(row) = usize::try_from(row) else {
+                return false;
+            };
+            let Some(start) = row
+                .checked_mul(stride)
+                .and_then(|start| start.checked_add(first_x))
+            else {
+                return false;
+            };
+            let Some(end) = start.checked_add(row_bytes) else {
+                return false;
+            };
+            let Some(source) = canvas.rgba.get(start..end) else {
+                return false;
+            };
+            destination.copy_from_slice(source);
+        }
+        true
     }
 }
 
@@ -6537,6 +6713,109 @@ mod tests {
     }
 
     #[test]
+    fn progressive_coverage_matches_a_per_pixel_reference() {
+        let mut state = 0xC0FF_EE00_D15E_A5E5_u64;
+        let mut next = move |bound: u32| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as u32) % bound
+        };
+        let (grid_w, grid_h) = (24_u32, 18_u32);
+        for case in 0..500 {
+            let mut target = ProgressiveRect {
+                x: next(grid_w - 1),
+                y: next(grid_h - 1),
+                width: 1 + next(8),
+                height: 1 + next(8),
+            };
+            target.width = target.width.min(grid_w - target.x);
+            target.height = target.height.min(grid_h - target.y);
+            let covered: Vec<[u32; 4]> = (0..next(7))
+                .map(|_| {
+                    let x = next(grid_w);
+                    let y = next(grid_h);
+                    [x, y, next(10), next(10)]
+                })
+                .collect();
+
+            let mut expected = true;
+            'outer: for y in target.y..target.bottom() {
+                for x in target.x..target.right() {
+                    let inside_any = covered
+                        .iter()
+                        .any(|&[cx, cy, cw, ch]| x >= cx && x < cx + cw && y >= cy && y < cy + ch);
+                    if !inside_any {
+                        expected = false;
+                        break 'outer;
+                    }
+                }
+            }
+            assert_eq!(
+                progressive_rect_fully_covered(target, &covered),
+                expected,
+                "case {case}: target {target:?} covered {covered:?}"
+            );
+        }
+
+        let sample = ProgressiveRect {
+            x: 3,
+            y: 2,
+            width: 6,
+            height: 5,
+        };
+        assert!(progressive_rect_fully_covered(sample, &[[3, 2, 6, 5]]));
+        assert!(progressive_rect_fully_covered(
+            sample,
+            &[[0, 0, 24, 4], [0, 4, 24, 14]]
+        ));
+        assert!(!progressive_rect_fully_covered(
+            sample,
+            &[[3, 2, 6, 4], [3, 6, 5, 1]]
+        ));
+    }
+
+    #[test]
+    fn progressive_region_copy_releases_callers_from_canvas_storage() {
+        let (shared, _receiver) = staging_test_shared();
+        let source = (0_u8..48).collect::<Vec<_>>();
+        *shared.progressive.lock().unwrap() = Some(ProgressiveCanvas {
+            index: 3,
+            width: 4,
+            height: 3,
+            rgba: source.clone(),
+            covered: vec![[0, 0, 2, 3], [2, 0, 2, 2]],
+        });
+        let engine = Engine {
+            shared: Arc::new(shared),
+            workers: Vec::new(),
+            persistence_worker: None,
+        };
+
+        assert_eq!(engine.progressive_full_size(3), Some((4, 3)));
+        let mut copied = vec![0; 12];
+        assert!(engine.copy_progressive_full_region_into(3, [1, 1, 3, 1], &mut copied));
+        assert_eq!(copied, source[20..32]);
+
+        assert!(
+            !engine.copy_progressive_full_region_into(3, [1, 2, 3, 1], &mut copied),
+            "the bottom-right pixels are not covered"
+        );
+        assert!(
+            !engine.copy_progressive_full_region_into(4, [1, 1, 3, 1], &mut copied),
+            "a different generation cannot read this canvas"
+        );
+        assert!(
+            !engine.copy_progressive_full_region_into(3, [u32::MAX, 0, 3, 1], &mut copied),
+            "coordinate overflow is rejected"
+        );
+        assert!(
+            !engine.copy_progressive_full_region_into(3, [1, 1, 3, 1], &mut copied[..8]),
+            "the destination length must be exact"
+        );
+    }
+
+    #[test]
     fn full_viewport_mailbox_round_trips_and_clears_when_not_zoomed() {
         let entries = Arc::new(vec![FolderEntry {
             path: "/nonexistent/viewr-progressive-test.arw".into(),
@@ -6552,7 +6831,7 @@ mod tests {
             *engine.shared.full_viewport.lock().unwrap(),
             Some((0, [0.25, 0.25, 0.75, 0.75]))
         );
-        assert!(engine.with_progressive_full(0, |_, _, _, _| ()).is_none());
+        assert!(engine.progressive_full_size(0).is_none());
 
         engine.navigate(NavState {
             current: 0,
