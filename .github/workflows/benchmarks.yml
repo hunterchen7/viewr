@@ -89,6 +89,8 @@ jobs:
       - name: Run application event-backlog benchmarks
         run: cargo bench -p viewr --features benchmarks --bench event_backlog --locked -- --noplot
       - name: Run generic RAW pipeline benchmarks
+        env:
+          CRITERION_HOME: ${{ github.workspace }}/target/criterion-rawler
         run: cargo bench --manifest-path thirdparty/dnglab/rawler/Cargo.toml --locked --bench perf -- --noplot
       - name: Run JPEG codec bake-off
         run: cargo bench --manifest-path tools/jpeg-bakeoff/Cargo.toml --locked --bench encode -- --noplot
@@ -99,7 +101,7 @@ jobs:
           name: criterion-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             target/criterion
-            thirdparty/dnglab/rawler/target/criterion
+            target/criterion-rawler
             tools/jpeg-bakeoff/target/criterion
             target/benchmark-metadata.json
           if-no-files-found: warn
