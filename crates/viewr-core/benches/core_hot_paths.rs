@@ -2021,6 +2021,53 @@ fn bench_opt_in_raw(c: &mut Criterion) {
         });
     }
 
+    // Keep the former materialized-f32 Browse path beside production so a
+    // fixture run measures the end-to-end benefit and checks exact pixels
+    // before timing either implementation.
+    let comparison_raw = decode::load(&raw_path)
+        .expect("RAW decoded for Browse-path comparison")
+        .raw;
+    let (browse_materialized, _) =
+        develop::benchmark_develop_browse_materialized(comparison_raw.clone())
+            .expect("materialized Browse reference develops");
+    let (browse_production, _) =
+        develop::develop(comparison_raw, Quality::Browse).expect("production Browse path develops");
+    assert_eq!(
+        (browse_production.width, browse_production.height),
+        (browse_materialized.width, browse_materialized.height),
+    );
+    assert_eq!(browse_production.rgba(), browse_materialized.rgba());
+    drop((browse_materialized, browse_production));
+
+    group.throughput(Throughput::Elements(sensor_pixels));
+    group.bench_function("develop_browse/materialized_f32", |b| {
+        b.iter_batched(
+            || {
+                decode::load(&raw_path)
+                    .expect("RAW decoded during benchmark setup")
+                    .raw
+            },
+            |raw| {
+                black_box(develop::benchmark_develop_browse_materialized(black_box(
+                    raw,
+                )))
+                .unwrap()
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    group.bench_function("develop_browse/production_fused", |b| {
+        b.iter_batched(
+            || {
+                decode::load(&raw_path)
+                    .expect("RAW decoded during benchmark setup")
+                    .raw
+            },
+            |raw| black_box(develop::develop(black_box(raw), Quality::Browse)).unwrap(),
+            BatchSize::PerIteration,
+        );
+    });
+
     for quality in [Quality::Browse, Quality::Full] {
         group.throughput(Throughput::Elements(sensor_pixels));
         group.bench_with_input(
