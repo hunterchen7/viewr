@@ -586,10 +586,12 @@ reference test. Validation includes these checks:
 - Exact monolithic-versus-progressive RAW output tests.
 - Panic, poison, stale-generation, cancellation, and malformed-storage tests.
 
-Miri reports known Crossbeam integer-pointer provenance diagnostics when Rayon
-initializes its global worker structures. The tested Viewr code completes. A
-run without `-Zmiri-ignore-leaks` ends on Crossbeam's global thread and leak
-state, not on a Viewr allocation or pointer error.
+Strict-provenance Miri cannot initialize Rayon's Crossbeam epoch sentinel,
+which encodes state as an integer-derived pointer. Miri builds therefore run
+the same disjoint Bayer expansion and PPG row bodies serially. Production
+builds compile that condition away and retain parallel dispatch. This keeps
+the strict gate focused on Viewr's pointer provenance instead of weakening it
+or accepting an upstream diagnostic before the tested kernel runs.
 
 ## Reproduce the important checks
 

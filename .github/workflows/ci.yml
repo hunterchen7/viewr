@@ -208,7 +208,7 @@ jobs:
           cargo +nightly-2026-07-21 miri test \
             --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
             --lib \
-            decoders::arw::tests::direct_output_rows_are_disjoint_strided_and_bounded \
+            decoders::arw::sony_ljpeg_validation_tests::direct_output_rows_are_disjoint_strided_and_bounded \
             --locked
           cargo +nightly-2026-07-21 miri test \
             --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
