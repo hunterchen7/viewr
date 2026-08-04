@@ -491,8 +491,8 @@ pub struct FullBand {
 /// visible rows of the Full decode currently in flight. The slot is outside
 /// every ring budget (bounded to one band, lifetime ≈ the tail of one
 /// decode): it is replaced by the next publication, cleared when the matching
-/// Full RGBA entry is installed, and cleared when its image leaves the
-/// desired Full working set.
+/// Full RGBA entry is installed, cleared when navigation changes the current
+/// image, and cleared when its image leaves the desired Full working set.
 ///
 /// All ring operations serialize through one mutex; the band slot has its
 /// own. When both are taken the order is always ring mutex → band mutex. A
@@ -762,13 +762,32 @@ impl RamCache {
         retained
     }
 
+    /// Retains a provisional Full band only when it belongs to the current
+    /// image. The jobs layer calls this while holding its navigation mutex, so
+    /// a generation-fenced publication cannot race a current-image change.
+    ///
+    /// The removed allocation is dropped after releasing the band mutex.
+    pub(crate) fn retain_full_band_for_current(&self, current: Option<usize>) {
+        let mut slot = self.band.lock().unwrap();
+        let removed = if slot
+            .as_ref()
+            .is_some_and(|(owner, _)| Some(*owner) != current)
+        {
+            slot.take()
+        } else {
+            None
+        };
+        drop(slot);
+        drop(removed);
+    }
+
     /// Publishes the provisional visible band of an in-progress Full decode,
     /// replacing whatever band the single slot held before.
     ///
     /// The slot is deliberately outside the ring byte budgets: it is bounded
     /// to one band whose lifetime spans only the tail of one decode. See
     /// [`get_full_band`](Self::get_full_band) for the read side.
-    pub fn publish_full_band(&self, index: usize, band: FullBand) {
+    pub(crate) fn publish_full_band(&self, index: usize, band: FullBand) {
         let replaced = self.band.lock().unwrap().replace((index, Arc::new(band)));
         drop(replaced);
     }

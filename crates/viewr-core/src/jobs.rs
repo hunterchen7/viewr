@@ -1195,6 +1195,13 @@ struct NavigationOrder {
     /// values under one mutex makes a sequence change atomically invalidate
     /// the cancellation generation.
     last_nav: Option<NavState>,
+    /// Monotonic identity for publications tied to one navigation state.
+    /// Unlike the scheduler's position-change result, this also advances for
+    /// zoom transitions so a stale zoomed callback cannot become valid again
+    /// after an intervening Fit view. Same-state hint and viewport updates do
+    /// not advance it on every pan frame; band publication separately matches
+    /// the exact captured hint against the latest mailbox value.
+    generation: u64,
 }
 
 impl NavigationOrder {
@@ -1209,6 +1216,9 @@ impl NavigationOrder {
         let position_changed = self
             .last_nav
             .is_none_or(|last| (last.current, last.direction) != (nav.current, nav.direction));
+        if self.last_nav != Some(nav) {
+            self.generation = self.generation.wrapping_add(1);
+        }
         self.last_nav = Some(nav);
         position_changed
     }
@@ -1234,6 +1244,7 @@ impl NavigationOrder {
             }
         }
         self.last_nav = None;
+        self.generation = self.generation.wrapping_add(1);
     }
 }
 
@@ -1322,6 +1333,41 @@ enum RawShareJoin<'share, T> {
     Shared(Arc<T>),
     /// Decode independently: waiting was cancelled or the leader failed.
     OwnDecode,
+}
+
+/// Result of resolving a raw-share join at the decode-call boundary.
+/// `Cancelled` is checked after a follower may have waited, so an OwnDecode
+/// wake-up caused by cancellation cannot accidentally start a fresh RAW
+/// decode. A live OwnDecode caused by leader failure still executes the
+/// supplied recovery loader.
+enum RawShareDecode<'share, T, D> {
+    Shared(Arc<T>),
+    Decoded {
+        lead: Option<RawShareLead<'share, T>>,
+        output: D,
+    },
+    Cancelled,
+}
+
+fn decode_after_raw_share_join<'share, T, D>(
+    join: RawShareJoin<'share, T>,
+    token: &CancelToken,
+    decode: impl FnOnce() -> D,
+) -> RawShareDecode<'share, T, D> {
+    if token.cancelled() {
+        return RawShareDecode::Cancelled;
+    }
+    match join {
+        RawShareJoin::Shared(shared) => RawShareDecode::Shared(shared),
+        RawShareJoin::Lead(lead) => RawShareDecode::Decoded {
+            lead: Some(lead),
+            output: decode(),
+        },
+        RawShareJoin::OwnDecode => RawShareDecode::Decoded {
+            lead: None,
+            output: decode(),
+        },
+    }
 }
 
 struct RawShareLead<'share, T> {
@@ -1971,6 +2017,13 @@ impl Engine {
         } else {
             (None, None)
         };
+        // Provisional JPEG rows are display state for exactly the zoomed
+        // current image, not generic Full-working-set residency. Holding the
+        // navigation mutex across this clear makes it atomic with guarded
+        // callback publication below: a callback either publishes before the
+        // change and is cleared here, or observes the new generation and is
+        // rejected.
+        cache.retain_full_band_for_current(nav.zoomed.then_some(current));
         let current_position = navigation.current_position(current);
         let (full_snapshot, browse_snapshot) = cache.prefetch_snapshots();
         let prefetch_budgets = NavigationPrefetchBudgets::new(
@@ -2100,6 +2153,9 @@ impl Engine {
     pub fn set_sequence(&self, sequence: Vec<usize>) {
         let mut navigation = self.shared.navigation.lock().unwrap();
         navigation.replace_indices(self.shared.entries.len(), sequence);
+        // Until the caller applies the next navigation, there is no current
+        // generation against which a provisional band can remain valid.
+        self.shared.cache.retain_full_band_for_current(None);
     }
 
     /// Replace the thumbnail viewport demand lane. It is intentionally
@@ -2829,6 +2885,7 @@ fn complete_thumb_attempt(
 
 /// Snapshots a current image's viewport under the same lock order used by
 /// navigation publication. The navigation mutex is the transaction fence.
+#[cfg(test)]
 fn current_full_viewport(shared: &Shared, index: usize) -> Option<[f32; 4]> {
     let navigation = shared.navigation.lock().unwrap();
     if !navigation
@@ -2843,9 +2900,67 @@ fn current_full_viewport(shared: &Shared, index: usize) -> Option<[f32; 4]> {
         .map(|(_, uv)| uv)
 }
 
+/// Validates the zoomed current image, snapshots its matching viewport, and
+/// reserves the sole progressive canvas as one navigation transaction.
+///
+/// Lock order is navigation -> viewport mailbox -> progressive staging, the
+/// same order used by navigation publication. Therefore a current-image
+/// change cannot land after validation but before the reservation becomes
+/// visible for retirement.
+fn reserve_current_progressive<'a>(
+    shared: &'a Shared,
+    index: usize,
+    token: &CancelToken,
+) -> Option<(ProgressiveLease<'a>, [f32; 4])> {
+    reserve_current_progressive_with_hook(shared, index, token, || {})
+}
+
+fn reserve_current_progressive_with_hook<'a, F>(
+    shared: &'a Shared,
+    index: usize,
+    token: &CancelToken,
+    after_validation: F,
+) -> Option<(ProgressiveLease<'a>, [f32; 4])>
+where
+    F: FnOnce(),
+{
+    let navigation = shared.navigation.lock().unwrap();
+    if token.cancelled()
+        || !navigation
+            .last_nav
+            .is_some_and(|nav| nav.current == index && nav.zoomed)
+    {
+        return None;
+    }
+    let viewport = shared.full_viewport.lock().unwrap();
+    let uv = viewport
+        .filter(|(viewport_index, _)| *viewport_index == index)
+        .map(|(_, uv)| uv)?;
+    // Test-only callers use this point to hold the exact historical race
+    // window open. Production passes a zero-sized no-op closure.
+    after_validation();
+    if token.cancelled() {
+        return None;
+    }
+    let (lease, replaced) = ProgressiveLease::acquire_with_deferred_drop(shared, index)?;
+    drop(viewport);
+    drop(navigation);
+    // Replacing a same-image generation can release a full-resolution
+    // allocation. Keep that allocator work outside all three transaction
+    // locks.
+    drop(replaced);
+    Some((lease, uv))
+}
+
 /// Snapshots the matching prioritized JPEG band request using navigation as
-/// the transaction fence, mirroring [`current_full_viewport`].
-fn current_view_hint(shared: &Shared, index: usize) -> Option<ViewHint> {
+/// the transaction fence.
+#[derive(Debug, Clone, Copy)]
+struct FullBandAdmission {
+    hint: ViewHint,
+    navigation_generation: u64,
+}
+
+fn current_view_hint(shared: &Shared, index: usize) -> Option<FullBandAdmission> {
     let navigation = shared.navigation.lock().unwrap();
     if !navigation
         .last_nav
@@ -2855,6 +2970,38 @@ fn current_view_hint(shared: &Shared, index: usize) -> Option<ViewHint> {
     }
     let hint = *shared.view_hint.lock().unwrap();
     hint.filter(|hint| hint.index == index)
+        .map(|hint| FullBandAdmission {
+            hint,
+            navigation_generation: navigation.generation,
+        })
+}
+
+/// Publishes a provisional band only while its admitting navigation remains
+/// the zoomed current generation and its exact visible-band hint is still the
+/// latest mailbox value. Holding navigation and then the hint mailbox through
+/// the band-slot write makes the check and publication indivisible with both
+/// navigation's band retirement and a same-image pan update.
+fn publish_current_full_band(
+    shared: &Shared,
+    index: usize,
+    admission: FullBandAdmission,
+    token: &CancelToken,
+    band: FullBand,
+) -> bool {
+    let navigation = shared.navigation.lock().unwrap();
+    let current_hint = shared.view_hint.lock().unwrap();
+    if token.cancelled()
+        || admission.hint.index != index
+        || navigation.generation != admission.navigation_generation
+        || *current_hint != Some(admission.hint)
+        || !navigation
+            .last_nav
+            .is_some_and(|nav| nav.current == index && nav.zoomed)
+    {
+        return false;
+    }
+    shared.cache.publish_full_band(index, band);
+    true
 }
 
 fn run_develop(
@@ -2883,8 +3030,10 @@ fn run_develop(
     // image reuses this decode instead of re-opening and entropy-decoding
     // the identical RAW.
     let join = shared.raw_share.join(index, token);
-    let (mut raw, meta) = match join {
-        RawShareJoin::Shared(shared_raw) => {
+    let decode = decode_after_raw_share_join(join, token, || decode::load(path));
+    let (raw, meta) = match decode {
+        RawShareDecode::Cancelled => return DevelopCompletion::Cancelled,
+        RawShareDecode::Shared(shared_raw) => {
             let meta = FileMeta::from_metadata(&shared_raw.metadata);
             // The publisher cloned for exactly one follower, so sole
             // ownership is the common case and the mosaic moves out.
@@ -2894,12 +3043,11 @@ fn run_develop(
             };
             (raw, meta)
         }
-        other => {
-            let lead = match other {
-                RawShareJoin::Lead(lead) => Some(lead),
-                _ => None,
-            };
-            let decoded = match decode::load(path) {
+        RawShareDecode::Decoded {
+            lead,
+            output: decoded,
+        } => {
+            let decoded = match decoded {
                 Ok(d) => d,
                 Err(e) => {
                     // A held lead marks the share entry failed on drop.
@@ -2949,22 +3097,19 @@ fn run_develop(
         && tier == Tier::Full
         && quality == Quality::Full
         && supports_region_develop(&raw)
+        && let Some((lease, uv)) = reserve_current_progressive(shared, index, token)
     {
-        if let Some(uv) = current_full_viewport(shared, index) {
-            match run_progressive_full_develop(
-                shared,
-                index,
-                tier,
-                raw,
-                meta.orient,
-                uv,
-                token,
-                emit,
-            ) {
-                Ok(completion) => return completion,
-                Err(declined) => raw = *declined,
-            }
-        }
+        return run_progressive_full_develop(
+            shared,
+            lease,
+            index,
+            tier,
+            raw,
+            meta.orient,
+            uv,
+            token,
+            emit,
+        );
     }
     let (buf, _) = match develop(raw, quality) {
         Ok(r) => r,
@@ -3054,21 +3199,39 @@ fn decode_jpeg_for_rehydrate(
     mode: DevelopMode,
     bytes: &[u8],
 ) -> DecodeOutcome {
-    let band = if mode == DevelopMode::Display && tier == Tier::Full {
-        current_view_hint(shared, index).map(|hint| BandRequest {
-            uv_y0: hint.uv_y0,
-            uv_y1: hint.uv_y1,
-            align_px: hint.align_px,
-            gutter_px: hint.gutter_px,
-        })
+    decode_jpeg_for_rehydrate_with_hook(shared, index, tier, token, mode, bytes, || {})
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_jpeg_for_rehydrate_with_hook<F>(
+    shared: &Shared,
+    index: usize,
+    tier: Tier,
+    token: &CancelToken,
+    mode: DevelopMode,
+    bytes: &[u8],
+    before_band_publish: F,
+) -> DecodeOutcome
+where
+    F: Fn(),
+{
+    let admission = if mode == DevelopMode::Display && tier == Tier::Full {
+        current_view_hint(shared, index)
     } else {
         None
     };
+    let band = admission.map(|admission| BandRequest {
+        uv_y0: admission.hint.uv_y0,
+        uv_y1: admission.hint.uv_y1,
+        align_px: admission.hint.align_px,
+        gutter_px: admission.hint.gutter_px,
+    });
     let outcome = crate::jpeg_restart::try_decode_prioritized(
         bytes,
         band,
         &|| token.cancelled(),
         &mut |band_pixels| {
+            before_band_publish();
             if token.cancelled() {
                 return;
             }
@@ -3077,8 +3240,14 @@ fn decode_jpeg_for_rehydrate(
                 return;
             }
             let band_height = band_pixels.rows.len() / row_bytes;
-            shared.cache.publish_full_band(
+            let Some(admission) = admission else {
+                return;
+            };
+            let published = publish_current_full_band(
+                shared,
                 index,
+                admission,
+                token,
                 FullBand {
                     full_width: band_pixels.full_width,
                     full_height: band_pixels.full_height,
@@ -3092,7 +3261,9 @@ fn decode_jpeg_for_rehydrate(
             );
             // No dedicated event: the UI polls the band slot each frame, so a
             // repaint request is enough to reach it.
-            notify_safely(shared.notify.as_ref());
+            if published {
+                notify_safely(shared.notify.as_ref());
+            }
         },
     );
     match outcome {
@@ -3283,7 +3454,17 @@ struct ProgressiveLease<'a> {
 }
 
 impl<'a> ProgressiveLease<'a> {
+    #[cfg(test)]
     fn acquire(shared: &'a Shared, index: usize) -> Option<Self> {
+        let (lease, replaced) = Self::acquire_with_deferred_drop(shared, index)?;
+        drop(replaced);
+        Some(lease)
+    }
+
+    fn acquire_with_deferred_drop(
+        shared: &'a Shared,
+        index: usize,
+    ) -> Option<(Self, Option<ProgressiveCanvas>)> {
         let generation = shared
             .progressive_generation
             .fetch_add(1, Ordering::Relaxed);
@@ -3300,12 +3481,14 @@ impl<'a> ProgressiveLease<'a> {
             covered: Vec::new(),
         });
         drop(staging);
-        drop(replaced);
-        Some(Self {
-            shared,
-            index,
-            generation,
-        })
+        Some((
+            Self {
+                shared,
+                index,
+                generation,
+            },
+            replaced,
+        ))
     }
 
     fn owns(&self, canvas: &ProgressiveCanvas) -> bool {
@@ -3327,11 +3510,11 @@ impl Drop for ProgressiveLease<'_> {
 /// and disk objects are unchanged. Cancellation is honored at every region
 /// boundary and clears the staging entry.
 #[allow(clippy::too_many_arguments)]
-/// Runs the visible-region-first Full develop, or returns the untouched
-/// mosaic in `Err` when the single staging slot is occupied by another
-/// image's mid-assembly develop (the caller then develops monolithically).
+/// Runs the visible-region-first Full develop after the caller atomically
+/// validated current ownership and reserved the staging slot.
 fn run_progressive_full_develop(
     shared: &Shared,
+    lease: ProgressiveLease<'_>,
     index: usize,
     tier: Tier,
     raw: rawler::RawImage,
@@ -3339,13 +3522,8 @@ fn run_progressive_full_develop(
     initial_uv: [f32; 4],
     token: &CancelToken,
     emit: &dyn Fn(Event),
-) -> Result<DevelopCompletion, Box<rawler::RawImage>> {
-    // Reserve the staging slot atomically before any expensive work: at most
-    // one canvas exists, and stealing an active one would discard a
-    // near-complete assembly whose job stays wanted as a neighbor.
-    let Some(lease) = ProgressiveLease::acquire(shared, index) else {
-        return Err(Box::new(raw));
-    };
+) -> DevelopCompletion {
+    debug_assert_eq!(lease.index, index);
     let plan = match plan_full_develop(raw) {
         Ok(plan) => plan,
         Err(e) => {
@@ -3356,17 +3534,17 @@ fn run_progressive_full_develop(
                     error: e.to_string(),
                 });
             }
-            return Ok(if token.cancelled() {
+            return if token.cancelled() {
                 DevelopCompletion::Cancelled
             } else {
                 DevelopCompletion::Finished
-            });
+            };
         }
     };
     let (display_w, display_h) = plan.display_size(orient);
     let (out_w, out_h) = plan.output_size();
     if token.cancelled() {
-        return Ok(DevelopCompletion::Cancelled);
+        return DevelopCompletion::Cancelled;
     }
 
     let Some(canvas_len) = (display_w as usize)
@@ -3378,11 +3556,11 @@ fn run_progressive_full_develop(
             tier,
             error: "progressive Full dimensions overflow addressable memory".into(),
         });
-        return Ok(DevelopCompletion::Finished);
+        return DevelopCompletion::Finished;
     };
     let rgba = vec![0; canvas_len];
     if token.cancelled() {
-        return Ok(DevelopCompletion::Cancelled);
+        return DevelopCompletion::Cancelled;
     }
 
     // Fill in the reserved staging canvas; `in_flight` guarantees a single
@@ -3391,7 +3569,7 @@ fn run_progressive_full_develop(
     {
         let mut staging = lock_progressive(shared);
         if !staging.as_ref().is_some_and(|canvas| lease.owns(canvas)) {
-            return Ok(DevelopCompletion::Cancelled);
+            return DevelopCompletion::Cancelled;
         }
         *staging = Some(ProgressiveCanvas {
             index,
@@ -3452,7 +3630,7 @@ fn run_progressive_full_develop(
         && first[3] > 0
         && let Some(done) = develop_one(first, &mut scratch)
     {
-        return Ok(done);
+        return done;
     }
     while !remaining.is_empty() {
         // Ordering only: a moved viewport re-prioritizes the remaining bands
@@ -3469,7 +3647,7 @@ fn run_progressive_full_develop(
             .expect("remaining is non-empty");
         let rect = remaining.swap_remove(nearest);
         if let Some(done) = develop_one(rect, &mut scratch) {
-            return Ok(done);
+            return done;
         }
     }
     drop(scratch);
@@ -3482,7 +3660,7 @@ fn run_progressive_full_develop(
     let (buf, retained) = {
         let mut staging = lock_progressive(shared);
         if token.cancelled() {
-            return Ok(DevelopCompletion::Cancelled);
+            return DevelopCompletion::Cancelled;
         }
         let taken = if staging.as_ref().is_some_and(|canvas| lease.owns(canvas)) {
             staging.take()
@@ -3490,7 +3668,7 @@ fn run_progressive_full_develop(
             None
         };
         let Some(canvas) = taken else {
-            return Ok(DevelopCompletion::Cancelled);
+            return DevelopCompletion::Cancelled;
         };
         let buf = Arc::new(PixelBuf::new_opaque(
             canvas.width,
@@ -3504,7 +3682,7 @@ fn run_progressive_full_develop(
     };
     // From here on: exactly the monolithic Display-mode tail.
     if !retained {
-        return Ok(DevelopCompletion::Finished);
+        return DevelopCompletion::Finished;
     }
     emit(Event::ImageReady { index, tier });
     if !shared.cache.has_jpeg((index, tier)) {
@@ -3521,12 +3699,12 @@ fn run_progressive_full_develop(
                 shared.persistence.pending_budget_bytes
             );
         }
-        return Ok(DevelopCompletion::Persistence {
+        return DevelopCompletion::Persistence {
             outcome: enqueue,
             retained_bytes,
-        });
+        };
     }
-    Ok(DevelopCompletion::Finished)
+    DevelopCompletion::Finished
 }
 
 fn invalidate_full_band(shared: &Shared, index: usize) {
@@ -3873,8 +4051,7 @@ pub fn benchmark_encode_jpeg_plain(buf: &PixelBuf, quality: u8) -> Result<Vec<u8
 mod tests {
     use super::*;
 
-    /// Unwraps the progressive develop's slot-decline channel for tests that
-    /// start with a free staging slot.
+    /// Reserves the progressive slot for tests that bypass navigation.
     #[allow(clippy::too_many_arguments)]
     fn run_progressive_full_develop_ok(
         shared: &Shared,
@@ -3886,8 +4063,11 @@ mod tests {
         token: &CancelToken,
         emit: &dyn Fn(Event),
     ) -> DevelopCompletion {
-        run_progressive_full_develop(shared, index, tier, raw, orient, initial_uv, token, emit)
-            .unwrap_or_else(|_| panic!("staging slot unexpectedly occupied"))
+        let lease = ProgressiveLease::acquire(shared, index)
+            .unwrap_or_else(|| panic!("staging slot unexpectedly occupied"));
+        run_progressive_full_develop(
+            shared, lease, index, tier, raw, orient, initial_uv, token, emit,
+        )
     }
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -4132,6 +4312,41 @@ mod tests {
         let cancelled = CancelToken::default();
         cancelled.cancel();
         assert!(matches!(share.join(5, &cancelled), RawShareJoin::OwnDecode));
+    }
+
+    #[test]
+    fn cancelled_raw_share_fallback_skips_decode_but_leader_failure_does_not() {
+        let share: RawDecodeShare<usize> = RawDecodeShare::new();
+        let live = CancelToken::default();
+        let lead = match share.join(5, &live) {
+            RawShareJoin::Lead(lead) => lead,
+            _ => panic!("first caller leads"),
+        };
+        let cancelled = CancelToken::default();
+        cancelled.cancel();
+        let calls = AtomicUsize::new(0);
+
+        let cancelled_result =
+            decode_after_raw_share_join(share.join(5, &cancelled), &cancelled, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                41
+            });
+        assert!(matches!(cancelled_result, RawShareDecode::Cancelled));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // Dropping the leader marks the same entry Failed. A live follower
+        // then receives OwnDecode for recovery and must still invoke its
+        // loader exactly once.
+        drop(lead);
+        let recovery = decode_after_raw_share_join(share.join(5, &live), &live, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            42
+        });
+        let RawShareDecode::Decoded { lead: None, output } = recovery else {
+            panic!("failed leader falls back to an independent decode");
+        };
+        assert_eq!(output, 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -5226,6 +5441,240 @@ mod tests {
                 }]
             ));
         }
+    }
+
+    #[test]
+    fn navigation_during_prioritized_callback_cannot_publish_a_neighbor_band() {
+        let encoded = band_capable_jpeg();
+        let cache = Arc::new(RamCache::new(RamCacheBudgets::new(
+            0,
+            0,
+            64 * 1024 * 1024,
+            16 * 1024 * 1024,
+        )));
+        // Keep both images in the Full working set. Cache admission alone
+        // must not let the displaced current publish a provisional band.
+        cache.set_navigation_policy([], [(0, Tier::Full), (1, Tier::Full)]);
+        let (shared, _receiver) = band_shared(
+            vec![entry("old-current.arw", 1), entry("new-current.arw", 1)],
+            cache.clone(),
+            None,
+            Arc::new(|| {}),
+            Some(mid_band_hint(0)),
+        );
+        let engine = Engine {
+            shared: Arc::new(shared),
+            workers: Vec::new(),
+            persistence_worker: None,
+        };
+        let shared = engine.shared.clone();
+        let token = CancelToken::default();
+        let callback_entered = Arc::new(std::sync::Barrier::new(2));
+        let resume_callback = Arc::new(std::sync::Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            let worker_shared = shared.clone();
+            let entered = callback_entered.clone();
+            let resume = resume_callback.clone();
+            let worker_token = &token;
+            let worker_bytes = &encoded;
+            let decode = scope.spawn(move || {
+                decode_jpeg_for_rehydrate_with_hook(
+                    &worker_shared,
+                    0,
+                    Tier::Full,
+                    worker_token,
+                    DevelopMode::Display,
+                    worker_bytes,
+                    || {
+                        entered.wait();
+                        resume.wait();
+                    },
+                )
+            });
+
+            callback_entered.wait();
+            engine.navigate_with_view_demand(
+                NavState {
+                    current: 1,
+                    direction: 1,
+                    zoomed: true,
+                },
+                Some(mid_band_hint(1)),
+                Some([0.2, 0.2, 0.8, 0.8]),
+            );
+            assert!(
+                cache.insert_rgba_if_desired((0, Tier::Full), Arc::new(patterned_buf(2, 2))),
+                "the displaced image remains an admitted Full neighbor"
+            );
+            let new_current = current_view_hint(&shared, 1).expect("new current admission");
+            assert!(publish_current_full_band(
+                &shared,
+                1,
+                new_current,
+                &token,
+                FullBand {
+                    full_width: 2,
+                    full_height: 2,
+                    y0: 0,
+                    buf: patterned_buf(2, 1),
+                },
+            ));
+            resume_callback.wait();
+
+            assert!(matches!(decode.join().unwrap(), DecodeOutcome::Pixels(_)));
+        });
+
+        assert!(cache.get_full_band(0).is_none());
+        assert_eq!(
+            cache
+                .get_full_band(1)
+                .expect("new current keeps ownership")
+                .full_width,
+            2
+        );
+    }
+
+    #[test]
+    fn old_navigation_generation_cannot_overwrite_a_revisited_current_band() {
+        let cache = Arc::new(RamCache::new(RamCacheBudgets::new(0, 0, 64, 0)));
+        cache.set_navigation_policy([], [(0, Tier::Full), (1, Tier::Full)]);
+        let (shared, _receiver) = band_shared(
+            Vec::new(),
+            cache.clone(),
+            None,
+            Arc::new(|| {}),
+            Some(mid_band_hint(0)),
+        );
+        let token = CancelToken::default();
+        let old = current_view_hint(&shared, 0).expect("initial admission");
+        {
+            let mut navigation = shared.navigation.lock().unwrap();
+            navigation.update_navigation(NavState {
+                current: 1,
+                direction: 1,
+                zoomed: true,
+            });
+            navigation.update_navigation(NavState {
+                current: 0,
+                direction: -1,
+                zoomed: true,
+            });
+            *shared.view_hint.lock().unwrap() = Some(mid_band_hint(0));
+            shared.cache.retain_full_band_for_current(Some(0));
+        }
+        let current = current_view_hint(&shared, 0).expect("revisited admission");
+        assert!(publish_current_full_band(
+            &shared,
+            0,
+            current,
+            &token,
+            FullBand {
+                full_width: 2,
+                full_height: 2,
+                y0: 0,
+                buf: patterned_buf(2, 1),
+            },
+        ));
+        assert!(!publish_current_full_band(
+            &shared,
+            0,
+            old,
+            &token,
+            FullBand {
+                full_width: 3,
+                full_height: 3,
+                y0: 0,
+                buf: patterned_buf(3, 1),
+            },
+        ));
+        assert_eq!(cache.get_full_band(0).unwrap().full_width, 2);
+    }
+
+    #[test]
+    fn same_navigation_stale_hint_cannot_overwrite_the_newer_band() {
+        let cache = Arc::new(RamCache::new(RamCacheBudgets::new(0, 0, 64, 0)));
+        cache.set_navigation_policy([], [(0, Tier::Full)]);
+        let old_hint = mid_band_hint(0);
+        let (shared, _receiver) = band_shared(
+            Vec::new(),
+            cache.clone(),
+            None,
+            Arc::new(|| {}),
+            Some(old_hint),
+        );
+        let token = CancelToken::default();
+        let old = current_view_hint(&shared, 0).expect("initial demand");
+        let new_hint = ViewHint {
+            uv_y0: 0.1,
+            uv_y1: 0.3,
+            ..old_hint
+        };
+        *shared.view_hint.lock().unwrap() = Some(new_hint);
+        let current = current_view_hint(&shared, 0).expect("moved demand");
+        assert_eq!(
+            old.navigation_generation, current.navigation_generation,
+            "mailbox-only pans deliberately avoid navigation-generation churn"
+        );
+
+        assert!(publish_current_full_band(
+            &shared,
+            0,
+            current,
+            &token,
+            FullBand {
+                full_width: 2,
+                full_height: 2,
+                y0: 0,
+                buf: patterned_buf(2, 1),
+            },
+        ));
+        assert!(!publish_current_full_band(
+            &shared,
+            0,
+            old,
+            &token,
+            FullBand {
+                full_width: 3,
+                full_height: 3,
+                y0: 0,
+                buf: patterned_buf(3, 1),
+            },
+        ));
+        assert_eq!(cache.get_full_band(0).unwrap().full_width, 2);
+    }
+
+    #[test]
+    fn cancellation_during_prioritized_callback_suppresses_the_band() {
+        let encoded = band_capable_jpeg();
+        let cache = Arc::new(RamCache::new(RamCacheBudgets::new(
+            0,
+            0,
+            64 * 1024 * 1024,
+            16 * 1024 * 1024,
+        )));
+        cache.set_navigation_policy([], [(0, Tier::Full)]);
+        let (shared, _receiver) = band_shared(
+            Vec::new(),
+            cache.clone(),
+            None,
+            Arc::new(|| {}),
+            Some(mid_band_hint(0)),
+        );
+        let token = CancelToken::default();
+
+        let outcome = decode_jpeg_for_rehydrate_with_hook(
+            &shared,
+            0,
+            Tier::Full,
+            &token,
+            DevelopMode::Display,
+            &encoded,
+            || token.cancel(),
+        );
+
+        assert!(matches!(outcome, DecodeOutcome::Cancelled));
+        assert!(cache.get_full_band(0).is_none());
     }
 
     #[test]
@@ -7358,6 +7807,134 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_worker_waiting_on_navigation_cannot_reserve_progressive_staging() {
+        let cache = Arc::new(RamCache::new(RamCacheBudgets::new(0, 0, 1024, 0)));
+        let (shared, _receiver) = band_shared(
+            vec![entry("current.arw", 1)],
+            cache,
+            None,
+            Arc::new(|| {}),
+            Some(mid_band_hint(0)),
+        );
+        let shared = Arc::new(shared);
+        *shared.full_viewport.lock().unwrap() = Some((0, [0.1, 0.2, 0.7, 0.8]));
+        let token = CancelToken::default();
+        let worker_started = Arc::new(std::sync::Barrier::new(2));
+        let navigation = shared.navigation.lock().unwrap();
+
+        std::thread::scope(|scope| {
+            let worker_shared = shared.clone();
+            let started = worker_started.clone();
+            let worker_token = &token;
+            let worker = scope.spawn(move || {
+                started.wait();
+                reserve_current_progressive(&worker_shared, 0, worker_token).is_none()
+            });
+
+            worker_started.wait();
+            // This models queue cancellation performed by a navigation that
+            // owns the transaction mutex before the stale worker reaches it.
+            token.cancel();
+            drop(navigation);
+            assert!(worker.join().unwrap());
+        });
+        assert!(lock_progressive(&shared).is_none());
+    }
+
+    #[test]
+    fn current_validation_and_progressive_reservation_are_one_navigation_transaction() {
+        let cache = Arc::new(RamCache::new(RamCacheBudgets::new(0, 0, 1024, 0)));
+        let (shared, _receiver) = band_shared(
+            vec![entry("old-current.arw", 1), entry("new-current.arw", 1)],
+            cache,
+            None,
+            Arc::new(|| {}),
+            None,
+        );
+        let engine = Engine {
+            shared: Arc::new(shared),
+            workers: Vec::new(),
+            persistence_worker: None,
+        };
+        let old_uv = [0.1, 0.2, 0.7, 0.8];
+        let new_uv = [0.2, 0.3, 0.8, 0.9];
+        engine.navigate_with_view_demand(
+            NavState {
+                current: 0,
+                direction: 1,
+                zoomed: true,
+            },
+            Some(mid_band_hint(0)),
+            Some(old_uv),
+        );
+
+        let validated = Arc::new(std::sync::Barrier::new(2));
+        let allow_reservation = Arc::new(std::sync::Barrier::new(2));
+        let old_lease_live = Arc::new(std::sync::Barrier::new(2));
+        let allow_old_drop = Arc::new(std::sync::Barrier::new(2));
+        let token = CancelToken::default();
+
+        std::thread::scope(|scope| {
+            let shared = engine.shared.clone();
+            let worker_validated = validated.clone();
+            let worker_allow_reservation = allow_reservation.clone();
+            let worker_lease_live = old_lease_live.clone();
+            let worker_allow_old_drop = allow_old_drop.clone();
+            let worker_token = &token;
+            let old_worker = scope.spawn(move || {
+                let (lease, uv) =
+                    reserve_current_progressive_with_hook(&shared, 0, worker_token, || {
+                        // Both the navigation and viewport locks are still
+                        // held here. Navigation cannot retire a canvas that
+                        // has not yet become visible in the progressive slot.
+                        worker_validated.wait();
+                        worker_allow_reservation.wait();
+                    })
+                    .expect("old current reserves staging");
+                assert_eq!(uv, old_uv);
+                worker_lease_live.wait();
+                worker_allow_old_drop.wait();
+                drop(lease);
+            });
+
+            validated.wait();
+            let navigator = scope.spawn(|| {
+                engine.navigate_with_view_demand(
+                    NavState {
+                        current: 1,
+                        direction: 1,
+                        zoomed: true,
+                    },
+                    Some(mid_band_hint(1)),
+                    Some(new_uv),
+                );
+            });
+            allow_reservation.wait();
+            old_lease_live.wait();
+            navigator.join().unwrap();
+
+            assert!(
+                lock_progressive(&engine.shared).is_none(),
+                "navigation retires the old current's reserved generation"
+            );
+            let (new_lease, captured) = reserve_current_progressive(&engine.shared, 1, &token)
+                .expect("new current must not be forced into monolithic develop");
+            assert_eq!(captured, new_uv);
+
+            allow_old_drop.wait();
+            old_worker.join().unwrap();
+            assert_eq!(
+                lock_progressive(&engine.shared)
+                    .as_ref()
+                    .map(|canvas| (canvas.index, canvas.generation)),
+                Some((1, new_lease.generation)),
+                "dropping the retired lease cannot clear the new current"
+            );
+            drop(new_lease);
+        });
+    }
+
+    #[test]
     fn progressive_coverage_matches_a_per_pixel_reference() {
         let mut state = 0xC0FF_EE00_D15E_A5E5_u64;
         let mut next = move |bound: u32| {
@@ -7499,7 +8076,10 @@ mod tests {
             current_full_viewport(&engine.shared, 0),
             Some([0.25, 0.25, 0.75, 0.75])
         );
-        assert_eq!(current_view_hint(&engine.shared, 0), Some(hint));
+        assert_eq!(
+            current_view_hint(&engine.shared, 0).map(|admission| admission.hint),
+            Some(hint)
+        );
 
         engine.navigate_with_view_demand(
             NavState {
