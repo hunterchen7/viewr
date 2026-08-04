@@ -546,3 +546,97 @@ fn upsample_chroma_row(
         x_out += 1;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ChromaSubsampling, JpegEncoder};
+
+    fn decode_hex_fixture(hex: &str) -> Vec<u8> {
+        let digits: Vec<u8> = hex
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect();
+        assert_eq!(digits.len() % 2, 0, "hex fixture must contain byte pairs");
+        digits
+            .chunks_exact(2)
+            .map(|pair| {
+                let pair = std::str::from_utf8(pair).expect("fixture is ASCII");
+                u8::from_str_radix(pair, 16).expect("fixture contains only hexadecimal digits")
+            })
+            .collect()
+    }
+
+    fn encode_rgba(width: u32, height: u32, progressive: bool, optimize: bool) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                rgba.extend_from_slice(&[
+                    x.wrapping_mul(29).wrapping_add(y.wrapping_mul(7)) as u8,
+                    x.wrapping_mul(5).wrapping_add(y.wrapping_mul(31)) as u8,
+                    x.wrapping_mul(17).wrapping_add(y.wrapping_mul(11)) as u8,
+                    255,
+                ]);
+            }
+        }
+
+        let mut jpeg = Vec::new();
+        let mut encoder = JpegEncoder::new_with_quality(&mut jpeg, 91);
+        encoder.set_subsampling(ChromaSubsampling::Yuv420);
+        encoder.set_progressive(progressive);
+        encoder.set_optimize_huffman(optimize);
+        encoder
+            .encode_rgba(&rgba, width, height)
+            .expect("test image should encode");
+        drop(encoder);
+        jpeg
+    }
+
+    fn assert_decode_is_complete(width: u32, height: u32, progressive: bool, optimize: bool) {
+        let jpeg = encode_rgba(width, height, progressive, optimize);
+        let decoded = decode(&jpeg, PixelFormat::Rgba).expect("test image should decode");
+        assert_eq!(decoded.len(), (width * height * 4) as usize);
+        assert!(
+            decoded.chunks_exact(4).all(|pixel| pixel[3] == 255),
+            "RGBA decode must initialize every output pixel's alpha channel",
+        );
+    }
+
+    #[test]
+    fn odd_sized_baseline_decode_initializes_padded_planes_and_output() {
+        assert_decode_is_complete(9, 7, false, false);
+    }
+
+    #[test]
+    fn progressive_decode_initializes_planes_and_output() {
+        // This end-to-end fixture uses one complete 4:2:0 MCU. Unwritten
+        // progressive-plane padding is covered directly in progressive.rs.
+        assert_decode_is_complete(16, 16, true, false);
+    }
+
+    #[test]
+    fn partial_mcu_progressive_self_round_trips() {
+        for &(width, height) in &[(9, 7), (17, 16)] {
+            for optimize in [false, true] {
+                assert_decode_is_complete(width, height, true, optimize);
+            }
+        }
+    }
+
+    #[test]
+    fn known_valid_cjpeg_partial_mcu_progressive_decodes() {
+        // Synthetic 9x7 image encoded by libjpeg-turbo 3.1.4.1 cjpeg with
+        // `-progressive -quality 91 -sample 2x2,1x1,1x1`. The fixture SHA-256
+        // is d5a5eb24627d2690f86bbedb69de548cb1f31af51a76c07d0049928f3bf5af74.
+        let jpeg = decode_hex_fixture(include_str!("fixtures/cjpeg-progressive-9x7.hex"));
+        let decoder = Decoder::new(&jpeg).expect("known-valid fixture headers should parse");
+        let info = decoder.info();
+        assert_eq!((info.width, info.height), (9, 7));
+        assert!(info.progressive);
+        let rgba = decoder
+            .decode(PixelFormat::Rgba)
+            .expect("known-valid partial-MCU progressive fixture should decode");
+        assert_eq!(rgba.len(), 9 * 7 * 4);
+        assert!(rgba.chunks_exact(4).all(|pixel| pixel[3] == 255));
+    }
+}

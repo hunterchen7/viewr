@@ -34,6 +34,19 @@ All other inputs use the upstream path. The fork does not add public unsafe
 code or inline assembly. Existing architecture-specific SIMD stays behind the
 upstream dispatch and scalar fallback.
 
+The fork also removes three unsound decoder allocations inherited from
+upstream. A `Vec<u8>` cannot increase its length across uninitialized elements,
+even though every bit pattern is valid for `u8`. Baseline planes, progressive
+planes, and composed output now use initialized storage. This does not affect
+Viewr's production encoder path.
+
+The upstream progressive encoder also reused the interleaved DC scan's padded
+luma grid for non-interleaved AC scans. On partial right or bottom MCUs, those
+extra blocks left entropy bytes outside the decoder's true component grid. The
+fork now maps AC scans over only
+`ceil(width * Hi / (8 * Hmax)) × ceil(height * Vi / (8 * Vmax))` blocks. The DC
+scan still includes and predictor-chains every required padding block.
+
 ## Correctness contract
 
 For eligible input, every thread count must produce the same bytes as the
@@ -44,6 +57,11 @@ compares production-size output across its one-thread and multi-thread pools.
 The row join rejects an append when the destination bit writer is not empty or
 byte-aligned. Parallel workers only read shared pixels and tables. Each worker
 owns its predictors, bit writer, and output vector.
+
+Progressive tests cover standard and optimized-Huffman 4:2:0 streams at 9×7
+and 17×16, the exact luma raster permutation, and a known-valid 9×7 fixture
+from libjpeg-turbo 3.1.4.1. The corrected streams also decode with
+libjpeg-turbo's `djpeg`.
 
 ## Update procedure
 

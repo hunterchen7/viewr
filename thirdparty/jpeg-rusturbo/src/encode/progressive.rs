@@ -177,28 +177,8 @@ fn encode_progressive_scheme<S: SamplingScheme, W: Write>(
     // raster `(bx=2, by=0)`, not `(bx=2, by=1)` which is where the
     // MCU-chunked stride would land it). Reorder once into a raster
     // index permutation; the AC scans iterate that.
-    let y_raster_indices: Vec<usize> = {
-        let (h_y, v_y) = S::H_V;
-        let h_y = h_y as usize;
-        let v_y = v_y as usize;
-        let blocks_x = mcus_x as usize * h_y;
-        let mut out = vec![0usize; y_blocks.len()];
-        for my in 0..mcus_y as usize {
-            for mx in 0..mcus_x as usize {
-                let mcu_idx = my * mcus_x as usize + mx;
-                for sv in 0..v_y {
-                    for sh in 0..h_y {
-                        let bx = mx * h_y + sh;
-                        let by = my * v_y + sv;
-                        let mcu_intra = sv * h_y + sh;
-                        let raster_idx = by * blocks_x + bx;
-                        out[raster_idx] = mcu_idx * (h_y * v_y) + mcu_intra;
-                    }
-                }
-            }
-        }
-        out
-    };
+    let y_raster_indices =
+        y_noninterleaved_raster_indices::<S>(width, height, mcus_x, mcus_y, y_blocks.len());
 
     // ---- Header emission.
     let exif_blob: Option<Vec<u8>> = enc.exif_bytes().map(<[u8]>::to_vec);
@@ -244,10 +224,52 @@ fn encode_progressive_scheme<S: SamplingScheme, W: Write>(
     Ok(())
 }
 
+/// Map the luma blocks stored in interleaved-MCU order to the block raster
+/// required by a non-interleaved progressive AC scan.
+///
+/// Interleaved DC scans include every padded block in the final MCU row and
+/// column. Non-interleaved AC scans do not: their MCU is one block and their
+/// grid is `ceil(width * Hi / (8 * Hmax)) × ceil(height * Vi / (8 * Vmax))`.
+/// Returning only that true grid keeps partial right/bottom MCUs from leaking
+/// extra entropy bytes into the following marker stream.
+fn y_noninterleaved_raster_indices<S: SamplingScheme>(
+    width: u32,
+    height: u32,
+    mcus_x: u32,
+    mcus_y: u32,
+    y_blocks_len: usize,
+) -> Vec<usize> {
+    let (h_y, v_y) = S::H_V;
+    let h_y = h_y as usize;
+    let v_y = v_y as usize;
+    debug_assert_eq!(S::MCU_W as usize, h_y * 8);
+    debug_assert_eq!(S::MCU_H as usize, v_y * 8);
+    debug_assert_eq!(S::Y_BLOCKS_PER_MCU, h_y * v_y);
+
+    let blocks_x = (width as usize * h_y).div_ceil(S::MCU_W as usize);
+    let blocks_y = (height as usize * v_y).div_ceil(S::MCU_H as usize);
+    let mut out = Vec::with_capacity(blocks_x * blocks_y);
+    for by in 0..blocks_y {
+        let my = by / v_y;
+        let sv = by % v_y;
+        for bx in 0..blocks_x {
+            let mx = bx / h_y;
+            let sh = bx % h_y;
+            debug_assert!(mx < mcus_x as usize && my < mcus_y as usize);
+            let mcu_idx = my * mcus_x as usize + mx;
+            let source_idx = mcu_idx * S::Y_BLOCKS_PER_MCU + sv * h_y + sh;
+            debug_assert!(source_idx < y_blocks_len);
+            out.push(source_idx);
+        }
+    }
+    out
+}
+
 /// Standard (Annex K reference tables) progressive scan plan. Emits
 /// the four DHT segments up front, then runs the eight scans with the
-/// per-block `EOB0` strategy — byte-identical to the 0.8.0 progressive
-/// output.
+/// per-block `EOB0` strategy from 0.8.0. This fork intentionally differs
+/// only for partial luma MCUs, where 0.8.0 emitted invalid padding blocks in
+/// non-interleaved AC scans.
 fn encode_progressive_scans_standard<S: SamplingScheme, W: Write>(
     out: &mut W,
     y_blocks: &[[i16; 64]],
@@ -718,8 +740,8 @@ fn encode_one_ac_first_scan<W: Write>(
 /// Standard-tables variant: walk blocks in scan order and emit
 /// per-block contributions with `EOB0` per block (no run extension);
 /// the EOBn-packing emitter is the separate `encode_one_ac_first_scan`
-/// used by the optimize path. This is what keeps the default
-/// progressive output byte-identical to 0.8.0.
+/// used by the optimize path. Each provided block is encoded exactly as in
+/// 0.8.0; the caller now omits off-image partial-MCU padding blocks.
 #[allow(clippy::too_many_arguments)]
 fn encode_ac_first_scan_indexed<W: Write>(
     out: &mut W,
@@ -774,7 +796,7 @@ fn walk_ac_first(
     sink: &mut dyn Sink,
     state: &mut EobrunState,
 ) -> io::Result<()> {
-    let n = blocks.len();
+    let n = raster_indices.map_or(blocks.len(), |indices| indices.len());
     for idx in 0..n {
         let block_idx = raster_indices.map(|r| r[idx]).unwrap_or(idx);
         let block = &blocks[block_idx];
@@ -1033,7 +1055,7 @@ fn walk_ac_refine(
     sink: &mut dyn Sink,
     state: &mut EobrunState,
 ) -> io::Result<()> {
-    let n = blocks.len();
+    let n = raster_indices.map_or(blocks.len(), |indices| indices.len());
     for idx in 0..n {
         let block_idx = raster_indices.map(|r| r[idx]).unwrap_or(idx);
         let block = &blocks[block_idx];
@@ -1299,6 +1321,26 @@ impl<W: Write> JpegEncoder<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn noninterleaved_luma_scan_omits_partial_mcu_padding() {
+        assert_eq!(
+            y_noninterleaved_raster_indices::<Yuv420Scheme>(9, 7, 1, 1, 4),
+            [0, 1],
+        );
+        assert_eq!(
+            y_noninterleaved_raster_indices::<Yuv420Scheme>(17, 16, 2, 1, 8),
+            [0, 1, 4, 2, 3, 6],
+        );
+        assert_eq!(
+            y_noninterleaved_raster_indices::<Yuv422Scheme>(7, 7, 1, 1, 2),
+            [0],
+        );
+        assert_eq!(
+            y_noninterleaved_raster_indices::<Yuv444Scheme>(9, 7, 2, 1, 2),
+            [0, 1],
+        );
+    }
 
     /// AC-first toward-zero shift matches Rust's signed `/`:
     /// positive coefs floor toward zero, negative coefs ceiling
