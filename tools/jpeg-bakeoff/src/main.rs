@@ -17,6 +17,9 @@ fn main() -> anyhow::Result<()> {
     if args.first().is_some_and(|arg| arg == "dedicated-stress") {
         return dedicated_stress(&args[1..]);
     }
+    if args.first().is_some_and(|arg| arg == "restart-compare") {
+        return restart_compare(&args[1..]);
+    }
     if args
         .first()
         .is_some_and(|arg| arg == "dedicated-contention")
@@ -49,6 +52,69 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn restart_compare(args: &[String]) -> anyhow::Result<()> {
+    if args.len() != 3 {
+        bail!("usage: viewr-jpeg-bakeoff restart-compare WORKERS RUNS QUALITY");
+    }
+    let workers: usize = args[0].parse().context("invalid worker count")?;
+    let runs: usize = args[1].parse().context("invalid run count")?;
+    let quality: u8 = args[2].parse().context("invalid quality")?;
+    if runs == 0 {
+        bail!("run count must be at least one");
+    }
+
+    let fixture = full_resolution_fixture();
+    let parallel = DedicatedRusturboEncoder::new(workers, quality)?;
+    let serial_codec = Codec::JpegRusturboRows { threads: 1 };
+    let serial_reference = encode(serial_codec, &fixture, quality)?;
+    let parallel_reference = parallel.encode(&fixture)?;
+    if parallel_reference != serial_reference {
+        bail!("row-parallel output differs from the serial restart stream");
+    }
+
+    let mut serial_times = Vec::with_capacity(runs);
+    let mut parallel_times = Vec::with_capacity(runs);
+    println!("run,first,serial_ms,parallel_ms,encoded_bytes");
+    for run in 1..=runs {
+        let (serial_elapsed, parallel_elapsed) = if run & 1 == 1 {
+            let started = Instant::now();
+            black_box(encode(serial_codec, black_box(&fixture), quality)?);
+            let serial_elapsed = started.elapsed();
+            let started = Instant::now();
+            black_box(parallel.encode(black_box(&fixture))?);
+            (serial_elapsed, started.elapsed())
+        } else {
+            let started = Instant::now();
+            black_box(parallel.encode(black_box(&fixture))?);
+            let parallel_elapsed = started.elapsed();
+            let started = Instant::now();
+            black_box(encode(serial_codec, black_box(&fixture), quality)?);
+            (started.elapsed(), parallel_elapsed)
+        };
+        serial_times.push(serial_elapsed);
+        parallel_times.push(parallel_elapsed);
+        println!(
+            "{run},{},{:.3},{:.3},{}",
+            if run & 1 == 1 { "serial" } else { "parallel" },
+            millis(serial_elapsed),
+            millis(parallel_elapsed),
+            serial_reference.len(),
+        );
+    }
+
+    let serial_median = median(serial_times);
+    let parallel_median = median(parallel_times);
+    println!(
+        "summary workers={} runs={runs} quality={quality} serial_median_ms={:.3} parallel_median_ms={:.3} speedup={:.3} encoded_bytes={}",
+        parallel.workers(),
+        millis(serial_median),
+        millis(parallel_median),
+        serial_median.as_secs_f64() / parallel_median.as_secs_f64(),
+        serial_reference.len(),
+    );
     Ok(())
 }
 

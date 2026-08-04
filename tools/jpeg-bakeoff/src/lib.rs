@@ -10,18 +10,24 @@ pub const QUALITIES: [u8; 4] = [80, 90, 97, 100];
 pub enum Codec {
     JpegEncoder,
     JpegRusturbo { threads: u32 },
+    JpegRusturboRows { threads: u32 },
     LibjpegTurboRs,
     LibjpegTurboC,
 }
 
 impl Codec {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 13] = [
         Self::JpegEncoder,
         Self::JpegRusturbo { threads: 1 },
         Self::JpegRusturbo { threads: 2 },
         Self::JpegRusturbo { threads: 4 },
         Self::JpegRusturbo { threads: 8 },
         Self::JpegRusturbo { threads: 0 },
+        Self::JpegRusturboRows { threads: 1 },
+        Self::JpegRusturboRows { threads: 2 },
+        Self::JpegRusturboRows { threads: 4 },
+        Self::JpegRusturboRows { threads: 8 },
+        Self::JpegRusturboRows { threads: 0 },
         Self::LibjpegTurboRs,
         Self::LibjpegTurboC,
     ];
@@ -35,6 +41,12 @@ impl Codec {
             Self::JpegRusturbo { threads: 8 } => "jpeg-rusturbo-t8",
             Self::JpegRusturbo { threads: 0 } => "jpeg-rusturbo-auto",
             Self::JpegRusturbo { .. } => "jpeg-rusturbo-custom",
+            Self::JpegRusturboRows { threads: 1 } => "jpeg-rusturbo-rows-t1",
+            Self::JpegRusturboRows { threads: 2 } => "jpeg-rusturbo-rows-t2",
+            Self::JpegRusturboRows { threads: 4 } => "jpeg-rusturbo-rows-t4",
+            Self::JpegRusturboRows { threads: 8 } => "jpeg-rusturbo-rows-t8",
+            Self::JpegRusturboRows { threads: 0 } => "jpeg-rusturbo-rows-auto",
+            Self::JpegRusturboRows { .. } => "jpeg-rusturbo-rows-custom",
             Self::LibjpegTurboRs => "libjpeg-turbo-rs",
             Self::LibjpegTurboC => "libjpeg-turbo-c",
         }
@@ -242,7 +254,8 @@ pub fn encode(codec: Codec, fixture: &Fixture, quality: u8) -> Result<Vec<u8>> {
                 .context("jpeg-encoder failed")?;
             Ok(output)
         }
-        Codec::JpegRusturbo { threads } => encode_rusturbo(fixture, quality, threads),
+        Codec::JpegRusturbo { threads } => encode_rusturbo(fixture, quality, threads, false),
+        Codec::JpegRusturboRows { threads } => encode_rusturbo(fixture, quality, threads, true),
         Codec::LibjpegTurboRs => libjpeg_turbo_rs::compress(
             &fixture.rgba,
             fixture.width as usize,
@@ -259,11 +272,19 @@ pub fn encode(codec: Codec, fixture: &Fixture, quality: u8) -> Result<Vec<u8>> {
     }
 }
 
-fn encode_rusturbo(fixture: &Fixture, quality: u8, threads: u32) -> Result<Vec<u8>> {
+fn encode_rusturbo(
+    fixture: &Fixture,
+    quality: u8,
+    threads: u32,
+    restart_rows: bool,
+) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     let mut encoder = jpeg_rusturbo::JpegEncoder::new_with_quality(&mut output, quality);
     encoder.set_subsampling(jpeg_rusturbo::ChromaSubsampling::Yuv444);
     encoder.set_threads(threads);
+    if restart_rows {
+        encoder.set_restart_interval(fixture.width.div_ceil(8) as u16);
+    }
     encoder
         .encode_rgba(&fixture.rgba, fixture.width, fixture.height)
         .context("jpeg-rusturbo failed")?;
@@ -300,7 +321,7 @@ impl DedicatedRusturboEncoder {
     pub fn encode(&self, fixture: &Fixture) -> Result<Vec<u8>> {
         validate_input(fixture, self.quality)?;
         self.pool
-            .install(|| encode_rusturbo(fixture, self.quality, 0))
+            .install(|| encode_rusturbo(fixture, self.quality, 0, true))
     }
 }
 
@@ -592,7 +613,12 @@ mod tests {
         assert_eq!(dedicated.workers(), 2);
         assert_eq!(
             dedicated.encode(&fixture).unwrap(),
-            encode(Codec::JpegRusturbo { threads: 0 }, &fixture, 97).unwrap()
+            encode(
+                Codec::JpegRusturboRows { threads: 0 },
+                &fixture,
+                97,
+            )
+            .unwrap()
         );
     }
 
