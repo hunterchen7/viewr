@@ -54,6 +54,35 @@ tests used alternating order or named baselines when practical. A change was
 kept only when it preserved exact output and produced a useful end-to-end win.
 A kernel-only improvement was not sufficient.
 
+### Release-profile experiment
+
+The audit also compared the existing thin-LTO release profile with thin LTO
+plus one code-generation unit and fat LTO plus one code-generation unit. Each
+profile used a separate cold target directory. Two independent, balanced
+36-block campaigns ran all three binaries in every order. This produced 72
+fresh-process samples per profile and 216 measured processes in total. Every
+run produced identical dimensions, byte counts, RGBA hashes, JPEG hashes, and
+JPEG sizes.
+
+Neither candidate produced a statistically credible end-to-end improvement.
+Thin LTO with one code-generation unit was faster in 43 of 72 timed-pipeline
+runs (`p = 0.1249`). Fat LTO with one code-generation unit was also faster in
+43 of 72 (`p = 0.1249`). External wall-time sign tests were similarly
+inconclusive (`p = 0.2888` and `p = 0.0764`, respectively). Fat LTO did improve
+the isolated JPEG-encode stage by about 7.5 to 8.8 percent, but the gain did
+not survive into the complete pipeline.
+
+| Profile | Cold build wall | Peak build RSS | Binary size |
+| --- | ---: | ---: | ---: |
+| Thin LTO, default code-generation units | 92.24 s | 1,034,551,296 B | 29,757,184 B |
+| Thin LTO, one code-generation unit | 103.59 s | 1,861,386,240 B | 25,357,040 B |
+| Fat LTO, one code-generation unit | 165.51 s | 2,809,102,336 B | 22,241,200 B |
+
+The project therefore keeps its existing release profile. The alternatives
+reduced binary size, but increased cold-build wall time by 12.3 and 79.4
+percent and peak build RSS by 79.9 and 171.5 percent without a confirmed
+complete-pipeline benefit.
+
 ## Initial latency map
 
 These values are the isolated reference measurements collected before this
@@ -407,6 +436,7 @@ but ineffective changes from being repeated.
 | Allocate one JPEG output per row | Peak RSS grew to about 580 MB | Replaced by caller-owned stripes and one final write. |
 | ARM64 fused NEON RGBA JPEG front half | Exact tests passed; Full median moved from 27.15 to 27.75 ms | Removed because there was no end-to-end win. |
 | Handwritten ARM64 assembly | No compiler-codegen defect remained after the intrinsics test | Not added. An unmeasured unsafe path is not an optimization. |
+| One code-generation unit and fat LTO release profiles | 216 exact fresh-process runs found no credible complete-pipeline win; cold builds used up to 171.5 percent more peak RSS | Keep the existing thin-LTO/default-CGU profile. |
 | Naive per-sample integer Browse fusion | Cold allocation improved, but steady-state changed from 11.284 to 12.855 ms | Refined into the accepted row-pair implementation. |
 
 The assembly decision is deliberate. The tested NEON intrinsic already maps
