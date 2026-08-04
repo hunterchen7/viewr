@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-benchmarks = ["dep:criterion"]
+benchmarks = ["dep:criterion", "viewr-core/benchmarks"]
 
 [[bin]]
 name = "viewr"
@@ -34,6 +34,11 @@ chrono.workspace = true
 
 [[bench]]
 name = "filmstrip_scaling"
+harness = false
+required-features = ["benchmarks"]
+
+[[bench]]
+name = "event_backlog"
 harness = false
 required-features = ["benchmarks"]
 

@@ -18,7 +18,7 @@ use viewr_core::cache_disk::DiskCache;
 use viewr_core::cache_ram::{RamCache, RamCacheBudgets};
 use viewr_core::db::{Db, default_db_path};
 use viewr_core::folder::{FolderEntry, normalize_physical_path, scan};
-use viewr_core::jobs::{Engine, EngineOptions, Event, NavState, ViewHint};
+use viewr_core::jobs::{Engine, EngineOptions, Event, EventReceiver, NavState, ViewHint};
 use viewr_core::library::{
     Library, load_ratings_with_owners, rating_owner_keys, try_load_ratings_with_owners,
 };
@@ -52,6 +52,15 @@ const BACKGROUND_FULL_TILE_UPLOADS_PER_FRAME: usize = 1;
 const THUMB_REQUEST_POLL_AFTER: Duration = Duration::from_millis(16);
 const THUMB_REQUEST_STALE_AFTER: Duration = Duration::from_millis(500);
 const THUMB_FAILURE_RETRY_AFTER: Duration = Duration::from_secs(2);
+/// Progressive regions and image completions should preempt metadata, but a
+/// corrupt-file or region-publication storm must not make one frame unbounded.
+/// A full batch explicitly schedules the next frame, preserving per-lane FIFO
+/// order while guaranteeing that every queued foreground event makes progress.
+const FOREGROUND_EVENTS_PER_FRAME: usize = 256;
+/// Folder-wide metadata is useful but never urgent enough to monopolize one
+/// UI frame. At the measured 100,000-event cost this keeps the drain below a
+/// millisecond while clearing a fully synthetic backlog in 25 frames.
+const BACKGROUND_EVENTS_PER_FRAME: usize = 4_096;
 const RATING_DB_REFRESH_POLL: Duration = Duration::from_millis(50);
 const RATING_DB_REFRESH_MAX_POLL: Duration = Duration::from_secs(5);
 
@@ -361,7 +370,7 @@ struct Session {
     dir: PathBuf,
     entries: Arc<Vec<FolderEntry>>,
     engine: Engine,
-    events: Receiver<Event>,
+    events: EventReceiver,
     cache: Arc<RamCache>,
     library: Library,
     ratings: HashMap<usize, u8>,
@@ -395,6 +404,95 @@ struct Session {
     /// races (install-then-clear between the two cache probes, or a cancelled
     /// straggler overwriting the band slot) cannot drop still-valid tiles.
     band_tile_miss_frames: u8,
+}
+
+#[derive(Default)]
+struct EventDrainEffects {
+    replan: bool,
+    filter_dirty: bool,
+    star_markers_dirty: bool,
+}
+
+#[derive(Clone, Copy)]
+struct EventDrainContext {
+    current: usize,
+    mode: Mode,
+    zoom: Zoom,
+    filter: Filter,
+    accept_metadata_ratings: bool,
+}
+
+fn apply_engine_event(
+    session: &mut Session,
+    status: &mut Status,
+    event: Event,
+    context: EventDrainContext,
+    effects: &mut EventDrainEffects,
+) {
+    match event {
+        Event::ThumbReady { index, meta } => {
+            // Pixels stay in the byte-bounded RAM ring until a visible
+            // viewport asks to upload them. If they were already evicted,
+            // the demand path safely queues a replacement decode.
+            session.thumb_requests.remove(&index);
+            session.thumb_retry_after.remove(&index);
+            let old_rating = session.ratings.get(&index).copied().unwrap_or(0);
+            effects.filter_dirty |= install_metadata(
+                &mut session.ratings,
+                &mut session.metas,
+                index,
+                *meta,
+                context.filter,
+                context.accept_metadata_ratings,
+            );
+            let new_rating = session.ratings.get(&index).copied().unwrap_or(0);
+            effects.star_markers_dirty |= (old_rating > 0) != (new_rating > 0);
+        }
+        Event::MetadataReady { index, meta } => {
+            let old_rating = session.ratings.get(&index).copied().unwrap_or(0);
+            effects.filter_dirty |= install_metadata(
+                &mut session.ratings,
+                &mut session.metas,
+                index,
+                *meta,
+                context.filter,
+                context.accept_metadata_ratings,
+            );
+            let new_rating = session.ratings.get(&index).copied().unwrap_or(0);
+            effects.star_markers_dirty |= (old_rating > 0) != (new_rating > 0);
+        }
+        Event::ImageReady { .. } => effects.replan = true,
+        // Progress ping only: the staged rects are read from the engine's
+        // snapshot during painting, and publication already requested this
+        // repaint. No replan.
+        Event::ImageRegionReady { .. } => {}
+        Event::FullBandInvalidated { index } => {
+            for key in take_band_tile_keys_for_index(&mut session.full_tiles_from_band, index) {
+                session.full_tiles.remove(&key);
+            }
+            session.band_tile_miss_frames = 0;
+        }
+        Event::ImageFailed { index, tier, error } => {
+            if tier == Tier::Thumb && session.thumb_requests.remove(&index).is_some() {
+                session
+                    .thumb_retry_after
+                    .insert(index, Instant::now() + THUMB_FAILURE_RETRY_AFTER);
+            } else if image_failure_is_visible(
+                context.current,
+                context.mode,
+                context.zoom,
+                index,
+                tier,
+            ) {
+                *status = Status::Error(format!("error: {error}"));
+            } else {
+                eprintln!("job failed {index}/{tier:?}: {error}");
+            }
+        }
+        Event::MetadataFailed { index, error } => {
+            eprintln!("metadata failed {index}: {error}");
+        }
+    }
 }
 
 pub struct App {
@@ -738,81 +836,42 @@ impl App {
     }
 
     fn drain_events(&mut self) {
-        let current = self.current;
-        let mode = self.mode;
-        let zoom = self.zoom;
         let Some(session) = &mut self.session else {
             return;
         };
-        let mut replan = false;
-        let mut filter_dirty = false;
-        let mut star_markers_dirty = false;
-        let accept_metadata_ratings = !session.rating_sources_blocked;
-        while let Ok(event) = session.events.try_recv() {
-            match event {
-                Event::ThumbReady { index, meta } => {
-                    // Pixels stay in the byte-bounded RAM ring until a visible
-                    // viewport asks to upload them. If they were already evicted,
-                    // the demand path below safely queues a replacement decode.
-                    session.thumb_requests.remove(&index);
-                    session.thumb_retry_after.remove(&index);
-                    let old_rating = session.ratings.get(&index).copied().unwrap_or(0);
-                    filter_dirty |= install_metadata(
-                        &mut session.ratings,
-                        &mut session.metas,
-                        index,
-                        *meta,
-                        self.filter,
-                        accept_metadata_ratings,
-                    );
-                    let new_rating = session.ratings.get(&index).copied().unwrap_or(0);
-                    star_markers_dirty |= (old_rating > 0) != (new_rating > 0);
-                }
-                Event::MetadataReady { index, meta } => {
-                    let old_rating = session.ratings.get(&index).copied().unwrap_or(0);
-                    filter_dirty |= install_metadata(
-                        &mut session.ratings,
-                        &mut session.metas,
-                        index,
-                        *meta,
-                        self.filter,
-                        accept_metadata_ratings,
-                    );
-                    let new_rating = session.ratings.get(&index).copied().unwrap_or(0);
-                    star_markers_dirty |= (old_rating > 0) != (new_rating > 0);
-                }
-                Event::ImageReady { .. } => replan = true,
-                // Progress ping only: the staged rects are read from the
-                // engine's snapshot during painting, and the notify callback
-                // already requested this repaint. No replan.
-                Event::ImageRegionReady { .. } => {}
-                Event::FullBandInvalidated { index } => {
-                    for key in
-                        take_band_tile_keys_for_index(&mut session.full_tiles_from_band, index)
-                    {
-                        session.full_tiles.remove(&key);
-                    }
-                    session.band_tile_miss_frames = 0;
-                }
-                Event::ImageFailed { index, tier, error } => {
-                    if tier == Tier::Thumb && session.thumb_requests.remove(&index).is_some() {
-                        session
-                            .thumb_retry_after
-                            .insert(index, Instant::now() + THUMB_FAILURE_RETRY_AFTER);
-                    } else if image_failure_is_visible(current, mode, zoom, index, tier) {
-                        self.status = Status::Error(format!("error: {error}"));
-                    } else {
-                        eprintln!("job failed {index}/{tier:?}: {error}");
-                    }
-                }
-                Event::MetadataFailed { index, error } => {
-                    eprintln!("metadata failed {index}: {error}");
-                }
-            }
+        let mut effects = EventDrainEffects::default();
+        let context = EventDrainContext {
+            current: self.current,
+            mode: self.mode,
+            zoom: self.zoom,
+            filter: self.filter,
+            accept_metadata_ratings: !session.rating_sources_blocked,
+        };
+        let mut foreground_events = 0;
+        while foreground_events < FOREGROUND_EVENTS_PER_FRAME
+            && let Ok(event) = session.events.try_recv_foreground()
+        {
+            foreground_events += 1;
+            apply_engine_event(session, &mut self.status, event, context, &mut effects);
         }
-        self.filter_dirty |= filter_dirty;
-        self.star_markers_dirty |= star_markers_dirty;
-        if replan {
+        let mut background_events = 0;
+        while background_events < BACKGROUND_EVENTS_PER_FRAME
+            && let Ok(event) = session.events.try_recv_background()
+        {
+            background_events += 1;
+            apply_engine_event(session, &mut self.status, event, context, &mut effects);
+        }
+        // A full batch conservatively schedules one more frame. If the queue
+        // became empty exactly at the boundary, that frame is a cheap no-op;
+        // otherwise it guarantees progress even after the producers stop.
+        if foreground_events == FOREGROUND_EVENTS_PER_FRAME
+            || background_events == BACKGROUND_EVENTS_PER_FRAME
+        {
+            self.ctx.request_repaint();
+        }
+        self.filter_dirty |= effects.filter_dirty;
+        self.star_markers_dirty |= effects.star_markers_dirty;
+        if effects.replan {
             self.replan();
         }
     }

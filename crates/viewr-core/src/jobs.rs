@@ -18,7 +18,7 @@
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, TryLockError};
 use std::time::Duration;
 
@@ -178,6 +178,101 @@ pub enum Event {
         /// Human-readable underlying error.
         error: String,
     },
+}
+
+/// Ordered engine results split into independent foreground-image and
+/// background-metadata lanes.
+///
+/// Each lane preserves publication order. Keeping the lanes separate lets the
+/// UI handle image readiness and visible failures promptly while applying a
+/// deterministic per-frame bound to folder-wide metadata work.
+pub struct EventReceiver {
+    foreground: Receiver<Event>,
+    background: Receiver<Event>,
+}
+
+impl EventReceiver {
+    /// Receives the next foreground image result without waiting.
+    pub fn try_recv_foreground(&self) -> Result<Event, TryRecvError> {
+        self.foreground.try_recv()
+    }
+
+    /// Receives the next background metadata result without waiting.
+    pub fn try_recv_background(&self) -> Result<Event, TryRecvError> {
+        self.background.try_recv()
+    }
+
+    /// Receives the next result without waiting, preferring foreground work.
+    ///
+    /// This compatibility method is useful to non-UI consumers that do not
+    /// need a frame budget.
+    pub fn try_recv(&self) -> Result<Event, TryRecvError> {
+        match self.foreground.try_recv() {
+            Ok(event) => Ok(event),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => self.background.try_recv(),
+        }
+    }
+
+    /// Iterates over all results currently available without waiting.
+    pub fn try_iter(&self) -> impl Iterator<Item = Event> + '_ {
+        std::iter::from_fn(|| self.try_recv().ok())
+    }
+}
+
+struct EventSender {
+    foreground: Sender<Event>,
+    background: Sender<Event>,
+}
+
+impl EventSender {
+    fn send(&self, event: Event) -> bool {
+        let sender = if event_is_foreground(&event) {
+            &self.foreground
+        } else {
+            &self.background
+        };
+        sender.send(event).is_ok()
+    }
+}
+
+fn event_channel() -> (EventSender, EventReceiver) {
+    let (foreground, foreground_rx) = std::sync::mpsc::channel();
+    let (background, background_rx) = std::sync::mpsc::channel();
+    (
+        EventSender {
+            foreground,
+            background,
+        },
+        EventReceiver {
+            foreground: foreground_rx,
+            background: background_rx,
+        },
+    )
+}
+
+/// Builds a preloaded event receiver for the headless UI-backlog benchmark.
+#[cfg(feature = "benchmarks")]
+#[doc(hidden)]
+pub fn benchmark_event_receiver(events: impl IntoIterator<Item = Event>) -> EventReceiver {
+    let (sender, receiver) = event_channel();
+    for event in events {
+        let _ = sender.send(event);
+    }
+    receiver
+}
+
+fn event_is_foreground(event: &Event) -> bool {
+    // ThumbReady carries metadata. Keep it in the background FIFO so a
+    // viewport thumbnail cannot overtake an earlier metadata-only result for
+    // the same file and change which snapshot the UI retains. Failures carry
+    // no metadata and are safe to prioritize for prompt retry/status handling.
+    matches!(
+        event,
+        Event::ImageReady { .. }
+            | Event::ImageRegionReady { .. }
+            | Event::FullBandInvalidated { .. }
+            | Event::ImageFailed { .. }
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -955,7 +1050,7 @@ impl JobQueue {
         &self,
         id: JobId,
         token: &Arc<CancelToken>,
-        events: &Sender<Event>,
+        events: &EventSender,
         event: Event,
     ) -> bool {
         let state = self.state.lock().unwrap();
@@ -984,7 +1079,7 @@ impl JobQueue {
         id: JobId,
         token: &Arc<CancelToken>,
         completion: JobCompletion,
-        publication: Option<(&Sender<Event>, Event)>,
+        publication: Option<(&EventSender, Event)>,
     ) -> bool {
         let mut state = self.state.lock().unwrap();
         let publishable = state
@@ -1390,7 +1485,7 @@ struct Shared {
     entries: Arc<Vec<FolderEntry>>,
     cache: Arc<RamCache>,
     disk: Option<DiskCache>,
-    events: Sender<Event>,
+    events: EventSender,
     notify: Arc<dyn Fn() + Send + Sync>,
     /// A fixed user limit owns the pool that contains CPU-heavy work, its
     /// source/cache reads, every nested Rayon operation, and cache JPEG
@@ -1679,7 +1774,7 @@ impl Engine {
         cache: Arc<RamCache>,
         disk: Option<DiskCache>,
         notify: Arc<dyn Fn() + Send + Sync>,
-    ) -> (Self, Receiver<Event>) {
+    ) -> (Self, EventReceiver) {
         Self::new_with_options(
             entries,
             start,
@@ -1702,7 +1797,7 @@ impl Engine {
         disk: Option<DiskCache>,
         jpeg_quality: u8,
         notify: Arc<dyn Fn() + Send + Sync>,
-    ) -> (Self, Receiver<Event>) {
+    ) -> (Self, EventReceiver) {
         Self::new_with_options(
             entries,
             start,
@@ -1733,8 +1828,8 @@ impl Engine {
         disk: Option<DiskCache>,
         options: EngineOptions,
         notify: Arc<dyn Fn() + Send + Sync>,
-    ) -> (Self, Receiver<Event>) {
-        let (events, rx) = std::sync::mpsc::channel();
+    ) -> (Self, EventReceiver) {
+        let (events, rx) = event_channel();
         let processing_pool = options
             .worker_threads
             .map(build_processing_pool)
@@ -2359,7 +2454,7 @@ fn execute_claimed_job(
     action: Action,
     token: &Arc<CancelToken>,
     run: impl FnOnce() -> JobCompletion,
-    events: &Sender<Event>,
+    events: &EventSender,
     notify: impl FnOnce(),
 ) -> Option<usize> {
     let (completion, panic_payload) =
@@ -3799,6 +3894,120 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[test]
+    fn event_lanes_prioritize_display_results_and_preserve_each_lanes_order() {
+        let (events, receiver) = event_channel();
+        assert!(events.send(Event::MetadataReady {
+            index: 0,
+            meta: Box::new(FileMeta::default()),
+        }));
+        assert!(events.send(Event::ThumbReady {
+            index: 1,
+            meta: Box::new(FileMeta::default()),
+        }));
+        assert!(events.send(Event::ImageFailed {
+            index: 2,
+            tier: Tier::Thumb,
+            error: "thumb".into(),
+        }));
+        assert!(events.send(Event::ImageReady {
+            index: 3,
+            tier: Tier::Browse,
+        }));
+        assert!(events.send(Event::ImageFailed {
+            index: 4,
+            tier: Tier::Full,
+            error: "full".into(),
+        }));
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::ImageFailed {
+                index: 2,
+                tier: Tier::Thumb,
+                ..
+            })
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::ImageReady {
+                index: 3,
+                tier: Tier::Browse
+            })
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::ImageFailed {
+                index: 4,
+                tier: Tier::Full,
+                ..
+            })
+        ));
+        assert!(matches!(
+            receiver.try_recv_background(),
+            Ok(Event::MetadataReady { index: 0, .. })
+        ));
+        assert!(matches!(
+            receiver.try_recv_background(),
+            Ok(Event::ThumbReady { index: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn event_lanes_bound_a_metadata_frame_without_delaying_foreground() {
+        const BACKLOG: usize = 100_000;
+        const FRAME_BUDGET: usize = 4_096;
+
+        let (events, receiver) = event_channel();
+        for index in 0..BACKLOG {
+            assert!(events.send(Event::MetadataReady {
+                index,
+                meta: Box::new(FileMeta::default()),
+            }));
+        }
+        assert!(events.send(Event::ImageReady {
+            index: 7,
+            tier: Tier::Full,
+        }));
+
+        assert!(matches!(
+            receiver.try_recv_foreground(),
+            Ok(Event::ImageReady {
+                index: 7,
+                tier: Tier::Full
+            })
+        ));
+        for expected in 0..FRAME_BUDGET {
+            assert!(matches!(
+                receiver.try_recv_background(),
+                Ok(Event::MetadataReady { index, .. }) if index == expected
+            ));
+        }
+        assert!(matches!(
+            receiver.try_recv_background(),
+            Ok(Event::MetadataReady {
+                index: FRAME_BUDGET,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn dropping_event_receiver_disconnects_both_publication_lanes() {
+        let (events, receiver) = event_channel();
+        drop(receiver);
+
+        assert!(!events.send(Event::MetadataFailed {
+            index: 0,
+            error: "metadata".into(),
+        }));
+        assert!(!events.send(Event::ImageFailed {
+            index: 0,
+            tier: Tier::Full,
+            error: "image".into(),
+        }));
+    }
+
+    #[test]
     fn raw_share_leader_publishes_to_a_waiting_follower() {
         let share: RawDecodeShare<u32> = RawDecodeShare::new();
         let token = CancelToken::default();
@@ -4319,7 +4528,7 @@ mod tests {
             (failed_id, failed_action),
             ((3, Tier::Thumb), Action::Metadata)
         );
-        let (events, receiver) = std::sync::mpsc::channel();
+        let (events, receiver) = event_channel();
         let notifications = AtomicUsize::new(0);
         let deferred = execute_claimed_job(
             &queue,
@@ -4399,7 +4608,7 @@ mod tests {
         queue.extend([((3, Tier::Thumb), 0, 0, Action::Metadata)]);
         let (id, action, token) = queue.pop().unwrap();
         token.cancel();
-        let (events, receiver) = std::sync::mpsc::channel();
+        let (events, receiver) = event_channel();
 
         execute_claimed_job(
             &queue,
@@ -4424,7 +4633,7 @@ mod tests {
         let id = (3, Tier::Thumb);
         queue.extend([(id, 0, 0, Action::Metadata)]);
         let (claimed_id, action, token) = queue.pop().unwrap();
-        let (events, receiver) = std::sync::mpsc::channel();
+        let (events, receiver) = event_channel();
         let mut notified = false;
 
         execute_claimed_job(
@@ -4464,7 +4673,7 @@ mod tests {
         let id = (3, Tier::Browse);
         queue.extend([(id, 0, 0, Action::Metadata)]);
         let (claimed_id, _, token) = queue.pop().unwrap();
-        let (events, receiver) = std::sync::mpsc::channel();
+        let (events, receiver) = event_channel();
         let notified = Arc::new(AtomicBool::new(false));
         let notify_unlocked = Arc::new(AtomicBool::new(false));
         let notify_queue = queue.clone();
@@ -4533,7 +4742,7 @@ mod tests {
         queue.extend([(id, 0, 0, Action::Metadata)]);
         let (claimed_id, _, stale_token) = queue.pop().unwrap();
         queue.set_plan(vec![(id, 0, 0, Action::Develop(Quality::Browse))], false);
-        let (events, receiver) = std::sync::mpsc::channel();
+        let (events, receiver) = event_channel();
 
         assert!(stale_token.cancelled());
         assert!(!queue.enqueue_current_event(
@@ -4750,7 +4959,7 @@ mod tests {
         jpeg_quality: u8,
         fixed_processing_limit: bool,
     ) -> Arc<Shared> {
-        let (events, _receiver) = std::sync::mpsc::channel();
+        let (events, _receiver) = event_channel();
         Arc::new(Shared {
             entries: Arc::new(entries),
             cache,
@@ -4856,8 +5065,8 @@ mod tests {
         disk: Option<DiskCache>,
         notify: Arc<dyn Fn() + Send + Sync>,
         hint: Option<ViewHint>,
-    ) -> (Shared, Receiver<Event>) {
-        let (events, receiver) = std::sync::mpsc::channel();
+    ) -> (Shared, EventReceiver) {
+        let (events, receiver) = event_channel();
         let mut navigation = NavigationOrder::default();
         if let Some(hint) = hint {
             navigation.update_navigation(NavState {
@@ -6276,7 +6485,7 @@ mod tests {
         let disk = DiskCache::open_at(dir.path().join("cache"));
         let key = DiskCache::key(&entry, Tier::Browse);
         disk.put(&key, b"already warm").unwrap();
-        let (events, receiver) = std::sync::mpsc::channel();
+        let (events, receiver) = event_channel();
         let shared = Shared {
             entries: Arc::new(vec![entry]),
             cache: Arc::new(test_cache(0, 0, 0)),
@@ -6696,7 +6905,7 @@ mod tests {
 
         let cache = Arc::new(test_cache(0, 0, 1024));
         cache.insert_jpeg((0, Tier::Browse), Arc::new(b"not a jpeg".to_vec()));
-        let (events, receiver) = std::sync::mpsc::channel();
+        let (events, receiver) = event_channel();
         let shared = Shared {
             entries: Arc::new(vec![raw_entry]),
             cache: cache.clone(),
@@ -7111,8 +7320,8 @@ mod tests {
         }
     }
 
-    fn staging_test_shared() -> (Shared, Receiver<Event>) {
-        let (events, receiver) = std::sync::mpsc::channel();
+    fn staging_test_shared() -> (Shared, EventReceiver) {
+        let (events, receiver) = event_channel();
         let shared = Shared {
             entries: Arc::new(Vec::new()),
             cache: Arc::new(test_cache(0, 0, 0)),
@@ -7346,8 +7555,8 @@ mod tests {
             })
     }
 
-    fn progressive_fixture_shared(path: &std::path::Path) -> (Shared, Receiver<Event>) {
-        let (events, receiver) = std::sync::mpsc::channel();
+    fn progressive_fixture_shared(path: &std::path::Path) -> (Shared, EventReceiver) {
+        let (events, receiver) = event_channel();
         let shared = Shared {
             entries: Arc::new(vec![FolderEntry {
                 path: path.to_path_buf(),
