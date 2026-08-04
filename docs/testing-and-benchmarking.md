@@ -11,9 +11,16 @@ Run these commands before each commit:
 cargo fmt --all --check
 cargo fmt --manifest-path thirdparty/dnglab/rawler/Cargo.toml -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo clippy --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
+  --all-targets --all-features --locked -- \
+  -D clippy::correctness -D clippy::suspicious \
+  -D future_incompatible -D unused_must_use
 cargo test --workspace --locked
 cargo test --manifest-path thirdparty/dnglab/rawler/Cargo.toml --lib --release --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
+RUSTDOCFLAGS="-D warnings" cargo doc \
+  --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
+  --no-deps --all-features --locked
 ```
 
 The test suite covers these areas:
@@ -33,6 +40,12 @@ Windows checks also compile all-feature benchmark targets. The quality check
 runs formatting, Clippy, Rustdoc, the release build, release tests, vendored
 Rawler release tests, pinned public-domain Sony RAW tests, every optimized
 benchmark smoke test, and the focused Miri checks.
+
+The Viewr workspace treats every Clippy warning as an error. Rawler is an
+upstream fork with an existing style-lint backlog, so its separate gate treats
+Clippy correctness, suspicious-code, future-incompatibility, and unused-result
+warnings as errors. Its Rustdoc gate remains fully strict. This adds decoder
+coverage without making CI depend on unrelated upstream style cleanup.
 
 Windows-specific database tests recreate ordinary drive-path rows from the
 released ownerless schemas and from the pre-v8 owner schema. They verify clean
@@ -167,8 +180,11 @@ The suite measures these workloads:
   bilinear demosaic. The latter keeps generic non-Sony pixel-access changes in
   the controlled benchmark surface.
 
-Criterion stores reports in `target/criterion`.
-Git ignores this directory.
+Viewr's Criterion reports use `target/criterion`. The scheduled workflow sets
+Rawler's `CRITERION_HOME` to `target/criterion-rawler`, and the separately
+locked JPEG bakeoff uses `tools/jpeg-bakeoff/target/criterion`. Git ignores
+these generated directories and CI uploads all three with the matching
+environment record.
 See [the first reference run](benchmark-baseline-2026-07-21.md).
 See [the optimization campaign](performance-optimization-2026-07-21.md) for the current results and tradeoffs.
 See [the second performance and adversarial pass](performance-adversarial-pass-2026-07-21.md)

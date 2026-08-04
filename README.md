@@ -183,6 +183,7 @@ package validation, default-viewer steps, and release architecture.
   obsolete journal write. Do not relaunch or downgrade to 0.1.x for folders or
   databases already used by 0.2.x.
 - [Testing and benchmark procedures](docs/testing-and-benchmarking.md).
+- [Whole-system performance and correctness audit](docs/whole-system-performance-audit-2026-08-04.md).
 - [Adaptive Full-prefetch design and measurements](docs/adaptive-full-prefetch-2026-08-01.md).
 - [Performance and adversarial audit](docs/performance-adversarial-pass-2026-07-21.md).
 - [Design and implementation notes](docs/m0-notes.md).

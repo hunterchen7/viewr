@@ -77,12 +77,11 @@ opt-level = 0
 [profile.test.package."*"]
 opt-level = 0
 
-# Redirect the pinned crates.io rawler to the in-tree fork submodule
-# (hunterchen7/dnglab, branch viewr-ppg-fusion-0.7.2). The branch is based on
-# the v0.7.2 tag — byte-identical to the crates.io source — plus the fused
-# PPG R/B interpolation pass: bit-identical develops (pinned by the private
-# corpus hash comparison) with one fewer full-frame traversal, ~20-25% faster
-# Full develop at 33 MP. See docs/browsing-loading-optimization-2026-08-01.md.
+# Redirect the pinned crates.io rawler to the reviewed in-tree fork submodule
+# (hunterchen7/dnglab, branch codex/whole-system-performance-audit). It remains
+# based on v0.7.2 and carries the measured PPG, Sony LJPEG, generic bilinear,
+# bounds, provenance, and malformed-header changes documented in
+# docs/whole-system-performance-audit-2026-08-04.md.
 [patch.crates-io]
 rawler = { path = "thirdparty/dnglab/rawler" }
 jpeg-rusturbo = { path = "thirdparty/jpeg-rusturbo" }
