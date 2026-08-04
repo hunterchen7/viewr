@@ -757,7 +757,7 @@ impl RamCache {
         drop(removed_pixels);
         if retained && key.1 == Tier::Full {
             // The resident full frame supersedes its provisional band.
-            self.clear_full_band(key.0);
+            let _ = self.clear_full_band(key.0);
         }
         retained
     }
@@ -784,11 +784,17 @@ impl RamCache {
     }
 
     /// Clears the band slot when it belongs to `index`.
-    pub(crate) fn clear_full_band(&self, index: usize) {
+    pub(crate) fn clear_full_band(&self, index: usize) -> bool {
         let mut band = self.band.lock().unwrap();
-        if band.as_ref().is_some_and(|(owner, _)| *owner == index) {
-            *band = None;
-        }
+        let removed = if band.as_ref().is_some_and(|(owner, _)| *owner == index) {
+            band.take()
+        } else {
+            None
+        };
+        drop(band);
+        let existed = removed.is_some();
+        drop(removed);
+        existed
     }
 
     /// Inserts or replaces an encoded JPEG entry and enforces the JPEG budget.
@@ -1384,12 +1390,12 @@ mod tests {
         assert!(cache.get_full_band(3).is_none());
         assert_eq!(cache.get_full_band(4).map(|band| band.y0), Some(4));
 
-        cache.clear_full_band(3);
+        let _ = cache.clear_full_band(3);
         assert!(
             cache.get_full_band(4).is_some(),
             "mismatched clear is a no-op"
         );
-        cache.clear_full_band(4);
+        let _ = cache.clear_full_band(4);
         assert!(cache.get_full_band(4).is_none());
     }
 

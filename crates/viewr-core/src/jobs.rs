@@ -17,7 +17,7 @@
 
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, TryLockError};
 use std::time::Duration;
@@ -147,6 +147,13 @@ pub enum Event {
         /// Tier being staged (always [`Tier::Full`] today).
         tier: Tier,
     },
+    /// A provisional Full JPEG band was invalidated after the source object
+    /// failed validation. Receivers must discard textures derived from that
+    /// band before RAW fallback pixels can replace them.
+    FullBandInvalidated {
+        /// Index whose provisional JPEG pixels are no longer valid.
+        index: usize,
+    },
     /// An image decode, development, or rehydration attempt failed.
     ImageFailed {
         /// Index in the engine's immutable folder entry list.
@@ -228,14 +235,12 @@ enum Action {
 
 impl Action {
     fn compatible_with(self, requested: Self) -> bool {
+        // A speculative Full uses monolithic/no-event/no-persistence behavior.
+        // Once that image becomes required display work it must be replaced,
+        // not treated as equivalent, so the live generation can use viewport-
+        // first staging and publish readiness. Exact-action replans still keep
+        // their existing generation.
         self == requested
-            || matches!(
-                (self, requested),
-                (
-                    Self::PrefetchFull,
-                    Self::Develop(Quality::Full) | Self::Rehydrate
-                )
-            )
     }
 
     fn is_speculative_full(self) -> bool {
@@ -622,7 +627,22 @@ impl JobQueue {
     /// (not a zoom toggle); it also cancels active background generations so
     /// newly interactive work reaches a worker at the next cancellation
     /// point, and grants failed speculative targets a retry.
-    fn set_plan(&self, mut plan: Vec<(JobId, u8, u32, Action)>, navigation_changed: bool) {
+    #[cfg(any(test, feature = "benchmarks"))]
+    fn set_plan(&self, plan: Vec<(JobId, u8, u32, Action)>, navigation_changed: bool) {
+        self.set_plan_with_restarts(plan, navigation_changed, [None, None]);
+    }
+
+    /// Replaces the interactive plan and restarts up to two still-wanted
+    /// jobs whose execution mode depends on a navigation transition. This is
+    /// used for the new zoomed current Full and for a displaced progressive
+    /// owner; both must observe the new viewport/staging ownership even when
+    /// their action enum itself remains unchanged.
+    fn set_plan_with_restarts(
+        &self,
+        mut plan: Vec<(JobId, u8, u32, Action)>,
+        navigation_changed: bool,
+        force_restart: [Option<JobId>; 2],
+    ) {
         let mut state = self.state.lock().unwrap();
         if state.closed {
             return;
@@ -663,13 +683,18 @@ impl JobQueue {
             }
         }
         for (id, running) in &state.in_flight {
+            let forced = force_restart
+                .into_iter()
+                .flatten()
+                .any(|forced| forced == *id);
             let is_background = state
                 .background_in_flight
                 .get(id)
                 .is_some_and(|background| Arc::ptr_eq(&background.token, &running.token));
             let wanted_action = state.queued.get(id).map(|wanted| wanted.action);
-            if (!is_background
-                && !wanted_action.is_some_and(|action| running.action.compatible_with(action)))
+            if forced
+                || (!is_background
+                    && !wanted_action.is_some_and(|action| running.action.compatible_with(action)))
                 || (is_background
                     && wanted_action.is_some_and(|action| !running.action.compatible_with(action)))
             {
@@ -685,9 +710,15 @@ impl JobQueue {
         for (id, class, eff_dist, action) in plan {
             // Skip only if a LIVE instance is already running; a cancelled
             // in-flight instance won't publish, so queue a fresh one.
-            if state.in_flight.get(&id).is_some_and(|running| {
-                running.action.compatible_with(action) && !running.token.cancelled()
-            }) {
+            let forced = force_restart
+                .into_iter()
+                .flatten()
+                .any(|forced| forced == id);
+            if !forced
+                && state.in_flight.get(&id).is_some_and(|running| {
+                    running.action.compatible_with(action) && !running.token.cancelled()
+                })
+            {
                 state.queued.remove(&id);
                 continue;
             }
@@ -1103,6 +1134,14 @@ impl NavigationOrder {
     }
 }
 
+fn restart_current_full_for_view_transition(
+    previous: Option<NavState>,
+    next: NavState,
+    position_changed: bool,
+) -> bool {
+    next.zoomed && (position_changed || previous.is_none_or(|previous| !previous.zoomed))
+}
+
 /// Decoded CFA mosaic and metadata shared between paired develop jobs.
 struct SharedRaw {
     raw: rawler::RawImage,
@@ -1376,6 +1415,9 @@ struct Shared {
     /// develop. `in_flight` guarantees one writer per (index, Full); a
     /// replacing generation reinstalls the entry and cancellation clears it.
     progressive: Mutex<Option<ProgressiveCanvas>>,
+    /// Monotonic identity for progressive staging ownership. An old worker
+    /// can never publish into or clear a replacement generation.
+    progressive_generation: AtomicU64,
 }
 
 /// Display-space staging canvas assembled region by region by a progressive
@@ -1383,6 +1425,7 @@ struct Shared {
 /// retain references.
 struct ProgressiveCanvas {
     index: usize,
+    generation: u64,
     width: u32,
     height: u32,
     rgba: Vec<u8>,
@@ -1713,6 +1756,7 @@ impl Engine {
                 view_hint: Mutex::new(None),
                 full_viewport: Mutex::new(None),
                 progressive: Mutex::new(None),
+                progressive_generation: AtomicU64::new(1),
             }),
             workers: Vec::with_capacity(HEAVY_WORKERS + LIGHT_WORKERS),
             persistence_worker: None,
@@ -1760,6 +1804,28 @@ impl Engine {
     /// mode raises the current Full job's priority. The first call with a disk
     /// cache also installs the one-shot folder-wide Browse warm lane.
     pub fn navigate(&self, nav: NavState) {
+        self.navigate_inner(nav, None);
+    }
+
+    /// Recomputes navigation while publishing its matching zoom demand in the
+    /// same transaction. Workers snapshot navigation before either mailbox,
+    /// so they observe the old state or the complete new state, never a new
+    /// viewport paired with the previous current image.
+    pub fn navigate_with_view_demand(
+        &self,
+        nav: NavState,
+        hint: Option<ViewHint>,
+        viewport: Option<[f32; 4]>,
+    ) {
+        let viewport = viewport.filter(|uv| uv.iter().all(|value| value.is_finite()));
+        self.navigate_inner(nav, Some((hint, viewport)));
+    }
+
+    fn navigate_inner(
+        &self,
+        nav: NavState,
+        view_demand: Option<(Option<ViewHint>, Option<[f32; 4]>)>,
+    ) {
         let len = self.shared.entries.len();
         if len == 0 {
             return;
@@ -1769,12 +1835,6 @@ impl Engine {
             direction: if nav.direction < 0 { -1 } else { 1 },
             zoomed: nav.zoomed,
         };
-        // Leaving zoom retires the viewport mailbox so later Full develops
-        // take the monolithic path; while zoomed the app republishes the
-        // viewport for the new current image every loupe frame.
-        if !nav.zoomed {
-            *self.shared.full_viewport.lock().unwrap() = None;
-        }
         let current = nav.current;
         let cache = &self.shared.cache;
         // Keep navigation generation, cache admission, and queue replacement
@@ -1783,7 +1843,31 @@ impl Engine {
         // snapshots inside this transaction also keeps a waiting navigate call
         // from extending the copy-on-write observation window.
         let mut navigation = self.shared.navigation.lock().unwrap();
+        if let Some((hint, viewport)) = view_demand {
+            *self.shared.view_hint.lock().unwrap() = hint;
+            *self.shared.full_viewport.lock().unwrap() = viewport.map(|uv| (current, uv));
+        } else if !nav.zoomed {
+            // Preserve the legacy standalone setters for callers of
+            // `navigate`, but always retire a viewport when leaving zoom.
+            *self.shared.full_viewport.lock().unwrap() = None;
+        }
+        let previous_nav = navigation.last_nav;
         let position_changed = navigation.update_navigation(nav);
+        let (retired_progressive, retired_progressive_id) = if position_changed {
+            let mut staging = lock_progressive(&self.shared);
+            if staging
+                .as_ref()
+                .is_some_and(|canvas| canvas.index != current)
+            {
+                let retired = staging.take();
+                let id = retired.as_ref().map(|canvas| (canvas.index, Tier::Full));
+                (retired, id)
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
         let current_position = navigation.current_position(current);
         let (full_snapshot, browse_snapshot) = cache.prefetch_snapshots();
         let prefetch_budgets = NavigationPrefetchBudgets::new(
@@ -1880,13 +1964,28 @@ impl Engine {
         }
         drop(persistence_known_present);
 
-        self.shared.heavy.set_plan(plan, position_changed);
+        // A new zoomed current must restart even when it was already a Full
+        // display neighbor: its old worker chose monolithic behavior before
+        // it became current. A displaced staging owner is also restarted so
+        // retiring its canvas cannot silently consume still-wanted work.
+        let restart_current =
+            restart_current_full_for_view_transition(previous_nav, nav, position_changed)
+                .then_some((current, Tier::Full));
+        self.shared.heavy.set_plan_with_restarts(
+            plan,
+            position_changed,
+            [restart_current, retired_progressive_id],
+        );
         if disk.is_some() {
             self.shared
                 .heavy
                 .initialize_background(|| background_warm_jobs(len, current));
         }
         drop(navigation);
+        // Retiring the old generation before queue replacement lets the new
+        // current image reserve staging immediately. Release its potentially
+        // large allocation after every scheduler/cache lock is gone.
+        drop(retired_progressive);
     }
 
     /// Sets the display order followed by navigation and pinning.
@@ -1952,7 +2051,7 @@ impl Engine {
 
     /// Returns the display dimensions of an in-progress Full staging canvas.
     pub fn progressive_full_size(&self, index: usize) -> Option<(u32, u32)> {
-        let staging = self.shared.progressive.lock().unwrap();
+        let staging = lock_progressive(&self.shared);
         let canvas = staging.as_ref().filter(|canvas| canvas.index == index)?;
         Some((canvas.width, canvas.height))
     }
@@ -1998,7 +2097,7 @@ impl Engine {
             return false;
         }
 
-        let staging = self.shared.progressive.lock().unwrap();
+        let staging = lock_progressive(&self.shared);
         let Some(canvas) = staging.as_ref().filter(|canvas| canvas.index == index) else {
             return false;
         };
@@ -2069,7 +2168,8 @@ impl Drop for Engine {
             let _ = worker.join();
         }
         // Workers have joined: any staging canvas is abandoned for certain.
-        *self.shared.progressive.lock().unwrap() = None;
+        let abandoned = lock_progressive(&self.shared).take();
+        drop(abandoned);
     }
 }
 
@@ -2311,7 +2411,6 @@ fn worker_panic_event(
     }
 }
 
-#[cfg(test)]
 fn publish(shared: &Shared, event: Event) {
     let _ = shared.events.send(event);
     notify_safely(shared.notify.as_ref());
@@ -2625,6 +2724,36 @@ fn complete_thumb_attempt(
     }
 }
 
+/// Snapshots a current image's viewport under the same lock order used by
+/// navigation publication. The navigation mutex is the transaction fence.
+fn current_full_viewport(shared: &Shared, index: usize) -> Option<[f32; 4]> {
+    let navigation = shared.navigation.lock().unwrap();
+    if !navigation
+        .last_nav
+        .is_some_and(|nav| nav.current == index && nav.zoomed)
+    {
+        return None;
+    }
+    let viewport = *shared.full_viewport.lock().unwrap();
+    viewport
+        .filter(|(viewport_index, _)| *viewport_index == index)
+        .map(|(_, uv)| uv)
+}
+
+/// Snapshots the matching prioritized JPEG band request using navigation as
+/// the transaction fence, mirroring [`current_full_viewport`].
+fn current_view_hint(shared: &Shared, index: usize) -> Option<ViewHint> {
+    let navigation = shared.navigation.lock().unwrap();
+    if !navigation
+        .last_nav
+        .is_some_and(|nav| nav.current == index && nav.zoomed)
+    {
+        return None;
+    }
+    let hint = *shared.view_hint.lock().unwrap();
+    hint.filter(|hint| hint.index == index)
+}
+
 fn run_develop(
     shared: &Shared,
     index: usize,
@@ -2718,16 +2847,7 @@ fn run_develop(
         && quality == Quality::Full
         && supports_region_develop(&raw)
     {
-        let viewport = *shared.full_viewport.lock().unwrap();
-        let is_navigation_current = shared
-            .navigation
-            .lock()
-            .unwrap()
-            .last_nav
-            .is_some_and(|nav| nav.current == index);
-        if is_navigation_current
-            && let Some((_, uv)) = viewport.filter(|(viewport_index, _)| *viewport_index == index)
-        {
+        if let Some(uv) = current_full_viewport(shared, index) {
             match run_progressive_full_develop(
                 shared,
                 index,
@@ -2832,14 +2952,12 @@ fn decode_jpeg_for_rehydrate(
     bytes: &[u8],
 ) -> DecodeOutcome {
     let band = if mode == DevelopMode::Display && tier == Tier::Full {
-        let hint = *shared.view_hint.lock().unwrap();
-        hint.filter(|hint| hint.index == index)
-            .map(|hint| BandRequest {
-                uv_y0: hint.uv_y0,
-                uv_y1: hint.uv_y1,
-                align_px: hint.align_px,
-                gutter_px: hint.gutter_px,
-            })
+        current_view_hint(shared, index).map(|hint| BandRequest {
+            uv_y0: hint.uv_y0,
+            uv_y1: hint.uv_y1,
+            align_px: hint.align_px,
+            gutter_px: hint.gutter_px,
+        })
     } else {
         None
     };
@@ -3012,11 +3130,72 @@ fn rect_distance_key(rect: [u32; 4], target: [u32; 4]) -> (u64, u64) {
     (gap_x * gap_x + gap_y * gap_y, dx * dx + dy * dy)
 }
 
-/// Drops the staging canvas if this develop still owns it.
-fn clear_progressive(shared: &Shared, index: usize) {
-    let mut staging = shared.progressive.lock().unwrap();
-    if staging.as_ref().is_some_and(|canvas| canvas.index == index) {
-        *staging = None;
+/// Takes the staging canvas only when both its image and worker generation
+/// match. The potentially large allocation is returned so its final drop can
+/// happen after releasing the mutex.
+fn lock_progressive(shared: &Shared) -> std::sync::MutexGuard<'_, Option<ProgressiveCanvas>> {
+    shared
+        .progressive
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn take_progressive(shared: &Shared, index: usize, generation: u64) -> Option<ProgressiveCanvas> {
+    let mut staging = lock_progressive(shared);
+    let canvas = if staging
+        .as_ref()
+        .is_some_and(|canvas| canvas.index == index && canvas.generation == generation)
+    {
+        staging.take()
+    } else {
+        None
+    };
+    drop(staging);
+    canvas
+}
+
+/// RAII ownership for the single progressive staging slot. It makes every
+/// return and unwind clear only this worker's generation.
+struct ProgressiveLease<'a> {
+    shared: &'a Shared,
+    index: usize,
+    generation: u64,
+}
+
+impl<'a> ProgressiveLease<'a> {
+    fn acquire(shared: &'a Shared, index: usize) -> Option<Self> {
+        let generation = shared
+            .progressive_generation
+            .fetch_add(1, Ordering::Relaxed);
+        let mut staging = lock_progressive(shared);
+        if staging.as_ref().is_some_and(|canvas| canvas.index != index) {
+            return None;
+        }
+        let replaced = staging.replace(ProgressiveCanvas {
+            index,
+            generation,
+            width: 0,
+            height: 0,
+            rgba: Vec::new(),
+            covered: Vec::new(),
+        });
+        drop(staging);
+        drop(replaced);
+        Some(Self {
+            shared,
+            index,
+            generation,
+        })
+    }
+
+    fn owns(&self, canvas: &ProgressiveCanvas) -> bool {
+        canvas.index == self.index && canvas.generation == self.generation
+    }
+}
+
+impl Drop for ProgressiveLease<'_> {
+    fn drop(&mut self) {
+        drop(take_progressive(self.shared, self.index, self.generation));
     }
 }
 
@@ -3044,23 +3223,12 @@ fn run_progressive_full_develop(
     // Reserve the staging slot atomically before any expensive work: at most
     // one canvas exists, and stealing an active one would discard a
     // near-complete assembly whose job stays wanted as a neighbor.
-    {
-        let mut staging = shared.progressive.lock().unwrap();
-        if staging.as_ref().is_some_and(|canvas| canvas.index != index) {
-            return Err(Box::new(raw));
-        }
-        *staging = Some(ProgressiveCanvas {
-            index,
-            width: 0,
-            height: 0,
-            rgba: Vec::new(),
-            covered: Vec::new(),
-        });
-    }
+    let Some(lease) = ProgressiveLease::acquire(shared, index) else {
+        return Err(Box::new(raw));
+    };
     let plan = match plan_full_develop(raw) {
         Ok(plan) => plan,
         Err(e) => {
-            clear_progressive(shared, index);
             if !token.cancelled() {
                 emit(Event::ImageFailed {
                     index,
@@ -3077,17 +3245,40 @@ fn run_progressive_full_develop(
     };
     let (display_w, display_h) = plan.display_size(orient);
     let (out_w, out_h) = plan.output_size();
+    if token.cancelled() {
+        return Ok(DevelopCompletion::Cancelled);
+    }
+
+    let Some(canvas_len) = (display_w as usize)
+        .checked_mul(display_h as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+    else {
+        emit(Event::ImageFailed {
+            index,
+            tier,
+            error: "progressive Full dimensions overflow addressable memory".into(),
+        });
+        return Ok(DevelopCompletion::Finished);
+    };
+    let rgba = vec![0; canvas_len];
+    if token.cancelled() {
+        return Ok(DevelopCompletion::Cancelled);
+    }
 
     // Fill in the reserved staging canvas; `in_flight` guarantees a single
     // writer per (index, Full), and the reservation above guarantees the
     // slot is ours.
     {
-        let mut staging = shared.progressive.lock().unwrap();
+        let mut staging = lock_progressive(shared);
+        if !staging.as_ref().is_some_and(|canvas| lease.owns(canvas)) {
+            return Ok(DevelopCompletion::Cancelled);
+        }
         *staging = Some(ProgressiveCanvas {
             index,
+            generation: lease.generation,
             width: display_w,
             height: display_h,
-            rgba: vec![0; display_w as usize * display_h as usize * 4],
+            rgba,
             covered: Vec::new(),
         });
     }
@@ -3097,7 +3288,6 @@ fn run_progressive_full_develop(
     let mut scratch: Vec<u8> = Vec::new();
     let develop_one = |rect: [u32; 4], scratch: &mut Vec<u8>| -> Option<DevelopCompletion> {
         if token.cancelled() {
-            clear_progressive(shared, index);
             return Some(DevelopCompletion::Cancelled);
         }
         let out_rect = Rect::new(
@@ -3105,7 +3295,6 @@ fn run_progressive_full_develop(
             Dim2::new(rect[2] as usize, rect[3] as usize),
         );
         let display = plan.display_rect(out_rect, orient);
-        scratch.clear();
         scratch.resize(display[2] as usize * display[3] as usize * 4, 0);
         plan.develop_region_into(
             out_rect,
@@ -3114,9 +3303,12 @@ fn run_progressive_full_develop(
             display[2],
             [display[0], display[1]],
         );
+        if token.cancelled() {
+            return Some(DevelopCompletion::Cancelled);
+        }
         let row_bytes = display[2] as usize * 4;
-        let mut staging = shared.progressive.lock().unwrap();
-        let Some(canvas) = staging.as_mut().filter(|canvas| canvas.index == index) else {
+        let mut staging = lock_progressive(shared);
+        let Some(canvas) = staging.as_mut().filter(|canvas| lease.owns(canvas)) else {
             // A replacing generation owns the staging slot; this generation's
             // publication would be rejected anyway.
             return Some(DevelopCompletion::Cancelled);
@@ -3168,14 +3360,11 @@ fn run_progressive_full_develop(
     // inside the critical section takes the staging lock again (the cache
     // ring has its own mutex and never calls back), so no cycle exists.
     let (buf, retained) = {
-        let mut staging = shared.progressive.lock().unwrap();
+        let mut staging = lock_progressive(shared);
         if token.cancelled() {
-            if staging.as_ref().is_some_and(|canvas| canvas.index == index) {
-                *staging = None;
-            }
             return Ok(DevelopCompletion::Cancelled);
         }
-        let taken = if staging.as_ref().is_some_and(|canvas| canvas.index == index) {
+        let taken = if staging.as_ref().is_some_and(|canvas| lease.owns(canvas)) {
             staging.take()
         } else {
             None
@@ -3220,6 +3409,15 @@ fn run_progressive_full_develop(
     Ok(DevelopCompletion::Finished)
 }
 
+fn invalidate_full_band(shared: &Shared, index: usize) {
+    if shared.cache.clear_full_band(index) {
+        // Cache invalidation is authoritative shared state, not a result owned
+        // by the rehydrate generation. Once pixels disappear, the matching UI
+        // event must survive cancellation so no stale GPU tiles outlive them.
+        publish(shared, Event::FullBandInvalidated { index });
+    }
+}
+
 fn run_rehydrate(
     shared: &Shared,
     index: usize,
@@ -3249,7 +3447,7 @@ fn run_rehydrate(
                 if tier == Tier::Full {
                     // A band decoded from the corrupt object must not
                     // outlive it: the fallback re-develops from RAW.
-                    shared.cache.clear_full_band(index);
+                    invalidate_full_band(shared, index);
                 }
             }
         }
@@ -3278,7 +3476,7 @@ fn run_rehydrate(
                 DecodeOutcome::Corrupt => {}
             }
             if tier == Tier::Full {
-                shared.cache.clear_full_band(index);
+                invalidate_full_band(shared, index);
             }
             if let Err(error) = disk.remove(&key) {
                 eprintln!("failed to remove corrupt disk cache object: {error}");
@@ -4269,6 +4467,7 @@ mod tests {
             view_hint: Mutex::new(None),
             full_viewport: Mutex::new(None),
             progressive: Mutex::new(None),
+            progressive_generation: AtomicU64::new(1),
         };
 
         publish_claimed(
@@ -4544,6 +4743,7 @@ mod tests {
             view_hint: Mutex::new(None),
             full_viewport: Mutex::new(None),
             progressive: Mutex::new(None),
+            progressive_generation: AtomicU64::new(1),
         })
     }
 
@@ -4633,6 +4833,14 @@ mod tests {
         hint: Option<ViewHint>,
     ) -> (Shared, Receiver<Event>) {
         let (events, receiver) = std::sync::mpsc::channel();
+        let mut navigation = NavigationOrder::default();
+        if let Some(hint) = hint {
+            navigation.update_navigation(NavState {
+                current: hint.index,
+                direction: 1,
+                zoomed: true,
+            });
+        }
         (
             Shared {
                 entries: Arc::new(entries),
@@ -4646,11 +4854,12 @@ mod tests {
                 persistence: PersistenceQueue::new(),
                 persistence_known_present: Mutex::new(HashSet::new()),
                 jpeg_quality: CACHE_JPEG_QUALITY,
-                navigation: Mutex::new(NavigationOrder::default()),
+                navigation: Mutex::new(navigation),
                 raw_share: RawDecodeShare::new(),
                 view_hint: Mutex::new(hint),
                 full_viewport: Mutex::new(None),
                 progressive: Mutex::new(None),
+                progressive_generation: AtomicU64::new(1),
             },
             receiver,
         )
@@ -4845,6 +5054,32 @@ mod tests {
                 index: 0,
                 tier: Tier::Full
             }]
+        ));
+    }
+
+    #[test]
+    fn corrupt_band_invalidation_emits_once_and_clears_the_pixels() {
+        let cache = Arc::new(RamCache::new(RamCacheBudgets::new(0, 0, 64, 0)));
+        cache.publish_full_band(
+            4,
+            FullBand {
+                full_width: 2,
+                full_height: 2,
+                y0: 0,
+                buf: patterned_buf(2, 1),
+            },
+        );
+        let (shared, receiver) =
+            band_shared(Vec::new(), cache.clone(), None, Arc::new(|| {}), None);
+
+        invalidate_full_band(&shared, 4);
+        invalidate_full_band(&shared, 4);
+
+        assert!(cache.get_full_band(4).is_none());
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert!(matches!(
+            events.as_slice(),
+            [Event::FullBandInvalidated { index: 4 }]
         ));
     }
 
@@ -5136,6 +5371,42 @@ mod tests {
             direction: -1,
             zoomed: false,
         }));
+    }
+
+    #[test]
+    fn entering_zoom_or_moving_while_zoomed_restarts_the_current_full_worker() {
+        let fit = NavState {
+            current: 4,
+            direction: 1,
+            zoomed: false,
+        };
+        let zoomed = NavState {
+            zoomed: true,
+            ..fit
+        };
+        assert!(restart_current_full_for_view_transition(
+            Some(fit),
+            zoomed,
+            false
+        ));
+        assert!(!restart_current_full_for_view_transition(
+            Some(zoomed),
+            zoomed,
+            false
+        ));
+        assert!(restart_current_full_for_view_transition(
+            Some(zoomed),
+            NavState {
+                current: 5,
+                ..zoomed
+            },
+            true
+        ));
+        assert!(!restart_current_full_for_view_transition(
+            Some(zoomed),
+            NavState { current: 5, ..fit },
+            true
+        ));
     }
 
     #[test]
@@ -5700,6 +5971,29 @@ mod tests {
     }
 
     #[test]
+    fn forced_restart_requeues_a_still_wanted_live_generation() {
+        let q = JobQueue::new();
+        let id = (7, Tier::Full);
+        let plan = vec![(id, 0, 0, Action::Develop(Quality::Full))];
+        q.set_plan(plan.clone(), true);
+        let (_, _, stale) = q.pop().unwrap();
+
+        q.set_plan_with_restarts(plan, true, [Some(id), None]);
+        assert!(stale.cancelled());
+        assert!(
+            q.try_pop().is_none(),
+            "one id cannot run twice concurrently"
+        );
+
+        q.finish(id, &stale);
+        let (replacement_id, replacement_action, replacement) = q.try_pop().unwrap();
+        assert_eq!(replacement_id, id);
+        assert_eq!(replacement_action, Action::Develop(Quality::Full));
+        assert!(!Arc::ptr_eq(&stale, &replacement));
+        q.finish(id, &replacement);
+    }
+
+    #[test]
     fn speculative_full_uses_one_worker_and_yields_to_lower_priority_foreground() {
         let q = JobQueue::new();
         q.set_plan(
@@ -5819,16 +6113,20 @@ mod tests {
     }
 
     #[test]
-    fn live_speculative_full_can_be_promoted_without_restart() {
+    fn live_speculative_full_restarts_with_display_semantics_on_promotion() {
         let q = JobQueue::new();
         let id = (7, Tier::Full);
         q.set_plan(vec![(id, 5, 1, Action::PrefetchFull)], true);
         let (_, _, token) = q.pop().unwrap();
 
         q.set_plan(vec![(id, 0, 0, Action::Develop(Quality::Full))], true);
-        assert!(!token.cancelled());
+        assert!(token.cancelled());
         assert!(q.try_pop().is_none());
         q.finish(id, &token);
+        let (_, action, display_token) = q.try_pop().unwrap();
+        assert_eq!(action, Action::Develop(Quality::Full));
+        assert!(!display_token.cancelled());
+        q.finish(id, &display_token);
     }
 
     #[test]
@@ -5971,6 +6269,7 @@ mod tests {
             view_hint: Mutex::new(None),
             full_viewport: Mutex::new(None),
             progressive: Mutex::new(None),
+            progressive_generation: AtomicU64::new(1),
         };
 
         run_warm_develop(
@@ -6390,6 +6689,7 @@ mod tests {
             view_hint: Mutex::new(None),
             full_viewport: Mutex::new(None),
             progressive: Mutex::new(None),
+            progressive_generation: AtomicU64::new(1),
         };
 
         run_rehydrate(
@@ -6692,24 +6992,54 @@ mod tests {
             view_hint: Mutex::new(None),
             full_viewport: Mutex::new(None),
             progressive: Mutex::new(None),
+            progressive_generation: AtomicU64::new(1),
         };
         (shared, receiver)
     }
 
     #[test]
-    fn progressive_staging_is_cleared_only_by_its_owning_index() {
+    fn progressive_staging_is_cleared_only_by_its_owning_generation() {
         let (shared, _receiver) = staging_test_shared();
         *shared.progressive.lock().unwrap() = Some(ProgressiveCanvas {
             index: 3,
+            generation: 7,
             width: 2,
             height: 1,
             rgba: vec![0; 8],
             covered: vec![[0, 0, 1, 1]],
         });
-        clear_progressive(&shared, 5);
+        assert!(take_progressive(&shared, 5, 7).is_none());
         assert!(shared.progressive.lock().unwrap().is_some());
-        clear_progressive(&shared, 3);
+        assert!(take_progressive(&shared, 3, 8).is_none());
+        assert!(shared.progressive.lock().unwrap().is_some());
+        assert!(take_progressive(&shared, 3, 7).is_some());
         assert!(shared.progressive.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn progressive_lease_cleans_up_on_unwind_without_clearing_a_replacement() {
+        let (shared, _receiver) = staging_test_shared();
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _lease = ProgressiveLease::acquire(&shared, 3).unwrap();
+            let _staging = lock_progressive(&shared);
+            panic!("injected progressive worker panic");
+        }));
+        assert!(unwind.is_err());
+        assert!(lock_progressive(&shared).is_none());
+
+        let old = ProgressiveLease::acquire(&shared, 3).unwrap();
+        let replacement = ProgressiveLease::acquire(&shared, 3).unwrap();
+        let replacement_generation = replacement.generation;
+        drop(old);
+        assert_eq!(
+            lock_progressive(&shared)
+                .as_ref()
+                .map(|canvas| canvas.generation),
+            Some(replacement_generation)
+        );
+        assert!(ProgressiveLease::acquire(&shared, 4).is_none());
+        drop(replacement);
+        assert!(lock_progressive(&shared).is_none());
     }
 
     #[test]
@@ -6781,6 +7111,7 @@ mod tests {
         let source = (0_u8..48).collect::<Vec<_>>();
         *shared.progressive.lock().unwrap() = Some(ProgressiveCanvas {
             index: 3,
+            generation: 9,
             width: 4,
             height: 3,
             rgba: source.clone(),
@@ -6833,19 +7164,39 @@ mod tests {
         );
         assert!(engine.progressive_full_size(0).is_none());
 
-        engine.navigate(NavState {
-            current: 0,
-            direction: 1,
-            zoomed: true,
-        });
-        assert!(engine.shared.full_viewport.lock().unwrap().is_some());
+        let hint = ViewHint {
+            index: 0,
+            uv_y0: 0.25,
+            uv_y1: 0.75,
+            align_px: 512,
+            gutter_px: 1,
+        };
+        engine.navigate_with_view_demand(
+            NavState {
+                current: 0,
+                direction: 1,
+                zoomed: true,
+            },
+            Some(hint),
+            Some([0.25, 0.25, 0.75, 0.75]),
+        );
+        assert_eq!(
+            current_full_viewport(&engine.shared, 0),
+            Some([0.25, 0.25, 0.75, 0.75])
+        );
+        assert_eq!(current_view_hint(&engine.shared, 0), Some(hint));
 
-        engine.navigate(NavState {
-            current: 0,
-            direction: 1,
-            zoomed: false,
-        });
+        engine.navigate_with_view_demand(
+            NavState {
+                current: 0,
+                direction: 1,
+                zoomed: false,
+            },
+            None,
+            None,
+        );
         assert!(engine.shared.full_viewport.lock().unwrap().is_none());
+        assert!(engine.shared.view_hint.lock().unwrap().is_none());
     }
 
     fn real_sony_raw_fixture() -> std::path::PathBuf {
@@ -6884,6 +7235,7 @@ mod tests {
             view_hint: Mutex::new(None),
             full_viewport: Mutex::new(None),
             progressive: Mutex::new(None),
+            progressive_generation: AtomicU64::new(1),
         };
         shared
             .cache

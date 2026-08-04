@@ -264,6 +264,32 @@ fn full_tile_should_be_kept(
     zoomed && (index == current || Some(index) == next_ahead)
 }
 
+fn take_band_tile_keys_for_index(
+    keys: &mut HashSet<(usize, TileCoord)>,
+    index: usize,
+) -> Vec<(usize, TileCoord)> {
+    let mut removed = Vec::new();
+    keys.retain(|key| {
+        if key.0 == index {
+            removed.push(*key);
+            false
+        } else {
+            true
+        }
+    });
+    removed
+}
+
+fn record_band_tile_key(
+    keys: &mut HashSet<(usize, TileCoord)>,
+    key: (usize, TileCoord),
+    from_band: bool,
+) {
+    if from_band {
+        keys.insert(key);
+    }
+}
+
 fn install_metadata(
     ratings: &mut HashMap<usize, u8>,
     metas: &mut HashMap<usize, FileMeta>,
@@ -581,16 +607,20 @@ impl App {
 
     fn replan(&self) {
         if let Some(session) = &self.session {
-            // Publish the hint before the plan so a rehydrate claimed right
-            // after set_plan already sees the framing it decodes for. The
-            // hint is advisory and outside job identity: updating it cannot
-            // cancel in-flight work, and staleness only costs latency.
-            session.engine.set_view_hint(self.view_hint(session));
-            session.engine.navigate(NavState {
+            let demand = self.view_demand(session);
+            let nav = NavState {
                 current: self.current,
                 direction: self.direction,
                 zoomed: full_resolution_is_urgent(self.mode, self.zoom),
-            });
+            };
+            // Publish both viewport forms inside the engine's navigation
+            // transaction so a promoted Full worker observes either the old
+            // demand or the complete new demand.
+            session.engine.navigate_with_view_demand(
+                nav,
+                demand.map(|(hint, _)| hint),
+                demand.map(|(_, uv)| uv),
+            );
         }
     }
 
@@ -599,7 +629,7 @@ impl App {
     /// Zoom framing is retained across navigation, so the previous logical
     /// size reproduces the new image's visible rows for burst sequences; a
     /// dimension mismatch only degrades the advisory band, never the output.
-    fn view_hint(&self, session: &Session) -> Option<ViewHint> {
+    fn view_demand(&self, session: &Session) -> Option<(ViewHint, [f32; 4])> {
         if !full_resolution_is_urgent(self.mode, self.zoom) {
             return None;
         }
@@ -610,13 +640,16 @@ impl App {
             .map(|buf| vec2(buf.width as f32, buf.height as f32))
             .or(self.last_logical)?;
         let uv = loupe::visible_uv_for(rect, img_size, self.zoom);
-        Some(ViewHint {
-            index: self.current,
-            uv_y0: uv.min.y,
-            uv_y1: uv.max.y,
-            align_px: progressive_texture::TILE_EDGE,
-            gutter_px: progressive_texture::SAMPLE_GUTTER,
-        })
+        Some((
+            ViewHint {
+                index: self.current,
+                uv_y0: uv.min.y,
+                uv_y1: uv.max.y,
+                align_px: progressive_texture::TILE_EDGE,
+                gutter_px: progressive_texture::SAMPLE_GUTTER,
+            },
+            [uv.min.x, uv.min.y, uv.max.x, uv.max.y],
+        ))
     }
 
     /// Position of `current` within the visible sequence (nearest if the
@@ -750,6 +783,14 @@ impl App {
                 // engine's snapshot during painting, and the notify callback
                 // already requested this repaint. No replan.
                 Event::ImageRegionReady { .. } => {}
+                Event::FullBandInvalidated { index } => {
+                    for key in
+                        take_band_tile_keys_for_index(&mut session.full_tiles_from_band, index)
+                    {
+                        session.full_tiles.remove(&key);
+                    }
+                    session.band_tile_miss_frames = 0;
+                }
                 Event::ImageFailed { index, tier, error } => {
                     if tier == Tier::Thumb && session.thumb_requests.remove(&index).is_some() {
                         session
@@ -1084,7 +1125,9 @@ impl App {
                     return false;
                 };
                 if session.band_tile_miss_frames >= 1 {
-                    for key in session.full_tiles_from_band.drain() {
+                    for key in
+                        take_band_tile_keys_for_index(&mut session.full_tiles_from_band, current)
+                    {
                         session.full_tiles.remove(&key);
                     }
                 } else {
@@ -1103,6 +1146,7 @@ impl App {
             OverlaySource::Band(band) => (band.full_width, band.full_height),
             OverlaySource::Staging { width, height } => (*width, *height),
         };
+        let source_is_band = matches!(&source, OverlaySource::Band(_));
         let order =
             progressive_texture::priority_order(image_width, image_height, response.visible_uv);
         let visible_count = progressive_texture::visible_prefix_len(
@@ -1196,17 +1240,14 @@ impl App {
                     egui::TextureOptions::LINEAR,
                 );
                 session.full_tiles.insert(key, texture);
-                if matches!(source, OverlaySource::Band(_)) {
-                    session.full_tiles_from_band.insert(key);
-                }
+                record_band_tile_key(&mut session.full_tiles_from_band, key, source_is_band);
                 uploaded += 1;
             }
         }
-        if matches!(source, OverlaySource::Full(_)) {
-            // The finished buffer contains the same bytes the band carried;
-            // its tiles are no longer provisional.
-            session.full_tiles_from_band.clear();
-        }
+        // Keep band provenance after Full arrives. An invalidation event can
+        // already be queued behind this frame's event drain; retaining the
+        // key lets that delayed event conservatively remove and re-upload the
+        // texture from the authoritative Full buffer on the next frame.
         // With the visible rect complete, the background budget goes first to
         // the next-ahead warm below — an imminent zoomed navigation values the
         // neighbor's visible tiles above this image's off-screen remainder —
@@ -1322,6 +1363,7 @@ impl App {
                     egui::TextureOptions::LINEAR,
                 );
                 session.full_tiles.insert(key, texture);
+                record_band_tile_key(&mut session.full_tiles_from_band, key, source_is_band);
                 uploaded += 1;
             }
         }
@@ -2207,6 +2249,19 @@ mod tests {
         assert!(full_resolution_is_urgent(Mode::Loupe, anchored));
         assert!(!full_resolution_is_urgent(Mode::Grid, Zoom::Fit));
         assert!(!full_resolution_is_urgent(Mode::Grid, anchored));
+    }
+
+    #[test]
+    fn band_invalidation_removes_only_the_failed_images_tiles() {
+        let tile_a = TileCoord { col: 1, row: 2 };
+        let tile_b = TileCoord { col: 3, row: 4 };
+        let mut keys = HashSet::from([(7, tile_a), (8, tile_a)]);
+        record_band_tile_key(&mut keys, (7, tile_b), true);
+        record_band_tile_key(&mut keys, (9, tile_a), false);
+        let mut removed = take_band_tile_keys_for_index(&mut keys, 7);
+        removed.sort_by_key(|(_, tile)| (tile.row, tile.col));
+        assert_eq!(removed, vec![(7, tile_a), (7, tile_b)]);
+        assert_eq!(keys, HashSet::from([(8, tile_a)]));
     }
 
     #[test]
