@@ -50,9 +50,10 @@ scan still includes and predictor-chains every required padding block.
 ## Correctness contract
 
 For eligible input, every thread count must produce the same bytes as the
-single-thread encoder. Tests cover odd and partial MCUs, qualities 1 through
-100, automatic and fixed pools, and restart marker wraparound. Viewr also
-compares production-size output across its one-thread and multi-thread pools.
+single-thread encoder. Tests cover odd and partial MCUs, representative
+qualities 1, 50, 97, and 100, automatic and fixed pools, and restart marker
+wraparound. Viewr also compares production-size output across its one-thread
+and multi-thread pools.
 
 The row join rejects an append when the destination bit writer is not empty or
 byte-aligned. Parallel workers only read shared pixels and tables. Each worker

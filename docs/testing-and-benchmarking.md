@@ -13,7 +13,7 @@ cargo fmt --manifest-path thirdparty/dnglab/rawler/Cargo.toml -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo clippy --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
   --all-targets --all-features --locked -- \
-  -D clippy::correctness -D clippy::suspicious \
+  -A clippy::all -D clippy::correctness -D clippy::suspicious \
   -D future_incompatible -D unused_must_use
 cargo test --workspace --locked
 cargo test --manifest-path thirdparty/dnglab/rawler/Cargo.toml --lib --release --locked
@@ -98,6 +98,15 @@ cargo bench -p viewr --features benchmarks --bench filmstrip_scaling --locked
 cargo bench -p viewr --features benchmarks --bench event_backlog --locked
 cargo bench --manifest-path thirdparty/dnglab/rawler/Cargo.toml --locked --bench perf
 cargo bench --manifest-path tools/jpeg-bakeoff/Cargo.toml --locked --bench encode
+```
+
+Reproduce the counterbalanced Panasonic table-setup comparison in release
+mode. This benchmark is ignored during ordinary test runs and does not assert
+timing in CI:
+
+```sh
+cargo test --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
+  --release benchmark_panasonic_v8_table_sharing -- --ignored --nocapture
 ```
 
 Use a filter when you work on one subsystem:

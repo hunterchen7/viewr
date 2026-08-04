@@ -206,6 +206,49 @@ versus 3.819 ms in the noisier ten-thread lane. This optimization is limited
 to the measured four-channel bilinear path. Similar-looking RW2, IIQ, and RADC
 accesses remain unchanged without representative fixtures.
 
+### Safe Panasonic and Fuji strip ownership
+
+The final generic-format review found a pre-existing aliasing defect shared by
+Panasonic V8 and Fuji RAF decode. Each parallel strip called
+`SharedPix2D::inner_mut(&self)` and created a mutable reference to the complete
+pixel allocation. Logical strip separation did not make those overlapping
+whole-object references valid Rust, and malformed Panasonic rectangles could
+also overlap into a real concurrent data race.
+
+`SharedPix2D` and its `UnsafeCell`/`Sync` escape hatch are removed. Before any
+parallel work, Panasonic now checked-multiplies its strip-grid count, requires
+nonzero grid divisors and exact metadata-vector cardinality, and rejects odd,
+empty, overflowing, out-of-bounds, overlapping, or incomplete rectangles.
+It also validates Huffman lengths, symbols, prefix conflicts, and the currently
+supported zero shift before construction, preventing malformed metadata from
+reaching a release-mode shift overflow.
+Fuji validates the declared strip count, complete image dimensions, each block
+offset, and the narrower final strip. A common safe partitioner proves that
+the rectangles cover the image exactly once, then builds each worker an
+exclusive vector of mutable row slices with `chunks_exact_mut` and
+`split_at_mut`. The decode remains zero-copy and introduces no new unsafe code.
+
+Synthetic grid, vertical-strip, narrow-tail, reordered-strip, overlap, gap,
+overflow, and out-of-bounds tests cover the ownership contract independently
+of a camera fixture. Native tests compare sequential and Rayon writes, while a
+Miri configuration exercises the same partition with serial workers because
+Miri cannot run Rayon's global Crossbeam pool. No Panasonic V8 or compressed
+Fuji fixture is currently available, so unchanged decode math and independent
+ownership tests replace an end-to-end hash for those two formats. Adding
+public fixtures remains coverage debt; retaining invalid aliasing was not an
+acceptable substitute.
+
+The same pass found that every Panasonic strip rebuilt the identical 65,536
+entry Huffman cache and, for nonlinear files, a 65,536 entry gamma table.
+Those immutable tables now build once per image and are shared by reference;
+only predictor coefficients remain strip-local. In counterbalanced 31-sample
+release runs, representative 16-strip linear control runs were 4.402 to 4.501
+ms; shared-table runs were 0.260 to 0.267 ms (93.9 to 94.2 percent less).
+Nonlinear control runs were 5.64 to 6.682 ms; shared-table runs were 0.392 to
+0.415 ms (about 93 to 94 percent less). An exhaustive Huffman cache comparison
+and a full gamma-table fingerprint preserve every table entry. The benchmark
+composes the same production constructors and makes no timing assertion in CI.
+
 ### Fused integer Browse development
 
 The common Browse path no longer creates a complete normalized `f32` CFA and
@@ -441,6 +484,19 @@ These operations are measured and intentionally unchanged in this pass:
 - Update checks and downloads run on workers, but the app still polls a small
   local update event queue. No measured update-frame operation crossed the
   few-millisecond threshold.
+- The asynchronous configuration barrier reports that the queued write was
+  attempted. A filesystem failure is logged, but the caller does not receive a
+  separate durability-success result. Exit still waits for the attempt; a
+  future settings-error channel can expose failures without blocking the UI.
+- A completed shared RAW decode can retain one decoded mosaic until the next
+  relevant cache or job activity retires the sharing slot. The retention is
+  bounded, and generation checks prevent stale publication, but immediate
+  retirement would need an additional follower/owner protocol to avoid a rare
+  duplicate decode race.
+- RW2, IIQ, and RADC contain other checked per-pixel access sites. They remain
+  unchanged because the repository has no representative fixtures or
+  format-specific benchmarks that can prove exact output and an end-to-end
+  win.
 
 `jobs.rs` and `app.rs` still contain several responsibilities. Splitting them
 without an orchestration benchmark would change lock and event boundaries with
@@ -491,9 +547,10 @@ reference test. Validation includes these checks:
   JPEG truncation, Browse vector initialization and parity tails, and threaded
   output equivalence where Miri can run it.
 - CI runs strict-provenance Rawler tests for mutable tile ownership, PPG raw
-  pointers, Sony output rectangles, direct LJPEG scatter, and every structural
-  LJPEG header prefix. It force-selects scalar JPEG entropy code so Miri can
-  inspect both pointer-bump writers without SIMD intrinsics.
+  pointers, Panasonic/Fuji rectangle partitions, Sony output rectangles,
+  direct LJPEG scatter, and every structural LJPEG header prefix. It
+  force-selects scalar JPEG entropy code so Miri can inspect both pointer-bump
+  writers without SIMD intrinsics.
 - Scalar-forced JPEG tests on ARM64.
 - Exact serial-versus-parallel JPEG stream tests.
 - Exact monolithic-versus-progressive RAW output tests.
@@ -542,6 +599,15 @@ CRITERION_HOME=/tmp/viewr-criterion-rawler \
 cargo test --manifest-path tools/jpeg-bakeoff/Cargo.toml --locked
 cargo run --release --manifest-path tools/jpeg-bakeoff/Cargo.toml \
   --locked -- restart-compare 10 21 97
+
+cargo +nightly-2026-07-21 miri test -p jpeg-rusturbo \
+  --features force-scalar --lib \
+  encode::huffman::tests::equiv_full_random --locked
+MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-strict-provenance -Zmiri-ignore-leaks" \
+  cargo +nightly-2026-07-21 miri test \
+  --manifest-path thirdparty/dnglab/rawler/Cargo.toml --lib \
+  pixarray::tests::disjoint_rect_partitions_match_sequential_and_parallel_writes \
+  --locked
 
 scripts/validate-third-party-licenses.sh
 scripts/validate-source-archive.sh
