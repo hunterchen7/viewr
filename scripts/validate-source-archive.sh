@@ -76,6 +76,9 @@ required=(
   "$top_level/packaging/THIRD-PARTY-NOTICES.txt"
   "$top_level/tools/jpeg-bakeoff/Cargo.lock"
   "$top_level/tools/jpeg-bakeoff/Cargo.toml"
+  "$top_level/thirdparty/dnglab/Cargo.lock"
+  "$top_level/thirdparty/dnglab/rawler/Cargo.toml"
+  "$top_level/thirdparty/dnglab/rawler/benches/perf.rs"
   "$top_level/vendor/jpeg-encoder-0.6.1/LICENSE-APACHE"
   "$top_level/vendor/jpeg-encoder-0.6.1/LICENSE-MIT"
   "$top_level/thirdparty/jpeg-rusturbo/NOTICE.md"
@@ -178,6 +181,17 @@ fi
     --locked \
     --offline \
     --format-version 1 >/dev/null
+  cargo metadata \
+    --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
+    --locked \
+    --offline \
+    --format-version 1 >/dev/null
+  cargo test \
+    --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
+    --lib \
+    --release \
+    --locked \
+    --offline
   cargo test \
     --manifest-path tools/jpeg-bakeoff/Cargo.toml \
     --locked \

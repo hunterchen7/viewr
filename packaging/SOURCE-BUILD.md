@@ -18,7 +18,10 @@ The executable is in `target/release`. On Windows, the file name is
 `viewr.exe`.
 
 The rawler and jpeg-rusturbo libraries that Viewr builds are reviewed in-tree
-forks at `thirdparty/dnglab/rawler` and `thirdparty/jpeg-rusturbo`.
+forks at `thirdparty/dnglab/rawler` and `thirdparty/jpeg-rusturbo`. Source
+archive validation also runs Rawler's library tests from its own locked
+workspace, so submodule-only safety tests cannot disappear behind Viewr's path
+dependency build.
 `Cargo.toml` already patches the crates.io dependencies to those paths, so
 their files are directly editable:
 
