@@ -41,6 +41,9 @@ pub struct SettingsState {
     pub open: bool,
     /// Action currently waiting for a key capture.
     listening: Option<Action>,
+    /// Tracks a close between frames so the asynchronous configuration writer
+    /// receives one durable barrier, not one barrier per closed frame.
+    was_open: bool,
 }
 
 impl SettingsState {
@@ -83,8 +86,13 @@ impl SettingsState {
         let mut actions = SettingsActions::default();
         if !self.open {
             self.listening = None;
+            if self.was_open {
+                config.save_and_flush();
+                self.was_open = false;
+            }
             return actions;
         }
+        self.was_open = true;
         let mut open = self.open;
         let mut changed = false;
         egui::Window::new("Preferences")
@@ -440,6 +448,10 @@ impl SettingsState {
         self.open = open;
         if changed {
             config.save();
+        }
+        if !open {
+            config.save_and_flush();
+            self.was_open = false;
         }
         actions
     }

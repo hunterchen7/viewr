@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::io::Write as _;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::sync::mpsc::{self, Receiver, Sender};
 
 use eframe::egui;
 use serde::Deserialize;
@@ -519,10 +521,16 @@ impl Config {
     /// Regenerate viewr.toml from the current state. (Hand-edited
     /// comments are replaced — the file is round-tripped by the app.)
     pub fn save(&self) {
-        let Some(path) = config_path() else { return };
-        let out = self.serialized();
-        if let Err(error) = replace_file_durable(&path, out.as_bytes()) {
-            eprintln!("failed to save {}: {error}", path.display());
+        config_writer().save(self.serialized());
+    }
+
+    /// Saves the current state and waits until the durable replacement is
+    /// complete. Window-close and process-exit paths use this barrier. Normal
+    /// UI changes use [`save`](Self::save) and never wait for filesystem I/O.
+    pub fn save_and_flush(&self) {
+        let serialized = self.serialized();
+        if !config_writer().save_and_flush(serialized) {
+            save_config_now(self.serialized());
         }
     }
 
@@ -570,6 +578,99 @@ impl Config {
             out.push_str(&format!("{name} = [{}]\n", labels.join(", ")));
         }
         out
+    }
+}
+
+enum ConfigWrite {
+    Save(String),
+    Flush(Sender<()>),
+}
+
+struct ConfigWriter {
+    sender: Option<Sender<ConfigWrite>>,
+}
+
+impl ConfigWriter {
+    fn start() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("viewr-config".into())
+            .spawn(move || config_writer_loop(receiver, save_config_now));
+        if let Err(error) = worker {
+            eprintln!("failed to start configuration writer: {error}");
+            return Self { sender: None };
+        }
+        Self {
+            sender: Some(sender),
+        }
+    }
+
+    fn save(&self, serialized: String) {
+        let Some(sender) = &self.sender else {
+            save_config_now(serialized);
+            return;
+        };
+        if let Err(error) = sender.send(ConfigWrite::Save(serialized)) {
+            let ConfigWrite::Save(serialized) = error.0 else {
+                unreachable!("the failed message was a save")
+            };
+            save_config_now(serialized);
+        }
+    }
+
+    fn save_and_flush(&self, serialized: String) -> bool {
+        let Some(sender) = &self.sender else {
+            return false;
+        };
+        let (done, wait) = mpsc::channel();
+        if sender.send(ConfigWrite::Save(serialized)).is_err()
+            || sender.send(ConfigWrite::Flush(done)).is_err()
+        {
+            return false;
+        }
+        wait.recv().is_ok()
+    }
+}
+
+fn config_writer() -> &'static ConfigWriter {
+    static WRITER: OnceLock<ConfigWriter> = OnceLock::new();
+    WRITER.get_or_init(ConfigWriter::start)
+}
+
+/// Runs one latest-value-wins writer. A flush is an ordering barrier: all
+/// saves that precede it are durable before the acknowledgement is sent.
+fn config_writer_loop(receiver: Receiver<ConfigWrite>, mut persist: impl FnMut(String)) {
+    while let Ok(message) = receiver.recv() {
+        match message {
+            ConfigWrite::Save(mut latest) => {
+                let mut flush = None;
+                loop {
+                    match receiver.try_recv() {
+                        Ok(ConfigWrite::Save(serialized)) => latest = serialized,
+                        Ok(ConfigWrite::Flush(done)) => {
+                            flush = Some(done);
+                            break;
+                        }
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+                persist(latest);
+                if let Some(done) = flush {
+                    let _ = done.send(());
+                }
+            }
+            ConfigWrite::Flush(done) => {
+                let _ = done.send(());
+            }
+        }
+    }
+}
+
+fn save_config_now(serialized: String) {
+    let Some(path) = config_path() else { return };
+    if let Err(error) = replace_file_durable(&path, serialized.as_bytes()) {
+        eprintln!("failed to save {}: {error}", path.display());
     }
 }
 
@@ -726,6 +827,31 @@ jpeg_quality = 97
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_writer_coalesces_changes_before_a_flush_barrier() {
+        let (sender, receiver) = mpsc::channel();
+        for value in 0..1_000 {
+            sender
+                .send(ConfigWrite::Save(format!("revision={value}")))
+                .unwrap();
+        }
+        let (done, wait) = mpsc::channel();
+        sender.send(ConfigWrite::Flush(done)).unwrap();
+
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let worker_writes = writes.clone();
+        let worker = std::thread::spawn(move || {
+            config_writer_loop(receiver, |serialized| {
+                worker_writes.lock().unwrap().push(serialized);
+            });
+        });
+
+        wait.recv().unwrap();
+        assert_eq!(writes.lock().unwrap().as_slice(), ["revision=999"]);
+        drop(sender);
+        worker.join().unwrap();
+    }
 
     #[test]
     fn clear_on_exit_round_trips_and_defaults_off() {

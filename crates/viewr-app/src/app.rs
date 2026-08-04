@@ -1545,6 +1545,7 @@ fn purge_disk_cache() {
 
 impl eframe::App for App {
     fn on_exit(&mut self) {
+        self.config.save_and_flush();
         if !self.config.clear_disk_cache_on_exit {
             return;
         }
