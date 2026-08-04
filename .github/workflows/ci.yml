@@ -72,7 +72,11 @@ jobs:
             --all-features \
             --locked \
             -- \
-            -D warnings
+            -A clippy::all \
+            -D clippy::correctness \
+            -D clippy::suspicious \
+            -D future_incompatible \
+            -D unused_must_use
       - name: Check documentation
         run: |
           cargo doc --workspace --no-deps --all-features --locked
@@ -194,6 +198,11 @@ jobs:
           cargo +nightly-2026-07-21 miri test \
             --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
             --lib \
+            pixarray::tests::disjoint_rect_partitions_match_sequential_and_parallel_writes \
+            --locked
+          cargo +nightly-2026-07-21 miri test \
+            --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
+            --lib \
             imgop::sensor::bayer::ppg::tests::small_frame_raw_pointer_kernels_are_finite \
             --locked
           cargo +nightly-2026-07-21 miri test \
@@ -205,6 +214,11 @@ jobs:
             --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
             --lib \
             decompressors::ljpeg::decompressors::tests::sony_arw_scatter_stays_inside_each_destination_row \
+            --locked
+          cargo +nightly-2026-07-21 miri test \
+            --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
+            --lib \
+            decompressors::ljpeg::tests::every_encoded_stream_prefix_is_panic_free \
             --locked
 
   macos-compatibility:
