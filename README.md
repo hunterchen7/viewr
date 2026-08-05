@@ -92,8 +92,10 @@ The Preferences window controls the loading message, performance details,
 cache indicator, processing-thread limit, budgets, and cache JPEG quality. A
 separate image-information strip can sit above or below the loupe; filename,
 camera and lens, capture and modified timestamps, exposure, focal length, and
-file size can each be shown or hidden. The cache indicator has border, mark,
-and hidden modes.
+file size can each be shown or hidden. Its labels have three modes: minimal
+(the default) names only the timestamps and ISO because `1/3200` and `f/6.3`
+already say what they are, verbose names every field, and none shows bare
+values. The cache indicator has border, mark, and hidden modes.
 Processing and cache changes apply when the next folder is opened. All binds,
 loupe scroll behavior, and optional vertical scrolling of the horizontal
 filmstrip are also configurable.

@@ -3,7 +3,7 @@ use eframe::egui;
 use viewr_core::folder::FolderEntry;
 use viewr_core::meta::FileMeta;
 
-use crate::config::{ImageInfoConfig, ImageInfoPosition};
+use crate::config::{ImageInfoConfig, ImageInfoLabels, ImageInfoPosition};
 
 const MAX_VALUE_CHARS: usize = 512;
 const MAX_ITEM_CHARS: usize = MAX_VALUE_CHARS + 32;
@@ -23,6 +23,37 @@ pub(crate) enum ImageInfoField {
     FileSize,
 }
 
+impl ImageInfoField {
+    /// The name to print before the value, or `""` when the value identifies
+    /// itself well enough at this verbosity.
+    fn label(self, labels: ImageInfoLabels) -> &'static str {
+        match labels {
+            ImageInfoLabels::None => "",
+            // Every other value carries its own unit or notation, but the two
+            // timestamps are indistinguishable dates and a bare ISO speed
+            // reads as an arbitrary number.
+            ImageInfoLabels::Minimal => match self {
+                Self::Captured => "Shot",
+                Self::Modified => "Modified",
+                Self::Iso => "ISO",
+                _ => "",
+            },
+            ImageInfoLabels::Verbose => match self {
+                Self::FileName => "File",
+                Self::Captured => "Captured",
+                Self::Modified => "Modified",
+                Self::Camera => "Camera",
+                Self::Lens => "Lens",
+                Self::Iso => "ISO",
+                Self::Shutter => "Shutter",
+                Self::Aperture => "Aperture",
+                Self::FocalLength => "Focal",
+                Self::FileSize => "Size",
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImageInfoItem {
     field: ImageInfoField,
@@ -40,12 +71,13 @@ pub(crate) fn build_items(
     }
 
     let fields = config.fields;
+    let labels = config.labels;
     let mut items = Vec::with_capacity(10);
     if fields.file_name {
         push_item(
             &mut items,
             ImageInfoField::FileName,
-            "File",
+            labels,
             &entry.file_name,
         );
     }
@@ -55,44 +87,39 @@ pub(crate) fn build_items(
         push_item(
             &mut items,
             ImageInfoField::Captured,
-            "Captured",
+            labels,
             &captured.to_string(),
         );
     }
     if fields.modified
         && let Some(modified) = format_modified_time(entry.mtime_ns)
     {
-        push_item(&mut items, ImageInfoField::Modified, "Modified", &modified);
+        push_item(&mut items, ImageInfoField::Modified, labels, &modified);
     }
     if fields.camera
         && let Some(metadata) = metadata
     {
-        push_item(
-            &mut items,
-            ImageInfoField::Camera,
-            "Camera",
-            &metadata.camera,
-        );
+        push_item(&mut items, ImageInfoField::Camera, labels, &metadata.camera);
     }
     if fields.lens
         && let Some(lens) = metadata.and_then(|metadata| metadata.lens.as_deref())
     {
-        push_item(&mut items, ImageInfoField::Lens, "Lens", lens);
+        push_item(&mut items, ImageInfoField::Lens, labels, lens);
     }
     if fields.iso
         && let Some(iso) = metadata.and_then(|metadata| metadata.iso)
     {
-        push_item(&mut items, ImageInfoField::Iso, "ISO", &iso.to_string());
+        push_item(&mut items, ImageInfoField::Iso, labels, &iso.to_string());
     }
     if fields.shutter
         && let Some(shutter) = metadata.and_then(|metadata| metadata.shutter.as_deref())
     {
-        push_item(&mut items, ImageInfoField::Shutter, "Shutter", shutter);
+        push_item(&mut items, ImageInfoField::Shutter, labels, shutter);
     }
     if fields.aperture
         && let Some(aperture) = metadata.and_then(|metadata| metadata.aperture.as_deref())
     {
-        push_item(&mut items, ImageInfoField::Aperture, "Aperture", aperture);
+        push_item(&mut items, ImageInfoField::Aperture, labels, aperture);
     }
     if fields.focal_length
         && let Some(focal_mm) = metadata
@@ -104,24 +131,34 @@ pub(crate) fn build_items(
         } else {
             format!("{focal_mm:.1} mm")
         };
-        push_item(&mut items, ImageInfoField::FocalLength, "Focal", &focal);
+        push_item(&mut items, ImageInfoField::FocalLength, labels, &focal);
     }
     if fields.file_size {
         push_item(
             &mut items,
             ImageInfoField::FileSize,
-            "Size",
+            labels,
             &format_file_size(entry.size),
         );
     }
     items
 }
 
-fn push_item(items: &mut Vec<ImageInfoItem>, field: ImageInfoField, label: &str, value: &str) {
+fn push_item(
+    items: &mut Vec<ImageInfoItem>,
+    field: ImageInfoField,
+    labels: ImageInfoLabels,
+    value: &str,
+) {
     let Some(value) = compact_value(value) else {
         return;
     };
-    let text = format!("{label} {value}");
+    let label = field.label(labels);
+    let text = if label.is_empty() {
+        value
+    } else {
+        format!("{label} {value}")
+    };
     debug_assert!(text.chars().count() <= MAX_ITEM_CHARS);
     items.push(ImageInfoItem { field, text });
 }
@@ -283,7 +320,7 @@ mod tests {
     use viewr_core::meta::{CaptureTimestamp, FileMeta};
 
     use super::*;
-    use crate::config::{ImageInfoConfig, ImageInfoFields, ImageInfoPosition};
+    use crate::config::{ImageInfoConfig, ImageInfoFields, ImageInfoLabels, ImageInfoPosition};
 
     fn entry() -> FolderEntry {
         FolderEntry {
@@ -328,6 +365,7 @@ mod tests {
         ImageInfoConfig {
             enabled: true,
             position: ImageInfoPosition::Above,
+            labels: ImageInfoLabels::Verbose,
             fields,
         }
     }
@@ -445,18 +483,22 @@ mod tests {
         let _ = format_modified_time(i64::MAX);
     }
 
-    #[test]
-    fn field_text_is_explicit_and_stable() {
-        let mut config = ImageInfoConfig::default();
+    fn texts(labels: ImageInfoLabels) -> Vec<String> {
+        let mut config = ImageInfoConfig {
+            labels,
+            ..ImageInfoConfig::default()
+        };
         config.fields.modified = false;
+        build_items(&config, &entry(), Some(&metadata()))
+            .into_iter()
+            .map(|item| item.text)
+            .collect()
+    }
 
-        let items = build_items(&config, &entry(), Some(&metadata()));
-
+    #[test]
+    fn verbose_labels_name_every_field() {
         assert_eq!(
-            items
-                .iter()
-                .map(|item| item.text.as_str())
-                .collect::<Vec<_>>(),
+            texts(ImageInfoLabels::Verbose),
             [
                 "File test.ARW",
                 "Captured 2024-01-02 03:04:05.25 -07:00",
@@ -469,6 +511,71 @@ mod tests {
                 "Size 24.5 MB",
             ]
         );
+    }
+
+    #[test]
+    fn minimal_labels_keep_only_the_values_that_cannot_speak_for_themselves() {
+        assert_eq!(
+            texts(ImageInfoLabels::Minimal),
+            [
+                "test.ARW",
+                "Shot 2024-01-02 03:04:05.25 -07:00",
+                "Sony A1",
+                "FE 50mm F1.2 GM",
+                "ISO 800",
+                "1/1000",
+                "f/2.8",
+                "50 mm",
+                "24.5 MB",
+            ]
+        );
+    }
+
+    #[test]
+    fn minimal_labels_still_separate_the_two_timestamps() {
+        let config = ImageInfoConfig {
+            labels: ImageInfoLabels::Minimal,
+            ..ImageInfoConfig::default()
+        };
+
+        let items = build_items(&config, &entry(), Some(&metadata()));
+
+        let timestamps: Vec<&str> = items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.field,
+                    ImageInfoField::Captured | ImageInfoField::Modified
+                )
+            })
+            .map(|item| item.text.as_str())
+            .collect();
+        assert_eq!(timestamps.len(), 2);
+        assert!(timestamps[0].starts_with("Shot "));
+        assert!(timestamps[1].starts_with("Modified "));
+    }
+
+    #[test]
+    fn label_mode_none_shows_bare_values() {
+        assert_eq!(
+            texts(ImageInfoLabels::None),
+            [
+                "test.ARW",
+                "2024-01-02 03:04:05.25 -07:00",
+                "Sony A1",
+                "FE 50mm F1.2 GM",
+                "800",
+                "1/1000",
+                "f/2.8",
+                "50 mm",
+                "24.5 MB",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_default_strip_is_minimal() {
+        assert_eq!(ImageInfoConfig::default().labels, ImageInfoLabels::Minimal);
     }
 
     #[test]
