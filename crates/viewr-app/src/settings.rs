@@ -9,8 +9,8 @@ use eframe::egui;
 use viewr_core::jobs::{MAX_CACHE_JPEG_QUALITY, MIN_CACHE_JPEG_QUALITY};
 
 use crate::config::{
-    ACTIONS, Action, Bind, Config, ImageInfoPosition, MAX_CONFIGURED_PROCESSING_THREADS,
-    ProcessingThreadLimit, ScrollMode, TierIndicator,
+    ACTIONS, Action, Bind, Config, ImageInfoLabels, ImageInfoPosition,
+    MAX_CONFIGURED_PROCESSING_THREADS, ProcessingThreadLimit, ScrollMode, TierIndicator,
 };
 
 fn max_processing_thread_choice(available: usize) -> usize {
@@ -177,6 +177,33 @@ impl SettingsState {
                                 ImageInfoPosition::Below,
                                 "Below image",
                             )
+                            .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Labels:");
+                        changed |= ui
+                            .radio_value(
+                                &mut config.image_info.labels,
+                                ImageInfoLabels::Minimal,
+                                "Minimal",
+                            )
+                            .on_hover_text("Name only the timestamps and ISO: 1/3200 · f/6.3")
+                            .changed();
+                        changed |= ui
+                            .radio_value(
+                                &mut config.image_info.labels,
+                                ImageInfoLabels::Verbose,
+                                "Verbose",
+                            )
+                            .on_hover_text("Name every field: Shutter 1/3200 · Aperture f/6.3")
+                            .changed();
+                        changed |= ui
+                            .radio_value(
+                                &mut config.image_info.labels,
+                                ImageInfoLabels::None,
+                                "None",
+                            )
+                            .on_hover_text("Values only: 1/3200 · f/6.3 · 800")
                             .changed();
                     });
                     ui.label(egui::RichText::new("Information fields").weak().size(11.0));

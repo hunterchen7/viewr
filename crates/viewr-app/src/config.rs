@@ -84,6 +84,30 @@ impl ImageInfoPosition {
     }
 }
 
+/// How much each strip item names the value it shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageInfoLabels {
+    /// Values only: `1/3200`, `800`, `42.2 MB`.
+    None,
+    /// Name only the values that cannot be told apart on sight, so the two
+    /// timestamps stay distinguishable and ISO keeps its unit.
+    #[default]
+    Minimal,
+    /// Name every value: `Shutter 1/3200`.
+    Verbose,
+}
+
+impl ImageInfoLabels {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Verbose => "verbose",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct ImageInfoFields {
@@ -142,6 +166,7 @@ impl Default for ImageInfoFields {
 pub struct ImageInfoConfig {
     pub enabled: bool,
     pub position: ImageInfoPosition,
+    pub labels: ImageInfoLabels,
     #[serde(flatten)]
     pub fields: ImageInfoFields,
 }
@@ -151,6 +176,7 @@ impl Default for ImageInfoConfig {
         Self {
             enabled: true,
             position: ImageInfoPosition::Above,
+            labels: ImageInfoLabels::default(),
             fields: ImageInfoFields::default(),
         }
     }
@@ -551,7 +577,7 @@ impl Config {
              # hand-edits are read at startup but comments are not kept.\n\n[input]\n",
         );
         out.push_str(&format!(
-            "scroll = \"{}\"\nvertical_scroll_filmstrip = {}\n\n[ui]\ntier_indicator = \"{}\"\nshow_loading = {}\nshow_performance = {}\nfilmstrip_height = {:.0}\ngrid_cell = {:.0}\n\n[ui.image_info]\nenabled = {}\nposition = \"{}\"\nfile_name = {}\ncaptured = {}\nmodified = {}\ncamera = {}\nlens = {}\niso = {}\nshutter = {}\naperture = {}\nfocal_length = {}\nfile_size = {}\n\n[performance]\nworker_threads = {}\n\n[cache]\nram_gb = {:.1}\ndisk_gb = {:.1}\njpeg_quality = {}\nclear_on_exit = {}\n\n[binds]\n",
+            "scroll = \"{}\"\nvertical_scroll_filmstrip = {}\n\n[ui]\ntier_indicator = \"{}\"\nshow_loading = {}\nshow_performance = {}\nfilmstrip_height = {:.0}\ngrid_cell = {:.0}\n\n[ui.image_info]\nenabled = {}\nposition = \"{}\"\nlabels = \"{}\"\nfile_name = {}\ncaptured = {}\nmodified = {}\ncamera = {}\nlens = {}\niso = {}\nshutter = {}\naperture = {}\nfocal_length = {}\nfile_size = {}\n\n[performance]\nworker_threads = {}\n\n[cache]\nram_gb = {:.1}\ndisk_gb = {:.1}\njpeg_quality = {}\nclear_on_exit = {}\n\n[binds]\n",
             match self.scroll {
                 ScrollMode::Pan => "pan",
                 ScrollMode::Zoom => "zoom",
@@ -564,6 +590,7 @@ impl Config {
             self.grid_cell,
             self.image_info.enabled,
             self.image_info.position.as_str(),
+            self.image_info.labels.as_str(),
             self.image_info.fields.file_name,
             self.image_info.fields.captured,
             self.image_info.fields.modified,
@@ -792,6 +819,10 @@ show_performance = true
 enabled = true
 # "above" places the strip below the toolbar; "below" places it above the filmstrip.
 position = "above"
+# How much each value names itself: "verbose" labels every field
+# (Shutter 1/3200), "minimal" labels only the timestamps and ISO, and "none"
+# shows bare values.
+labels = "minimal"
 # Choose the fields in the strip. Missing metadata is omitted without a placeholder.
 file_name = true
 captured = true
@@ -1237,6 +1268,7 @@ mod tests {
             [ui.image_info]
             enabled = false
             position = "below"
+            labels = "verbose"
             file_name = false
             captured = true
             modified = false
@@ -1253,6 +1285,7 @@ mod tests {
         let expected = ImageInfoConfig {
             enabled: false,
             position: ImageInfoPosition::Below,
+            labels: ImageInfoLabels::Verbose,
             fields: ImageInfoFields {
                 file_name: false,
                 captured: true,
@@ -1324,6 +1357,25 @@ mod tests {
         assert!(configured.fields.modified);
         assert!(configured.fields.iso);
         assert!(configured.fields.file_size);
+        assert_eq!(configured.labels, ImageInfoLabels::Minimal);
+    }
+
+    #[test]
+    fn every_label_verbosity_round_trips() {
+        for (written, expected) in [
+            ("none", ImageInfoLabels::None),
+            ("minimal", ImageInfoLabels::Minimal),
+            ("verbose", ImageInfoLabels::Verbose),
+        ] {
+            let raw: RawConfig =
+                toml::from_str(&format!("[ui.image_info]\nlabels = \"{written}\"\n")).unwrap();
+            let configured = Config::from_raw(raw);
+
+            assert_eq!(configured.image_info.labels, expected, "{written}");
+
+            let reparsed: RawConfig = toml::from_str(&configured.serialized()).unwrap();
+            assert_eq!(Config::from_raw(reparsed).image_info.labels, expected);
+        }
     }
 
     #[test]
