@@ -1,5 +1,73 @@
 # Changelog
 
+## [0.6.0](https://github.com/hunterchen7/viewr/compare/v0.5.0...v0.6.0) (2026-08-05)
+
+
+### Features
+
+* add minimal, verbose, and none label modes to the info strip ([#38](https://github.com/hunterchen7/viewr/issues/38)) ([f2ecef6](https://github.com/hunterchen7/viewr/commit/f2ecef6ef926c51c0f3e8cb9b8874704cceb87f8))
+* **app:** produce view hints and consume decode-band tiles ([e5903c1](https://github.com/hunterchen7/viewr/commit/e5903c1c031569f50bf2a3f11dd8f4aeb375607b))
+* band-first JPEG rehydrate — sharp visible rows in ~17ms instead of ~43ms ([a4622fa](https://github.com/hunterchen7/viewr/commit/a4622fa06dacbeb75ba9eab4d24bb57621bbc94c))
+* **core:** advisory view-hint mailbox and band publication in rehydrates ([02c5636](https://github.com/hunterchen7/viewr/commit/02c5636a6917166375b3a49633a126814b6a2cf2))
+* **core:** single-slot FullBand side channel on RamCache ([254f886](https://github.com/hunterchen7/viewr/commit/254f886a972c2dedb8d581b5d5207a9e1125d6d9))
+* **core:** two-phase visible-band-first restart-JPEG decode ([1a1d96f](https://github.com/hunterchen7/viewr/commit/1a1d96fe8ace392c9415ab77da087d7328aceda2))
+
+
+### Bug Fixes
+
+* archive rawler criterion reports ([43c960e](https://github.com/hunterchen7/viewr/commit/43c960eeda3f280f39db216265b07cd580f3d118))
+* bound restart decode allocation geometry ([8cd0e78](https://github.com/hunterchen7/viewr/commit/8cd0e785f998e28bdc948e54b16291a5b72a8886))
+* compose the overlay across buffer, staging, and band sources ([d40dec5](https://github.com/hunterchen7/viewr/commit/d40dec556873561b714ec347ec2c72849cb4b4ed))
+* debounce band-tile draining across one probe race frame ([89fdc76](https://github.com/hunterchen7/viewr/commit/89fdc761c7283c992529ab624e8107cee4a214f9))
+* encode partial progressive mcus correctly ([a9be080](https://github.com/hunterchen7/viewr/commit/a9be0809b032ff199782b2874c538cce2e4a4568))
+* fence interactive publications to navigation ([16cc0d4](https://github.com/hunterchen7/viewr/commit/16cc0d4903d63ec358f6edf44bf64b1f5a51816f))
+* harden generic raw parallel decode ([5e60f7a](https://github.com/hunterchen7/viewr/commit/5e60f7acb9f3dc4aebde579bd7804d4e6eec89c8))
+* harden raw pixel access invariants ([fedcc6b](https://github.com/hunterchen7/viewr/commit/fedcc6b0d62138613a651dbc17fbd20d46fa81ae))
+* harden the decode share against regeneration races ([3e632ae](https://github.com/hunterchen7/viewr/commit/3e632aea2a39b4de6bdbacde33a245f666dbc131))
+* harden the progressive staging lifecycle ([c6ea267](https://github.com/hunterchen7/viewr/commit/c6ea2673cf22195a2855ff6073d40c33ede5a8e7))
+* initialize jpeg decoder storage safely ([177ff12](https://github.com/hunterchen7/viewr/commit/177ff12aa314a85ac6797d4dd47ba1cab69d22c2))
+* keep the portrait region test out of CI's pinned-fixture pass ([8e82ee3](https://github.com/hunterchen7/viewr/commit/8e82ee3036857226e6fba30beacdcf99dcb6d48a))
+* make parallel PPG component access sound ([989d3ab](https://github.com/hunterchen7/viewr/commit/989d3abf80eebb75ce4489dd9850969ea590e3b6))
+* make progressive full publication race free ([eaccfb2](https://github.com/hunterchen7/viewr/commit/eaccfb28737137f9bc578bdd310a0b7dacef27a0))
+* make tiled raw partitions provenance-safe ([14713dd](https://github.com/hunterchen7/viewr/commit/14713dd7d68556e7943f5f078f16e9729cb36162))
+* move the rawler fork submodule out of the vendor directory ([1450079](https://github.com/hunterchen7/viewr/commit/14500794afee4f9bf8173192310052ea8f776e43))
+* never park a share lead inside the regeneration test ([54b36ba](https://github.com/hunterchen7/viewr/commit/54b36ba4c489ae6c4dbf7c3050ba2c225b318c6e))
+* pin rawler benchmark report path ([871f989](https://github.com/hunterchen7/viewr/commit/871f989874a3d64744fb8986b95893d033865339))
+* prove demosaic allocation geometry ([bb6921e](https://github.com/hunterchen7/viewr/commit/bb6921e73e85d3e8c1050fcd39da9b482c2e0fbe))
+* reject truncated entropy marker reads safely ([fbe5918](https://github.com/hunterchen7/viewr/commit/fbe59187c0be33cb14ad42946e6be099a85aed9b))
+* repair release plumbing for the in-tree rawler fork ([1576a59](https://github.com/hunterchen7/viewr/commit/1576a5987acf3dd56d4014c21bd7a65c50fd12d7))
+* require an early band only when the request stays partial ([e957aab](https://github.com/hunterchen7/viewr/commit/e957aab389e4cae3479faed02c99f8ad1b4775bc))
+* resolve the bake-off workspace's rawler from the in-tree fork ([2a428a5](https://github.com/hunterchen7/viewr/commit/2a428a51655bdd102073922d6d3a5531749e9bd2))
+* stage the rawler fork on both sides of cargo vendor ([04cb243](https://github.com/hunterchen7/viewr/commit/04cb24314686b45d0bdee98e74b2fd23fcae7496))
+* validate bounded Sony LJPEG tiles ([4e97b3c](https://github.com/hunterchen7/viewr/commit/4e97b3c92e74191fbfaa9d04107e1c96acfc7edd))
+* vendor rawler's locked release graph ([ac23045](https://github.com/hunterchen7/viewr/commit/ac2304585d2b126756b73971b9c33bb187ffdb4a))
+* warm the next image before trickling off-screen tiles ([79cf6d9](https://github.com/hunterchen7/viewr/commit/79cf6d9d309b9e213d02a72c043e1607c7f4ef79))
+
+
+### Performance Improvements
+
+* accelerate progressive PPG regions ([449afa2](https://github.com/hunterchen7/viewr/commit/449afa210f28d5f0f8b2616d776873d2343ae44a))
+* add structured raw pipeline records ([87eb41d](https://github.com/hunterchen7/viewr/commit/87eb41dfff0ce653350a3571c406f495efffefac))
+* adopt the fused-PPG rawler fork as an in-tree submodule ([6991de9](https://github.com/hunterchen7/viewr/commit/6991de9f139dd1069dab46a8218829bd5e96f0b5))
+* audit and accelerate the full image pipeline ([16f2c76](https://github.com/hunterchen7/viewr/commit/16f2c767934bd6925f2b02af5f174be2c9cb1156))
+* behavior-preserving browsing/loading speed pass ([e59b0b5](https://github.com/hunterchen7/viewr/commit/e59b0b5ea15b6aa52a7388b95eace1c1ec1e09e6))
+* bound background event work per frame ([306181d](https://github.com/hunterchen7/viewr/commit/306181d8877295f3597ce5e59ee37adb5f0e9bd4))
+* carry opaque pixel provenance to textures ([581033e](https://github.com/hunterchen7/viewr/commit/581033e52d77989856750bc28da7bdeaf9b354d9))
+* cut one frame from every keypress and sharpen viewports in one frame ([2e0b4c6](https://github.com/hunterchen7/viewr/commit/2e0b4c65446d054a9bf2d5711c31bc42bbe5da93))
+* decode Sony LJPEG tiles directly ([3559795](https://github.com/hunterchen7/viewr/commit/35597950fe2a05b2961da91cc2ee38287711a871))
+* faster ARW decode and warm decoder databases at startup ([ddf24d0](https://github.com/hunterchen7/viewr/commit/ddf24d0f2d9cca3bab2df9df2093d20abc02efa8))
+* fuse integer browse normalization ([2cb7f2a](https://github.com/hunterchen7/viewr/commit/2cb7f2adff0d5033f4a768ef94a03687b706f529))
+* group refreshed ratings off the UI thread ([9f4a8c2](https://github.com/hunterchen7/viewr/commit/9f4a8c26ab2baf19c2cacbf1434dcf9dab31ccdf))
+* in-tree fused-PPG rawler via submodule ([981fee4](https://github.com/hunterchen7/viewr/commit/981fee4f5bbee2bdb392338f877585b220d136fe))
+* keep preferences close off filesystem I/O ([800d413](https://github.com/hunterchen7/viewr/commit/800d413ecb2fc904892d34a6bae024140763bd21))
+* make first progressive region uploadable ([415fdae](https://github.com/hunterchen7/viewr/commit/415fdaeb10b2a8816316550bb9bf87864320963e))
+* move config durability off the UI thread ([db047f1](https://github.com/hunterchen7/viewr/commit/db047f1fe3c9dbd7c76c04bdbae0be878a617914))
+* parallel-tile ARW decode, inlined huffman, startup DB prewarm ([f612ccd](https://github.com/hunterchen7/viewr/commit/f612ccd5809ed7598bdf6df4a87f3ef4aac23d8e))
+* parallelize restart-row jpeg encoding ([eee7d9b](https://github.com/hunterchen7/viewr/commit/eee7d9b61b22050a9284e964436845a12b380bd0))
+* reuse Sony tile decode tables ([7af2d75](https://github.com/hunterchen7/viewr/commit/7af2d75ce0903f34d6f4e6d3963f3e2258fb57ac))
+* same-frame keypress navigation and one-frame viewport sharpening ([5baa571](https://github.com/hunterchen7/viewr/commit/5baa571e5cb1b402501a1740ab92114a9864d3d6))
+* shorten progressive texture publication locks ([1de8f4f](https://github.com/hunterchen7/viewr/commit/1de8f4f1a46ef4342aebc468cb0ce9748714c57c))
+
 ## [0.5.0](https://github.com/hunterchen7/viewr/compare/v0.4.0...v0.5.0) (2026-08-02)
 
 
