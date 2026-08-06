@@ -220,6 +220,12 @@ jobs:
             --lib \
             decompressors::ljpeg::tests::every_encoded_stream_prefix_is_panic_free \
             --locked
+          cargo +nightly-2026-07-21 miri test \
+            --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
+            --features force-baseline \
+            --lib \
+            ljpeg92::tests::compressor_rejects_invalid_layout_before_encoding \
+            --locked
 
   platform:
     name: Platform (${{ matrix.platform }})
