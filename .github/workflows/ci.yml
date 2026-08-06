@@ -65,6 +65,9 @@ jobs:
           cargo fmt --manifest-path thirdparty/dnglab/rawler/Cargo.toml -- --check
       - name: Lint all targets and features
         run: |
+          # jpeg-rusturbo's force-scalar feature is subtractive, so lint its
+          # shipped architecture backends before the workspace all-feature pass.
+          cargo clippy -p jpeg-rusturbo --all-targets --locked -- -D warnings
           cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
           cargo clippy \
             --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
@@ -79,6 +82,7 @@ jobs:
             -D unused_must_use
       - name: Check documentation
         run: |
+          cargo doc -p jpeg-rusturbo --no-deps --locked
           cargo doc --workspace --no-deps --all-features --locked
           cargo doc \
             --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
@@ -297,6 +301,19 @@ jobs:
         run: |
           cargo test \
             -p jpeg-rusturbo \
+            --lib \
+            --release \
+            --locked \
+            --target ${{ matrix.target }}
+      - name: Test jpeg-rusturbo scalar release behavior
+        id: test_jpeg_rusturbo_scalar
+        if: ${{ !cancelled() && runner.os != 'Linux' }}
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: |
+          cargo test \
+            -p jpeg-rusturbo \
+            --features force-scalar \
             --lib \
             --release \
             --locked \
