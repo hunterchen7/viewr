@@ -459,15 +459,23 @@ pub fn supports_region_develop(raw: &RawImage) -> bool {
     let RawPhotometricInterpretation::Cfa(config) = &raw.photometric else {
         return false;
     };
-    if !config.cfa.is_rgb() {
+    if !PPGDemosaic::supports_region(&config.cfa) {
         return false;
     }
     let dim = Dim2::new(raw.width, raw.height);
     let active = raw.active_area.unwrap_or(Rect::new(Point::zero(), dim));
     active.d.w >= 6
         && active.d.h >= 6
-        && active.p.x + active.d.w <= dim.w
-        && active.p.y + active.d.h <= dim.h
+        && active
+            .p
+            .x
+            .checked_add(active.d.w)
+            .is_some_and(|end| end <= dim.w)
+        && active
+            .p
+            .y
+            .checked_add(active.d.h)
+            .is_some_and(|end| end <= dim.h)
 }
 
 /// Reusable state for developing one Full-tier frame region by region.
@@ -499,14 +507,15 @@ pub struct FullDevelopPlan {
 ///
 /// # Errors
 ///
-/// Returns [`DevelopError::Unsupported`] for non-CFA or non-RGB CFA sensors.
+/// Returns [`DevelopError::Unsupported`] for non-CFA sensors or CFA layouts
+/// without the fixed-radius dependencies required by regional PPG.
 pub fn plan_full_develop(raw: RawImage) -> Result<FullDevelopPlan, DevelopError> {
     let RawPhotometricInterpretation::Cfa(config) = &raw.photometric else {
         return Err(DevelopError::Unsupported("not a CFA sensor".into()));
     };
-    if !config.cfa.is_rgb() {
+    if !PPGDemosaic::supports_region(&config.cfa) {
         return Err(DevelopError::Unsupported(format!(
-            "non-RGB CFA: {}",
+            "regional PPG does not support CFA: {}",
             config.cfa
         )));
     }
@@ -520,10 +529,27 @@ pub fn plan_full_develop(raw: RawImage) -> Result<FullDevelopPlan, DevelopError>
     let whitelevel = raw.whitelevel.as_bayer_array();
     let crop_area = raw.crop_area;
     let active_area = raw.active_area;
+    let active = active_area.unwrap_or(Rect::new(Point::zero(), Dim2::new(width, height)));
+    let active_fits = active.d.w >= 6
+        && active.d.h >= 6
+        && active
+            .p
+            .x
+            .checked_add(active.d.w)
+            .is_some_and(|end| end <= width)
+        && active
+            .p
+            .y
+            .checked_add(active.d.h)
+            .is_some_and(|end| end <= height);
+    if !active_fits {
+        return Err(DevelopError::Unsupported(
+            "regional PPG requires an in-bounds active area of at least 6x6".into(),
+        ));
+    }
     let data = scale_cfa_data(raw.data, width, height, blacklevel, whitelevel);
     let mosaic = PixF32::new_with(data, width, height);
 
-    let active = active_area.unwrap_or(mosaic.rect());
     let out_region = develop_region(active.d, crop_area, active_area, Quality::Full);
     Ok(FullDevelopPlan {
         mosaic,
@@ -1795,6 +1821,51 @@ mod tests {
             super::develop_region(Dim2::new(7, 5), None, None, super::Quality::Browse),
             Rect::new(Point::zero(), Dim2::new(7, 5))
         );
+    }
+
+    #[test]
+    fn irregular_rgb_mosaics_reject_the_regional_develop_plan() {
+        let pattern = "GGRGGBGGBGGRBRGRBGGGBGGRGGRGGBRBGBRG";
+        let width = 18;
+        let height = 18;
+        let raw = synthetic_bayer_raw(
+            pattern,
+            width,
+            height,
+            RawImageData::Integer(deterministic_integer_mosaic(width, height)),
+            None,
+            None,
+            ([0; 4], [u16::MAX as u32; 4]),
+        );
+
+        assert!(!super::supports_region_develop(&raw));
+        assert!(matches!(
+            super::plan_full_develop(raw),
+            Err(super::DevelopError::Unsupported(message))
+                if message.contains("regional PPG")
+        ));
+    }
+
+    #[test]
+    fn regional_develop_rejects_overflowing_active_areas() {
+        let width = 18;
+        let height = 18;
+        let raw = synthetic_bayer_raw(
+            "RGGB",
+            width,
+            height,
+            RawImageData::Integer(deterministic_integer_mosaic(width, height)),
+            Some(Rect::new(Point::new(usize::MAX, 0), Dim2::new(6, 6))),
+            None,
+            ([0; 4], [u16::MAX as u32; 4]),
+        );
+
+        assert!(!super::supports_region_develop(&raw));
+        assert!(matches!(
+            super::plan_full_develop(raw),
+            Err(super::DevelopError::Unsupported(message))
+                if message.contains("in-bounds active area")
+        ));
     }
 
     #[test]
