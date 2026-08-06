@@ -1,26 +1,72 @@
-name: Benchmarks
+name: Advisory benchmarks
+
 on:
   workflow_dispatch:
+  schedule:
+    # Weekly data, offset from the top of the hour to reduce hosted-runner noise.
+    - cron: '23 8 * * 1'
 
 permissions:
   contents: read
 
 concurrency:
-  group: benchmarks-${{ github.ref }}
+  group: advisory-benchmarks-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  synthetic:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+  benchmark:
+    name: ${{ matrix.platform }} (${{ matrix.scope }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Linux x64
+            slug: linux-x64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            rustflags: ''
+            scope: broad
+            broad: true
+            raw_opt_in: true
+            jpeg_bakeoff: true
+          - platform: macOS arm64
+            slug: macos-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+            rustflags: ''
+            scope: architecture hot paths
+            broad: false
+            raw_opt_in: true
+            jpeg_bakeoff: false
+          - platform: Windows x64
+            slug: windows-x64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+            rustflags: -C target-feature=+crt-static
+            scope: architecture hot paths
+            broad: false
+            raw_opt_in: true
+            jpeg_bakeoff: false
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      BENCH_RESULTS_DIR: ${{ runner.temp }}/viewr-benchmarks-${{ matrix.slug }}
+      BENCH_TARGET: ${{ matrix.target }}
+      CARGO_TARGET_DIR: ${{ runner.temp }}/viewr-benchmark-build-${{ matrix.slug }}
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      VIEWR_BENCH_RAW: ${{ runner.temp }}/viewr-public-domain-sony.ARW
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: true
-      - name: Linux build deps
+
+      - name: Install Linux benchmark dependencies
+        if: runner.os == 'Linux'
+        shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            build-essential \
             cmake \
             libgtk-3-dev \
             libxcb-render0-dev \
@@ -28,81 +74,202 @@ jobs:
             libxcb-xfixes0-dev \
             libxkbcommon-dev \
             nasm
+
       - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Select available Python 3
+        shell: bash
+        run: |
+          if python3 --version >/dev/null 2>&1; then
+            printf '%s\n' 'BENCHMARK_PYTHON=python3' >> "$GITHUB_ENV"
+          elif python --version >/dev/null 2>&1; then
+            printf '%s\n' 'BENCHMARK_PYTHON=python' >> "$GITHUB_ENV"
+          else
+            echo '::error::A Python 3 interpreter is required to record benchmark metadata.'
+            exit 1
+          fi
+
+      # Cache downloaded dependencies, but never cache the build directory.
+      # Criterion reports live under runner.temp as artifacts, not cache state.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          shared-key: benchmarks
+          cache-targets: false
+          shared-key: advisory-benchmarks-${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: Record benchmark environment
         shell: bash
         run: |
-          rustc -Vv
-          uname -a
-          lscpu
-          mkdir -p target
-          bench_commit="$(git rev-parse HEAD)"
-          bench_rust="$(rustc -Vv)"
-          bench_os="$(uname -a)"
-          bench_cpu="$(lscpu | awk -F: '/Model name/ {sub(/^[ \t]+/, "", $2); print $2; exit}')"
-          bench_cores="$(nproc)"
-          bench_memory="$(awk '/MemTotal/ {print $2 * 1024; exit}' /proc/meminfo)"
-          bench_lock_hash="$(sha256sum Cargo.lock | awk '{print $1}')"
-          rawler_commit="$(git -C thirdparty/dnglab rev-parse HEAD)"
-          rawler_lock_hash="$(sha256sum thirdparty/dnglab/Cargo.lock | awk '{print $1}')"
-          jpeg_bakeoff_lock_hash="$(
-            sha256sum tools/jpeg-bakeoff/Cargo.lock | awk '{print $1}'
-          )"
-          jq -n \
-            --arg commit "$bench_commit" \
-            --arg cargo_lock_sha256 "$bench_lock_hash" \
-            --arg rawler_commit "$rawler_commit" \
-            --arg rawler_cargo_lock_sha256 "$rawler_lock_hash" \
-            --arg jpeg_bakeoff_lock_sha256 "$jpeg_bakeoff_lock_hash" \
-            --arg rustc "$bench_rust" \
-            --arg os "$bench_os" \
-            --arg cpu "$bench_cpu" \
-            --argjson logical_cores "$bench_cores" \
-            --argjson memory_bytes "$bench_memory" \
-            --arg rayon_threads "${RAYON_NUM_THREADS:-default}" \
-            '{
-              schema_version: 2,
-              commit: $commit,
-              cargo_lock_sha256: $cargo_lock_sha256,
-              rawler_commit: $rawler_commit,
-              rawler_cargo_lock_sha256: $rawler_cargo_lock_sha256,
-              jpeg_bakeoff_lock_sha256: $jpeg_bakeoff_lock_sha256,
-              rustc: $rustc,
-              os: $os,
-              cpu: $cpu,
-              logical_cores: $logical_cores,
-              memory_bytes: $memory_bytes,
-              rayon_threads: $rayon_threads,
-              raw_fixture: null,
-              cache_condition: "Criterion warm-up; operating-system cache not reset",
-              power_mode: "GitHub-hosted runner (not controlled)"
-            }' > target/benchmark-metadata.json
-          cat target/benchmark-metadata.json
-      - name: Run core synthetic benchmarks
-        run: cargo bench -p viewr-core --features benchmarks --bench core_hot_paths --locked -- --noplot
-      - name: Run filmstrip scaling benchmarks
-        run: cargo bench -p viewr --features benchmarks --bench filmstrip_scaling --locked -- --noplot
-      - name: Run application event-backlog benchmarks
-        run: cargo bench -p viewr --features benchmarks --bench event_backlog --locked -- --noplot
-      - name: Run generic RAW pipeline benchmarks
+          "$BENCHMARK_PYTHON" scripts/benchmark-metadata.py collect \
+            --output "$BENCH_RESULTS_DIR/metadata.json" \
+            --markdown-output "$BENCH_RESULTS_DIR/metadata.md" \
+            --platform "${{ matrix.platform }}" \
+            --scope "${{ matrix.scope }}" \
+            --target "$BENCH_TARGET" \
+            --rustflags "$RUSTFLAGS" \
+            --profile bench
+          cat "$BENCH_RESULTS_DIR/metadata.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download and verify public Sony RAW fixture
+        if: matrix.raw_opt_in
+        shell: bash
+        run: |
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            --retry-all-errors \
+            --show-error \
+            --silent \
+            https://raw.pixls.us/data/Sony/DSC-RX100/DSC00838.ARW \
+            --output "$VIEWR_BENCH_RAW"
+          "$BENCHMARK_PYTHON" scripts/benchmark-metadata.py verify-sha256 \
+            "$VIEWR_BENCH_RAW" \
+            579a485b5126a25cbd55cbd5dadfa7d09cf021c99cc7d4869f9e56e3f759390b
+
+      - name: Run complete Viewr benchmark suites
+        if: matrix.broad
+        shell: bash
         env:
-          CRITERION_HOME: ${{ github.workspace }}/target/criterion-rawler
-        run: cargo bench --manifest-path thirdparty/dnglab/rawler/Cargo.toml --locked --bench perf -- --noplot
-      - name: Run JPEG codec bake-off
-        run: cargo bench --manifest-path tools/jpeg-bakeoff/Cargo.toml --locked --bench encode -- --noplot
-      - name: Upload Criterion results
+          CRITERION_HOME: ${{ env.BENCH_RESULTS_DIR }}/criterion/viewr
+        run: |
+          cargo bench \
+            -p viewr-core \
+            --features benchmarks \
+            --bench core_hot_paths \
+            --locked \
+            --target "$BENCH_TARGET" \
+            -- \
+            --noplot
+          cargo bench \
+            -p viewr \
+            --features benchmarks \
+            --bench filmstrip_scaling \
+            --locked \
+            --target "$BENCH_TARGET" \
+            -- \
+            --noplot
+          cargo bench \
+            -p viewr \
+            --features benchmarks \
+            --bench event_backlog \
+            --locked \
+            --target "$BENCH_TARGET" \
+            -- \
+            --noplot
+
+      - name: Run architecture-sensitive Viewr hot paths
+        if: ${{ !matrix.broad }}
+        shell: bash
+        env:
+          CRITERION_HOME: ${{ env.BENCH_RESULTS_DIR }}/criterion/viewr
+        run: |
+          for benchmark_filter in resize orientation raw_opt_in; do
+            cargo bench \
+              -p viewr-core \
+              --features benchmarks \
+              --bench core_hot_paths \
+              --locked \
+              --target "$BENCH_TARGET" \
+              -- \
+              "$benchmark_filter" \
+              --noplot
+          done
+
+      - name: Run JPEG automatic-backend baseline
+        shell: bash
+        env:
+          CRITERION_HOME: ${{ env.BENCH_RESULTS_DIR }}/criterion/viewr
+        run: |
+          cargo bench \
+            -p viewr-core \
+            --features benchmarks \
+            --bench core_hot_paths \
+            --locked \
+            --target "$BENCH_TARGET" \
+            -- \
+            jpeg_ \
+            --save-baseline jpeg-automatic \
+            --noplot
+
+      - name: Compare JPEG scalar policy with automatic backend
+        shell: bash
+        env:
+          CRITERION_HOME: ${{ env.BENCH_RESULTS_DIR }}/criterion/viewr
+        run: |
+          cargo bench \
+            -p viewr-core \
+            --features benchmarks,jpeg-rusturbo/force-scalar \
+            --bench core_hot_paths \
+            --locked \
+            --target "$BENCH_TARGET" \
+            -- \
+            jpeg_ \
+            --baseline jpeg-automatic \
+            --noplot
+
+      - name: Run Rawler automatic-dispatch baseline
+        shell: bash
+        env:
+          CRITERION_HOME: ${{ env.BENCH_RESULTS_DIR }}/criterion/rawler
+        run: |
+          cargo bench \
+            --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
+            --locked \
+            --target "$BENCH_TARGET" \
+            --bench perf \
+            -- \
+            --save-baseline automatic-dispatch \
+            --noplot
+
+      - name: Compare Rawler portable baseline with automatic dispatch
+        shell: bash
+        env:
+          CRITERION_HOME: ${{ env.BENCH_RESULTS_DIR }}/criterion/rawler
+          RAWLER_FORCE_BASELINE: '1'
+        run: |
+          cargo bench \
+            --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
+            --locked \
+            --target "$BENCH_TARGET" \
+            --bench perf \
+            -- \
+            --baseline automatic-dispatch \
+            --noplot
+
+      - name: Run Linux JPEG codec bake-off
+        if: matrix.jpeg_bakeoff
+        shell: bash
+        env:
+          CRITERION_HOME: ${{ env.BENCH_RESULTS_DIR }}/criterion/jpeg-bakeoff
+        run: |
+          cargo bench \
+            --manifest-path tools/jpeg-bakeoff/Cargo.toml \
+            --locked \
+            --target "$BENCH_TARGET" \
+            --bench encode \
+            -- \
+            --noplot
+
+      - name: Explain advisory results
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$BENCH_RESULTS_DIR"
+          printf '%s\n' \
+            'These measurements are advisory and do not enforce numeric pass/fail thresholds.' \
+            'In the Viewr JPEG report, jpeg-automatic is the saved baseline and new is the jpeg-rusturbo force-scalar build.' \
+            'In the Rawler report, automatic-dispatch is the saved baseline and new is the RAWLER_FORCE_BASELINE=1 build.' \
+            'Both comparisons use separate whole-build policies, not isolated same-binary kernels.' \
+            > "$BENCH_RESULTS_DIR/README.txt"
+
+      - name: Upload platform benchmark results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: criterion-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            target/criterion
-            target/criterion-rawler
-            tools/jpeg-bakeoff/target/criterion
-            target/benchmark-metadata.json
+          name: advisory-benchmarks-${{ matrix.slug }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.BENCH_RESULTS_DIR }}
           if-no-files-found: warn
           retention-days: 90
