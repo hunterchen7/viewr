@@ -220,9 +220,8 @@ jobs:
             --lib \
             decompressors::ljpeg::tests::every_encoded_stream_prefix_is_panic_free \
             --locked
-          cargo +nightly-2026-07-21 miri test \
+          RAWLER_FORCE_BASELINE=1 cargo +nightly-2026-07-21 miri test \
             --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
-            --features force-baseline \
             --lib \
             ljpeg92::tests::compressor_rejects_invalid_layout_before_encoding \
             --locked
@@ -318,13 +317,13 @@ jobs:
         id: test_rawler_baseline
         if: ${{ !cancelled() && runner.os == 'Windows' }}
         env:
+          RAWLER_FORCE_BASELINE: '1'
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: |
           cargo test \
             --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
             --lib \
             --release \
-            --features force-baseline \
             --locked \
             --target ${{ matrix.target }}
       - name: Check benchmark targets
