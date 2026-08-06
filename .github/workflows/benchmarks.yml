@@ -50,11 +50,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     env:
-      BENCH_RESULTS_DIR: ${{ runner.temp }}/viewr-benchmarks-${{ matrix.slug }}
       BENCH_TARGET: ${{ matrix.target }}
-      CARGO_TARGET_DIR: ${{ runner.temp }}/viewr-benchmark-build-${{ matrix.slug }}
       RUSTFLAGS: ${{ matrix.rustflags }}
-      VIEWR_BENCH_RAW: ${{ runner.temp }}/viewr-public-domain-sony.ARW
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -79,9 +76,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Select available Python 3
+      - name: Initialize portable benchmark environment
         shell: bash
         run: |
+          printf 'BENCH_RESULTS_DIR=%s/viewr-benchmarks-${{ matrix.slug }}\n' \
+            "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'CARGO_TARGET_DIR=%s/viewr-benchmark-build-${{ matrix.slug }}\n' \
+            "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'VIEWR_BENCH_RAW=%s/viewr-public-domain-sony.ARW\n' \
+            "$RUNNER_TEMP" >> "$GITHUB_ENV"
           if python3 --version >/dev/null 2>&1; then
             printf '%s\n' 'BENCHMARK_PYTHON=python3' >> "$GITHUB_ENV"
           elif python --version >/dev/null 2>&1; then
@@ -133,7 +136,7 @@ jobs:
         if: matrix.broad
         shell: bash
         env:
-          CRITERION_HOME: ${{ env.BENCH_RESULTS_DIR }}/criterion/viewr
+          CRITERION_HOME: ${{ runner.temp }}/viewr-benchmarks-${{ matrix.slug }}/criterion/viewr
         run: |
           cargo bench \
             -p viewr-core \
@@ -164,7 +167,7 @@ jobs:
         if: ${{ !matrix.broad }}
         shell: bash
         env:
-          CRITERION_HOME: ${{ env.BENCH_RESULTS_DIR }}/criterion/viewr
+          CRITERION_HOME: ${{ runner.temp }}/viewr-benchmarks-${{ matrix.slug }}/criterion/viewr
         run: |
           for benchmark_filter in resize orientation raw_opt_in; do
             cargo bench \
@@ -181,7 +184,7 @@ jobs:
       - name: Run JPEG encode automatic-backend baseline
         shell: bash
         env:
-          CRITERION_HOME: ${{ env.BENCH_RESULTS_DIR }}/criterion/viewr
+          CRITERION_HOME: ${{ runner.temp }}/viewr-benchmarks-${{ matrix.slug }}/criterion/viewr
         run: |
           cargo bench \
             -p viewr-core \
@@ -197,7 +200,7 @@ jobs:
       - name: Compare JPEG encode scalar policy with automatic backend
         shell: bash
         env:
-          CRITERION_HOME: ${{ env.BENCH_RESULTS_DIR }}/criterion/viewr
+          CRITERION_HOME: ${{ runner.temp }}/viewr-benchmarks-${{ matrix.slug }}/criterion/viewr
         run: |
           cargo bench \
             -p viewr-core \
@@ -244,7 +247,7 @@ jobs:
       - name: Run Rawler automatic-dispatch baseline
         shell: bash
         env:
-          CRITERION_HOME: ${{ env.BENCH_RESULTS_DIR }}/criterion/rawler
+          CRITERION_HOME: ${{ runner.temp }}/viewr-benchmarks-${{ matrix.slug }}/criterion/rawler
         run: |
           cargo bench \
             --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
@@ -258,7 +261,7 @@ jobs:
       - name: Compare Rawler portable baseline with automatic dispatch
         shell: bash
         env:
-          CRITERION_HOME: ${{ env.BENCH_RESULTS_DIR }}/criterion/rawler
+          CRITERION_HOME: ${{ runner.temp }}/viewr-benchmarks-${{ matrix.slug }}/criterion/rawler
           RAWLER_FORCE_BASELINE: '1'
         run: |
           cargo bench \
@@ -274,7 +277,7 @@ jobs:
         if: matrix.jpeg_bakeoff
         shell: bash
         env:
-          CRITERION_HOME: ${{ env.BENCH_RESULTS_DIR }}/criterion/jpeg-bakeoff
+          CRITERION_HOME: ${{ runner.temp }}/viewr-benchmarks-${{ matrix.slug }}/criterion/jpeg-bakeoff
         run: |
           cargo bench \
             --manifest-path tools/jpeg-bakeoff/Cargo.toml \
@@ -302,6 +305,6 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: advisory-benchmarks-${{ matrix.slug }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.BENCH_RESULTS_DIR }}
+          path: ${{ runner.temp }}/viewr-benchmarks-${{ matrix.slug }}
           if-no-files-found: warn
           retention-days: 90
