@@ -178,7 +178,7 @@ jobs:
               --noplot
           done
 
-      - name: Run JPEG automatic-backend baseline
+      - name: Run JPEG encode automatic-backend baseline
         shell: bash
         env:
           CRITERION_HOME: ${{ env.BENCH_RESULTS_DIR }}/criterion/viewr
@@ -190,11 +190,11 @@ jobs:
             --locked \
             --target "$BENCH_TARGET" \
             -- \
-            jpeg_ \
+            jpeg_encode \
             --save-baseline jpeg-automatic \
             --noplot
 
-      - name: Compare JPEG scalar policy with automatic backend
+      - name: Compare JPEG encode scalar policy with automatic backend
         shell: bash
         env:
           CRITERION_HOME: ${{ env.BENCH_RESULTS_DIR }}/criterion/viewr
@@ -206,9 +206,40 @@ jobs:
             --locked \
             --target "$BENCH_TARGET" \
             -- \
-            jpeg_ \
+            jpeg_encode \
             --baseline jpeg-automatic \
             --noplot
+
+      - name: Run direct jpeg-rusturbo automatic decode
+        shell: bash
+        run: |
+          mkdir -p "$BENCH_RESULTS_DIR/jpeg-rusturbo"
+          for section in decode-synthetic decode-natural; do
+            cargo bench \
+              -p jpeg-rusturbo \
+              --bench pipeline \
+              --locked \
+              --target "$BENCH_TARGET" \
+              -- \
+              --section "$section" \
+              | tee "$BENCH_RESULTS_DIR/jpeg-rusturbo/automatic-$section.txt"
+          done
+
+      - name: Run direct jpeg-rusturbo scalar decode
+        shell: bash
+        run: |
+          mkdir -p "$BENCH_RESULTS_DIR/jpeg-rusturbo"
+          for section in decode-synthetic decode-natural; do
+            cargo bench \
+              -p jpeg-rusturbo \
+              --features force-scalar \
+              --bench pipeline \
+              --locked \
+              --target "$BENCH_TARGET" \
+              -- \
+              --section "$section" \
+              | tee "$BENCH_RESULTS_DIR/jpeg-rusturbo/force-scalar-$section.txt"
+          done
 
       - name: Run Rawler automatic-dispatch baseline
         shell: bash
@@ -260,7 +291,8 @@ jobs:
           mkdir -p "$BENCH_RESULTS_DIR"
           printf '%s\n' \
             'These measurements are advisory and do not enforce numeric pass/fail thresholds.' \
-            'In the Viewr JPEG report, jpeg-automatic is the saved baseline and new is the jpeg-rusturbo force-scalar build.' \
+            'In the Viewr JPEG encode report, jpeg-automatic is the saved baseline and new is the jpeg-rusturbo force-scalar build.' \
+            'Direct jpeg-rusturbo automatic and scalar decode reports are stored as text; Viewr zune-jpeg decode groups are not part of that ISA comparison.' \
             'In the Rawler report, automatic-dispatch is the saved baseline and new is the RAWLER_FORCE_BASELINE=1 build.' \
             'Both comparisons use separate whole-build policies, not isolated same-binary kernels.' \
             > "$BENCH_RESULTS_DIR/README.txt"

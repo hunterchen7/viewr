@@ -300,6 +300,7 @@ def collect(args: argparse.Namespace) -> int:
             "numeric_gate": False,
             "jpeg_auto_baseline": "jpeg-automatic",
             "jpeg_force_scalar_result": "new",
+            "jpeg_criterion_scope": "jpeg_encode groups only; Viewr decode uses zune-jpeg",
             "jpeg_comparison_kind": "separate whole-build policy comparison",
             "raw_auto_baseline": "automatic-dispatch",
             "raw_force_baseline_result": "new",

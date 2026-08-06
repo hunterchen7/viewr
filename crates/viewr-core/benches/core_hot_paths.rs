@@ -1520,7 +1520,9 @@ fn bench_jpeg(c: &mut Criterion) {
     }
     plain_group.finish();
 
-    let mut decode_group = c.benchmark_group("jpeg_decode");
+    // jpeg-rusturbo creates the fixture outside the timed loop. The timed
+    // decoder is zune-jpeg through decode_jpeg, so keep the backend in the ID.
+    let mut decode_group = c.benchmark_group("zune_jpeg_decode");
     decode_group.sample_size(10);
     decode_group.warm_up_time(Duration::from_millis(300));
     decode_group.measurement_time(Duration::from_secs(2));
@@ -1536,7 +1538,7 @@ fn bench_jpeg(c: &mut Criterion) {
 
     // The whole-buffer serial decode stays measurable so the restart-marker
     // split remains independently comparable on any host.
-    let mut serial_group = c.benchmark_group("jpeg_decode_serial");
+    let mut serial_group = c.benchmark_group("zune_jpeg_decode_serial");
     serial_group.sample_size(10);
     serial_group.warm_up_time(Duration::from_millis(300));
     serial_group.measurement_time(Duration::from_secs(2));
