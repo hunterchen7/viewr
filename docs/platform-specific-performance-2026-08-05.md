@@ -10,7 +10,7 @@ Audit branches:
 - Rawler fork: `codex/platform-specific-performance`
 
 Audited Rawler revision:
-`76bd24eb54e76606013ed7f4bdcf5d6b2be2a142`.
+`1119684aaf7039f9dd3744dd31ec6d37ea22f867`.
 
 ## Scope and invariant
 
@@ -33,9 +33,36 @@ zero or out-of-range dimensions, component counts outside 1 through 4, point
 transforms that are not smaller than the bit depth, overflowing row and image
 layouts, and undersized input buffers before encoding begins.
 
-The production and forced-baseline release suites each pass 97 tests, with one
-ignored test. The added layout regression covers zero dimensions, invalid
-component counts and point transforms, and arithmetic overflow.
+The final production release suite passes 105 tests, with one ignored test.
+The forced-baseline suite has the same result. The layout tests cover zero
+dimensions, invalid component counts, invalid point transforms, and arithmetic
+overflow.
+
+The first PPG fusion applied one traversal to all RGB mosaics. This changed
+the dependency order for irregular mosaics such as Fuji X-Trans. Regional PPG
+also used a fixed halo that is valid only for a 2 by 2 Bayer pattern.
+
+The final code keeps the fused path for verified Bayer patterns. Irregular RGB
+mosaics use the original two-stage traversal. The regional API rejects these
+mosaics. A deterministic X-Trans output hash and Viewr plan tests protect this
+boundary. Region validation also rejects zero-width, zero-height, and
+overflowing rectangles before endpoint arithmetic.
+
+The LJPEG bit pump previously supplied zero bits after an early end marker or
+end of file. A decoder could consume these bits and return corrupt pixels as a
+successful result. The pump now distinguishes a fixed-width Huffman peek from
+the consumption of synthetic bits. Each LJPEG decoder checks the final state.
+The CRW decoder applies the same error policy.
+
+An incomplete Huffman table also left unassigned prefixes as zero-bit cache
+entries. Such an entry returned a zero difference and did not consume input.
+The cache now omits these entries. The slow LJPEG, Hasselblad, and CRW paths
+return an error for an unassigned prefix.
+
+The Sony tile template previously copied the complete pre-entropy header. A
+malformed file could make this allocation very large. The template now borrows
+the parsed header from the first tile. This change also removes one allocation
+and one header copy from each tiled decode.
 
 ## Dispatch changes
 
@@ -172,6 +199,10 @@ policy remains unchanged.
 | Proposal | Decision | Evidence |
 | --- | --- | --- |
 | Validate safe LJPEG encoder layouts | Accept | Prevents invalid safe inputs from reaching unchecked kernels; regression passes in both builds. |
+| Preserve staged PPG for irregular mosaics | Accept | Restores the pinned X-Trans result and limits regional PPG to verified 2 by 2 Bayer patterns. |
+| Reject consumed LJPEG padding | Accept | Truncated entropy now returns an error without changing valid fixed-width lookahead. |
+| Reject unassigned Huffman prefixes | Accept | Prevents zero-bit cache entries from producing corrupt output without input progress. |
+| Borrow the shared Sony LJPEG header | Accept | Removes an unbounded allocation and a repeated header copy. |
 | Match standalone Rawler profiles to Viewr | Accept | Makes isolated measurements representative of the shipped thin-LTO profile. |
 | Separate Fuji BMI2 and LZCNT tiers | Accept | Matches the instructions emitted by each clone and avoids unrelated AVX requirements. |
 | Remove LJPEG FMA and BMI1 requirements | Accept | Emitted AVX2 code uses neither capability; optional BMI2 remains used. |
@@ -182,6 +213,7 @@ policy remains unchanged.
 | Add inline assembly | Reject for this phase | No measured LLVM defect or end-to-end benefit justified the added safety and maintenance cost. |
 | Add AVX-512 clones | Reject for this phase | No representative workload and host comparison demonstrated a benefit. |
 | Hoist Fuji dispatch outside the per-code reader | Defer | It could remove an indirect call per code, but it requires a real Fuji fixture and physical x86 measurement first. |
+| Replace `RawSource` file mappings with owned bytes | Defer to an owned-range parser phase | The safe mapping API has a pre-existing file-mutation soundness risk. A full copy would make metadata reads proportional to file size. |
 
 ## Validation and hosted coverage
 
@@ -211,7 +243,7 @@ env CARGO_TARGET_DIR=/private/tmp/viewr-codegen-x86 \
     -- -C codegen-units=1 --emit=asm
 ```
 
-Both release modes reported 97 passed and one ignored. The x86-64
+Both release modes reported 105 passed and one ignored. The x86-64
 Linux and Windows MSVC cross-checks compiled successfully. The Linux assembly
 output was then inspected for the tier-specific instructions listed above.
 The layout regression also passed under Miri with strict provenance and tree
@@ -237,3 +269,22 @@ forced-baseline builds. It records the OS, CPU, memory, target, flags,
 compiler-reported native features, profile, lockfile hashes, and submodule
 revision in a platform-specific artifact. The workflow has no numeric timing
 gate; hosted-runner results require reviewer interpretation.
+
+## Residual risks and coverage gaps
+
+`RawSource::new` and `RawSource::new_lazy` use safe APIs around file-backed
+memory maps. An external file change can violate the mapping requirement. This
+risk is present on the audited base. This branch does not increase the risk.
+
+An owned buffer fixes the soundness issue for full decoding. The same change
+would make metadata-only loading read each complete RAW file. The selected
+follow-up is an owned-range or `ReadAt` parser design. That design can keep
+metadata work proportional to the ranges that the parser reads.
+
+The remaining platform coverage gaps are:
+
+- A checked-in multi-tile Sony ARW fixture for Rayon equivalence tests.
+- A real Fuji RAW fixture for the BMI2 and LZCNT tiers.
+- A real predictor-8 stream for Hasselblad output equivalence tests.
+- A ThreadSanitizer run for parallel unsafe paths.
+- A controlled x86 runner without AVX2 for automatic dispatch.
