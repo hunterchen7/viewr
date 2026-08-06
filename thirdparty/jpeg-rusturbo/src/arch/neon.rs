@@ -10,10 +10,11 @@
 //!
 //! Every `unsafe { … }` block in this module wraps a `core::arch::aarch64::*`
 //! NEON intrinsic. NEON is mandatory on AArch64 per the ARMv8-A architecture
-//! reference manual, and this entire module is gated upstream by
-//! `#[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]` in
-//! `src/arch/mod.rs`. The intrinsics therefore have a well-defined CPU-side
-//! contract on every reachable target. On the Rust side, each call passes
+//! reference manual. The module compiles on every AArch64 build so its
+//! cross-checks can run with `force-scalar`; that feature only changes the
+//! production `arch::backend` alias. The intrinsics therefore have a
+//! well-defined CPU-side contract on every reachable target. On the Rust side,
+//! each call passes
 //! `vld1q_*` / `vst1q_*` pointers derived from `&[i16; 64]` / `&mut [u8]`
 //! borrows whose lifetime covers the load/store, with element counts equal
 //! to the intrinsic's vector width (16-lane u8 / 8-lane i16 / 4-lane i32).
@@ -248,6 +249,138 @@ pub mod encode {
             super::quant::quantize_inner(block, div, &mut natural);
         }
         super::quant::zigzag_scatter(&natural, out);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::arch::scalar;
+        use crate::tables::{STD_CHROMA_QUANT, STD_LUMA_QUANT, build_divisors, scale_quant_table};
+
+        const WIDTH: u32 = 48;
+        const HEIGHT: u32 = 48;
+        const X0: u32 = 16;
+        const Y0: u32 = 16;
+
+        fn rgb_fixture(seed: u64) -> Vec<u8> {
+            let mut state = seed;
+            let mut pixels = vec![0u8; WIDTH as usize * HEIGHT as usize * RGB.bpp];
+            for (i, pixel) in pixels.chunks_exact_mut(RGB.bpp).enumerate() {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let random = [state as u8, (state >> 24) as u8, (state >> 48) as u8];
+                let value = match i % 31 {
+                    0 => [0, 0, 0],
+                    1 => [255, 255, 255],
+                    2 => [255, 0, 0],
+                    3 => [0, 255, 0],
+                    4 => [0, 0, 255],
+                    _ => random,
+                };
+                pixel.copy_from_slice(&value);
+            }
+            pixels
+        }
+
+        fn divisors(quality: u8) -> (Divisors, Divisors) {
+            let luma = scale_quant_table(&STD_LUMA_QUANT, quality);
+            let chroma = scale_quant_table(&STD_CHROMA_QUANT, quality);
+            (build_divisors(&luma), build_divisors(&chroma))
+        }
+
+        #[test]
+        fn fused_444_neon_matches_scalar() {
+            for (seed, quality) in [(0, 25), (0xC0DE_CAFE, 80), (u64::MAX, 100)] {
+                let pixels = rgb_fixture(seed);
+                let (div_luma, div_chroma) = divisors(quality);
+                let mut expected = [[0i16; 64]; 3];
+                let mut actual = [[0i16; 64]; 3];
+                scalar::encode::quantize_mcu_444_rgb_full(
+                    &pixels,
+                    WIDTH,
+                    X0,
+                    Y0,
+                    &div_luma,
+                    &div_chroma,
+                    &mut expected,
+                );
+                unsafe {
+                    quantize_mcu_444_rgb_full_neon(
+                        &pixels,
+                        WIDTH,
+                        X0,
+                        Y0,
+                        &div_luma,
+                        &div_chroma,
+                        &mut actual,
+                    );
+                }
+                assert_eq!(expected, actual, "seed={seed:#x} quality={quality}");
+            }
+        }
+
+        #[test]
+        fn fused_422_neon_matches_scalar() {
+            for (seed, quality) in [(0, 25), (0xC0DE_CAFE, 80), (u64::MAX, 100)] {
+                let pixels = rgb_fixture(seed);
+                let (div_luma, div_chroma) = divisors(quality);
+                let mut expected = [[0i16; 64]; 4];
+                let mut actual = [[0i16; 64]; 4];
+                scalar::encode::quantize_mcu_422_rgb_full(
+                    &pixels,
+                    WIDTH,
+                    X0,
+                    Y0,
+                    &div_luma,
+                    &div_chroma,
+                    &mut expected,
+                );
+                unsafe {
+                    quantize_mcu_422_rgb_full_neon(
+                        &pixels,
+                        WIDTH,
+                        X0,
+                        Y0,
+                        &div_luma,
+                        &div_chroma,
+                        &mut actual,
+                    );
+                }
+                assert_eq!(expected, actual, "seed={seed:#x} quality={quality}");
+            }
+        }
+
+        #[test]
+        fn fused_420_neon_matches_scalar() {
+            for (seed, quality) in [(0, 25), (0xC0DE_CAFE, 80), (u64::MAX, 100)] {
+                let pixels = rgb_fixture(seed);
+                let (div_luma, div_chroma) = divisors(quality);
+                let mut expected = [[0i16; 64]; 6];
+                let mut actual = [[0i16; 64]; 6];
+                scalar::encode::quantize_mcu_420_rgb_full(
+                    &pixels,
+                    WIDTH,
+                    X0,
+                    Y0,
+                    &div_luma,
+                    &div_chroma,
+                    &mut expected,
+                );
+                unsafe {
+                    quantize_mcu_420_rgb_full_neon(
+                        &pixels,
+                        WIDTH,
+                        X0,
+                        Y0,
+                        &div_luma,
+                        &div_chroma,
+                        &mut actual,
+                    );
+                }
+                assert_eq!(expected, actual, "seed={seed:#x} quality={quality}");
+            }
+        }
     }
 }
 

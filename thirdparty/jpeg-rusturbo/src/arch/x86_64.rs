@@ -19,9 +19,10 @@
 //! # Safety
 //!
 //! Every `unsafe { … }` block in this module wraps a `core::arch::x86_64::*`
-//! intrinsic. The module is reached only when both compile-time
-//! `#[cfg(all(target_arch = "x86_64", not(feature = "force-scalar")))]` and
-//! the runtime guard hold:
+//! intrinsic. The module compiles on every x86_64 build so its cross-checks can
+//! run even with `force-scalar`; that feature only changes the production
+//! `arch::backend` alias. Every AVX2 production or test call still requires the
+//! runtime guard:
 //!
 //! - **AVX2 paths** (`color`, `dct`, `quant`) are dispatched only when
 //!   `is_x86_feature_detected!("avx2")` returns true. The check is performed
@@ -597,6 +598,194 @@ pub mod encode {
             super::quant::quantize_natural(block, div, &mut natural);
         }
         super::quant::zigzag_scatter(&natural, out);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::arch::scalar;
+        use crate::tables::{STD_CHROMA_QUANT, STD_LUMA_QUANT, build_divisors, scale_quant_table};
+
+        const WIDTH: u32 = 48;
+        const HEIGHT: u32 = 48;
+        const X0: u32 = 16;
+        const Y0: u32 = 16;
+
+        fn rgb_fixture(seed: u64) -> Vec<u8> {
+            let mut state = seed;
+            let mut pixels = vec![0u8; WIDTH as usize * HEIGHT as usize * RGB.bpp];
+            for (i, pixel) in pixels.chunks_exact_mut(RGB.bpp).enumerate() {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let random = [state as u8, (state >> 24) as u8, (state >> 48) as u8];
+                let value = match i % 31 {
+                    0 => [0, 0, 0],
+                    1 => [255, 255, 255],
+                    2 => [255, 0, 0],
+                    3 => [0, 255, 0],
+                    4 => [0, 0, 255],
+                    _ => random,
+                };
+                pixel.copy_from_slice(&value);
+            }
+            pixels
+        }
+
+        fn divisors(quality: u8) -> (Divisors, Divisors) {
+            let luma = scale_quant_table(&STD_LUMA_QUANT, quality);
+            let chroma = scale_quant_table(&STD_CHROMA_QUANT, quality);
+            (build_divisors(&luma), build_divisors(&chroma))
+        }
+
+        #[test]
+        fn fused_444_avx2_matches_scalar() {
+            if !std::arch::is_x86_feature_detected!("avx2") {
+                return;
+            }
+
+            for (seed, quality) in [(0, 25), (0xC0DE_CAFE, 80), (u64::MAX, 100)] {
+                let pixels = rgb_fixture(seed);
+                let (div_luma, div_chroma) = divisors(quality);
+                let mut expected = [[0i16; 64]; 3];
+                let mut actual = [[0i16; 64]; 3];
+                scalar::encode::quantize_mcu_444_rgb_full(
+                    &pixels,
+                    WIDTH,
+                    X0,
+                    Y0,
+                    &div_luma,
+                    &div_chroma,
+                    &mut expected,
+                );
+                unsafe {
+                    quantize_mcu_444_rgb_full_avx2(
+                        &pixels,
+                        WIDTH,
+                        X0,
+                        Y0,
+                        &div_luma,
+                        &div_chroma,
+                        &mut actual,
+                    );
+                }
+                assert_eq!(expected, actual, "seed={seed:#x} quality={quality}");
+            }
+        }
+
+        #[test]
+        fn fused_444_pair_avx2_matches_two_scalar_mcus() {
+            if !std::arch::is_x86_feature_detected!("avx2") {
+                return;
+            }
+
+            for (seed, quality) in [(0, 25), (0xC0DE_CAFE, 80), (u64::MAX, 100)] {
+                let pixels = rgb_fixture(seed);
+                let (div_luma, div_chroma) = divisors(quality);
+                let mut expected = [[0i16; 64]; 6];
+                let mut actual = [[0i16; 64]; 6];
+                scalar::encode::quantize_mcu_444_rgb_full(
+                    &pixels,
+                    WIDTH,
+                    X0,
+                    Y0,
+                    &div_luma,
+                    &div_chroma,
+                    &mut expected[..3],
+                );
+                scalar::encode::quantize_mcu_444_rgb_full(
+                    &pixels,
+                    WIDTH,
+                    X0 + 8,
+                    Y0,
+                    &div_luma,
+                    &div_chroma,
+                    &mut expected[3..],
+                );
+                unsafe {
+                    quantize_mcu_444_rgb_pair_full_avx2(
+                        &pixels,
+                        WIDTH,
+                        X0,
+                        Y0,
+                        &div_luma,
+                        &div_chroma,
+                        &mut actual,
+                    );
+                }
+                assert_eq!(expected, actual, "seed={seed:#x} quality={quality}");
+            }
+        }
+
+        #[test]
+        fn fused_422_avx2_matches_scalar() {
+            if !std::arch::is_x86_feature_detected!("avx2") {
+                return;
+            }
+
+            for (seed, quality) in [(0, 25), (0xC0DE_CAFE, 80), (u64::MAX, 100)] {
+                let pixels = rgb_fixture(seed);
+                let (div_luma, div_chroma) = divisors(quality);
+                let mut expected = [[0i16; 64]; 4];
+                let mut actual = [[0i16; 64]; 4];
+                scalar::encode::quantize_mcu_422_rgb_full(
+                    &pixels,
+                    WIDTH,
+                    X0,
+                    Y0,
+                    &div_luma,
+                    &div_chroma,
+                    &mut expected,
+                );
+                unsafe {
+                    quantize_mcu_422_rgb_full_avx2(
+                        &pixels,
+                        WIDTH,
+                        X0,
+                        Y0,
+                        &div_luma,
+                        &div_chroma,
+                        &mut actual,
+                    );
+                }
+                assert_eq!(expected, actual, "seed={seed:#x} quality={quality}");
+            }
+        }
+
+        #[test]
+        fn fused_420_avx2_matches_scalar() {
+            if !std::arch::is_x86_feature_detected!("avx2") {
+                return;
+            }
+
+            for (seed, quality) in [(0, 25), (0xC0DE_CAFE, 80), (u64::MAX, 100)] {
+                let pixels = rgb_fixture(seed);
+                let (div_luma, div_chroma) = divisors(quality);
+                let mut expected = [[0i16; 64]; 6];
+                let mut actual = [[0i16; 64]; 6];
+                scalar::encode::quantize_mcu_420_rgb_full(
+                    &pixels,
+                    WIDTH,
+                    X0,
+                    Y0,
+                    &div_luma,
+                    &div_chroma,
+                    &mut expected,
+                );
+                unsafe {
+                    quantize_mcu_420_rgb_full_avx2(
+                        &pixels,
+                        WIDTH,
+                        X0,
+                        Y0,
+                        &div_luma,
+                        &div_chroma,
+                        &mut actual,
+                    );
+                }
+                assert_eq!(expected, actual, "seed={seed:#x} quality={quality}");
+            }
+        }
     }
 }
 

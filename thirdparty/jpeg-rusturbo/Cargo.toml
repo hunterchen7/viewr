@@ -32,8 +32,10 @@ name = "vs_image"
 harness = false
 
 [features]
-# Force the scalar fallback even on aarch64. Used by the bench harness
-# to measure NEON speedup vs scalar without leaving the same binary.
+# Force the scalar backend on aarch64 and x86_64. This benchmark-only switch
+# builds a separate whole-program comparison; it cannot change backends inside
+# one binary. Do not enable it in production dependency graphs because Cargo
+# features unify.
 force-scalar = []
 
 [dependencies]
