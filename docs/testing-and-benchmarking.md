@@ -10,12 +10,15 @@ Run these commands before each commit:
 ```sh
 cargo fmt --all --check
 cargo fmt --manifest-path thirdparty/dnglab/rawler/Cargo.toml -- --check
+cargo clippy -p jpeg-rusturbo --all-targets --locked -- -D warnings
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo clippy --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
   --all-targets --all-features --locked -- \
   -A clippy::all -D clippy::correctness -D clippy::suspicious \
   -D future_incompatible -D unused_must_use
 cargo test --workspace --locked
+cargo test -p jpeg-rusturbo --lib --release --locked
+cargo test -p jpeg-rusturbo --features force-scalar --lib --release --locked
 cargo test --manifest-path thirdparty/dnglab/rawler/Cargo.toml --lib --release --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features --locked
 RUSTDOCFLAGS="-D warnings" cargo doc \
@@ -27,19 +30,24 @@ The test suite covers these areas:
 
 - Cache budgets, eviction, pin changes, concurrency, and disk replacement.
 - Folder scans, navigation waves, queue generations, and cancellation.
-- JPEG cache round-trips, resize geometry, rotation, and tone-curve invariants.
+- JPEG cache round-trips, scalar-versus-NEON/AVX2 fused-kernel equivalence,
+  resize geometry, rotation, and tone-curve invariants.
 - RAW crop layout, Bayer superpixels, transfer-table error, and persistence bounds.
 - XMP preservation, rating precedence, cross-process ownership, native paths,
   SQLite reopen behavior, and durable flushes.
 - Configuration parsing and loupe layout mathematics.
 
-CI reports five checks. It uses one shared Linux quality check, one current
-macOS compatibility check, and one installer check for each release platform.
-The full test suite runs on current macOS, Windows, and Linux. The macOS and
-Windows checks also compile all-feature benchmark targets. The quality check
-runs formatting, Clippy, Rustdoc, the release build, release tests, vendored
-Rawler release tests, pinned public-domain Sony RAW tests, every optimized
-benchmark smoke test, and the focused Miri checks.
+CI reports four job results: one Linux quality check and a consolidated
+three-row platform matrix for macOS 15 ARM64, Windows 2025 x64, and Debian x64.
+Every platform row tests the workspace with its explicit Rust target and
+`RUSTFLAGS`, builds Viewr, and validates that platform's portable archive and
+installer. The macOS and Windows rows also run default and `force-scalar`
+release tests for jpeg-rusturbo, run vendored Rawler release tests, and compile
+all-feature benchmark targets. Windows runs a second Rawler release suite with
+`RAWLER_FORCE_BASELINE=1`. The quality check runs
+formatting, Clippy, Rustdoc, the release build, release tests, default-dispatch
+vendored Rawler release tests, pinned public-domain Sony RAW tests, every
+optimized benchmark smoke test, and the focused Miri checks.
 
 The Viewr workspace treats every Clippy warning as an error. Rawler is an
 upstream fork with an existing style-lint backlog, so its separate gate treats
@@ -66,13 +74,15 @@ These checks are intentional: optimized-only parallel paths, code hidden behind
 compile.
 
 CI caches downloaded Cargo registry and Git sources plus compiled dependency
-artifacts. The quality check, current macOS check, three installer targets, and
-manual benchmarks use separate keys because their platforms and profiles are
-not interchangeable. Pull request jobs can restore default-branch caches, but
-only `main` writes new caches. This avoids filling the repository cache quota
-with merge-ref caches that cannot seed `main`. The Miri steps reuse the quality
-job's downloaded sources but write nightly target artifacts to temporary
-runner storage so they do not enter the stable target cache.
+artifacts. The quality check, three platform targets, and advisory benchmark
+targets use separate keys because their platforms and profiles are not
+interchangeable. Pull request jobs can restore default-branch caches, but only
+`main` writes new caches. This avoids filling the repository cache quota with
+merge-ref caches that cannot seed `main`. The advisory workflow caches
+dependencies but keeps build and Criterion outputs outside that cache. The
+Miri steps reuse the quality job's downloaded sources but write nightly target
+artifacts to temporary runner storage so they do not enter the stable target
+cache.
 
 Workspace crate outputs are intentionally excluded from the shared cache.
 Fresh hosted checkouts can invalidate local-source artifacts by modification
@@ -87,6 +97,43 @@ Normal test builds exclude Criterion and use an unoptimized test profile. This
 keeps correctness feedback fast without changing the optimized development,
 benchmark, or release profiles. The `benchmarks` feature opts into Criterion and
 the custom benchmark targets.
+
+### Rawler architecture baseline
+
+Rawler's default build uses automatic architecture dispatch. Run its separate
+baseline build with:
+
+```sh
+env CARGO_TARGET_DIR=/tmp/viewr-rawler-force-baseline \
+  RAWLER_FORCE_BASELINE=1 \
+  cargo test \
+    --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
+    --lib --release --locked
+```
+
+The Rawler build script recognizes `RAWLER_FORCE_BASELINE=1` and selects a
+private build configuration that disables optional multiversioning across the
+complete Rawler build. It means SSE2 on x86-64 and NEON on AArch64, not scalar
+execution. It is not a Cargo feature and cannot be enabled through feature
+unification. Use a separate invocation and target directory when comparing it
+with automatic dispatch. Leave the variable unset for every production build.
+
+### JPEG architecture policies
+
+jpeg-rusturbo selects NEON on AArch64. On x86-64 it checks AVX2 at runtime and
+falls back to scalar main kernels when AVX2 is unavailable; its SSE2 bitmap
+kernel is valid on the x86-64 baseline. The benchmark-only `force-scalar`
+feature selects the scalar backend in a separate build:
+
+```sh
+cargo test -p jpeg-rusturbo --lib --release --locked
+cargo test -p jpeg-rusturbo --features force-scalar --lib --release --locked
+```
+
+`force-scalar` is subtractive and Cargo features unify, so do not enable it in
+a production dependency graph. CI lints jpeg-rusturbo once with default
+features before the workspace all-feature pass, and it release-tests both
+policies on macOS ARM64 and Windows x64.
 
 ## Synthetic benchmarks
 
@@ -162,9 +209,11 @@ The suite measures these workloads:
   snapshot with the per-target probe reference it replaced.
   A dark-gradient regression compares production quality against the legacy
   Full-cache setting. Decode throughput uses compressed input bytes; latency
-  remains the primary comparison. The `jpeg_decode_serial` and
+  remains the primary comparison. The `zune_jpeg_decode_serial` and
   `jpeg_encode_plain` groups keep the whole-buffer serial decode and the
   markerless encode measurable beside the production restart-marker split.
+  Both `zune_jpeg_decode` groups name their timed decoder explicitly;
+  jpeg-rusturbo only creates their input fixture before timing.
 - XMP parsing, XMP updates, and disk-cache key generation. A rating-free
   sidecar case measures the substring prefilter's early return.
 - Warm, under-budget cache-GC scans for up to 10,000 objects.
@@ -189,11 +238,11 @@ The suite measures these workloads:
   bilinear demosaic. The latter keeps generic non-Sony pixel-access changes in
   the controlled benchmark surface.
 
-Viewr's Criterion reports use `target/criterion`. The scheduled workflow sets
-Rawler's `CRITERION_HOME` to `target/criterion-rawler`, and the separately
-locked JPEG bakeoff uses `tools/jpeg-bakeoff/target/criterion`. Git ignores
-these generated directories and CI uploads all three with the matching
-environment record.
+Local Viewr Criterion reports use `target/criterion`; standalone Rawler and the
+separately locked JPEG bakeoff use their workspace target directories. The
+advisory workflow redirects every report to a platform-specific temporary
+artifact under `criterion/viewr`, `criterion/rawler`, or
+`criterion/jpeg-bakeoff`. Criterion output is never reused as cache state.
 See [the first reference run](benchmark-baseline-2026-07-21.md).
 See [the optimization campaign](performance-optimization-2026-07-21.md) for the current results and tradeoffs.
 See [the second performance and adversarial pass](performance-adversarial-pass-2026-07-21.md)
@@ -206,6 +255,8 @@ See [the parallel cache-decode experiment](jpeg-parallel-decode-2026-07-28.md)
 for the restart-marker split decode and its rejected variants.
 See [the adaptive Full-prefetch experiment](adaptive-full-prefetch-2026-08-01.md)
 for the RAM policy, scheduler limits, and local benchmark results.
+See [the platform-specific performance audit](platform-specific-performance-2026-08-05.md)
+for Rawler dispatch tiers, forced-baseline semantics, and architecture coverage.
 
 ## Unsafe image-path checks
 
@@ -246,11 +297,19 @@ Use these initial review limits:
 - Review an image-pipeline change above 10 to 15 percent.
 - Do not reject a change from one hosted-runner result.
 
-The manual `Benchmarks` workflow is advisory.
-Download its Criterion artifact to inspect the complete report. The artifact
-also contains `benchmark-metadata.json` with the commit, Cargo.lock hash, Rust
-version, OS, CPU, logical-core count, memory, Rayon setting, cache condition,
-and fixture state. Benchmark artifacts are retained for 90 days.
+The manual and weekly `Advisory benchmarks` workflow is advisory. Every
+platform row compares jpeg-rusturbo's automatic backend with its separate
+scalar build and compares Rawler automatic dispatch with its private baseline
+build. These are whole-build policy comparisons, not same-binary kernel
+timings. The Viewr Criterion comparison covers `jpeg_encode` groups only;
+direct jpeg-rusturbo synthetic and natural decode reports are stored as text.
+Download the platform artifact to inspect the complete Criterion report. Each
+artifact also contains `metadata.json` and `metadata.md` with the commit,
+submodule revision, lockfile hashes, Rust version, OS, CPU and detected
+features, compiler-reported native target features, logical-core count, memory,
+target, `RUSTFLAGS`, profile, Rayon setting, and cache condition. Artifact names
+include the platform, run ID, and attempt, and artifacts are retained for 90
+days.
 CI smoke-runs every benchmark case but does not compare Criterion estimates
 with a stored numeric baseline, so performance regressions still require a
 reviewer to run and interpret a controlled before/after comparison.
