@@ -81,11 +81,14 @@ opt-level = 0
 [profile.test.package."*"]
 opt-level = 0
 
-# Redirect the pinned crates.io rawler to the reviewed in-tree fork submodule
-# (hunterchen7/dnglab, branch codex/whole-system-performance-audit). It remains
-# based on v0.7.2 and carries the measured PPG, Sony LJPEG, generic bilinear,
-# bounds, provenance, and malformed-header changes documented in
-# docs/whole-system-performance-audit-2026-08-04.md.
+# Redirect the pinned crates.io rawler to the reviewed in-tree fork submodule.
+# The superproject gitlink pins its exact hunterchen7/dnglab revision; the
+# current architecture work was developed on
+# codex/platform-specific-performance.
+# It remains based on v0.7.2 and carries the measured PPG, Sony LJPEG, generic
+# bilinear, bounds, provenance, malformed-header, and dispatch changes in
+# docs/whole-system-performance-audit-2026-08-04.md and
+# docs/platform-specific-performance-2026-08-05.md.
 [patch.crates-io]
 rawler = { path = "thirdparty/dnglab/rawler" }
 jpeg-rusturbo = { path = "thirdparty/jpeg-rusturbo" }

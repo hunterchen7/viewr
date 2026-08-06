@@ -111,18 +111,37 @@ fn usage_and_exit() -> ! {
     std::process::exit(2);
 }
 
-fn print_header(section: Section) {
-    let arch = if cfg!(all(target_arch = "aarch64", not(feature = "force-scalar"))) {
-        "aarch64 (NEON: main kernels + huffman bitmap)"
-    } else if cfg!(target_arch = "aarch64") {
-        "aarch64 (force-scalar — NEON kernels disabled)"
-    } else if cfg!(all(target_arch = "x86_64", not(feature = "force-scalar"))) {
+#[cfg(all(target_arch = "aarch64", not(feature = "force-scalar")))]
+fn active_arch_label() -> &'static str {
+    "aarch64 (NEON: main kernels + huffman bitmap)"
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "force-scalar"))]
+fn active_arch_label() -> &'static str {
+    "aarch64 (force-scalar — NEON kernels disabled)"
+}
+
+#[cfg(all(target_arch = "x86_64", not(feature = "force-scalar")))]
+fn active_arch_label() -> &'static str {
+    if std::arch::is_x86_feature_detected!("avx2") {
         "x86_64 (AVX2: main kernels; SSE2: huffman bitmap)"
-    } else if cfg!(target_arch = "x86_64") {
-        "x86_64 (force-scalar — AVX2 kernels disabled)"
     } else {
-        "scalar (other arch)"
-    };
+        "x86_64 (runtime fallback: scalar main kernels; SSE2: huffman bitmap)"
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "force-scalar"))]
+fn active_arch_label() -> &'static str {
+    "x86_64 (force-scalar — AVX2 and SSE2 kernels disabled)"
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn active_arch_label() -> &'static str {
+    "scalar (other arch)"
+}
+
+fn print_header(section: Section) {
+    let arch = active_arch_label();
     let profile = if cfg!(debug_assertions) {
         "debug (numbers will be useless)"
     } else {

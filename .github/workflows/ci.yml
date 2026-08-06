@@ -65,6 +65,9 @@ jobs:
           cargo fmt --manifest-path thirdparty/dnglab/rawler/Cargo.toml -- --check
       - name: Lint all targets and features
         run: |
+          # jpeg-rusturbo's force-scalar feature is subtractive, so lint its
+          # shipped architecture backends before the workspace all-feature pass.
+          cargo clippy -p jpeg-rusturbo --all-targets --locked -- -D warnings
           cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
           cargo clippy \
             --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
@@ -79,6 +82,7 @@ jobs:
             -D unused_must_use
       - name: Check documentation
         run: |
+          cargo doc -p jpeg-rusturbo --no-deps --locked
           cargo doc --workspace --no-deps --all-features --locked
           cargo doc \
             --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
@@ -220,26 +224,11 @@ jobs:
             --lib \
             decompressors::ljpeg::tests::every_encoded_stream_prefix_is_panic_free \
             --locked
-
-  macos-compatibility:
-    name: Compatibility (macOS latest)
-    runs-on: macos-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          submodules: true
-      - uses: dtolnay/rust-toolchain@2fe4ca74464c5902a4f6e302d0a619b4ea911ccc # 1.96
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: macos-latest
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Test workspace
-        id: test_workspace
-        run: cargo test --workspace --locked
-      - name: Check benchmark targets
-        if: ${{ !cancelled() }}
-        run: cargo check --workspace --benches --all-features --locked
+          RAWLER_FORCE_BASELINE=1 cargo +nightly-2026-07-21 miri test \
+            --manifest-path thirdparty/dnglab/rawler/Cargo.toml \
+            --lib \
+            ljpeg92::tests::compressor_rejects_invalid_layout_before_encoding \
+            --locked
 
   platform:
     name: Platform (${{ matrix.platform }})
@@ -254,7 +243,7 @@ jobs:
             portable_platform: macos-arm64
             rustflags: ''
           - platform: Windows x64
-            os: windows-latest
+            os: windows-2025
             target: x86_64-pc-windows-msvc
             archive: viewr-windows-x64.zip
             portable_platform: windows-x64
@@ -301,12 +290,40 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test workspace
         id: test_workspace
-        if: runner.os != 'macOS'
-        run: cargo test --workspace --locked
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo test --workspace --locked --target ${{ matrix.target }}
+      - name: Test jpeg-rusturbo release behavior
+        id: test_jpeg_rusturbo
+        if: ${{ !cancelled() && runner.os != 'Linux' }}
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo test -p jpeg-rusturbo --lib --release --locked --target ${{ matrix.target }}
+      - name: Test jpeg-rusturbo scalar release behavior
+        id: test_jpeg_rusturbo_scalar
+        if: ${{ !cancelled() && runner.os != 'Linux' }}
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo test -p jpeg-rusturbo --features force-scalar --lib --release --locked --target ${{ matrix.target }}
+      - name: Test vendored Rawler release behavior
+        id: test_rawler
+        if: ${{ !cancelled() && runner.os != 'Linux' }}
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo test --manifest-path thirdparty/dnglab/rawler/Cargo.toml --lib --release --locked --target ${{ matrix.target }}
+      - name: Test vendored Rawler force-baseline release behavior
+        id: test_rawler_baseline
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        env:
+          RAWLER_FORCE_BASELINE: '1'
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo test --manifest-path thirdparty/dnglab/rawler/Cargo.toml --lib --release --locked --target ${{ matrix.target }}
       - name: Check benchmark targets
         id: check_benchmarks
-        if: ${{ runner.os == 'Windows' && (success() || steps.test_workspace.outcome == 'failure') }}
-        run: cargo check --workspace --benches --all-features --locked
+        if: ${{ !cancelled() && runner.os != 'Linux' }}
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo check --workspace --benches --all-features --locked --target ${{ matrix.target }}
       - name: Report optional real-RAW fixture coverage
         if: ${{ always() && runner.os == 'Linux' }}
         shell: bash
@@ -325,7 +342,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Build Viewr
         id: build_viewr
-        if: ${{ success() || steps.test_workspace.outcome == 'failure' || steps.check_benchmarks.outcome == 'failure' }}
+        if: ${{ !cancelled() }}
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release --locked --target ${{ matrix.target }} -p viewr --bin viewr
