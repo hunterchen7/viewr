@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.6.1](https://github.com/hunterchen7/viewr/compare/v0.6.0...v0.6.1) (2026-08-06)
+
+
+### Bug Fixes
+
+* harden architecture-specific raw paths ([03d2068](https://github.com/hunterchen7/viewr/commit/03d206899df3d4d080be0558f2708eb61a2c4dc0))
+* harden vendored lossless JPEG inputs ([55de335](https://github.com/hunterchen7/viewr/commit/55de3358b5dce36a1d45b241d9edf95695812737))
+
+
+### Performance Improvements
+
+* add architecture-specific dispatch and benchmark coverage ([a4787b8](https://github.com/hunterchen7/viewr/commit/a4787b8bbf0d7d306952773092cde43c49d7ac7b))
+* align vendored architecture dispatch ([faba15b](https://github.com/hunterchen7/viewr/commit/faba15b2cc825f102e583fde9f9925d0f5d45c09))
+
 ## [0.6.0](https://github.com/hunterchen7/viewr/compare/v0.5.0...v0.6.0) (2026-08-05)
 
 
